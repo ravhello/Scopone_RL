@@ -1,7 +1,6 @@
 import pygame
 import sys
 import os
-import itertools
 
 from environment import ScoponeEnvMA
 from actions import encode_action, get_valid_actions, MAX_ACTIONS
