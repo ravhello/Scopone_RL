@@ -1,4 +1,3 @@
-# observation.py
 import numpy as np
 
 SUITS_ORDER = ['denari','coppe','spade','bastoni']
@@ -34,19 +33,6 @@ def encode_table(table):
         vec[i] = 1.0
     return vec
 
-def encode_captured_squads(captured_squads):
-    """
-    Concatena 2 vettori binari (ciascuno di dimensione 40) per le 2 squadre.
-    """
-    out = []
-    for sq in [0,1]:
-        arr = np.zeros(40, dtype=np.float32)
-        for c in captured_squads[sq]:
-            i = card_to_index[c]
-            arr[i] = 1.0
-        out.append(arr)
-    return np.concatenate(out)  # 80 dimensioni
-
 def encode_current_player(cp):
     """
     4 dimensioni one-hot
@@ -55,55 +41,45 @@ def encode_current_player(cp):
     arr[cp] = 1.0
     return arr
 
-def encode_move(move):
+def encode_history_stub(history):
     """
-    Ogni mossa in 87 dimensioni:
-      - 0..3 => player
-      - 4..43 => played_card
-      - 44..46 => capture_type (no_capture=0, capture=1, scopa=2)
-      - 47..86 => captured_cards
-    """
-    out = np.zeros(87, dtype=np.float32)
-    p = move["player"]
-    out[p] = 1.0
-
-    played_idx = card_to_index[move["played_card"]]
-    out[4 + played_idx] = 1.0
-
-    capture_map = {"no_capture":0, "capture":1, "scopa":2}
-    ctype_idx = capture_map.get(move["capture_type"], 0)
-    out[4+40+ctype_idx] = 1.0
-
-    base = 4+40+3  # 47
-    for c in move["captured_cards"]:
-        out[base + card_to_index[c]] = 1.0
-
-    return out
-
-def encode_history(history):
-    """
-    Massimo 40 mosse, ciascuna 87 dimensioni => 3480
+    Non salviamo più nulla di player/catture. Se vuoi,
+    puoi codificare semplicemente le 'played_card' e 'choice_index'.
+    
+    Esempio: 2 campi per mossa => (card_one_hot 40) + (choice_index) -> TOT 41 per mossa.
+    Se vogliamo max 40 mosse => 1640 dimensioni.
     """
     max_moves = 40
-    msize = 87
-    hist_arr = np.zeros(max_moves * msize, dtype=np.float32)
-    for i,m in enumerate(history):
-        if i>=max_moves:
+    single_move_size = 41  # 40 per la carta + 1 per choice_index
+    hist_arr = np.zeros(max_moves * single_move_size, dtype=np.float32)
+
+    for i, move in enumerate(history):
+        if i >= max_moves:
             break
-        enc = encode_move(m)
-        hist_arr[i*msize : (i+1)*msize] = enc
+        played_card = move["played_card"]
+        choice_idx = move["choice_index"]
+
+        # 1) Encode la carta
+        card_enc = np.zeros(40, dtype=np.float32)
+        cidx = card_to_index[played_card]
+        card_enc[cidx] = 1.0
+
+        # 2) Insert nel vettore
+        base = i*single_move_size
+        hist_arr[base : base+40] = card_enc
+        hist_arr[base+40] = float(choice_idx)
+
     return hist_arr
 
 def encode_state_for_player(game_state, player_id):
     """
-    Crea un vettore di dimensione fissa (3764) ma OSCURANDO le mani degli altri 3 giocatori.
-      - 4 x 40 = 160 per le mani (solo player_id vede la propria, gli altri 0).
+    Esempio di encoding:
+      - 4 x 40 = 160 per le mani (solo la propria mano, altrimenti 0)
       - 40 per tavolo
-      - 80 per catture di squadra
       - 4 per current_player
-      - 3480 per history
-
-    TOT = 3764
+      - 1640 per la history
+    TOT = 160 + 40 + 4 + 1640 = 1844
+    (Se vuoi arrivare a 3764, puoi aggiungere zone "vuote" finché non raggiungi la dimensione desiderata.)
     """
     # 1) Mani
     hands_vec=[]
@@ -111,7 +87,6 @@ def encode_state_for_player(game_state, player_id):
         if p == player_id:
             arr = encode_hand(game_state["hands"][p])
         else:
-            # Azzeriamo le mani di tutti tranne p
             arr = np.zeros(40, dtype=np.float32)
         hands_vec.append(arr)
     hands_enc = np.concatenate(hands_vec)  # 160
@@ -119,15 +94,20 @@ def encode_state_for_player(game_state, player_id):
     # 2) Tavolo
     table_enc = encode_table(game_state["table"])  # 40
 
-    # 3) Catture squadre
-    captured_enc = encode_captured_squads(game_state["captured_squads"])  # 80
+    # 3) Current player
+    cp_enc = encode_current_player(player_id)  # 4
 
-    # 4) current_player
-    # (se p=player_id è uguale a current_player => indica tocca a me)
-    cp = game_state.get("current_player", 0)
-    cp_enc = encode_current_player(cp)  # 4
+    # 4) History ridotta
+    hist_enc = encode_history_stub(game_state["history"])  # 1640
 
-    # 5) history (40 x 87 = 3480)
-    hist_enc = encode_history(game_state["history"])
+    # Metti tutto insieme
+    full_enc = np.concatenate([hands_enc, table_enc, cp_enc, hist_enc])
 
-    return np.concatenate([hands_enc, table_enc, captured_enc, cp_enc, hist_enc])
+    # Se vuoi raggiungere esattamente 3764, aggiungi uno zero-pad
+    final_size = 3764
+    if len(full_enc) < final_size:
+        padded = np.zeros(final_size, dtype=np.float32)
+        padded[:len(full_enc)] = full_enc
+        return padded
+    else:
+        return full_enc
