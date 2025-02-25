@@ -5,263 +5,270 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
+import collections
 import os
 
 from environment import ScoponeEnvMA
+from actions import encode_action, get_valid_actions, MAX_ACTIONS
 
 # Parametri di rete e training
 LR = 1e-3
 GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_END = 0.01
-EPSILON_DECAY = 5000   # passi totali di training
-BATCH_SIZE = 1         # Qui usiamo un update "step by step" (semplificato)
-CHECKPOINT_PATH = "scopone_checkpoint.pth"
+EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
+BATCH_SIZE = 32          # dimensione mini-batch
+REPLAY_SIZE = 10000      # capacità massima del replay buffer
+TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target
+CHECKPOINT_PATH = "scopone_checkpoint"
 
 ############################################################
-# 1) Definiamo la rete neurale per Q-learning
+# 1) Definiamo una classe ReplayBuffer
+############################################################
+
+class ReplayBuffer:
+    def __init__(self, capacity=REPLAY_SIZE):
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def push(self, transition):
+        """
+        Aggiunge una transizione: (obs, action, reward, next_obs, done, valid_actions_next)
+        """
+        self.buffer.append(transition)
+
+    def sample(self, batch_size):
+        """
+        Estrae in modo casuale un mini-batch di transizioni.
+        """
+        batch = random.sample(self.buffer, batch_size)
+        obs, actions, rewards, next_obs, dones, next_valids = zip(*batch)
+        return (np.array(obs), actions, rewards, np.array(next_obs), dones, next_valids)
+
+    def __len__(self):
+        return len(self.buffer)
+
+############################################################
+# 2) Rete neurale QNetwork
 ############################################################
 
 class QNetwork(nn.Module):
-    """
-    Rete neurale che apprende Q(s,a) data l'osservazione (3764 dimensioni).
-    Siccome 512 azioni possibili, lo strato di output è di dimensione 512.
-    Ma la maggior parte saranno "invalide" in ogni stato; scegliamo la massima Q fra quelle valide.
-    """
-    def __init__(self, obs_dim=3764, act_dim=512):
+    def __init__(self, obs_dim=3764, act_dim=2048):
         super().__init__()
-        # Esempio rete piccola: 2 layer
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 512),
+            nn.Linear(obs_dim, 2048),
             nn.ReLU(),
-            nn.Linear(512, act_dim)
+            nn.Linear(2048, act_dim)
         )
 
     def forward(self, x):
-        return self.net(x)  # shape: [batch_size, act_dim]
+        return self.net(x)
 
 ############################################################
-# 2) Definizione di un Agente Q-learning
+# 3) DQNAgent con target network + replay
 ############################################################
 
-class QAgent:
+class DQNAgent:
     def __init__(self, team_id):
         self.team_id = team_id
-        self.qnet = QNetwork()
-        self.optimizer = optim.Adam(self.qnet.parameters(), lr=LR)
-        self.epsilon = EPSILON_START
-        self.train_steps = 0  # conta i passi totali di training
+        self.online_qnet = QNetwork()
+        self.target_qnet = QNetwork()
+        self.sync_target()  # inizialmente copia i pesi
 
-    def pick_action(self, obs, valid_actions):
+        self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR)
+        self.epsilon = EPSILON_START
+        self.train_steps = 0
+        self.replay_buffer = ReplayBuffer()
+
+    def sync_target(self):
         """
-        Epsilon-greedy su Q(s,·), ma scegliamo un'azione tra quelle valide.
+        Copia i pesi dalla rete online (online_qnet) alla rete target (target_qnet).
         """
+        self.target_qnet.load_state_dict(self.online_qnet.state_dict())
+
+    def pick_action(self, obs, valid_actions, env):
+        """
+        Epsilon-greedy su Q(s,·). Se valid_actions è vuota, solleva eccezione (nessuna azione possibile).
+        """
+        if not valid_actions:
+            # Stampa debug di environment
+            print("\n[DEBUG] Nessuna azione valida! Stato attuale:")
+            print("  Current player:", env.current_player)
+            print("  Tavolo:", env.game_state["table"])
+            for p in range(4):
+                print(f"  Mano p{p}:", env.game_state["hands"][p])
+            print("  History:", env.game_state["history"])
+            raise ValueError("Nessuna azione valida (valid_actions=[]).")
+
+        # Epsilon-greedy
         if random.random() < self.epsilon:
-            # esplorazione
             return random.choice(valid_actions)
         else:
-            # sfruttamento
-            # calcoliamo Q per TUTTE le 512 azioni, poi filtriamo
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)  # shape=[1,3764]
             with torch.no_grad():
-                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)  # shape [1, 3764]
-                q_values = self.qnet(obs_t)  # shape [1, 512]
-                q_values = q_values[0].cpu().numpy()  # shape [512]
-
-            # scegliamo l'azione con Q max fra quelle valide
-            best_act = None
+                q_values = self.online_qnet(obs_t)[0]  # shape [2048]
+            best_a = None
             best_q = -1e9
             for a in valid_actions:
-                if q_values[a] > best_q:
-                    best_q = q_values[a]
-                    best_act = a
-            return best_act
+                val = q_values[a].item()
+                if val > best_q:
+                    best_q = val
+                    best_a = a
+            return best_a
 
     def update_epsilon(self):
         """
-        Decade epsilon col passare dei training steps.
+        Aggiorna epsilon step-by-step, scendendo linearmente da EPSILON_START a EPSILON_END entro EPSILON_DECAY step.
         """
         self.train_steps += 1
-        self.epsilon = max(EPSILON_END, EPSILON_START - self.train_steps / EPSILON_DECAY)
+        ratio = max(0, (EPSILON_DECAY - self.train_steps) / EPSILON_DECAY)
+        self.epsilon = EPSILON_END + (EPSILON_START - EPSILON_END)*ratio
 
-    def train_step(self, obs, action, reward, next_obs, done, next_valid_actions):
+    def store_transition(self, transition):
         """
-        Un singolo aggiornamento Q-learning:
-         Q(s,a) = r + gamma * max_{a' validi}(Q(s',a'))  se not done
-                  r                                     se done
+        Inserisce la transizione nel replay buffer: (obs, action, reward, next_obs, done, valid_next)
         """
-        # Converte in tensori
-        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)      # [1, 3764]
-        next_obs_t = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)  # [1, 3764]
-        action_t = torch.tensor([action], dtype=torch.long)              # [1]
-        reward_t = torch.tensor([reward], dtype=torch.float32)           # [1]
+        self.replay_buffer.push(transition)
 
-        # Stima Q(s,a)
-        q_values = self.qnet(obs_t)        # [1, 512]
-        q_sa = q_values[0, action_t]       # Q(s, action)
+    def can_train(self):
+        """
+        Verifica se il buffer ha abbastanza transizioni per un mini-batch.
+        """
+        return len(self.replay_buffer) >= BATCH_SIZE
 
-        # Calcola il target
-        if done:
-            target = reward_t
-        else:
-            # Cerchiamo massima Q nel next state ma SOLO tra next_valid_actions
-            with torch.no_grad():
-                q_next = self.qnet(next_obs_t)[0]   # shape [512]
-            max_q_next = max(q_next[a].item() for a in next_valid_actions)
-            target = reward_t + GAMMA * max_q_next
+    def train_step(self):
+        """
+        Esegue un update di Q-learning su un mini-batch dal replay buffer.
+        """
+        if not self.can_train():
+            return
 
-        # MSE loss
-        loss = (q_sa - target)**2
+        obs, actions, rewards, next_obs, dones, next_valids = self.replay_buffer.sample(BATCH_SIZE)
 
-        # Backprop
+        obs_t = torch.tensor(obs, dtype=torch.float32)       # [B,3764]
+        actions_t = torch.tensor(actions, dtype=torch.long)  # [B]
+        rewards_t = torch.tensor(rewards, dtype=torch.float32)  # [B]
+        next_obs_t = torch.tensor(next_obs, dtype=torch.float32) # [B,3764]
+        dones_t = torch.tensor(dones, dtype=torch.float32)    # [B]
+
+        # Q(s, a)
+        q_values = self.online_qnet(obs_t)  # [B,2048]
+        q_sa = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)  # [B]
+
+        # costruiamo il target
+        with torch.no_grad():
+            q_next_all = self.target_qnet(next_obs_t)  # [B,2048]
+
+        targets = []
+        for i in range(BATCH_SIZE):
+            if dones_t[i] > 0.5:
+                t = rewards_t[i]
+            else:
+                valid_acts = next_valids[i]  # array di azioni
+                max_q_next = max(q_next_all[i, a].item() for a in valid_acts) if valid_acts else 0.0
+                t = rewards_t[i] + GAMMA * max_q_next
+            targets.append(t)
+        targets_t = torch.tensor(targets, dtype=torch.float32)
+
+        loss_fn = nn.MSELoss()
+        loss = loss_fn(q_sa, targets_t)
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
+    def maybe_sync_target(self):
+        """
+        Se self.train_steps è multiplo di TARGET_UPDATE_FREQ, sincronizza la rete target.
+        """
+        if self.train_steps % TARGET_UPDATE_FREQ == 0:
+            self.sync_target()
+
     def save_checkpoint(self, filename):
-        """
-        Salva i pesi del modello su disco.
-        """
         torch.save({
-            "model_state_dict": self.qnet.state_dict(),
+            "online_state_dict": self.online_qnet.state_dict(),
+            "target_state_dict": self.target_qnet.state_dict(),
             "epsilon": self.epsilon,
             "train_steps": self.train_steps
         }, filename)
-        print(f"Checkpoint salvato su {filename}")
+        print(f"[DQNAgent] Checkpoint salvato: {filename}")
 
     def load_checkpoint(self, filename):
-        """
-        Carica i pesi del modello.
-        """
         ckpt = torch.load(filename)
-        self.qnet.load_state_dict(ckpt["model_state_dict"])
+        self.online_qnet.load_state_dict(ckpt["online_state_dict"])
+        self.target_qnet.load_state_dict(ckpt["target_state_dict"])
         self.epsilon = ckpt["epsilon"]
         self.train_steps = ckpt["train_steps"]
-        print(f"Checkpoint caricato da {filename}")
+        print(f"[DQNAgent] Checkpoint caricato da {filename}")
 
 ############################################################
-# 3) Funzione train principale
+# 4) Multi-agent training
 ############################################################
 
 def train_agents(num_episodes=10):
     """
-    Esegue un training multi-agent: i due agent imparano le rispettive Q-funzioni.
-    Rotazione del first_player dopo ogni partita.
-    Salva un checkpoint al termine.
+    Esegue un training multi-agent "nativo" (Team0 e Team1) con:
+      - Replay Buffer
+      - Target Network
+      - Nessuna reward intermedia
     """
-    # Creiamo i due agent (Team 0 e Team 1)
-    agent_team0 = QAgent(team_id=0)
-    agent_team1 = QAgent(team_id=1)
+    # Creiamo 2 agenti
+    agent_team0 = DQNAgent(team_id=0)
+    agent_team1 = DQNAgent(team_id=1)
+
+    # Caricamento checkpoint se esistono
+    if os.path.isfile(CHECKPOINT_PATH+"_team0.pth"):
+        agent_team0.load_checkpoint(CHECKPOINT_PATH+"_team0.pth")
+    if os.path.isfile(CHECKPOINT_PATH+"_team1.pth"):
+        agent_team1.load_checkpoint(CHECKPOINT_PATH+"_team1.pth")
 
     first_player = 0
+    global_step = 0  
 
-    # Ciclo sugli episodi
-    for episode in range(num_episodes):
-        print(f"\n=== Episodio {episode+1}, inizia player {first_player} ===")
+    for ep in range(num_episodes):
+        print(f"\n=== Episodio {ep+1}, inizia player {first_player} ===")
         env = ScoponeEnvMA()
         env.current_player = first_player
 
         done = False
-        obs_current = env._get_observation(env.current_player)  # osservazione del primo player
-        # Usiamo un buffer temporaneo per memorizzare la transizione (s,a,r,s') di ciascun team
-        # Poiché la reward finale è assegnata solo alla fine, accumuliamo reward = 0 finché non finisce
-        # e poi assegniamo la differenza di punteggio a ciascun team.
-        transitions_team0 = []
-        transitions_team1 = []
+        obs_current = env._get_observation(env.current_player)
 
         while not done:
             cp = env.current_player
-            # Determiniamo quale team sta giocando
             team_id = 0 if cp in [0,2] else 1
             agent = agent_team0 if team_id==0 else agent_team1
 
-            # Otteniamo le azioni valide
             valid_acts = env.get_valid_actions()
-            # Scegliamo l'azione con epsilon-greedy
-            action = agent.pick_action(obs_current, valid_acts)
+            action = agent.pick_action(obs_current, valid_acts, env)
 
-            # Eseguiamo lo step
             next_obs, reward_scalar, done, info = env.step(action)
-            # Qui, reward_scalar=0.0 se non done, info["team_rewards"] se done
+            global_step += 1
 
-            # Se la partita non è terminata, la reward immediata = 0
-            # Mettiamo in transizione
-            transitions_team0.append(None)  # placeholder
-            transitions_team1.append(None)
-
-            if team_id==0:
-                transitions_team0[-1] = (obs_current, action, 0.0, next_obs, done)  
-            else:
-                transitions_team1[-1] = (obs_current, action, 0.0, next_obs, done)
-
-            obs_next = next_obs
-
+            # reward=0 durante l'episodio
             if not done:
-                # Passiamo al prossimo
-                obs_current = obs_next
+                next_player = env.current_player
+                next_valid = env.get_valid_actions()
             else:
-                # Partita terminata => calcoliamo le due reward finali
-                team_rewards = info.get("team_rewards", [0.0, 0.0])  
-                print(f"Team Rewards finali = {team_rewards}")
-                # Assegniamo a tutti i passaggi di team0 la reward team_rewards[0],
-                # a tutti i passaggi di team1 la reward team_rewards[1]
-                # Poi aggiorniamo i Q-net
-                update_agents_after_episode(agent_team0, transitions_team0, team_rewards[0], env)
-                update_agents_after_episode(agent_team1, transitions_team1, team_rewards[1], env)
+                next_valid = []
 
-            # Decresce epsilon
+            agent.store_transition( (obs_current, action, 0.0, next_obs, done, next_valid) )
+
+            agent.train_step()
             agent.update_epsilon()
+            agent.maybe_sync_target()
 
-        # Cambiamo first_player
-        first_player = (first_player+1)%4
+            obs_current = next_obs
 
-    # Al termine del training salviamo i pesi
-    agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0")
-    agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1")
-    print("=== Training concluso e checkpoint salvati. ===")
+        # Fine partita
+        if "team_rewards" in info:
+            team_rewards = info["team_rewards"]
+            print(f"Team Rewards finali: {team_rewards}")
 
-def update_agents_after_episode(agent, transitions, final_reward, env):
-    """
-    Per ogni transizione (s, a, r=0, s'), aggiorniamo con r + final_reward. 
-    Esempio semplificato: assegniamo TUTTO il reward finale all'ultima transizione,
-    oppure lo assegniamo equamente a TUTTE le transizioni.
-    Qui, per semplicità, lo assegniamo uguale a tutte le transizioni di quell'agente.
-    """
-    if not transitions:
-        return
+        first_player = (first_player + 1)%4
 
-    # Se preferisci assegnare il reward finale all'ULTIMA transizione soltanto:
-    #   transitions[-1] = (s, a, final_reward, s', done)
-    # e le altre = 0
-    # Qui facciamo "spread" = final_reward su tutte le transizioni.
-
-    # Se la partita è durata N mosse per questo agente, distribuiamo final_reward su ognuna
-    # (approccio molto naive).
-    # Oppure potresti assegnare final_reward su TUTTE, generando un "monte" di training che
-    # potrebbe avere un segnale più forte.
-    # Scegliamo la seconda opzione, per semplicità.
-
-    for i, tr in enumerate(transitions):
-        if tr is None:
-            continue
-        obs, act, _, next_obs, done = tr
-        # calcoliamo reward = final_reward
-        # Il next_valid_actions lo otteniamo dal env, ma
-        # se done==True, next_valid_actions non serve (è finale).
-        if not done:
-            env.game_state["current_player"] = -1  # hack: forziamo un player inesistente
-            # Oppure creiamo un game_state fittizio
-            # Visto che la partita e' conclusa, potremmo ipotizzare che next_valid_actions=[]
-            # ma in Q-learning ci serve la massima Q tra le azioni valide del next state
-            # In uno scenario + complesso creeresti un "copia" del game_state e imposteresti
-            # "current_player" all' (cp+1)%4, ma la partita e' terminata, e' un edge case.
-            next_valid_acts = env.get_valid_actions()  
-        else:
-            next_valid_acts = []
-
-        agent.train_step(
-            obs, act, final_reward, next_obs, done, next_valid_acts
-        )
-
+    # Salviamo i checkpoint finali
+    agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0.pth")
+    agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1.pth")
+    print("=== Fine training con DQN multi-agent + Replay + Target Net ===")
 
 if __name__ == "__main__":
-    train_agents(num_episodes=20)
+    train_agents(num_episodes=2000)

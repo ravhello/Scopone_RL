@@ -26,7 +26,7 @@ class ScoponeEnvMA(gym.Env):
         
         # Observation space = 3764 dimensioni
         self.observation_space = spaces.Box(low=0, high=1, shape=(3764,), dtype=np.float32)
-        # Action space = Discrete(512)
+        # Action space = Discrete(2048)
         self.action_space = spaces.Discrete(MAX_ACTIONS)
         
         # Stato base

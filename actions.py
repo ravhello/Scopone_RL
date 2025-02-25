@@ -1,7 +1,7 @@
 # actions.py
 import itertools
 
-MAX_ACTIONS = 512
+MAX_ACTIONS = 2048
 
 def get_valid_actions(game_state, current_player):
     cp = current_player
