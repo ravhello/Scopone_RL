@@ -51,7 +51,6 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(2048, act_dim)
         )
-
     def forward(self, x):
         return self.net(x)
 
@@ -74,12 +73,7 @@ class DQNAgent:
 
     def pick_action(self, obs, valid_actions, env):
         if not valid_actions:
-            print("\n[DEBUG] Nessuna azione valida!")
-            print("  Current player:", env.current_player)
-            print("  Tavolo:", env.game_state["table"])
-            for p in range(4):
-                print(f"  Mano p{p}:", env.game_state["hands"][p])
-            print("  History:", env.game_state["history"])
+            print("\n[DEBUG] Nessuna azione valida per il player", env.current_player)
             raise ValueError("No valid actions!")
         if random.random() < self.epsilon:
             return random.choice(valid_actions)
@@ -158,28 +152,33 @@ class DQNAgent:
         print(f"[DQNAgent] Checkpoint loaded from {filename}")
 
 ############################################################
-# 4) Multi-agent training
+# 4) Multi-agent training con Monte Carlo
 ############################################################
 def train_agents(num_episodes=10):
     """
     Per ogni episodio:
       1. Esegui esattamente 40 mosse (4 giocatori x 10 carte).
-      2. Dopo le 40 mosse, calcola il punteggio finale e inserisci automaticamente
-         due dummy transitions (una per ciascun team) per trasmettere la final reward agli agenti.
+      2. Mantieni in memoria le transizioni dell'episodio in un buffer temporaneo.
+      3. Alla fine delle 40 mosse, calcola il punteggio finale e aggiorna retroattivamente
+         il reward di ogni transizione con il reward finale (approccio Monte Carlo).
+         In questo modo, ogni transizione dell'episodio "ottiene" il feedback finale.
     """
     agent_team0 = DQNAgent(team_id=0)
     agent_team1 = DQNAgent(team_id=1)
-    if os.path.isfile(CHECKPOINT_PATH+"_team0.pth"):
-        agent_team0.load_checkpoint(CHECKPOINT_PATH+"_team0.pth")
-    if os.path.isfile(CHECKPOINT_PATH+"_team1.pth"):
-        agent_team1.load_checkpoint(CHECKPOINT_PATH+"_team1.pth")
+    if os.path.isfile(CHECKPOINT_PATH + "_team0.pth"):
+        agent_team0.load_checkpoint(CHECKPOINT_PATH + "_team0.pth")
+    if os.path.isfile(CHECKPOINT_PATH + "_team1.pth"):
+        agent_team1.load_checkpoint(CHECKPOINT_PATH + "_team1.pth")
     first_player = 0
 
+    # Per ogni episodio, memorizziamo le transizioni per ciascun team in buffer temporanei
     for ep in range(num_episodes):
         print(f"\n=== Episodio {ep+1}, inizia player {first_player} ===")
         env = ScoponeEnvMA()
         env.current_player = first_player
 
+        # Buffer temporanei per le transizioni dell'episodio (per team)
+        episode_transitions = {0: [], 1: []}
         # Esegui esattamente 40 mosse
         for move in range(40):
             cp = env.current_player
@@ -190,33 +189,44 @@ def train_agents(num_episodes=10):
             action = agent.pick_action(obs_current, valid_actions, env)
             next_obs, rew, info = env.step(action)  # rew sempre 0.0
             next_valid = env.get_valid_actions()
-            agent.store_transition((obs_current, action, 0.0, next_obs, next_valid))
+            # Crea la transizione temporanea (reward inizialmente 0.0)
+            transition = (obs_current, action, 0.0, next_obs, next_valid)
+            episode_transitions[team_id].append(transition)
+            # Esegui anche un train_step parziale (opzionale) per non "accumulare troppo"
+            agent.store_transition(transition)
             agent.train_step()
             agent.update_epsilon()
             agent.maybe_sync_target()
 
-        # Calcola il punteggio finale
+        # Fine delle 40 mosse: calcola il punteggio finale
         breakdown = compute_final_score_breakdown(env.game_state)
         final_reward = compute_final_reward_from_breakdown(breakdown)
         r0, r1 = final_reward[0], final_reward[1]
         print(f"Team Rewards finali: [r0={r0}, r1={r1}]")
 
-        # Inserisci automaticamente le dummy transitions per trasmettere il feedback finale
-        obs0 = env._get_observation(0)
-        agent_team0.store_transition((obs0, 0, r0, obs0, []))
-        agent_team0.train_step()
-        obs1 = env._get_observation(1)
-        agent_team1.store_transition((obs1, 0, r1, obs1, []))
-        agent_team1.train_step()
+        # Per ogni transizione dell'episodio, aggiorna il reward con il feedback finale
+        for team_id, transitions in episode_transitions.items():
+            team_reward = r0 if team_id == 0 else r1
+            for trans in transitions:
+                updated_trans = (trans[0], trans[1], team_reward, trans[3], trans[4])
+                if team_id == 0:
+                    agent_team0.store_transition(updated_trans)
+                else:
+                    agent_team1.store_transition(updated_trans)
+
+        # Esegui alcuni step di training supplementare per far "incorporare" il feedback finale
+        for _ in range(50):
+            agent_team0.train_step()
+            agent_team1.train_step()
+            agent_team0.update_epsilon()
+            agent_team1.update_epsilon()
+            agent_team0.maybe_sync_target()
+            agent_team1.maybe_sync_target()
 
         first_player = (first_player + 1) % 4
-        #rewards_team0 = [transition[2] for transition in agent_team0.replay_buffer.buffer]
-        #rewards_team1 = [transition[2] for transition in agent_team1.replay_buffer.buffer]
-        #print(f"Rewards team 0: {rewards_team0}")
-        #print(f"Rewards team 1: {rewards_team1}")
 
-    agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0.pth")
-    agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1.pth")
+    agent_team0.save_checkpoint(CHECKPOINT_PATH + "_team0.pth")
+    agent_team1.save_checkpoint(CHECKPOINT_PATH + "_team1.pth")
     print("=== Fine training DQN multi-agent ===")
 
 if __name__ == "__main__":
