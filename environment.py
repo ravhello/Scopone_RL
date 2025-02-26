@@ -67,18 +67,20 @@ class ScoponeEnvMA(gym.Env):
         self.rewards = rw_array  # [r0, r1]
 
         if done:
-            # Partita finita => reward finale [r0, r1]
-            # Gym in singolo canale di reward => forziamo un'uscita custom.
-            # Per compatibilita', ritorniamo (obs_fittizio, <scalar_reward>, done, info)
-            # e in info mettiamo "team_rewards".
-            # Oppure ritorniamo come "reward=0" e "info['team_rewards']=[r0,r1]".
-            # Qui facciamo la 2a opzione, cosi' l'utente puo' leggerli.
+            # Partita finita => restituiamo la ricompensa per il team che ha mosso
             obs_final = np.zeros(3764, dtype=np.float32)
+
+            # In info mettiamo anche i punteggi di entrambi i team
             info["team_rewards"] = [rw_array[0], rw_array[1]]
-            return obs_final, 0.0, True, info
+
+            # Calcoliamo quale team ha mosso
+            team_id = 0 if self.current_player in [0,2] else 1
+            # Prendiamo la ricompensa finale per quell'agente
+            final_reward = rw_array[team_id]
+
+            return obs_final, final_reward, True, info
         else:
-            # Non finita => reward=[0,0]
-            # Passa al prossimo player
+            # Non finita => ricompensa 0.0
             self.current_player = (self.current_player + 1) % 4
             next_obs = self._get_observation(self.current_player)
             return next_obs, 0.0, False, info

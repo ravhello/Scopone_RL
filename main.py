@@ -210,6 +210,7 @@ def train_agents(num_episodes=10):
       - Replay Buffer
       - Target Network
       - Nessuna reward intermedia
+      - Entrambi gli agenti vedono la reward finale.
     """
     # Creiamo 2 agenti
     agent_team0 = DQNAgent(team_id=0)
@@ -232,6 +233,12 @@ def train_agents(num_episodes=10):
         done = False
         obs_current = env._get_observation(env.current_player)
 
+        # Ricordiamo chi ha mosso e quale azione per l'ultimo step
+        last_agent = None
+        last_obs = obs_current
+        last_action = None
+        last_valid = []
+
         while not done:
             cp = env.current_player
             team_id = 0 if cp in [0,2] else 1
@@ -243,32 +250,94 @@ def train_agents(num_episodes=10):
             next_obs, reward_scalar, done, info = env.step(action)
             global_step += 1
 
-            # reward=0 durante l'episodio
-            if not done:
-                next_player = env.current_player
-                next_valid = env.get_valid_actions()
-            else:
+            # Normalmente (non è finita la partita) -> reward=0.0
+            # Se la partita finisce, per ora salviamo "provvisorio"
+            final_rew = 0.0  
+            if done:
+                # Mettiamo "provvisorio" a 0.0, poi dopo il while
+                # correggeremo la transizione aggiungendo la final reward
                 next_valid = []
+            else:
+                next_valid = env.get_valid_actions()
 
-            agent.store_transition( (obs_current, action, 0.0, next_obs, done, next_valid) )
-
+            # Salviamo la transizione con reward=0.0
+            agent.store_transition( (obs_current, action, final_rew, next_obs, done, next_valid) )
             agent.train_step()
             agent.update_epsilon()
             agent.maybe_sync_target()
+
+            # Teniamo traccia dell'ultimo step
+            last_agent = agent
+            last_obs = obs_current
+            last_action = action
+            last_valid = next_valid
 
             obs_current = next_obs
 
         # Fine partita
         if "team_rewards" in info:
             team_rewards = info["team_rewards"]
+            r0, r1 = team_rewards
             print(f"Team Rewards finali: {team_rewards}")
 
-        first_player = (first_player + 1)%4
+            # 1) Aggiorniamo la transizione finale dell'agente che ha mosso
+            #    sostituendo reward=0.0 con la ricompensa vera
+            if last_agent is not None:
+                # Chi ha fatto l'ultima mossa?
+                # last_agent è agent_team0 se team_id=0, agent_team1 se team_id=1
+                # Troviamo anche team_id
+                agent_team_id = 0 if last_agent is agent_team0 else 1
+                final_reward_for_last_agent = team_rewards[agent_team_id]
+
+                # Sostituiamo l'ultima transizione nello replay buffer con la reward corretta.
+                # L'ultima transizione è in coda al replay buffer dell'agente in questione:
+                if len(last_agent.replay_buffer.buffer) > 0:
+                    # Ultima transizione
+                    old_t = last_agent.replay_buffer.buffer[-1]
+                    # old_t = (obs, action, reward=0.0, next_obs, done, next_valid)
+                    corrected_t = (
+                        old_t[0],             # obs
+                        old_t[1],             # action
+                        final_reward_for_last_agent,  # QUI la nuova reward
+                        old_t[3],             # next_obs
+                        old_t[4],             # done
+                        old_t[5]              # next_valid
+                    )
+                    # Sostituiamo
+                    last_agent.replay_buffer.buffer[-1] = corrected_t
+
+                # Ora rifacciamo un train_step per incorporare questa transizione aggiornata
+                last_agent.train_step()
+
+            # 2) Creiamo "dummy transition" anche per l'altro agente
+            #    in modo che pure lui veda la propria final reward.
+            other_agent = agent_team1 if last_agent is agent_team0 else agent_team0
+            other_team_id = 1 if last_agent is agent_team0 else 0
+            rew_other = team_rewards[other_team_id]
+
+            # Costruiamo un'osservazione dummy per quell'altro agente (e un'azione dummy=0).
+            # Qui prendiamo ad esempio l'osservazione attuale (o obs=0) giusto per salvare la reward.
+            obs_other = env._get_observation(1) if other_team_id==1 else env._get_observation(0)
+
+            dummy_transition = (
+                obs_other,  # oss fittizio
+                0,          # action fittizia
+                rew_other,  # reward finale
+                obs_other,  # next_obs fittizio
+                True,       # done
+                []
+            )
+            other_agent.replay_buffer.push(dummy_transition)
+            other_agent.train_step()
+
+        # Passiamo al prossimo "first_player"
+        first_player = (first_player + 1) % 4
 
     # Salviamo i checkpoint finali
     agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0.pth")
     agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1.pth")
     print("=== Fine training con DQN multi-agent + Replay + Target Net ===")
+
 
 if __name__ == "__main__":
     train_agents(num_episodes=2000)
