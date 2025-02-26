@@ -35,7 +35,7 @@ class ReplayBuffer:
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         obs, actions, rewards, next_obs, valid_next = zip(*batch)
-        return (list(obs), list(actions), list(rewards), list(next_obs), list(valid_next))
+        return (np.array(obs), actions, rewards, np.array(next_obs), valid_next)
 
     def __len__(self):
         return len(self.buffer)
@@ -60,10 +60,8 @@ class QNetwork(nn.Module):
 class DQNAgent:
     def __init__(self, team_id):
         self.team_id = team_id
-        # Definiamo il device (GPU se disponibile, altrimenti CPU)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.online_qnet = QNetwork().to(self.device)
-        self.target_qnet = QNetwork().to(self.device)
+        self.online_qnet = QNetwork()
+        self.target_qnet = QNetwork()
         self.sync_target()
         self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR)
         self.epsilon = EPSILON_START
@@ -77,22 +75,20 @@ class DQNAgent:
         if not valid_actions:
             print("\n[DEBUG] Nessuna azione valida per il player", env.current_player)
             raise ValueError("No valid actions!")
-        # Se il campione è già un tensore (in ambiente GPU) usiamo unsqueeze
-        if isinstance(obs, torch.Tensor):
-            obs_t = obs.unsqueeze(0)
+        if random.random() < self.epsilon:
+            return random.choice(valid_actions)
         else:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            q_values = self.online_qnet(obs_t)[0]
-        best_a = None
-        best_q = -1e9
-        for a in valid_actions:
-            # Qui per ogni indice di azione, estraiamo il valore (seppur con .item(), l'overhead è minimo)
-            val = q_values[a].item()
-            if val > best_q:
-                best_q = val
-                best_a = a
-        return best_a
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                q_values = self.online_qnet(obs_t)[0]
+            best_a = None
+            best_q = -1e9
+            for a in valid_actions:
+                val = q_values[a].item()
+                if val > best_q:
+                    best_q = val
+                    best_a = a
+            return best_a
 
     def update_epsilon(self):
         self.train_steps += 1
@@ -101,13 +97,7 @@ class DQNAgent:
 
     def store_transition(self, transition):
         # transition = (obs, action, reward, next_obs, valid_next)
-        obs, action, reward, next_obs, valid_next = transition
-        # Converto in tensori sul device se non lo sono già
-        if not torch.is_tensor(obs):
-            obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
-        if not torch.is_tensor(next_obs):
-            next_obs = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
-        self.replay_buffer.push((obs, action, reward, next_obs, valid_next))
+        self.replay_buffer.push(transition)
 
     def can_train(self):
         return len(self.replay_buffer) >= BATCH_SIZE
@@ -116,11 +106,10 @@ class DQNAgent:
         if not self.can_train():
             return
         obs, actions, rewards, next_obs, valid_next = self.replay_buffer.sample(BATCH_SIZE)
-        # Poiché abbiamo già salvato tensori su GPU, possiamo usare torch.stack
-        obs_t = torch.stack(obs)
-        actions_t = torch.tensor(actions, dtype=torch.long, device=self.device)
-        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        next_obs_t = torch.stack(next_obs)
+        obs_t = torch.tensor(obs, dtype=torch.float32)
+        actions_t = torch.tensor(actions, dtype=torch.long)
+        rewards_t = torch.tensor(rewards, dtype=torch.float32)
+        next_obs_t = torch.tensor(next_obs, dtype=torch.float32)
         q_values = self.online_qnet(obs_t)
         q_sa = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
@@ -134,7 +123,7 @@ class DQNAgent:
                 max_q_next = 0.0
             t = rewards_t[i] + GAMMA * max_q_next
             targets.append(t)
-        targets_t = torch.tensor(targets, dtype=torch.float32, device=self.device)
+        targets_t = torch.tensor(targets, dtype=torch.float32)
         loss_fn = nn.MSELoss()
         loss = loss_fn(q_sa, targets_t)
         self.optimizer.zero_grad()
@@ -155,7 +144,7 @@ class DQNAgent:
         print(f"[DQNAgent] Checkpoint saved: {filename}")
 
     def load_checkpoint(self, filename):
-        ckpt = torch.load(filename, map_location=self.device)
+        ckpt = torch.load(filename)
         self.online_qnet.load_state_dict(ckpt["online_state_dict"])
         self.target_qnet.load_state_dict(ckpt["target_state_dict"])
         self.epsilon = ckpt["epsilon"]
@@ -185,7 +174,7 @@ def train_agents(num_episodes=10):
     # Per ogni episodio, memorizziamo le transizioni per ciascun team in buffer temporanei
     for ep in range(num_episodes):
         print(f"\n=== Episodio {ep+1}, inizia player {first_player} ===")
-        env = ScoponeEnvMA()  # L'environment ora produce osservazioni su GPU
+        env = ScoponeEnvMA()
         env.current_player = first_player
 
         # Buffer temporanei per le transizioni dell'episodio (per team)
@@ -203,7 +192,7 @@ def train_agents(num_episodes=10):
             # Crea la transizione temporanea (reward inizialmente 0.0)
             transition = (obs_current, action, 0.0, next_obs, next_valid)
             episode_transitions[team_id].append(transition)
-            # Salva la transizione e esegui un train_step parziale
+            # Esegui anche un train_step parziale (opzionale) per non "accumulare troppo"
             agent.store_transition(transition)
             agent.train_step()
             agent.update_epsilon()
@@ -215,7 +204,7 @@ def train_agents(num_episodes=10):
         r0, r1 = final_reward[0], final_reward[1]
         print(f"Team Rewards finali: [r0={r0}, r1={r1}]")
 
-        # Aggiorna retroattivamente il reward per ogni transizione dell'episodio
+        # Per ogni transizione dell'episodio, aggiorna il reward con il feedback finale
         for team_id, transitions in episode_transitions.items():
             team_reward = r0 if team_id == 0 else r1
             for trans in transitions:
@@ -225,7 +214,7 @@ def train_agents(num_episodes=10):
                 else:
                     agent_team1.store_transition(updated_trans)
 
-        # Training supplementare per incorporare il feedback finale
+        # Esegui alcuni step di training supplementare per far "incorporare" il feedback finale
         for _ in range(50):
             agent_team0.train_step()
             agent_team1.train_step()
@@ -241,4 +230,18 @@ def train_agents(num_episodes=10):
     print("=== Fine training DQN multi-agent ===")
 
 if __name__ == "__main__":
+    import cProfile, pstats
+    import webbrowser
+    import os
+
+    profiler = cProfile.Profile()
+    profiler.enable()             # Avvia il profiling
     train_agents(num_episodes=10)
+    profiler.disable()            # Termina il profiling
+
+    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    stats.dump_stats('profiling_results.prof')
+
+    # Visualizza i risultati nel browser
+    os.system('snakeviz profiling_results.prof')
+    webbrowser.open('http://localhost:8080/snakeviz/profiling_results.prof')

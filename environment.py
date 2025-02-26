@@ -1,7 +1,6 @@
 import numpy as np
 import gym
 from gym import spaces
-import torch
 
 from state import initialize_game
 from observation import encode_state_for_player
@@ -22,8 +21,6 @@ class ScoponeEnvMA(gym.Env):
         self.action_space = spaces.Discrete(MAX_ACTIONS)
         self.game_state = None
         self.current_player = 0
-        # Definisce il device anche per l'environment
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.reset()
 
     def get_valid_actions(self):
@@ -45,9 +42,7 @@ class ScoponeEnvMA(gym.Env):
         return next_obs, 0.0, info
 
     def _get_observation(self, player_id):
-        # Converte la rappresentazione numpy in un tensore già sul device
-        obs_np = encode_state_for_player(self.game_state, player_id)
-        return torch.tensor(obs_np, device=self.device, dtype=torch.float32)
+        return encode_state_for_player(self.game_state, player_id)
 
     def render(self, mode="human"):
         print("=== Stato Ambiente Scopone ===")
