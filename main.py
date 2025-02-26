@@ -10,7 +10,7 @@ from environment import ScoponeEnvMA
 from actions import encode_action, get_valid_actions, MAX_ACTIONS
 from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
 
-# Parametri
+# Parametri di rete e training
 LR = 1e-3
 GAMMA = 0.99
 EPSILON_START = 1.0
@@ -22,7 +22,7 @@ TARGET_UPDATE_FREQ = 1000
 CHECKPOINT_PATH = "scopone_checkpoint"
 
 ############################################################
-# ReplayBuffer
+# 1) ReplayBuffer
 ############################################################
 class ReplayBuffer:
     def __init__(self, capacity=REPLAY_SIZE):
@@ -41,7 +41,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 ############################################################
-# QNetwork
+# 2) QNetwork
 ############################################################
 class QNetwork(nn.Module):
     def __init__(self, obs_dim=3764, act_dim=2048):
@@ -51,11 +51,12 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(2048, act_dim)
         )
+
     def forward(self, x):
         return self.net(x)
 
 ############################################################
-# DQNAgent
+# 3) DQNAgent
 ############################################################
 class DQNAgent:
     def __init__(self, team_id):
@@ -157,14 +158,14 @@ class DQNAgent:
         print(f"[DQNAgent] Checkpoint loaded from {filename}")
 
 ############################################################
-# Training (40 moves per episode + dummy transitions)
+# 4) Multi-agent training
 ############################################################
 def train_agents(num_episodes=10):
     """
     Per ogni episodio:
-      1. Si eseguono esattamente 40 mosse (una per ogni carta, 4x10).
-      2. Dopo le 40 mosse, si calcola il punteggio finale e si crea
-         una dummy transition per ciascun team in modo che entrambi vedano la final reward.
+      1. Esegui esattamente 40 mosse (4 giocatori x 10 carte).
+      2. Dopo le 40 mosse, calcola il punteggio finale e inserisci automaticamente
+         due dummy transitions (una per ciascun team) per trasmettere la final reward agli agenti.
     """
     agent_team0 = DQNAgent(team_id=0)
     agent_team1 = DQNAgent(team_id=1)
@@ -172,7 +173,6 @@ def train_agents(num_episodes=10):
         agent_team0.load_checkpoint(CHECKPOINT_PATH+"_team0.pth")
     if os.path.isfile(CHECKPOINT_PATH+"_team1.pth"):
         agent_team1.load_checkpoint(CHECKPOINT_PATH+"_team1.pth")
-
     first_player = 0
 
     for ep in range(num_episodes):
@@ -188,9 +188,8 @@ def train_agents(num_episodes=10):
             obs_current = env._get_observation(cp)
             valid_actions = env.get_valid_actions()
             action = agent.pick_action(obs_current, valid_actions, env)
-            next_obs, rew, info = env.step(action)  # rew è sempre 0.0
+            next_obs, rew, info = env.step(action)  # rew sempre 0.0
             next_valid = env.get_valid_actions()
-            # Salva la transizione con reward 0.0
             agent.store_transition((obs_current, action, 0.0, next_obs, next_valid))
             agent.train_step()
             agent.update_epsilon()
@@ -202,16 +201,19 @@ def train_agents(num_episodes=10):
         r0, r1 = final_reward[0], final_reward[1]
         print(f"Team Rewards finali: [r0={r0}, r1={r1}]")
 
-        # Aggiungi dummy transition per Team0 e Team1 affinché entrambi vedano la reward finale
+        # Inserisci automaticamente le dummy transitions per trasmettere il feedback finale
         obs0 = env._get_observation(0)
         agent_team0.store_transition((obs0, 0, r0, obs0, []))
         agent_team0.train_step()
-
         obs1 = env._get_observation(1)
         agent_team1.store_transition((obs1, 0, r1, obs1, []))
         agent_team1.train_step()
 
         first_player = (first_player + 1) % 4
+        #rewards_team0 = [transition[2] for transition in agent_team0.replay_buffer.buffer]
+        #rewards_team1 = [transition[2] for transition in agent_team1.replay_buffer.buffer]
+        #print(f"Rewards team 0: {rewards_team0}")
+        #print(f"Rewards team 1: {rewards_team1}")
 
     agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0.pth")
     agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1.pth")

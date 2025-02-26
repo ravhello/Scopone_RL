@@ -3,7 +3,7 @@ from actions import decode_action
 
 def update_game_state(game_state, action_id, current_player):
     """
-    Aggiorna lo stato (catture, scopa, ecc.) senza gestire reward o done.
+    Aggiorna lo stato (catture, scopa, ecc.) SENZA gestire reward finale o done.
     Restituisce sempre (game_state, [0.0, 0.0], info).
     """
     squad_id = 0 if current_player in [0, 2] else 1

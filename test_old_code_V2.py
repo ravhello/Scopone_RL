@@ -162,23 +162,16 @@ def test_40_mosse_e_calcolo_finale():
 
 @pytest.mark.parametrize("seed", [1234])
 def test_agents_final_reward_team1_with_4_scopes(seed):
-    """
-    Esempio test su 40 mosse (con forced moves per i primi 8 step, poi random)
-    e dummy transitions per trasmettere la final reward a ciascun agente.
-    Viene controllato se i Q-value di Team1 sono aumentati.
-    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
     agent_team0 = DQNAgent(team_id=0)
     agent_team1 = DQNAgent(team_id=1)
     agent_team0.epsilon = 0.0
     agent_team1.epsilon = 0.0
-
     env = ScoponeEnvMA()
     env.current_player = 0
-    # Assegniamo manualmente le mani
+    # Assegna manualmente le mani
     env.game_state["hands"][0] = [
         (1, 'denari'), (1, 'coppe'), (2, 'denari'), (2, 'bastoni'),
         (3, 'spade'), (4, 'coppe'), (5, 'bastoni'), (5, 'spade'),
@@ -200,14 +193,13 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
         (10, 'coppe'), (10, 'spade')
     ]
     env.game_state["table"] = []
-
     # Q-value di Team1 prima
     obs_t1_before = env._get_observation(1)
     tensor_before = torch.tensor(obs_t1_before, dtype=torch.float32).unsqueeze(0)
     with torch.no_grad():
         qvals_before = agent_team1.online_qnet(tensor_before)[0].clone()
 
-    # Forced moves: esattamente 8 mosse predefinite
+    # Forced moves: 8 mosse predefinite
     forced_moves = [
         dict(player=0, hand_index=0, subset=()),
         dict(player=1, hand_index=0, subset=(0, 1)),
@@ -218,59 +210,63 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
         dict(player=2, hand_index=1, subset=()),
         dict(player=3, hand_index=1, subset=(0, 1)),
     ]
-
     for move in forced_moves:
         p = move["player"]
         env.current_player = p
-        # Impostiamo il tavolo per forzare la scopa nei turni di p1 e p3
         if p == 1 and move["hand_index"] in [0, 1]:
             env.game_state["table"] = [(3, 'spade'), (4, 'coppe')] if move["hand_index"] == 0 else [(2, 'denari'), (5, 'spade')]
         elif p == 3 and move["hand_index"] in [0, 1]:
             env.game_state["table"] = [(2, 'spade'), (5, 'bastoni')] if move["hand_index"] == 0 else [(3, 'coppe'), (4, 'bastoni')]
         action = encode_action(move["hand_index"], move["subset"])
         obs_before = env._get_observation(p)
-        valids = env.get_valid_actions()
-        if action not in valids:
-            action = valids[0]
+        valid_actions = env.get_valid_actions()
+        if action not in valid_actions:
+            action = valid_actions[0]
         next_obs, rew, info = env.step(action)
-        # Storing della transizione forced (reward sempre 0.0)
         if p in [1, 3]:
             agent_team1.store_transition((obs_before, action, 0.0, next_obs, env.get_valid_actions()))
             agent_team1.train_step()
         else:
             agent_team0.store_transition((obs_before, action, 0.0, next_obs, env.get_valid_actions()))
             agent_team0.train_step()
-
-    # Ora eseguiamo mosse random fino a completare 40 mosse
+    # Random moves fino a completare 40 mosse
     step_count = 8
     while step_count < 40:
         cp = env.current_player
         obs_before = env._get_observation(cp)
         team_id = 0 if cp in [0, 2] else 1
         agent = agent_team0 if team_id == 0 else agent_team1
-        valids = env.get_valid_actions()
-        if not valids:
+        valid_actions = env.get_valid_actions()
+        if not valid_actions:
             break
-        action = random.choice(valids)
+        action = random.choice(valid_actions)
         next_obs, rew, info = env.step(action)
         agent.store_transition((obs_before, action, 0.0, next_obs, env.get_valid_actions()))
         agent.train_step()
         step_count += 1
 
-    # Calcolo finale del punteggio
+    # Al termine delle 40 mosse, il tuo codice (train_agents) dovrebbe aver inserito le dummy transitions.
+    # Qui controlliamo che, ad esempio, il replay buffer del team 1 contenga 21 transizioni
     breakdown = compute_final_score_breakdown(env.game_state)
     final_reward = compute_final_reward_from_breakdown(breakdown)
     r0, r1 = final_reward[0], final_reward[1]
-    print("Final reward:", r0, r1)
+    replay_team0 = agent_team0.replay_buffer.buffer
+    replay_team1 = agent_team1.replay_buffer.buffer
+    print("Transitions for Team 0:")
+    for transition in replay_team0:
+        print(f"State: {transition[0]}, Action: {transition[1]}, Reward: {transition[2]}, Next State: {transition[3]}, Valid Actions: {transition[4]}")
 
-    # Dummy transitions per trasmettere la final reward a ciascun agente
-    obs0 = env._get_observation(0)
-    agent_team0.store_transition((obs0, 0, r0, obs0, []))
-    agent_team0.train_step()
-
-    obs1 = env._get_observation(1)
-    agent_team1.store_transition((obs1, 0, r1, obs1, []))
-    agent_team1.train_step()
+    print("Transitions for Team 1:")
+    for transition in replay_team1:
+        print(f"State: {transition[0]}, Action: {transition[1]}, Reward: {transition[2]}, Next State: {transition[3]}, Valid Actions: {transition[4]}")
+    assert len(replay_team0) >= 21, "Il replay buffer di Team0 deve contenere almeno 21 transizioni"
+    assert len(replay_team1) >= 21, "Il replay buffer di Team1 deve contenere almeno 21 transizioni"
+    last_transition_team0 = replay_team0[-1]
+    last_transition_team1 = replay_team1[-1]
+    dummy_reward_team0 = last_transition_team0[2]
+    dummy_reward_team1 = last_transition_team1[2]
+    assert dummy_reward_team0 == r0, "La dummy transition di Team0 deve contenere la final reward"
+    assert dummy_reward_team1 == r1, "La dummy transition di Team1 deve contenere la final reward"
 
     for _ in range(50):
         agent_team0.train_step()

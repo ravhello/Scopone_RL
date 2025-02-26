@@ -10,8 +10,7 @@ from game_logic import update_game_state
 class ScoponeEnvMA(gym.Env):
     """
     Ambiente semplificato per Scopone.
-    Non gestisce lo stato "done" né la reward finale;
-    lo step restituisce sempre reward 0.0.
+    Non gestisce lo stato “done” o la reward finale; lo step restituisce sempre reward 0.0.
     Le 40 mosse totali sono gestite esternamente.
     """
     metadata = {"render.modes": ["human"]}
@@ -36,7 +35,7 @@ class ScoponeEnvMA(gym.Env):
         valid_actions = self.get_valid_actions()
         if action not in valid_actions:
             raise ValueError(f"Azione {action} non valida. Valide: {valid_actions}")
-        # Aggiorna lo stato, ignorando reward/done
+        # Aggiorna lo stato; ignoriamo reward finale e done
         self.game_state, _, info = update_game_state(self.game_state, action, self.current_player)
         self.current_player = (self.current_player + 1) % 4
         next_obs = self._get_observation(self.current_player)
