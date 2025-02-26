@@ -166,79 +166,83 @@ class DQNAgent:
 # 4) Multi-agent training con Monte Carlo
 ############################################################
 def train_agents(num_episodes=10):
-    """
-    Per ogni episodio:
-      1. Esegui esattamente 40 mosse (4 giocatori x 10 carte).
-      2. Mantieni in memoria le transizioni dell'episodio in un buffer temporaneo.
-      3. Alla fine delle 40 mosse, calcola il punteggio finale e aggiorna retroattivamente
-         il reward di ogni transizione con il reward finale (approccio Monte Carlo).
-         In questo modo, ogni transizione dell'episodio "ottiene" il feedback finale.
-    """
-    agent_team0 = DQNAgent(team_id=0)
-    agent_team1 = DQNAgent(team_id=1)
-    if os.path.isfile(CHECKPOINT_PATH + "_team0.pth"):
-        agent_team0.load_checkpoint(CHECKPOINT_PATH + "_team0.pth")
-    if os.path.isfile(CHECKPOINT_PATH + "_team1.pth"):
-        agent_team1.load_checkpoint(CHECKPOINT_PATH + "_team1.pth")
-    first_player = 0
+    # Impostiamo il profiler per monitorare sia attività CPU che GPU.
+    with torch.profiler.profile(
+         activities=[
+             torch.profiler.ProfilerActivity.CPU,
+             torch.profiler.ProfilerActivity.CUDA
+         ],
+         schedule=torch.profiler.schedule(
+             wait=1,    # salta il primo step
+             warmup=1,  # step di riscaldamento
+             active=3   # registra per 3 step
+         ),
+         on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/profiler'),
+         record_shapes=True,
+         profile_memory=True,
+         with_stack=True
+    ) as profiler:
+        
+        agent_team0 = DQNAgent(team_id=0)
+        agent_team1 = DQNAgent(team_id=1)
+        if os.path.isfile(CHECKPOINT_PATH + "_team0.pth"):
+            agent_team0.load_checkpoint(CHECKPOINT_PATH + "_team0.pth")
+        if os.path.isfile(CHECKPOINT_PATH + "_team1.pth"):
+            agent_team1.load_checkpoint(CHECKPOINT_PATH + "_team1.pth")
+        first_player = 0
 
-    # Per ogni episodio, memorizziamo le transizioni per ciascun team in buffer temporanei
-    for ep in range(num_episodes):
-        print(f"\n=== Episodio {ep+1}, inizia player {first_player} ===")
-        env = ScoponeEnvMA()  # L'environment ora produce osservazioni su GPU
-        env.current_player = first_player
+        for ep in range(num_episodes):
+            print(f"\n=== Episodio {ep+1}, inizia player {first_player} ===")
+            env = ScoponeEnvMA()
+            env.current_player = first_player
 
-        # Buffer temporanei per le transizioni dell'episodio (per team)
-        episode_transitions = {0: [], 1: []}
-        # Esegui esattamente 40 mosse
-        for move in range(40):
-            cp = env.current_player
-            team_id = 0 if cp in [0, 2] else 1
-            agent = agent_team0 if team_id == 0 else agent_team1
-            obs_current = env._get_observation(cp)
-            valid_actions = env.get_valid_actions()
-            action = agent.pick_action(obs_current, valid_actions, env)
-            next_obs, rew, info = env.step(action)  # rew sempre 0.0
-            next_valid = env.get_valid_actions()
-            # Crea la transizione temporanea (reward inizialmente 0.0)
-            transition = (obs_current, action, 0.0, next_obs, next_valid)
-            episode_transitions[team_id].append(transition)
-            # Salva la transizione e esegui un train_step parziale
-            agent.store_transition(transition)
-            agent.train_step()
-            agent.update_epsilon()
-            agent.maybe_sync_target()
+            episode_transitions = {0: [], 1: []}
+            for move in range(40):
+                cp = env.current_player
+                team_id = 0 if cp in [0, 2] else 1
+                agent = agent_team0 if team_id == 0 else agent_team1
+                obs_current = env._get_observation(cp)
+                valid_actions = env.get_valid_actions()
+                action = agent.pick_action(obs_current, valid_actions, env)
+                next_obs, rew, info = env.step(action)
+                next_valid = env.get_valid_actions()
+                transition = (obs_current, action, 0.0, next_obs, next_valid)
+                episode_transitions[team_id].append(transition)
+                agent.store_transition(transition)
+                agent.train_step()
+                agent.update_epsilon()
+                agent.maybe_sync_target()
 
-        # Fine delle 40 mosse: calcola il punteggio finale
-        breakdown = compute_final_score_breakdown(env.game_state)
-        final_reward = compute_final_reward_from_breakdown(breakdown)
-        r0, r1 = final_reward[0], final_reward[1]
-        print(f"Team Rewards finali: [r0={r0}, r1={r1}]")
+            breakdown = compute_final_score_breakdown(env.game_state)
+            final_reward = compute_final_reward_from_breakdown(breakdown)
+            r0, r1 = final_reward[0], final_reward[1]
+            print(f"Team Rewards finali: [r0={r0}, r1={r1}]")
 
-        # Aggiorna retroattivamente il reward per ogni transizione dell'episodio
-        for team_id, transitions in episode_transitions.items():
-            team_reward = r0 if team_id == 0 else r1
-            for trans in transitions:
-                updated_trans = (trans[0], trans[1], team_reward, trans[3], trans[4])
-                if team_id == 0:
-                    agent_team0.store_transition(updated_trans)
-                else:
-                    agent_team1.store_transition(updated_trans)
+            for team_id, transitions in episode_transitions.items():
+                team_reward = r0 if team_id == 0 else r1
+                for trans in transitions:
+                    updated_trans = (trans[0], trans[1], team_reward, trans[3], trans[4])
+                    if team_id == 0:
+                        agent_team0.store_transition(updated_trans)
+                    else:
+                        agent_team1.store_transition(updated_trans)
 
-        # Training supplementare per incorporare il feedback finale
-        for _ in range(50):
-            agent_team0.train_step()
-            agent_team1.train_step()
-            agent_team0.update_epsilon()
-            agent_team1.update_epsilon()
-            agent_team0.maybe_sync_target()
-            agent_team1.maybe_sync_target()
+            for _ in range(50):
+                agent_team0.train_step()
+                agent_team1.train_step()
+                agent_team0.update_epsilon()
+                agent_team1.update_epsilon()
+                agent_team0.maybe_sync_target()
+                agent_team1.maybe_sync_target()
 
-        first_player = (first_player + 1) % 4
+            first_player = (first_player + 1) % 4
 
-    agent_team0.save_checkpoint(CHECKPOINT_PATH + "_team0.pth")
-    agent_team1.save_checkpoint(CHECKPOINT_PATH + "_team1.pth")
-    print("=== Fine training DQN multi-agent ===")
+            # Ogni episodio, segnala un passo al profiler
+            profiler.step()
+
+        agent_team0.save_checkpoint(CHECKPOINT_PATH + "_team0.pth")
+        agent_team1.save_checkpoint(CHECKPOINT_PATH + "_team1.pth")
+        print("=== Fine training DQN multi-agent ===")
 
 if __name__ == "__main__":
     train_agents(num_episodes=10)
