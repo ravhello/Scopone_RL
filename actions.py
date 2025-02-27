@@ -15,22 +15,18 @@ def precompute_all_subsets(table_tuple):
       un dizionario { rank : [lista di tuple con gli indici del tavolo], ... }
       rank è un intero 1..10
     """
-    # Inizializziamo un dizionario in cui per ogni rank (1..10) teniamo una lista vuota.
     results = {r: [] for r in range(1, 11)}
-    table = list(table_tuple)  # ci serve come lista per fare backtracking
+    table = list(table_tuple)
 
     def backtrack(start, current_indices, current_sum):
-        # current_sum rientra in 1..10 => aggiungiamo la combinazione
         if 1 <= current_sum <= 10:
             results[current_sum].append(tuple(current_indices))
-        # Se abbiamo già superato 10, inutile proseguire
         if current_sum >= 10:
             return
 
         for i in range(start, len(table)):
             new_sum = current_sum + table[i]
             if new_sum > 10:
-                # Se la somma supera 10, proseguiremo oltre non aiuta (rank massimo è 10)
                 continue
             backtrack(i + 1, current_indices + [i], new_sum)
 
@@ -38,48 +34,49 @@ def precompute_all_subsets(table_tuple):
     return results
 
 
-def get_valid_actions(game_state, current_player):
+def get_valid_actions(game_state, current_player, device=None):
     """
-    Restituisce un tensore con tutte le azioni valide per il current_player, 
-    usando una precomputazione globale per trovare i subset che sommano il rank.
+    Restituisce un tensore con tutte le azioni valide per il current_player,
+    usando una precomputazione globale per trovare i sottoinsiemi di indici che sommano il rank.
+    
+    Se device è specificato (es: torch.device('cuda')),
+    allora il tensore finale verrà creato su quella device;
+    altrimenti, rimane su CPU.
     """
+    if device is None:
+        device = torch.device("cpu")
+
     hand = game_state["hands"][current_player]
     table = game_state["table"]
 
-    # Prepara la tupla dei rank del tavolo
-    # in modo che l'indice di table_tuple corrisponda all'indice della carta in "table".
     table_tuple = tuple(card[0] for card in table)
-
-    # Precompute una sola volta tutti i subset per tutti i rank (1..10)
-    # e avremo un dict come {1: [...], 2: [...], ...}
     all_subsets = precompute_all_subsets(table_tuple)
 
-    valid_actions = []
+    valid_actions_list = []
     for h_i, card in enumerate(hand):
         rank = card[0]
-
-        # 1) Se esiste una carta di ugual rank sul tavolo, cattura diretta
+        # 1) Cattura diretta (stesso rank)
         same_rank_indices = [idx for idx, t_c in enumerate(table) if t_c[0] == rank]
         if same_rank_indices:
-            # encode_action considera la bitmask: passiamo la lista degli indici
             action_id = encode_action(h_i, same_rank_indices)
             if action_id < MAX_ACTIONS:
-                valid_actions.append(action_id)
+                valid_actions_list.append(action_id)
         else:
-            # 2) Altrimenti, proviamo i subset con somma == rank
+            # 2) Sottoinsiemi con somma == rank
             possible_subsets = all_subsets.get(rank, [])
             if possible_subsets:
                 for subset_indices in possible_subsets:
                     action_id = encode_action(h_i, subset_indices)
                     if action_id < MAX_ACTIONS:
-                        valid_actions.append(action_id)
+                        valid_actions_list.append(action_id)
             else:
-                # 3) Nessuna cattura possibile => gioca la carta da sola
+                # 3) Gioca carta senza cattura
                 action_id = encode_action(h_i, ())
                 if action_id < MAX_ACTIONS:
-                    valid_actions.append(action_id)
+                    valid_actions_list.append(action_id)
 
-    return torch.tensor(valid_actions, dtype=torch.long)
+    # Creiamo il tensore su 'device' specificato
+    return torch.tensor(valid_actions_list, dtype=torch.long, device=device)
 
 
 def encode_action(hand_index, subset_indices):
