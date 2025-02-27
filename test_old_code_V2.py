@@ -3,8 +3,8 @@ import numpy as np
 import random
 import torch
 
-# Import dal tuo codice
-from main import DQNAgent
+# Import dal tuo codice aggiornato
+from main import DQNAgent, PrioritizedReplayBuffer, REPLAY_SIZE, WARMUP_STEPS
 from environment import ScoponeEnvMA  # Nuovo environment (senza done)
 from actions import encode_action, decode_action, get_valid_actions, MAX_ACTIONS
 from state import create_deck, initialize_game, SUITS, RANKS
@@ -125,7 +125,6 @@ def test_scopa_case():
     gs["captured_squads"] = {0:[], 1:[]}
     gs["history"] = []
 
-    from actions import encode_action
     action_id = encode_action(0, (0,1))  # Deve catturare 3,4
     new_gs, rw_array, info = update_game_state(gs, action_id, 0)
     # In questa funzione, reward è sempre [0.0,0.0]
@@ -147,9 +146,10 @@ def test_40_mosse_e_calcolo_finale():
     for i in range(40):
         cp = env.current_player
         valids = env.get_valid_actions()
-        if not valids:
+        # Controlla se non ci sono azioni valide
+        if valids.numel() == 0:
             break
-        action = random.choice(valids)
+        action = random.choice(valids.tolist())
         obs, rew, info = env.step(action)
         # rew è sempre 0.0
 
@@ -171,10 +171,16 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    agent_team0 = DQNAgent(team_id=0)
-    agent_team1 = DQNAgent(team_id=1)
+    # Creiamo un replay buffer condiviso (da usare in entrambi gli agenti)
+    shared_buffer = PrioritizedReplayBuffer(capacity=REPLAY_SIZE)
+    agent_team0 = DQNAgent(team_id=0, replay_buffer=shared_buffer)
+    agent_team1 = DQNAgent(team_id=1, replay_buffer=shared_buffer)
     agent_team0.epsilon = 0.0
     agent_team1.epsilon = 0.0
+
+    # Bypass del warmup: forza il contatore di training a WARMUP_STEPS
+    agent_team0.train_steps = WARMUP_STEPS
+    agent_team1.train_steps = WARMUP_STEPS
 
     env = ScoponeEnvMA()
     env.current_player = 0
@@ -203,7 +209,7 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
 
     # Q-value di Team1 prima
     obs_t1_before = env._get_observation(1)
-    tensor_before = torch.tensor(obs_t1_before, dtype=torch.float32).unsqueeze(0)
+    tensor_before = obs_t1_before.unsqueeze(0)
     with torch.no_grad():
         qvals_before = agent_team1.online_qnet(tensor_before)[0].clone()
 
@@ -232,8 +238,8 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
         action = encode_action(move["hand_index"], move["subset"])
         obs_before = env._get_observation(p)
         valids = env.get_valid_actions()
-        if action not in valids:
-            action = valids[0]
+        if action not in valids.tolist():
+            action = valids[0].item()
         next_obs, rew, info = env.step(action)
         team_id = 0 if p in [0, 2] else 1
         transition = (obs_before, action, 0.0, next_obs, env.get_valid_actions())
@@ -247,9 +253,9 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
         team_id = 0 if cp in [0, 2] else 1
         agent = agent_team0 if team_id == 0 else agent_team1
         valids = env.get_valid_actions()
-        if not valids:
+        if valids.numel() == 0:
             break
-        action = random.choice(valids)
+        action = random.choice(valids.tolist())
         next_obs, rew, info = env.step(action)
         transition = (obs_before, action, 0.0, next_obs, env.get_valid_actions())
         episode_transitions[team_id].append(transition)
@@ -261,7 +267,7 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
     r0, r1 = final_reward[0], final_reward[1]
     print("Final reward:", r0, r1)
 
-    # Ora aggiorna tutte le transizioni dell'episodio per ciascun team con il reward finale
+    # Aggiorna le transizioni con il reward finale
     for team_id, trans_list in episode_transitions.items():
         team_reward = r0 if team_id == 0 else r1
         for trans in trans_list:
@@ -271,17 +277,17 @@ def test_agents_final_reward_team1_with_4_scopes(seed):
             else:
                 agent_team1.store_transition(updated)
 
-    # Esegui ulteriori step di training
-    for _ in range(50):
+    # Esegui un maggior numero di step di training (ad esempio 200 iterazioni)
+    for _ in range(200):
         agent_team0.train_step()
         agent_team1.train_step()
         agent_team0.update_epsilon()
         agent_team1.update_epsilon()
-        agent_team0.maybe_sync_target()
-        agent_team1.maybe_sync_target()
+        agent_team0._soft_update()
+        agent_team1._soft_update()
 
     obs_t1_after = env._get_observation(1)
-    tensor_after = torch.tensor(obs_t1_after, dtype=torch.float32).unsqueeze(0)
+    tensor_after = obs_t1_after.unsqueeze(0)
     with torch.no_grad():
         qvals_after = agent_team1.online_qnet(tensor_after)[0]
     diff_q = (qvals_after - qvals_before).max().item()

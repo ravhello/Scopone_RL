@@ -278,11 +278,10 @@ class DQNAgent:
             # 2.a) Troviamo azioni argmax con la rete online
             q_all_next_online = self.online_qnet(next_obs_t)   # [B, MAX_ACTIONS]
 
-            # valid_next[i] => azioni valide per la i-esima transizione
-            # Dobbiamo estrarre l'argmax *tra le azioni valide* per ciascun sample
+            # valid_next[i] => tensore di azioni valide per la i-esima transizione
             best_actions_list = []
             for i in range(BATCH_SIZE):
-                va = valid_next[i]  # tensore di azioni valide
+                va = valid_next[i]  # tensore di azioni valide (probabilmente su CPU)
                 if va.numel() == 0:
                     # Se non ci sono azioni valide, forziamo "azione 0" e q_next=0
                     best_actions_list.append(torch.tensor(0, device=self.device))
@@ -290,9 +289,11 @@ class DQNAgent:
                     q_valid = q_all_next_online[i][va]  # [n_valid]
                     best_idx_local = torch.argmax(q_valid).item()
                     best_action = va[best_idx_local]
-                    best_actions_list.append(best_action)
-
+                    # Converti best_action in un tensore su self.device
+                    best_actions_list.append(torch.tensor(best_action.item(), device=self.device))
+            
             best_actions_t = torch.stack(best_actions_list)     # [B]
+
 
             # 2.b) Valutiamo le Q con la rete target e prendiamo Q(s', best_action)
             q_all_next_target = self.target_qnet(next_obs_t)    # [B, MAX_ACTIONS]
