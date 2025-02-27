@@ -4,6 +4,7 @@ import os
 
 from environment import ScoponeEnvMA
 from actions import encode_action, get_valid_actions, MAX_ACTIONS
+from rewards import compute_final_score_breakdown  # Importazione della funzione per il punteggio finale
 
 # Dizionari per i nomi completi di rank e suit
 RANK_NAMES = {
@@ -55,7 +56,7 @@ def load_card_images(folder="assets"):
     for r in possible_ranks:
         for s in possible_suits:
             key = (r,s)
-            filename_key = format_card(key)  # ad es. "01_Asso_di_denari"
+            filename_key = format_card(key)  # es. "01_Asso_di_denari"
             filename = os.path.join(folder, filename_key + ".jpg")
             if os.path.isfile(filename):
                 img = pygame.image.load(filename)
@@ -69,7 +70,8 @@ def load_card_images(folder="assets"):
 
 def format_move(move):
     """
-    Restituisce una stringa testuale per debug, ad es.:
+    Restituisce una stringa testuale per debug.
+    Esempio:
     "Player 2 => played (01_Asso_di_denari), capture=scopa, captured=[04_Quattro_di_denari 17_Sette_di_coppe]"
     """
     pl = move["player"]
@@ -221,7 +223,7 @@ def main_pygame():
         selected_hand_index = None
         selected_table_indices.clear()
 
-    def draw_text(surface, text, x, y, color=(0,0,0), font=font_msg):
+    def draw_text_local(surface, text, x, y, color=(0,0,0), font=font_msg):
         render = font.render(text, True, color)
         surface.blit(render, (x, y))
 
@@ -229,7 +231,7 @@ def main_pygame():
         screen.fill(WHITE)
         btn_new_game.draw(screen)
         btn_confirm.draw(screen)
-        draw_text(screen, msg_text, 160, 30, RED)
+        draw_text_local(screen, msg_text, 160, 30, RED)
 
         if env is not None:
             cp = env.current_player
@@ -247,11 +249,11 @@ def main_pygame():
                     lines.append("  " + format_move(move))
             oy = 110
             for ln in lines:
-                draw_text(screen, ln, 20, oy, BLACK, font_info)
+                draw_text_local(screen, ln, 20, oy, BLACK, font_info)
                 oy += 22
 
             # Disegna le carte in mano del giocatore corrente
-            if not done:
+            if not show_final_summary:
                 hand = gs["hands"][cp]
                 base_x = 150
                 base_y = 450
@@ -265,7 +267,7 @@ def main_pygame():
                             pygame.draw.rect(screen, GREEN, (x_i, y_i, CARD_W, CARD_H), 3)
                     else:
                         pygame.draw.rect(screen, GRAY, (x_i, y_i, CARD_W, CARD_H))
-                        draw_text(screen, format_card(c), x_i+5, y_i+5, BLACK, font_info)
+                        draw_text_local(screen, format_card(c), x_i+5, y_i+5, BLACK, font_info)
 
                 # Disegna le carte sul tavolo
                 table_cards = gs["table"]
@@ -281,7 +283,7 @@ def main_pygame():
                             pygame.draw.rect(screen, RED, (x_i, y_i, CARD_W, CARD_H), 3)
                     else:
                         pygame.draw.rect(screen, GRAY, (x_i, y_i, CARD_W, CARD_H))
-                        draw_text(screen, format_card(c), x_i+5, y_i+5, BLACK, font_info)
+                        draw_text_local(screen, format_card(c), x_i+5, y_i+5, BLACK, font_info)
 
         pygame.display.update()
 
@@ -301,7 +303,7 @@ def main_pygame():
                 if btn_new_game.is_clicked(pos):
                     reset_env()
                 elif btn_confirm.is_clicked(pos):
-                    if env is None or done:
+                    if env is None or show_final_summary:
                         msg_text = "Partita non avviata o già terminata."
                     else:
                         if selected_hand_index is None:
@@ -312,20 +314,19 @@ def main_pygame():
                             if act_id not in valid_acts:
                                 msg_text = "Mossa NON valida. Riprova."
                             else:
-                                obs_next, reward, done_flag, info = env.step(act_id)
-                                done = done_flag
-                                if done:
-                                    # Quando la partita finisce, prendiamo il breakdown dettagliato
-                                    final_breakdown = info.get("score_breakdown", None)
+                                # Chiamata al nuovo step (che restituisce 3 valori)
+                                obs_next, reward, info = env.step(act_id)
+                                # Verifica se tutte le mani sono vuote (partita terminata)
+                                if sum(len(env.game_state["hands"][p]) for p in range(4)) == 0:
+                                    final_breakdown = compute_final_score_breakdown(env.game_state)
                                     show_final_summary = True
                                     msg_text = "Partita terminata!"
                                 else:
                                     msg_text = "Mossa effettuata."
                                 selected_hand_index = None
                                 selected_table_indices.clear()
-
                 else:
-                    if env and not done:
+                    if env and not show_final_summary:
                         cp = env.current_player
                         gs = env.game_state
                         # Clic sulle carte in mano

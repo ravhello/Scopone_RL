@@ -432,4 +432,4 @@ def train_agents(num_episodes=50):
 
 
 if __name__ == "__main__":
-    train_agents(num_episodes=10)
+    train_agents(num_episodes=1000)
