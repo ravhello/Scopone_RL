@@ -3,7 +3,7 @@ import sys
 import os
 
 from environment import ScoponeEnvMA
-from actions import encode_action, get_valid_actions, MAX_ACTIONS
+from actions import encode_action, decode_action
 
 # Dizionari per i nomi completi di rank e suit
 RANK_NAMES = {
@@ -200,8 +200,8 @@ def main_pygame():
     final_breakdown = None
     msg_text = "Premi 'Nuova Partita' per iniziare."
 
-    selected_hand_index = None
-    selected_table_indices = set()
+    selected_hand_card = None     # Ora memorizziamo direttamente la carta selezionata, non il suo indice
+    selected_table_cards = set()  # Ora memorizziamo direttamente le carte selezionate, non i loro indici
 
     btn_new_game = Button(20, 20, 120, 30, "Nuova Partita", BLUE, WHITE)
     btn_confirm  = Button(20, 60, 120, 30, "Conferma Mossa", GREEN, WHITE)
@@ -211,15 +211,15 @@ def main_pygame():
 
     def reset_env():
         nonlocal env, done, show_final_summary, final_breakdown, msg_text
-        nonlocal selected_hand_index, selected_table_indices
+        nonlocal selected_hand_card, selected_table_cards
         env = ScoponeEnvMA()
         env.reset()
         done = False
         show_final_summary = False
         final_breakdown = None
         msg_text = "Nuova partita iniziata."
-        selected_hand_index = None
-        selected_table_indices.clear()
+        selected_hand_card = None
+        selected_table_cards.clear()
 
     def draw_text(surface, text, x, y, color=(0,0,0), font=font_msg):
         render = font.render(text, True, color)
@@ -256,32 +256,32 @@ def main_pygame():
                 base_x = 150
                 base_y = 450
                 gap = 70
-                for i, c in enumerate(hand):
+                for i, card in enumerate(hand):
                     x_i = base_x + i * gap
                     y_i = base_y
-                    if c in card_images:
-                        screen.blit(card_images[c], (x_i, y_i))
-                        if i == selected_hand_index:
+                    if card in card_images:
+                        screen.blit(card_images[card], (x_i, y_i))
+                        if card == selected_hand_card:
                             pygame.draw.rect(screen, GREEN, (x_i, y_i, CARD_W, CARD_H), 3)
                     else:
                         pygame.draw.rect(screen, GRAY, (x_i, y_i, CARD_W, CARD_H))
-                        draw_text(screen, format_card(c), x_i+5, y_i+5, BLACK, font_info)
+                        draw_text(screen, format_card(card), x_i+5, y_i+5, BLACK, font_info)
 
                 # Disegna le carte sul tavolo
                 table_cards = gs["table"]
                 base_tx = 220
                 base_ty = 150
                 gap_t = 70
-                for i, c in enumerate(table_cards):
+                for i, card in enumerate(table_cards):
                     x_i = base_tx + i * gap_t
                     y_i = base_ty
-                    if c in card_images:
-                        screen.blit(card_images[c], (x_i, y_i))
-                        if i in selected_table_indices:
+                    if card in card_images:
+                        screen.blit(card_images[card], (x_i, y_i))
+                        if card in selected_table_cards:
                             pygame.draw.rect(screen, RED, (x_i, y_i, CARD_W, CARD_H), 3)
                     else:
                         pygame.draw.rect(screen, GRAY, (x_i, y_i, CARD_W, CARD_H))
-                        draw_text(screen, format_card(c), x_i+5, y_i+5, BLACK, font_info)
+                        draw_text(screen, format_card(card), x_i+5, y_i+5, BLACK, font_info)
 
         pygame.display.update()
 
@@ -304,15 +304,26 @@ def main_pygame():
                     if env is None or done:
                         msg_text = "Partita non avviata o già terminata."
                     else:
-                        if selected_hand_index is None:
+                        if selected_hand_card is None:
                             msg_text = "Seleziona una carta in mano prima di confermare."
                         else:
+                            # Codifichiamo l'azione usando la rappresentazione one-hot
+                            action_vec = encode_action(selected_hand_card, list(selected_table_cards))
+                            
+                            # Verifichiamo se è un'azione valida confrontandola con le azioni valide
                             valid_acts = env.get_valid_actions()
-                            act_id = encode_action(selected_hand_index, sorted(selected_table_indices))
-                            if act_id not in valid_acts:
+                            valid_action = None
+                            
+                            for valid_act in valid_acts:
+                                card, captured = decode_action(valid_act)
+                                if card == selected_hand_card and set(captured) == selected_table_cards:
+                                    valid_action = valid_act
+                                    break
+                            
+                            if valid_action is None:
                                 msg_text = "Mossa NON valida. Riprova."
                             else:
-                                obs_next, reward, done_flag, info = env.step(act_id)
+                                obs_next, reward, done_flag, info = env.step(valid_action)
                                 done = done_flag
                                 if done:
                                     # Quando la partita finisce, prendiamo il breakdown dettagliato
@@ -321,8 +332,8 @@ def main_pygame():
                                     msg_text = "Partita terminata!"
                                 else:
                                     msg_text = "Mossa effettuata."
-                                selected_hand_index = None
-                                selected_table_indices.clear()
+                                selected_hand_card = None
+                                selected_table_cards.clear()
 
                 else:
                     if env and not done:
@@ -333,30 +344,30 @@ def main_pygame():
                         base_x = 150
                         base_y = 450
                         gap = 70
-                        for i, c in enumerate(hand):
+                        for i, card in enumerate(hand):
                             rx = base_x + i * gap
                             ry = base_y
                             r_rect = pygame.Rect(rx, ry, CARD_W, CARD_H)
                             if r_rect.collidepoint(pos):
-                                selected_hand_index = i
-                                msg_text = f"Selezionata carta indice {i} in mano"
+                                selected_hand_card = card
+                                msg_text = f"Selezionata carta {format_card(card)}"
                                 break
                         # Clic sulle carte sul tavolo
                         table_cards = gs["table"]
                         base_tx = 220
                         base_ty = 150
                         gap_t = 70
-                        for i, c in enumerate(table_cards):
+                        for i, card in enumerate(table_cards):
                             rx = base_tx + i * gap_t
                             ry = base_ty
                             r_rect = pygame.Rect(rx, ry, CARD_W, CARD_H)
                             if r_rect.collidepoint(pos):
-                                if i in selected_table_indices:
-                                    selected_table_indices.remove(i)
-                                    msg_text = f"Rimossa carta tavolo indice {i}"
+                                if card in selected_table_cards:
+                                    selected_table_cards.remove(card)
+                                    msg_text = f"Rimossa carta {format_card(card)}"
                                 else:
-                                    selected_table_indices.add(i)
-                                    msg_text = f"Aggiunta carta tavolo indice {i}"
+                                    selected_table_cards.add(card)
+                                    msg_text = f"Aggiunta carta {format_card(card)}"
                                 break
 
     pygame.quit()

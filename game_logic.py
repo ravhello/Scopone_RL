@@ -5,6 +5,10 @@ from actions import decode_action
 from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
 
 def update_game_state(game_state, action_id, current_player):
+    """
+    Ora accetta un'azione in formato one-hot (vettore a 154 dimensioni)
+    e aggiorna lo stato del gioco di conseguenza.
+    """
     squad_id = 0 if current_player in [0,2] else 1
 
     hand = game_state["hands"][current_player]
@@ -13,29 +17,38 @@ def update_game_state(game_state, action_id, current_player):
         final_reward = compute_final_reward_from_breakdown(final_breakdown)
         return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
 
-    hand_index, subset_ids = decode_action(action_id)
-    hand_index %= len(hand)
-    played_card = hand.pop(hand_index)
+    # Decodifica l'azione
+    played_card, cards_to_capture = decode_action(action_id)
+    
+    # Cerca la carta nella mano del giocatore corrente
+    if played_card not in hand:
+        raise ValueError(f"La carta {played_card} non è nella mano del giocatore {current_player}")
+    
+    # Rimuovi la carta dalla mano
+    hand.remove(played_card)
 
     table = game_state["table"]
-    chosen_cards = []
-    for i in sorted(subset_ids):
-        if i < len(table):
-            chosen_cards.append(table[i])
-
-    sum_chosen = sum(c[0] for c in chosen_cards)
+    
+    # Verifica che le carte da catturare siano sul tavolo
+    for card in cards_to_capture:
+        if card not in table:
+            raise ValueError(f"La carta {card} non è sul tavolo")
+    
+    sum_chosen = sum(c[0] for c in cards_to_capture)
     capture_type = "no_capture"
     scopa_flag = False
 
-    if sum_chosen == played_card[0]:
+    if cards_to_capture:
         # Cattura
-        for i in sorted(subset_ids, reverse=True):
-            if i < len(table):
-                table.pop(i)
-        game_state["captured_squads"][squad_id].extend(chosen_cards)
+        for card in cards_to_capture:
+            table.remove(card)
+        
+        game_state["captured_squads"][squad_id].extend(cards_to_capture)
         game_state["captured_squads"][squad_id].append(played_card)
+        
         if len(table) == 0:
             scopa_flag = True
+        
         capture_type = "capture"
     else:
         # Nessuna cattura: la carta viene messa sul tavolo
@@ -52,7 +65,7 @@ def update_game_state(game_state, action_id, current_player):
         "player": current_player,
         "played_card": played_card,
         "capture_type": capture_type,
-        "captured_cards": chosen_cards
+        "captured_cards": cards_to_capture
     }
     game_state["history"].append(move)
 
