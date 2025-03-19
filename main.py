@@ -198,6 +198,13 @@ class DQNAgent:
         """
         if valid_actions.numel() == 0:
             print("[DEBUG] Nessuna azione valida!")
+            if env is not None:
+                print("[DEBUG] Stato ambiente:")
+                print("Giocatore corrente:", env.current_player)
+                print("Mano del giocatore:", env.game_state["hands"][env.current_player])
+                print("Stato completo:", env.game_state)
+            else:
+                print("[DEBUG] Nessun ambiente specificato.")
             raise ValueError("No valid actions.")
 
         # Con probabilità epsilon, scelta casuale
@@ -370,7 +377,7 @@ def train_agents(num_episodes=50):
         agent_team1.load_checkpoint(CHECKPOINT_PATH + "_team1.pth")
 
     first_player = 0
-    BATCH_SIZE_EPISODES = 10
+    BATCH_SIZE_EPISODES = 1000
     TRAIN_STEPS_AFTER_BATCH = 200
 
     for ep in range(num_episodes):
@@ -389,7 +396,7 @@ def train_agents(num_episodes=50):
             obs_current = env._get_observation(cp)
             valid_actions = env.get_valid_actions()  # tensore di azioni valide
 
-            action = agent.pick_action(obs_current, valid_actions)
+            action = agent.pick_action(obs_current, valid_actions, env)
 
             next_obs, _, info = env.step(action)
             next_valid = env.get_valid_actions()
@@ -433,4 +440,4 @@ def train_agents(num_episodes=50):
 
 
 if __name__ == "__main__":
-    train_agents(num_episodes=1000)
+    train_agents(num_episodes=10000)
