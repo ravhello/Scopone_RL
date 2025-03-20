@@ -294,58 +294,58 @@ def compute_missing_cards_matrix(game_state, player_id):
 
 def compute_inferred_probabilities(game_state, player_id):
     """
-    Crea 3 matrici 10x4 di probabilità inferite per gli altri giocatori.
+    Calcola la probabilità condizionata che ogni giocatore abbia ciascuna carta,
+    dato ciò che ha già giocato.
     """
-    # Inizia con tutte le carte (40 carte)
+    # Tutte le carte nel mazzo
     all_cards = [(r, s) for r in RANKS for s in SUITS]
     all_cards_set = set(all_cards)
     
-    # Rimuovi le carte visibili
+    # Carte visibili (mano propria, tavolo, catturate)
     visible_cards = set()
-    
-    # Carte in mano propria
     visible_cards.update(game_state["hands"][player_id])
-    
-    # Carte sul tavolo
     visible_cards.update(game_state["table"])
-    
-    # Carte catturate da entrambe le squadre
     visible_cards.update(game_state["captured_squads"][0])
     visible_cards.update(game_state["captured_squads"][1])
     
-    # Le carte mancanti sono quelle che non sono visibili
-    missing_cards = all_cards_set - visible_cards
-    missing_cards_list = list(missing_cards)
+    # Carte invisibili
+    invisible_cards = all_cards_set - visible_cards
     
-    # Per ogni altro giocatore, calcola la probabilità di avere ciascuna carta
+    # Risultato finale
     probs = []
     other_players = [p for p in range(4) if p != player_id]
+    suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
     
     for p in other_players:
-        # Conteggio carte in mano
-        cards_in_hand = len(game_state["hands"][p])
+        # Carte già giocate da questo giocatore
+        played_cards = set()
+        for move in game_state["history"]:
+            if move["player"] == p:
+                played_cards.add(move["played_card"])
         
-        # Matrice delle probabilità
+        # Dimensione mano attuale
+        hand_size = len(game_state["hands"][p])
+        
+        # Matrice probabilità (10x4)
         prob_matrix = np.zeros((10, 4), dtype=np.float32)
-        suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
         
-        # Se il giocatore ha 0 carte, tutte le probabilità sono 0
-        if cards_in_hand == 0:
+        if hand_size == 0 or len(invisible_cards) == 0:
             probs.append(prob_matrix.flatten())
             continue
         
-        # Probabilità di base per ogni carta mancante
-        # (assumendo distribuzione uniforme tra i giocatori con carte)
-        total_missing_cards = sum(len(game_state["hands"][j]) for j in range(4) if j != player_id)
+        # Carte possibili per questo giocatore (invisibili e non già giocate)
+        possible_cards = invisible_cards - played_cards
         
-        if total_missing_cards > 0:
-            base_prob = cards_in_hand / total_missing_cards
+        # Totale carte rimaste nel gioco non visibili al giocatore corrente
+        total_unknown_cards = len(invisible_cards)
+        
+        # Per ogni carta possibile
+        for rank, suit in possible_cards:
+            row = rank - 1
+            col = suit_to_col[suit]
             
-            # Assegna la probabilità di base a tutte le carte mancanti
-            for rank, suit in missing_cards_list:
-                row = rank - 1
-                col = suit_to_col[suit]
-                prob_matrix[row, col] = base_prob
+            # Probabilità ipergeometrica semplice: hand_size / total_unknown_cards
+            prob_matrix[row, col] = hand_size / total_unknown_cards
         
         probs.append(prob_matrix.flatten())
     
@@ -464,49 +464,23 @@ def compute_table_sum(game_state):
     # Normalizza (la somma massima teorica è 78, ma in pratica raramente supera 30)
     return np.array([table_sum / 30.0], dtype=np.float32)  # 1 dim
 
-def compute_next_player_scopa_probabilities(game_state, player_id):
+def compute_next_player_scopa_probabilities(game_state, player_id, rank_probabilities=None):
     """
-    Per ogni rank (1-10) che il giocatore corrente potrebbe giocare,
-    calcola la probabilità che il giocatore successivo possa fare scopa.
-    
-    Args:
-        game_state: Stato attuale del gioco
-        player_id: ID del giocatore corrente
-    
-    Returns:
-        Array di 10 dimensioni con le probabilità di scopa per il prossimo giocatore
-        condizionate a ogni possibile rank giocato dal giocatore corrente.
+    Calcola la probabilità che il prossimo giocatore possa fare scopa,
+    utilizzando le probabilità di rank già calcolate se fornite.
     """
-    # Identifica il prossimo giocatore
     next_player = (player_id + 1) % 4
-    
-    # Carte già giocate dal prossimo giocatore
-    played_by_next = []
-    for move in game_state["history"]:
-        if move["player"] == next_player:
-            played_by_next.append(move["played_card"])
-    
-    # Carte sul tavolo attuale
-    current_table = game_state["table"].copy()
-    
-    # Carte visibili (per calcolare le invisibili)
-    visible_cards = set()
-    visible_cards.update(game_state["hands"][player_id])  # Mano propria
-    visible_cards.update(current_table)  # Tavolo
-    visible_cards.update(game_state["captured_squads"][0])  # Catturate team 0
-    visible_cards.update(game_state["captured_squads"][1])  # Catturate team 1
-    
-    # Tutte le carte possibili
-    all_cards = [(r, s) for r in RANKS for s in SUITS]
-    
-    # Carte invisibili (potenzialmente nelle mani degli altri)
-    invisible_cards = [c for c in all_cards if c not in visible_cards]
-    
-    # Calcola quante carte ha in mano il prossimo giocatore
-    next_player_hand_size = len(game_state["hands"].get(next_player, []))
-    
-    # Array di probabilità finale
+    next_player_idx = [i for i, p in enumerate([p for p in range(4) if p != player_id]) if p == next_player][0]
     scopa_probs = np.zeros(10, dtype=np.float32)
+    
+    # Se non vengono fornite le probabilità di rank, le calcoliamo
+    if rank_probabilities is None:
+        rank_probabilities = compute_rank_probabilities_by_player(game_state, player_id)
+    
+    # Dimensione mano del prossimo giocatore
+    hand_size = len(game_state["hands"].get(next_player, []))
+    if hand_size == 0:
+        return scopa_probs
     
     # Per ogni rank che il giocatore corrente potrebbe giocare
     for current_rank in range(1, 11):
@@ -516,20 +490,19 @@ def compute_next_player_scopa_probabilities(game_state, player_id):
             continue
         
         # Simula cosa accadrebbe al tavolo dopo aver giocato questa carta
-        simulated_table = current_table.copy()
+        simulated_table = game_state["table"].copy()
         
         # Determina se il giocatore corrente cattura carte e quali
         cards_to_capture = []
         
         # Regola 1: Cattura diretta di carte dello stesso rank
-        same_rank_cards = [c for c in current_table if c[0] == current_rank]
+        same_rank_cards = [c for c in simulated_table if c[0] == current_rank]
         if same_rank_cards:
             cards_to_capture = same_rank_cards
         else:
             # Regola 2: Cerca combinazioni che sommano al rank
-            # Per semplicità, implementiamo solo combinazioni fino a 3 carte
-            for subset_size in range(1, min(4, len(current_table)+1)):
-                for subset in itertools.combinations(current_table, subset_size):
+            for subset_size in range(1, min(4, len(simulated_table)+1)):
+                for subset in itertools.combinations(simulated_table, subset_size):
                     if sum(c[0] for c in subset) == current_rank:
                         cards_to_capture = list(subset)
                         break
@@ -543,169 +516,160 @@ def compute_next_player_scopa_probabilities(game_state, player_id):
                 simulated_table.remove(card)
         else:
             # Aggiungi la carta giocata al tavolo
-            # Il seme non è importante per questa simulazione
             simulated_table.append((current_rank, 'denari'))
-        
-        # Ora calcola la probabilità che il prossimo giocatore possa fare scopa
         
         # Caso 1: Se il tavolo è vuoto, qualsiasi carta porterebbe a scopa
         if not simulated_table:
-            if next_player_hand_size > 0:
-                scopa_probs[current_rank-1] = 1.0
+            # Probabilità che il giocatore abbia almeno una carta = 1 - P(avere 0 carte)
+            # Possiamo calcolare questa probabilità sommando tutte le probabilità che
+            # il giocatore abbia almeno una carta di qualsiasi rank
+            p_has_at_least_one_card = 0.0
+            for rank_idx in range(10):
+                # Probabilità di avere 0 carte di questo rank
+                p_zero = rank_probabilities[next_player_idx, 0, rank_idx]
+                # Probabilità di avere almeno una carta di questo rank
+                p_at_least_one = 1.0 - p_zero
+                p_has_at_least_one_card += p_at_least_one
+            
+            # Normalizza per evitare probabilità > 1.0
+            p_has_at_least_one_card = min(1.0, p_has_at_least_one_card)
+            scopa_probs[current_rank-1] = p_has_at_least_one_card
             continue
         
-        # Caso 2: Il tavolo non è vuoto, calcola per ogni rank che il prossimo 
-        # giocatore potrebbe avere
+        # Caso 2: Il tavolo non è vuoto, serve una carta specifica
         for next_rank in range(1, 11):
-            # Quante carte di questo rank il prossimo giocatore ha già giocato
-            played_count = sum(1 for card in played_by_next if card[0] == next_rank)
-            
-            # Quante carte di questo rank potrebbero essere ancora in mano
-            available_count = 4 - played_count
-            
-            # Quante carte di questo rank sono tra le invisibili
-            invisible_count = sum(1 for card in invisible_cards if card[0] == next_rank)
-            
-            # Se nessuna carta disponibile, salta
-            if available_count == 0 or invisible_count == 0:
-                continue
-            
             # Verifica se questo rank può catturare tutto il tavolo
             can_capture_all = False
             
             # Cattura diretta
             if all(card[0] == next_rank for card in simulated_table):
                 can_capture_all = True
-            else:
-                # Cattura per somma
-                if sum(card[0] for card in simulated_table) == next_rank:
-                    can_capture_all = True
+            # Cattura per somma
+            elif sum(card[0] for card in simulated_table) == next_rank:
+                can_capture_all = True
             
             if can_capture_all:
-                # Calcola probabilità che il prossimo giocatore abbia questo rank
-                # basata su: carte disponibili, invisibili e mano del giocatore
+                # Utilizziamo direttamente le probabilità calcolate da compute_rank_probabilities_by_player
+                # Probabilità di avere 0 carte di questo rank
+                p_zero = rank_probabilities[next_player_idx, 0, next_rank-1]
+                # Probabilità di avere almeno una carta di questo rank
+                p_at_least_one = 1.0 - p_zero
                 
-                # Probabilità base: carte di questo rank tra le invisibili / totale invisibili
-                base_prob = invisible_count / max(1, len(invisible_cards))
-                
-                # Aggiustamento per numero di carte in mano
-                hand_factor = next_player_hand_size / max(1, sum(len(game_state["hands"][p]) 
-                                                           for p in range(4) if p != player_id))
-                
-                # Probabilità finale
-                rank_prob = base_prob * hand_factor * available_count / 4.0
-                
-                # Aggiungi alla probabilità totale per questo rank corrente
-                scopa_probs[current_rank-1] += min(1.0, rank_prob)
+                # Aggiungi alla probabilità totale per questo rank
+                scopa_probs[current_rank-1] += p_at_least_one
         
         # Normalizza a 1.0 se necessario
         scopa_probs[current_rank-1] = min(1.0, scopa_probs[current_rank-1])
     
-    return scopa_probs  # 10 dim
+    return scopa_probs # 10 dim
 
 def compute_rank_probabilities_by_player(game_state, player_id):
     """
-    Calcola, per ogni giocatore esterno, la probabilità di avere 1-4 carte di ogni rank
-    considerando le carte che hanno già giocato.
+    Calcola la probabilità che ogni giocatore abbia 0-4 carte di ogni rank,
+    condizionata alle carte che ha già giocato.
     
     Returns:
-        Numpy array di dimensione (3, 4, 10) = 120 dimensioni totali
+        Numpy array di dimensione (3, 5, 10) = 150 dimensioni totali
         - 3 giocatori esterni
-        - 4 possibili quantità di carte (1, 2, 3, 4)
+        - 5 possibili quantità di carte (0, 1, 2, 3, 4)
         - 10 rank possibili
     """
-    # Inizializza l'array delle probabilità
-    all_probs = np.zeros((3, 4, 10), dtype=np.float32)
-    
-    # Identifica i giocatori diversi dal giocatore corrente
+    # Cambiamo la dimensione da (3,4,10) a (3,5,10) per includere la probabilità di 0 carte
+    all_probs = np.zeros((3, 5, 10), dtype=np.float32)
     other_players = [p for p in range(4) if p != player_id]
     
+    # Carte visibili per rank
+    visible_rank_counts = [0] * 10
+    
+    # Conta carte visibili
+    for card in game_state["table"]:
+        rank, _ = card
+        visible_rank_counts[rank-1] += 1
+    
+    for card in game_state["hands"][player_id]:
+        rank, _ = card
+        visible_rank_counts[rank-1] += 1
+    
+    for team_cards in game_state["captured_squads"].values():
+        for card in team_cards:
+            rank, _ = card
+            visible_rank_counts[rank-1] += 1
+    
+    # Totale carte visibili e invisibili
+    total_invisible = 40 - sum(visible_rank_counts)
+    
     for i, p in enumerate(other_players):
-        # Carte già giocate da questo giocatore specifico
-        played_cards_by_p = []
+        # Carte già giocate da questo giocatore (per rank)
+        played_rank_counts = [0] * 10
         for move in game_state["history"]:
             if move["player"] == p:
-                played_cards_by_p.append(move["played_card"])
+                rank, _ = move["played_card"]
+                played_rank_counts[rank-1] += 1
         
-        # Conteggio delle carte per rank giocate da questo giocatore
-        played_rank_counts = [0] * 10
-        for card in played_cards_by_p:
-            rank, _ = card
-            played_rank_counts[rank-1] += 1
-        
-        # Conteggio complessivo delle carte visibili per rank
-        visible_rank_counts = [0] * 10
-        
-        # Carte sul tavolo
-        for card in game_state["table"]:
-            rank, _ = card
-            visible_rank_counts[rank-1] += 1
-        
-        # Carte già giocate (nella storia)
-        for move in game_state["history"]:
-            rank, _ = move["played_card"]
-            visible_rank_counts[rank-1] += 1
-        
-        # Carte nella mano del giocatore corrente
-        for card in game_state["hands"][player_id]:
-            rank, _ = card
-            visible_rank_counts[rank-1] += 1
-        
-        # Carte catturate
-        for team_cards in game_state["captured_squads"].values():
-            for card in team_cards:
-                rank, _ = card
-                visible_rank_counts[rank-1] += 1
-        
-        # Calcolo delle probabilità
-        cards_in_hand = len(game_state["hands"][p])
+        # Carte in mano attualmente
+        hand_size = len(game_state["hands"][p])
+        if hand_size == 0:
+            # Tutti i rank hanno probabilità 1.0 di avere 0 carte
+            for rank_idx in range(10):
+                all_probs[i, 0, rank_idx] = 1.0
+            continue
         
         for rank in range(1, 11):
             rank_idx = rank - 1
             
-            # Carte già giocate da questo giocatore
-            played = played_rank_counts[rank_idx]
-            
             # Carte totali di questo rank
-            total = 4
+            total_rank = 4
             
-            # Potenziali carte rimanenti di questo rank
-            potentially_remaining = total - played
+            # Carte invisibili di questo rank
+            invisible_rank = total_rank - visible_rank_counts[rank_idx]
             
-            # Carte non visibili di questo rank
-            invisible = max(0, total - visible_rank_counts[rank_idx])
+            # Carte già giocate di questo rank dal giocatore
+            played_rank = played_rank_counts[rank_idx]
             
-            # Stima delle carte in mano
-            estimated_in_hand = min(potentially_remaining, invisible)
+            # Carte potenzialmente rimaste di questo rank
+            remaining_rank = total_rank - played_rank
             
-            if cards_in_hand == 0:
+            # Carte possibili per questo giocatore
+            possible_rank = min(remaining_rank, invisible_rank)
+            
+            if possible_rank < 0:
+                # Impossibile avere carte di questo rank
+                all_probs[i, 0, rank_idx] = 1.0  # Probabilità 1.0 di avere 0 carte
                 continue
+            
+            try:
+                from scipy.special import comb
                 
-            # Calcola probabilità per 1, 2, 3 o 4 carte
-            for num_cards in range(1, 5):
-                if num_cards <= estimated_in_hand and num_cards <= cards_in_hand:
-                    # Fattori di probabilità
+                # Per ogni possibile numero di carte (0-4)
+                for k in range(min(possible_rank + 1, hand_size + 1, 5)):
+                    # Probabilità ipergeometrica di avere esattamente k carte di questo rank
+                    # P(X=k) = [C(K,k) × C(N-K,n-k)] / C(N,n)
                     
-                    # Base: quanto questo rank è rappresentato tra le carte invisibili
-                    base_prob = estimated_in_hand / max(1, invisible)
+                    numerator = comb(invisible_rank, k, exact=True) * comb(total_invisible - invisible_rank, hand_size - k, exact=True)
+                    denominator = comb(total_invisible, hand_size, exact=True)
                     
-                    # Fattore mano: più carte ha, più probabile è che abbia questo rank
-                    hand_factor = min(1.0, cards_in_hand / 10.0)
+                    if denominator > 0:
+                        prob = numerator / denominator
+                        all_probs[i, k, rank_idx] = prob
+            except:
+                # Approssimazione se scipy non è disponibile
+                for k in range(min(possible_rank + 1, hand_size + 1, 5)):
+                    from math import comb as math_comb
+                    try:
+                        numerator = math_comb(invisible_rank, k) * math_comb(total_invisible - invisible_rank, hand_size - k)
+                        denominator = math_comb(total_invisible, hand_size)
+                        prob = numerator / denominator if denominator > 0 else 0
+                    except:
+                        # Fallback ancora più semplice
+                        prob = 0
+                        if k == 0:
+                            prob = ((total_invisible - invisible_rank) / total_invisible) ** hand_size
+                        else:
+                            prob = (invisible_rank / total_invisible) ** k * ((total_invisible - invisible_rank) / total_invisible) ** (hand_size - k)
                     
-                    # Fattore giocate: se ha già giocato carte di questo rank, è meno
-                    # probabile che ne abbia altre
-                    played_factor = max(0.1, 1.0 - (played / 4.0))
-                    
-                    # Probabilità finale
-                    prob = base_prob * hand_factor * played_factor
-                    
-                    # Riduzione per più carte dello stesso rank
-                    if num_cards > 1:
-                        prob = prob / (2.0 ** (num_cards - 1))
-                    
-                    all_probs[i, num_cards-1, rank_idx] = min(1.0, prob)
+                    all_probs[i, k, rank_idx] = prob
     
-    return all_probs  # Dimensione (3, 4, 10) = 120 dim
+    return all_probs  # Dimensione (3, 5, 10) = 150 dim
 
 def encode_state_for_player(game_state, player_id):
     """
@@ -755,7 +719,7 @@ def encode_state_for_player(game_state, player_id):
     scopa_probs = compute_next_player_scopa_probabilities(game_state, player_id)  # 10 dim
     
     # 14) Probabilità di rank per giocatore
-    rank_probs_by_player = compute_rank_probabilities_by_player(game_state, player_id).flatten()  # 120 dim
+    rank_probs_by_player = compute_rank_probabilities_by_player(game_state, player_id).flatten()  # 150 dim
     
     # Concatena tutte le features
     return np.concatenate([
@@ -772,5 +736,5 @@ def encode_state_for_player(game_state, player_id):
         score_estimate,        # 2 dim
         table_sum,             # 1 dim
         scopa_probs,            # 10 dim
-        rank_probs_by_player  # 120 dim
-    ])  # Totale: 10793 dim
+        rank_probs_by_player  # 150 dim
+    ])  # Totale: 10823 dim

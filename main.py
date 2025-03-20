@@ -16,7 +16,6 @@ from environment import ScoponeEnvMA
 
 # Parametri di rete e training
 LR = 1e-3
-GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
@@ -78,7 +77,7 @@ class EpisodicReplayBuffer:
 # 2) Rete neurale QNetwork
 ############################################################
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim=10793, action_dim=80):
+    def __init__(self, obs_dim=10823, action_dim=80):  # Aggiornato da 10793 a 10823
         super().__init__()
         # Feature extractor ottimizzato per la rappresentazione avanzata
         self.backbone = nn.Sequential(
@@ -104,7 +103,7 @@ class QNetwork(nn.Module):
         )
         
         self.stats_processor = nn.Sequential(
-            nn.Linear(304, 64),
+            nn.Linear(334, 64),  # Aggiornato da 304 a 334 (+30 per i nuovi valori)
             nn.ReLU()
         )
         
@@ -137,7 +136,7 @@ class QNetwork(nn.Module):
         hand_table = x[:, :83]
         captured = x[:, 83:165]
         history = x[:, 169:10489]
-        stats = x[:, 10489:]
+        stats = x[:, 10489:]  # L'indice non cambia, cambia solo la dimensione
         
         # Processa ogni sezione
         hand_table_features = self.hand_table_processor(hand_table)
@@ -214,148 +213,29 @@ class DQNAgent:
             
             return best_action
     
-    def train_step(self):
-        """
-        Esegue un passo di training con la rappresentazione a matrice (80 dim).
-        """
-        if not self.can_train():
-            return
+    def train_episodic_monte_carlo(self, specific_episode=None):
+        """Addestramento Monte Carlo su episodi usando flat rewards, ottimizzato per GPU"""
+        # Determina quali episodi processare
+        if specific_episode is not None:
+            episodes_to_process = [specific_episode]
+        elif self.episodic_buffer.episodes:
+            episodes_to_process = self.episodic_buffer.get_all_episodes()
+        else:
+            return  # Nessun episodio disponibile
         
-        obs, actions, rewards, next_obs, dones, next_valids = self.replay_buffer.sample(BATCH_SIZE)
-        
-        obs_t = torch.tensor(obs, dtype=torch.float32)
-        rewards_t = torch.tensor(rewards, dtype=torch.float32)
-        next_obs_t = torch.tensor(next_obs, dtype=torch.float32)
-        dones_t = torch.tensor(dones, dtype=torch.float32)
-        
-        # Calcola i Q-values per lo stato corrente
-        current_q_values = self.online_qnet(obs_t)
-        
-        # Calcola i Q-values per le azioni scelte
-        q_values = []
-        for i, action in enumerate(actions):
-            action_t = torch.tensor(action, dtype=torch.float32)
-            q_value = torch.sum(current_q_values[i] * action_t)
-            q_values.append(q_value)
-        
-        q_values = torch.stack(q_values)
-        
-        # Calcola i target Q-values usando la target network
-        with torch.no_grad():
-            target_q_values = self.target_qnet(next_obs_t)
-        
-        # Calcola i target per ciascun esempio nel batch
-        targets = []
-        for i in range(len(obs)):
-            if dones_t[i] > 0.5:
-                # Se lo stato è terminale, il target è semplicemente la reward
-                targets.append(rewards_t[i])
-            else:
-                # Altrimenti, calcola il massimo Q-value delle azioni valide nello stato successivo
-                valid_acts = next_valids[i]
-                if not valid_acts:
-                    max_q_next = 0.0
-                else:
-                    max_q_next = float('-inf')
-                    for action in valid_acts:
-                        action_t = torch.tensor(action, dtype=torch.float32)
-                        q_next = torch.sum(target_q_values[i] * action_t).item()
-                        max_q_next = max(max_q_next, q_next)
-                    
-                targets.append(rewards_t[i] + GAMMA * max_q_next)
-        
-        targets_t = torch.tensor(targets, dtype=torch.float32)
-        
-        # Calcola la loss e aggiorna i pesi
-        loss_fn = nn.MSELoss()
-        loss = loss_fn(q_values, targets_t)
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        # Aggiorna epsilon e la target network se necessario
-        self.update_epsilon()
-        self.maybe_sync_target()
-    
-    def train_monte_carlo(self, episode=None):
-        """Addestramento Monte Carlo ottimizzato per GPU"""
-        if episode is None and self.episodic_buffer.episodes:
-            episode = self.episodic_buffer.episodes[-1]
-        
-        if not episode:
-            return
-        
-        # Ottieni la reward finale dall'ultima transizione
-        final_reward = episode[-1][2] if episode else 0.0
-        
-        # Assegna la stessa reward finale a tutte le transizioni
-        returns = [final_reward for _ in range(len(episode))]
-        
-        # Ottimizzazione: processa in batch anziché una alla volta
-        batch_size = min(32, len(episode))  # Batch più piccoli per MC
-        num_batches = (len(episode) + batch_size - 1) // batch_size
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(episode))
-            
-            batch_obs = []
-            batch_actions = []
-            batch_returns = []
-            
-            for i in range(start_idx, end_idx):
-                obs, action, _, _, _, _ = episode[i]
-                G = returns[i]
+        # Processa ogni episodio nel buffer
+        for episode in episodes_to_process:
+            if not episode:
+                continue
                 
-                batch_obs.append(obs)
-                batch_actions.append(action)
-                batch_returns.append(G)
+            # Ottieni la reward finale dall'ultima transizione
+            final_reward = episode[-1][2] if episode else 0.0
             
-            # Converti in tensor e sposta su GPU
-            obs_t = torch.tensor(batch_obs, dtype=torch.float32).to(device)
-            batch_actions_t = [torch.tensor(a, dtype=torch.float32).to(device) for a in batch_actions]
-            returns_t = torch.tensor(batch_returns, dtype=torch.float32).to(device)
+            # Assegna la stessa reward finale a tutte le transizioni (flat Monte Carlo)
+            returns = [final_reward for _ in range(len(episode))]
             
-            # Calcola i Q-values correnti
-            self.optimizer.zero_grad()
-            q_values = self.online_qnet(obs_t)
-            
-            # Calcola i Q-values per le azioni scelte
-            q_values_for_actions = []
-            for i, action_t in enumerate(batch_actions_t):
-                q_value = torch.sum(q_values[i] * action_t)
-                q_values_for_actions.append(q_value)
-            
-            q_values_for_actions = torch.stack(q_values_for_actions)
-            
-            # Calcola loss e aggiorna
-            loss = nn.MSELoss()(q_values_for_actions, returns_t)
-            loss.backward()
-            self.optimizer.step()
-            
-            # Aggiorna counters
-            self.update_epsilon()
-            self.maybe_sync_target()
-    
-    def train_episodic(self):
-        """Training episodico ottimizzato per GPU"""
-        if not self.episodic_buffer.episodes:
-            return
-        
-        # Usa tutti gli episodi
-        all_episodes = self.episodic_buffer.get_all_episodes()
-        
-        for episode in all_episodes:
-            # Calcola i rendimenti per ogni transizione nell'episodio
-            G = 0
-            returns = []
-            for _, _, reward, _, _, _ in reversed(episode):
-                G = reward + GAMMA * G
-                returns.insert(0, G)
-            
-            # Processa episodio in batch
-            batch_size = min(64, len(episode))  # Batch più grande per episodic
+            # Ottimizzazione: processa in batch anziché una alla volta
+            batch_size = min(64, len(episode))
             num_batches = (len(episode) + batch_size - 1) // batch_size
             
             for batch_idx in range(num_batches):
@@ -401,10 +281,8 @@ class DQNAgent:
                 self.maybe_sync_target()
     
     def train(self):
-        """Always uses episodic buffer with Monte Carlo approach."""
-        # We always train on all episodes when we have them
-        if self.episodic_buffer.episodes:
-            self.train_episodic()
+        """Addestramento su tutti gli episodi disponibili usando Monte Carlo flat rewards."""
+        self.train_episodic_monte_carlo()
     
     def start_episode(self):
         """Inizia un nuovo episodio."""
@@ -412,17 +290,17 @@ class DQNAgent:
     
     def end_episode(self):
         """
-        Termina l'episodio corrente e applica sempre Monte Carlo.
+        Termina l'episodio corrente e applica immediatamente Monte Carlo sull'ultimo episodio.
         """
         self.episodic_buffer.end_episode()
         
-        # Always apply Monte Carlo on the last episode if available
+        # Applica Monte Carlo solo sull'ultimo episodio, se disponibile
         if self.episodic_buffer.episodes:
-            self.train_monte_carlo()
+            self.train_episodic_monte_carlo(self.episodic_buffer.episodes[-1])
     
     def store_episode_transition(self, transition):
         """
-        Memorizza una transizione sia nell'episodic buffer che nel buffer standard.
+        Memorizza una transizione nell'episodic buffer.
         """
         # Aggiungi all'episodio corrente
         self.episodic_buffer.add_transition(transition)
@@ -440,10 +318,6 @@ class DQNAgent:
         """Updates epsilon for epsilon-greedy exploration based on training steps."""
         self.epsilon = max(EPSILON_END, EPSILON_START - (self.train_steps / EPSILON_DECAY) * (EPSILON_START - EPSILON_END))
         self.train_steps += 1
-
-    def can_train(self):
-        """Checks if there are enough samples in the replay buffer to train."""
-        return len(self.replay_buffer) >= BATCH_SIZE
 
     def save_checkpoint(self, filename):
         """Salva il checkpoint tenendo conto della GPU"""
@@ -645,4 +519,4 @@ def monte_carlo_update_team(agent, transitions):
         agent.sync_target()
 
 if __name__ == "__main__":
-    train_agents(num_episodes=2000)
+    train_agents(num_episodes=400)

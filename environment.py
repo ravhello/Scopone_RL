@@ -13,7 +13,7 @@ class ScoponeEnvMA(gym.Env):
         super().__init__()
         
         # Observation space con la rappresentazione avanzata e lo storico migliorato
-        self.observation_space = spaces.Box(low=0, high=1, shape=(10793,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=0, high=1, shape=(10823,), dtype=np.float32)
         
         # Action space usando la rappresentazione a matrice (80 dim)
         self.action_space = spaces.MultiBinary(80)
