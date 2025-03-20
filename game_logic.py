@@ -1,12 +1,11 @@
 # game_logic.py
 
-from state import initialize_game
 from actions import decode_action
 from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
 
 def update_game_state(game_state, action_id, current_player):
     """
-    Ora accetta un'azione in formato one-hot (vettore a 154 dimensioni)
+    Ora accetta un'azione in formato matrice (vettore a 80 dimensioni)
     e aggiorna lo stato del gioco di conseguenza.
     """
     squad_id = 0 if current_player in [0,2] else 1

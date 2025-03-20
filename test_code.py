@@ -84,7 +84,8 @@ def test_encode_card_onehot():
 
 def test_encode_action_decode_action():
     """
-    Verifica che encode_action+decode_action siano inversi con diverse combinazioni di carte.
+    Verifica che encode_action+decode_action siano inversi con diverse combinazioni di carte
+    usando la rappresentazione a matrice.
     """
     # Esempio di codifica: carta (7, 'denari') cattura [(3, 'spade'), (4, 'coppe')]
     card = (7, 'denari')
@@ -92,7 +93,7 @@ def test_encode_action_decode_action():
     action_vec = encode_action(card, cards_to_capture)
     
     # Verifichiamo la dimensione del vettore di azione
-    assert action_vec.shape == (154,), "Il vettore di azione deve avere 154 dimensioni"
+    assert action_vec.shape == (80,), "Il vettore di azione deve avere 80 dimensioni"
     
     # Decodifichiamo e verifichiamo che otteniamo la stessa carta e carte da catturare
     dec_card, dec_captured = decode_action(action_vec)
@@ -236,7 +237,7 @@ def test_step_basic(env_old):
 
     next_obs, reward, done, info = env_old.step(first_action)
 
-    assert next_obs.shape == (4484,), f"Dimensione osservazione errata: {next_obs.shape} invece di (4484,)"
+    assert next_obs.shape == (1389,), f"Dimensione osservazione errata: {next_obs.shape} invece di (1389,)"
     assert reward == 0.0
     assert done == False
     assert "team_rewards" not in info

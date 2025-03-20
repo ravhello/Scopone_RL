@@ -8,6 +8,10 @@ import random
 import collections
 import os
 
+# Configurazione GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
 from environment import ScoponeEnvMA
 
 # Parametri di rete e training
@@ -16,37 +20,14 @@ GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
-BATCH_SIZE = 32          # dimensione mini-batch
+BATCH_SIZE = 128          # dimensione mini-batch
 REPLAY_SIZE = 10000      # capacità massima del replay buffer
 TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target
 CHECKPOINT_PATH = "scopone_checkpoint"
 
 ############################################################
-# 1) Definiamo una classe ReplayBuffer
+# 1) Definiamo una classe EpisodicReplayBuffer
 ############################################################
-
-class ReplayBuffer:
-    def __init__(self, capacity=REPLAY_SIZE):
-        self.buffer = collections.deque(maxlen=capacity)
-
-    def push(self, transition):
-        """
-        Aggiunge una transizione: (obs, action, reward, next_obs, done, valid_actions_next)
-        """
-        self.buffer.append(transition)
-
-    def sample(self, batch_size):
-        """
-        Estrae in modo casuale un mini-batch di transizioni.
-        """
-        batch = random.sample(self.buffer, batch_size)
-        obs, actions, rewards, next_obs, dones, next_valids = zip(*batch)
-        return (np.array(obs), actions, rewards, np.array(next_obs), dones, next_valids)
-
-    def __len__(self):
-        return len(self.buffer)
-    
-
 class EpisodicReplayBuffer:
     def __init__(self, capacity=100):  # Memorizza fino a 100 episodi completi
         self.episodes = collections.deque(maxlen=capacity)
@@ -96,26 +77,89 @@ class EpisodicReplayBuffer:
 ############################################################
 # 2) Rete neurale QNetwork
 ############################################################
-
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim=4484, action_dim=154):
+    def __init__(self, obs_dim=10793, action_dim=80):
         super().__init__()
-        # Feature extractor
+        # Feature extractor ottimizzato per la rappresentazione avanzata
         self.backbone = nn.Sequential(
             nn.Linear(obs_dim, 1024),
             nn.ReLU(),
             nn.Linear(1024, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
             nn.ReLU()
         )
         
-        # Singola testa per valutare l'intera azione
+        # Sezioni aggiuntive
+        self.hand_table_processor = nn.Sequential(
+            nn.Linear(83, 64),
+            nn.ReLU()
+        )
+        
+        self.captured_processor = nn.Sequential(
+            nn.Linear(82, 64),
+            nn.ReLU()
+        )
+        
+        self.stats_processor = nn.Sequential(
+            nn.Linear(304, 64),
+            nn.ReLU()
+        )
+        
+        self.history_processor = nn.Sequential(
+            nn.Linear(10320, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        
+        self.combiner = nn.Sequential(
+            nn.Linear(128 + 64*4, 256),
+            nn.ReLU()
+        )
+        
         self.action_head = nn.Linear(256, action_dim)
+        
+        # Sposta tutto il modello su GPU all'inizializzazione
+        self.to(device)
     
     def forward(self, x):
-        features = self.backbone(x)
-        action_values = self.action_head(features)
+        # Assicurati che l'input sia sulla GPU
+        if x.device != next(self.parameters()).device:
+            x = x.to(device)
+            
+        # Processa l'intero input attraverso il backbone
+        backbone_features = self.backbone(x)
+        
+        # Divide l'input in sezioni semantiche
+        hand_table = x[:, :83]
+        captured = x[:, 83:165]
+        history = x[:, 169:10489]
+        stats = x[:, 10489:]
+        
+        # Processa ogni sezione
+        hand_table_features = self.hand_table_processor(hand_table)
+        captured_features = self.captured_processor(captured)
+        history_features = self.history_processor(history)
+        stats_features = self.stats_processor(stats)
+        
+        # Combina tutte le features
+        combined = torch.cat([
+            backbone_features,
+            hand_table_features,
+            captured_features,
+            history_features,
+            stats_features
+        ], dim=1)
+        
+        # Elabora le features combinate
+        final_features = self.combiner(combined)
+        
+        # Calcola i valori delle azioni
+        action_values = self.action_head(final_features)
+        
         return action_values
 
 ############################################################
@@ -125,31 +169,18 @@ class QNetwork(nn.Module):
 class DQNAgent:
     def __init__(self, team_id):
         self.team_id = team_id
-        self.online_qnet = QNetwork()
-        self.target_qnet = QNetwork()
+        self.online_qnet = QNetwork()  # Già spostato su GPU nell'inizializzazione
+        self.target_qnet = QNetwork()  # Già spostato su GPU nell'inizializzazione
         self.sync_target()
         
         self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR)
         self.epsilon = EPSILON_START
         self.train_steps = 0
-        
-        # Mantieni il ReplayBuffer standard
-        self.replay_buffer = ReplayBuffer()
-        
-        # Aggiungi il nuovo EpisodicReplayBuffer
         self.episodic_buffer = EpisodicReplayBuffer()
-        
-        # Flags per controllare quali strategie di apprendimento utilizzare
-        self.use_dqn = True             # DQN standard 
-        self.use_monte_carlo = True     # Monte Carlo
-        self.use_episodic = True        # Episodic Learning
     
     def pick_action(self, obs, valid_actions, env):
-        """
-        Epsilon-greedy con singola testa che valuta l'azione completa.
-        """
+        """Epsilon-greedy con gestione GPU"""
         if not valid_actions:
-            # Debug in caso di nessuna azione valida
             print("\n[DEBUG] Nessuna azione valida! Stato attuale:")
             print("  Current player:", env.current_player)
             print("  Tavolo:", env.game_state["table"])
@@ -162,8 +193,8 @@ class DQNAgent:
         if random.random() < self.epsilon:
             return random.choice(valid_actions)
         else:
-            # Ottieni i valori Q per ogni azione
-            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            # Ottieni i valori Q per ogni azione - spostato su GPU
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
                 action_values = self.online_qnet(obs_t)
             
@@ -171,8 +202,8 @@ class DQNAgent:
             best_q_value = float('-inf')
             
             for action in valid_actions:
-                # Converti l'azione in tensor
-                action_t = torch.tensor(action, dtype=torch.float32)
+                # Converti l'azione in tensor e spostala su GPU
+                action_t = torch.tensor(action, dtype=torch.float32).to(device)
                 
                 # Calcola il valore Q come prodotto scalare
                 q_value = torch.sum(action_values[0] * action_t).item()
@@ -185,7 +216,7 @@ class DQNAgent:
     
     def train_step(self):
         """
-        Esegue un passo di training con singola testa (DQN standard).
+        Esegue un passo di training con la rappresentazione a matrice (80 dim).
         """
         if not self.can_train():
             return
@@ -248,9 +279,7 @@ class DQNAgent:
         self.maybe_sync_target()
     
     def train_monte_carlo(self, episode=None):
-        """
-        Applica l'apprendimento Monte Carlo con pesi uniformi per tutte le transizioni.
-        """
+        """Addestramento Monte Carlo ottimizzato per GPU"""
         if episode is None and self.episodic_buffer.episodes:
             episode = self.episodic_buffer.episodes[-1]
         
@@ -260,25 +289,48 @@ class DQNAgent:
         # Ottieni la reward finale dall'ultima transizione
         final_reward = episode[-1][2] if episode else 0.0
         
-        # Invece di applicare il decadimento gamma,
-        # assegna la stessa reward finale a tutte le transizioni
+        # Assegna la stessa reward finale a tutte le transizioni
         returns = [final_reward for _ in range(len(episode))]
         
-        # Aggiorna i Q-values per ogni transizione con lo stesso peso
-        for i, ((obs, action, _, _, _, _), G) in enumerate(zip(episode, returns)):
-            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-            action_t = torch.tensor(action, dtype=torch.float32)
+        # Ottimizzazione: processa in batch anziché una alla volta
+        batch_size = min(32, len(episode))  # Batch più piccoli per MC
+        num_batches = (len(episode) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(episode))
             
-            # Calcola Q-value corrente
+            batch_obs = []
+            batch_actions = []
+            batch_returns = []
+            
+            for i in range(start_idx, end_idx):
+                obs, action, _, _, _, _ = episode[i]
+                G = returns[i]
+                
+                batch_obs.append(obs)
+                batch_actions.append(action)
+                batch_returns.append(G)
+            
+            # Converti in tensor e sposta su GPU
+            obs_t = torch.tensor(batch_obs, dtype=torch.float32).to(device)
+            batch_actions_t = [torch.tensor(a, dtype=torch.float32).to(device) for a in batch_actions]
+            returns_t = torch.tensor(batch_returns, dtype=torch.float32).to(device)
+            
+            # Calcola i Q-values correnti
             self.optimizer.zero_grad()
             q_values = self.online_qnet(obs_t)
-            q_value = torch.sum(q_values[0] * action_t)
             
-            # Target è il rendimento finale uguale per tutte le transizioni
-            target = torch.tensor([G], dtype=torch.float32)
+            # Calcola i Q-values per le azioni scelte
+            q_values_for_actions = []
+            for i, action_t in enumerate(batch_actions_t):
+                q_value = torch.sum(q_values[i] * action_t)
+                q_values_for_actions.append(q_value)
+            
+            q_values_for_actions = torch.stack(q_values_for_actions)
             
             # Calcola loss e aggiorna
-            loss = nn.MSELoss()(q_value.unsqueeze(0), target)
+            loss = nn.MSELoss()(q_values_for_actions, returns_t)
             loss.backward()
             self.optimizer.step()
             
@@ -287,13 +339,11 @@ class DQNAgent:
             self.maybe_sync_target()
     
     def train_episodic(self):
-        """
-        Esegue un passo di training usando tutti gli episodi disponibili.
-        """
+        """Training episodico ottimizzato per GPU"""
         if not self.episodic_buffer.episodes:
             return
         
-        # Usa tutti gli episodi senza campionamento
+        # Usa tutti gli episodi
         all_episodes = self.episodic_buffer.get_all_episodes()
         
         for episode in all_episodes:
@@ -304,21 +354,45 @@ class DQNAgent:
                 G = reward + GAMMA * G
                 returns.insert(0, G)
             
-            # Aggiorna i Q-values per ogni transizione con il suo rendimento
-            for i, ((obs, action, _, _, _, _), G) in enumerate(zip(episode, returns)):
-                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-                action_t = torch.tensor(action, dtype=torch.float32)
+            # Processa episodio in batch
+            batch_size = min(64, len(episode))  # Batch più grande per episodic
+            num_batches = (len(episode) + batch_size - 1) // batch_size
+            
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(episode))
                 
-                # Calcola Q-value corrente
+                batch_obs = []
+                batch_actions = []
+                batch_returns = []
+                
+                for i in range(start_idx, end_idx):
+                    obs, action, _, _, _, _ = episode[i]
+                    G = returns[i]
+                    
+                    batch_obs.append(obs)
+                    batch_actions.append(action)
+                    batch_returns.append(G)
+                
+                # Converti in tensor e sposta su GPU
+                obs_t = torch.tensor(batch_obs, dtype=torch.float32).to(device)
+                batch_actions_t = [torch.tensor(a, dtype=torch.float32).to(device) for a in batch_actions]
+                returns_t = torch.tensor(batch_returns, dtype=torch.float32).to(device)
+                
+                # Calcola i Q-values correnti
                 self.optimizer.zero_grad()
                 q_values = self.online_qnet(obs_t)
-                q_value = torch.sum(q_values[0] * action_t)
                 
-                # Target è il rendimento dell'episodio
-                target = torch.tensor([G], dtype=torch.float32)
+                # Calcola i Q-values per le azioni scelte
+                q_values_for_actions = []
+                for i, action_t in enumerate(batch_actions_t):
+                    q_value = torch.sum(q_values[i] * action_t)
+                    q_values_for_actions.append(q_value)
+                
+                q_values_for_actions = torch.stack(q_values_for_actions)
                 
                 # Calcola loss e aggiorna
-                loss = nn.MSELoss()(q_value.unsqueeze(0), target)
+                loss = nn.MSELoss()(q_values_for_actions, returns_t)
                 loss.backward()
                 self.optimizer.step()
                 
@@ -326,16 +400,10 @@ class DQNAgent:
                 self.update_epsilon()
                 self.maybe_sync_target()
     
-    def train_combined(self):
-        """
-        Combina le diverse strategie di training in un unico metodo.
-        """
-        # DQN standard
-        if self.use_dqn and self.can_train():
-            self.train_step()
-        
-        # Episodic learning - trains on all episodes
-        if self.use_episodic and self.episodic_buffer.episodes:
+    def train(self):
+        """Always uses episodic buffer with Monte Carlo approach."""
+        # We always train on all episodes when we have them
+        if self.episodic_buffer.episodes:
             self.train_episodic()
     
     def start_episode(self):
@@ -344,17 +412,13 @@ class DQNAgent:
     
     def end_episode(self):
         """
-        Termina l'episodio corrente e applica Monte Carlo se abilitato.
+        Termina l'episodio corrente e applica sempre Monte Carlo.
         """
         self.episodic_buffer.end_episode()
         
-        # Applica Monte Carlo se abilitato
-        if self.use_monte_carlo and self.episodic_buffer.episodes:
+        # Always apply Monte Carlo on the last episode if available
+        if self.episodic_buffer.episodes:
             self.train_monte_carlo()
-    
-    def store_transition(self, transition):
-        """Memorizza nel replay buffer standard (compatibilità)."""
-        self.replay_buffer.push(transition)
     
     def store_episode_transition(self, transition):
         """
@@ -362,9 +426,6 @@ class DQNAgent:
         """
         # Aggiungi all'episodio corrente
         self.episodic_buffer.add_transition(transition)
-        
-        # Mantieni compatibilità con il buffer standard
-        self.replay_buffer.push(transition)
     
     def sync_target(self):
         """Synchronizes the target network weights with the online network weights."""
@@ -385,7 +446,7 @@ class DQNAgent:
         return len(self.replay_buffer) >= BATCH_SIZE
 
     def save_checkpoint(self, filename):
-        """Saves the agent's state to a checkpoint file."""
+        """Salva il checkpoint tenendo conto della GPU"""
         torch.save({
             "online_state_dict": self.online_qnet.state_dict(),
             "target_state_dict": self.target_qnet.state_dict(),
@@ -395,8 +456,8 @@ class DQNAgent:
         print(f"[DQNAgent] Checkpoint saved: {filename}")
 
     def load_checkpoint(self, filename):
-        """Loads the agent's state from a checkpoint file."""
-        ckpt = torch.load(filename)
+        """Carica il checkpoint tenendo conto della GPU"""
+        ckpt = torch.load(filename, map_location=device)
         self.online_qnet.load_state_dict(ckpt["online_state_dict"])
         self.target_qnet.load_state_dict(ckpt["target_state_dict"])
         self.epsilon = ckpt["epsilon"]
@@ -410,6 +471,7 @@ class DQNAgent:
 def train_agents(num_episodes=10):
     """
     Esegue un training multi-agent combinando DQN, Monte Carlo ed Episodic.
+    Compatibile con la rappresentazione a matrice (80 dim).
     """
     # Creiamo 2 agenti
     agent_team0 = DQNAgent(team_id=0)
@@ -468,13 +530,13 @@ def train_agents(num_episodes=10):
                 
                 # Transizione finale per Team0
                 team0_final_transition = (
-                    team0_obs, np.zeros_like(action), team0_reward,
+                    team0_obs, np.zeros(80, dtype=np.float32), team0_reward,
                     np.zeros_like(team0_obs), True, []
                 )
                 
                 # Transizione finale per Team1
                 team1_final_transition = (
-                    team1_obs, np.zeros_like(action), team1_reward,
+                    team1_obs, np.zeros(80, dtype=np.float32), team1_reward,
                     np.zeros_like(team1_obs), True, []
                 )
                 
@@ -501,7 +563,7 @@ def train_agents(num_episodes=10):
                     agent_team1.store_episode_transition(transition)
             
             # Training step standard (verrà usato solo se enabled)
-            agent.train_combined()
+            agent.train()
             
             obs_current = next_obs
 
@@ -527,9 +589,7 @@ def train_agents(num_episodes=10):
     print("=== Fine training con strategie combinate DQN + Monte Carlo + Episodic ===")
 
 def monte_carlo_update_team(agent, transitions):
-    """
-    Aggiorna i Q-values usando Monte Carlo con pesi uniformi per tutte le transizioni.
-    """
+    """Aggiornamento Monte Carlo ottimizzato per GPU"""
     if not transitions:
         return
     
@@ -539,28 +599,50 @@ def monte_carlo_update_team(agent, transitions):
     # Usa lo stesso valore di reward per tutte le transizioni
     returns = [final_reward] * len(transitions)
     
-    # Aggiorna i Q-values per ciascuna transizione
-    for i, ((obs, action, _, _, _, _), G) in enumerate(zip(transitions, returns)):
-        # Converti osservazione e azione in tensori
-        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-        action_t = torch.tensor(action, dtype=torch.float32)
+    # Elaborazione in batch anziché per singola transizione
+    batch_size = min(64, len(transitions))
+    num_batches = (len(transitions) + batch_size - 1) // batch_size
+    
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, len(transitions))
         
-        # Calcola il valore Q corrente
+        batch_obs = []
+        batch_actions = []
+        batch_returns = []
+        
+        for i in range(start_idx, end_idx):
+            obs, action, _, _, _, _ = transitions[i]
+            G = returns[i]
+            
+            batch_obs.append(obs)
+            batch_actions.append(action)
+            batch_returns.append(G)
+        
+        # Converti in tensor e sposta su GPU
+        obs_t = torch.tensor(batch_obs, dtype=torch.float32).to(device)
+        batch_actions_t = [torch.tensor(a, dtype=torch.float32).to(device) for a in batch_actions]
+        returns_t = torch.tensor(batch_returns, dtype=torch.float32).to(device)
+        
+        # Calcola i Q-values correnti
         agent.optimizer.zero_grad()
-        current_q_values = agent.online_qnet(obs_t)
-        q_value = torch.sum(current_q_values[0] * action_t)
+        q_values = agent.online_qnet(obs_t)
         
-        # Target è il rendimento finale uguale per tutte le transizioni
-        target = torch.tensor([G], dtype=torch.float32)
+        # Calcola i Q-values per le azioni scelte
+        q_values_for_actions = []
+        for i, action_t in enumerate(batch_actions_t):
+            q_value = torch.sum(q_values[i] * action_t)
+            q_values_for_actions.append(q_value)
         
-        # Calcola la loss e aggiorna i pesi
-        loss = nn.MSELoss()(q_value.unsqueeze(0), target)
+        q_values_for_actions = torch.stack(q_values_for_actions)
+        
+        # Calcola loss e aggiorna i pesi
+        loss = nn.MSELoss()(q_values_for_actions, returns_t)
         loss.backward()
         agent.optimizer.step()
         
         # Aggiorna target periodicamente
-        if i % 10 == 0:  # Ogni 10 aggiornamenti
-            agent.sync_target()
+        agent.sync_target()
 
 if __name__ == "__main__":
     train_agents(num_episodes=2000)

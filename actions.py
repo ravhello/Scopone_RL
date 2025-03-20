@@ -1,98 +1,89 @@
 # actions.py
 import itertools
 import numpy as np
-from observation import encode_card_onehot
 
 def encode_action(card, cards_to_capture):
     """
-    Codifica un'azione come vettore:
-    - 14 bit per la carta giocata (10 per rank, 4 per suit)
-    - 10 * 14 = 140 bit per le carte da catturare (fino a 10 carte)
+    Codifica un'azione utilizzando la rappresentazione a matrice:
+    - Carta giocata: matrice 10x4 con 1 solo bit attivo (40 dim)
+    - Carte catturate: matrice 10x4 con i bit attivi corrispondenti (40 dim)
     
-    Totale: 14 + 140 = 154 dimensioni
+    Totale: 80 dimensioni
     """
-    max_cards_to_capture = 10
-    card_dim = 14  # 10 per rank + 4 per suit
+    # Inizializza le matrici
+    played_card_matrix = np.zeros((10, 4), dtype=np.float32)
+    captured_cards_matrix = np.zeros((10, 4), dtype=np.float32)
     
-    action_vec = np.zeros(card_dim + max_cards_to_capture * card_dim, dtype=np.float32)
+    # Mappatura dei semi agli indici di colonna
+    suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
     
-    # Encoding della carta giocata (one-hot)
-    action_vec[:card_dim] = encode_card_onehot(card)
+    # Codifica la carta giocata
+    rank, suit = card
+    row = rank - 1
+    col = suit_to_col[suit]
+    played_card_matrix[row, col] = 1.0
     
-    # Encoding delle carte da catturare (one-hot per ciascuna)
-    for i, capture_card in enumerate(cards_to_capture):
-        if i >= max_cards_to_capture:
-            break
-        base = card_dim + i * card_dim
-        action_vec[base:base+card_dim] = encode_card_onehot(capture_card)
+    # Codifica le carte catturate
+    for capt_card in cards_to_capture:
+        capt_rank, capt_suit = capt_card
+        capt_row = capt_rank - 1
+        capt_col = suit_to_col[capt_suit]
+        captured_cards_matrix[capt_row, capt_col] = 1.0
     
-    return action_vec
+    # Appiattisci le matrici e concatenale
+    return np.concatenate([played_card_matrix.flatten(), captured_cards_matrix.flatten()])
 
 def decode_action(action_vec):
     """
-    Decodifica un vettore di azione in carta giocata e carte catturate.
+    Decodifica un vettore di azione nella rappresentazione a matrice.
     
     Args:
-        action_vec: Numpy array
+        action_vec: Numpy array di dimensione 80
     
     Returns:
-        Tupla (card, cards_to_capture) dove:
-            - card: Tupla (rank, suit) della carta giocata
-            - cards_to_capture: Lista di tuple (rank, suit) delle carte catturate
+        Tupla (card, cards_to_capture)
     """
-    # Decodifica la carta giocata
-    card_dim = 14
+    # Separa la carta giocata e le carte catturate
+    played_card_flat = action_vec[:40]
+    captured_cards_flat = action_vec[40:]
     
-    # Rank (primi 10 bit)
-    rank_hot = action_vec[0:10]
-    if np.max(rank_hot) > 0:  # Verifica che ci sia almeno un bit attivo
-        rank = np.argmax(rank_hot) + 1  # +1 perché rank è 1-indexed
+    # Reshapa in matrici 10x4
+    played_card_matrix = played_card_flat.reshape(10, 4)
+    captured_cards_matrix = captured_cards_flat.reshape(10, 4)
+    
+    # Mappatura degli indici di colonna ai semi
+    col_to_suit = {0: 'denari', 1: 'coppe', 2: 'spade', 3: 'bastoni'}
+    
+    # Trova la carta giocata (l'unico bit attivo nella matrice)
+    if np.max(played_card_matrix) > 0:
+        row, col = np.unravel_index(np.argmax(played_card_matrix), played_card_matrix.shape)
+        rank = row + 1  # +1 perché rank è 1-indexed
+        suit = col_to_suit[col]
+        played_card = (rank, suit)
     else:
-        rank = 0  # Valore di default se nessun bit è attivo
+        played_card = (1, 'denari')  # Default se nessun bit è attivo
     
-    # Suit (successivi 4 bit)
-    suit_hot = action_vec[10:14]
-    if np.max(suit_hot) > 0:
-        suit_idx = np.argmax(suit_hot)
-        suits = ['denari', 'coppe', 'spade', 'bastoni']
-        suit = suits[suit_idx]
-    else:
-        suit = 'denari'  # Valore di default
-    
-    played_card = (rank, suit)
-    
-    # Decodifica le carte da catturare
+    # Trova le carte catturate (tutti i bit attivi nella matrice)
     cards_to_capture = []
-    max_cards = 10
-    
-    for i in range(max_cards):
-        base = card_dim + i * card_dim
-        
-        # Verifica se questa posizione ha una carta (almeno un bit attivo)
-        if np.max(action_vec[base:base+card_dim]) > 0:
-            # Decodifica rank
-            c_rank_hot = action_vec[base:base+10]
-            c_rank = np.argmax(c_rank_hot) + 1
-            
-            # Decodifica suit
-            c_suit_hot = action_vec[base+10:base+card_dim]
-            c_suit_idx = np.argmax(c_suit_hot)
-            c_suit = suits[c_suit_idx]
-            
-            cards_to_capture.append((c_rank, c_suit))
+    for row in range(10):
+        for col in range(4):
+            if captured_cards_matrix[row, col] > 0:
+                rank = row + 1
+                suit = col_to_suit[col]
+                cards_to_capture.append((rank, suit))
     
     return played_card, cards_to_capture
 
 def get_valid_actions(game_state, current_player):
     """
-    Restituisce una lista di azioni valide nel formato one-hot per il giocatore corrente.
+    Restituisce una lista di azioni valide nel formato matrice per il giocatore corrente.
     
     Args:
         game_state: Stato del gioco
         current_player: ID del giocatore corrente
     
     Returns:
-        Lista di azioni valide nel formato one-hot (154 bit)
+        Lista di azioni valide nel formato matrice (80 bit)
     """
     cp = current_player
     hand = game_state["hands"][cp]

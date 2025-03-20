@@ -1,4 +1,4 @@
-# environment.py
+# environment.py (per osservazione avanzata)
 
 import numpy as np
 import gym
@@ -12,14 +12,11 @@ class ScoponeEnvMA(gym.Env):
     def __init__(self):
         super().__init__()
         
-        # Observation space con la nuova dimensione
-        # 4*140 (mani) + 140 (tavolo) + 560 (catture) + 4 (current player) + 3220 (history)
-        self.observation_space = spaces.Box(low=0, high=1, shape=(4484,), dtype=np.float32)
+        # Observation space con la rappresentazione avanzata e lo storico migliorato
+        self.observation_space = spaces.Box(low=0, high=1, shape=(10793,), dtype=np.float32)
         
-        # Action space viene definito come un vettore di 154 bit
-        # - 14 bit per la carta giocata (one-hot rank+suit)
-        # - 140 bit per le carte da catturare (10 carte x 14 bit)
-        self.action_space = spaces.MultiBinary(154)
+        # Action space usando la rappresentazione a matrice (80 dim)
+        self.action_space = spaces.MultiBinary(80)
         
         # Stato base
         self.game_state = None
@@ -30,7 +27,7 @@ class ScoponeEnvMA(gym.Env):
         self.reset()
     
     def get_valid_actions(self):
-        # Usiamo la funzione aggiornata che restituisce azioni nel nuovo formato one-hot
+        # Usiamo la funzione che restituisce azioni nel formato matrice
         return get_valid_actions(
             game_state=self.game_state,
             current_player=self.current_player
@@ -38,12 +35,10 @@ class ScoponeEnvMA(gym.Env):
     
     def step(self, action_vec):
         """
-        Esegue un'azione nel formato one-hot.
+        Esegue un'azione nel formato matrice.
         
         Args:
-            action_vec: Array di 154 bit dove:
-                - primi 14 bit: one-hot della carta giocata (rank + suit)
-                - restanti 140 bit: rappresentazione delle carte da catturare
+            action_vec: Array di 80 bit
         """
         if self.done:
             raise ValueError("Partita già finita: non puoi fare altri step.")
@@ -149,7 +144,7 @@ class ScoponeEnvMA(gym.Env):
             # Reset dell'osservazione per lo stato terminale
             obs_final = np.zeros_like(self._get_observation(self.current_player))
             
-            # FIX: Restituisci la ricompensa finale per il team del giocatore corrente
+            # Restituisci la ricompensa finale per il team del giocatore corrente
             current_team = 0 if current_player in [0, 2] else 1
             return obs_final, final_reward[current_team], True, info
         else:
