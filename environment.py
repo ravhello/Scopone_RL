@@ -7,6 +7,7 @@ from gym import spaces
 from state import initialize_game
 from observation import encode_state_for_player
 from actions import get_valid_actions, encode_action, decode_action
+from line_profiler import LineProfiler, profile, global_profiler
 
 class ScoponeEnvMA(gym.Env):
     def __init__(self):
@@ -26,6 +27,7 @@ class ScoponeEnvMA(gym.Env):
         
         self.reset()
     
+    @profile
     def get_valid_actions(self):
         # Usiamo la funzione che restituisce azioni nel formato matrice
         return get_valid_actions(
@@ -152,7 +154,8 @@ class ScoponeEnvMA(gym.Env):
             self.current_player = (self.current_player + 1) % 4
             next_obs = self._get_observation(self.current_player)
             return next_obs, 0.0, False, {"last_move": move_info}
-        
+    
+    @profile
     def _get_observation(self, player_id):
         """
         Gets the observation for the specified player.

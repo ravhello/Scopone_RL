@@ -7,6 +7,8 @@ import torch.optim as optim
 import random
 import collections
 import os
+from line_profiler import LineProfiler, profile, global_profiler
+import time
 
 # Configurazione GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -28,7 +30,7 @@ CHECKPOINT_PATH = "scopone_checkpoint"
 # 1) Definiamo una classe EpisodicReplayBuffer
 ############################################################
 class EpisodicReplayBuffer:
-    def __init__(self, capacity=100):  # Memorizza fino a 100 episodi completi
+    def __init__(self, capacity=20):  # Memorizza fino a 20 episodi completi
         self.episodes = collections.deque(maxlen=capacity)
         self.current_episode = []  # Episodio corrente in costruzione
         
@@ -72,6 +74,15 @@ class EpisodicReplayBuffer:
     def get_all_episodes(self):
         """Restituisce tutti gli episodi"""
         return list(self.episodes)
+    
+    def get_previous_episodes(self):
+        """
+        Returns all episodes except the most recent one.
+        Useful for training on past episodes.
+        """
+        if len(self.episodes) <= 1:
+            return []
+        return list(self.episodes)[:-1]
 
 ############################################################
 # 2) Rete neurale QNetwork
@@ -124,6 +135,7 @@ class QNetwork(nn.Module):
         # Sposta tutto il modello su GPU all'inizializzazione
         self.to(device)
     
+    @profile
     def forward(self, x):
         # Assicurati che l'input sia sulla GPU
         if x.device != next(self.parameters()).device:
@@ -177,6 +189,7 @@ class DQNAgent:
         self.train_steps = 0
         self.episodic_buffer = EpisodicReplayBuffer()
     
+    @profile
     def pick_action(self, obs, valid_actions, env):
         """Epsilon-greedy con gestione GPU"""
         if not valid_actions:
@@ -213,8 +226,17 @@ class DQNAgent:
             
             return best_action
     
+    @profile
     def train_episodic_monte_carlo(self, specific_episode=None):
-        """Addestramento Monte Carlo su episodi usando flat rewards, ottimizzato per GPU"""
+        """
+        Addestramento Monte Carlo su episodi usando flat rewards.
+        
+        - Se specific_episode è fornito, usa quell'episodio specifico
+        - Altrimenti, usa tutti gli episodi nel buffer
+        
+        La reward dell'ultima transizione dell'episodio viene applicata a tutte
+        le transizioni dell'episodio in modo flat (stesso valore per tutti).
+        """
         # Determina quali episodi processare
         if specific_episode is not None:
             episodes_to_process = [specific_episode]
@@ -223,87 +245,110 @@ class DQNAgent:
         else:
             return  # Nessun episodio disponibile
         
-        # Processa ogni episodio nel buffer
+        # Prepara tutti i dati prima di processarli
+        all_transitions = []
+        all_returns = []
+        
         for episode in episodes_to_process:
             if not episode:
                 continue
                 
-            # Ottieni la reward finale dall'ultima transizione
+            # Ottieni la reward finale dall'ultima transizione dell'episodio
             final_reward = episode[-1][2] if episode else 0.0
             
-            # Assegna la stessa reward finale a tutte le transizioni (flat Monte Carlo)
-            returns = [final_reward for _ in range(len(episode))]
-            
-            # Ottimizzazione: processa in batch anziché una alla volta
-            batch_size = min(64, len(episode))
-            num_batches = (len(episode) + batch_size - 1) // batch_size
-            
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, len(episode))
-                
-                batch_obs = []
-                batch_actions = []
-                batch_returns = []
-                
-                for i in range(start_idx, end_idx):
-                    obs, action, _, _, _, _ = episode[i]
-                    G = returns[i]
-                    
-                    batch_obs.append(obs)
-                    batch_actions.append(action)
-                    batch_returns.append(G)
-                
-                # Converti in tensor e sposta su GPU
-                obs_t = torch.tensor(batch_obs, dtype=torch.float32).to(device)
-                batch_actions_t = [torch.tensor(a, dtype=torch.float32).to(device) for a in batch_actions]
-                returns_t = torch.tensor(batch_returns, dtype=torch.float32).to(device)
-                
-                # Calcola i Q-values correnti
-                self.optimizer.zero_grad()
-                q_values = self.online_qnet(obs_t)
-                
-                # Calcola i Q-values per le azioni scelte
-                q_values_for_actions = []
-                for i, action_t in enumerate(batch_actions_t):
-                    q_value = torch.sum(q_values[i] * action_t)
-                    q_values_for_actions.append(q_value)
-                
-                q_values_for_actions = torch.stack(q_values_for_actions)
-                
-                # Calcola loss e aggiorna
-                loss = nn.MSELoss()(q_values_for_actions, returns_t)
-                loss.backward()
-                self.optimizer.step()
-                
-                # Aggiorna counters
-                self.update_epsilon()
-                self.maybe_sync_target()
-    
-    def train(self):
-        """Addestramento su tutti gli episodi disponibili usando Monte Carlo flat rewards."""
-        self.train_episodic_monte_carlo()
-    
-    def start_episode(self):
-        """Inizia un nuovo episodio."""
-        self.episodic_buffer.start_episode()
-    
-    def end_episode(self):
-        """
-        Termina l'episodio corrente e applica immediatamente Monte Carlo sull'ultimo episodio.
-        """
-        self.episodic_buffer.end_episode()
+            # Aggiungi tutte le transizioni, usando la stessa reward finale per tutte
+            for obs, action, _, _, _, _ in episode:
+                all_transitions.append((obs, action))
+                all_returns.append(final_reward)  # Reward flat - stessa reward per tutte le transizioni
         
-        # Applica Monte Carlo solo sull'ultimo episodio, se disponibile
-        if self.episodic_buffer.episodes:
-            self.train_episodic_monte_carlo(self.episodic_buffer.episodes[-1])
+        if not all_transitions:
+            return  # Nessuna transizione da processare
+        
+        # Process in batch più grandi per sfruttare meglio la GPU
+        batch_size = min(256, len(all_transitions))
+        num_batches = (len(all_transitions) + batch_size - 1) // batch_size
+        
+        # Riduci la frequenza di sync_target
+        sync_counter = 0
+        sync_frequency = 10  # Esegui sync ogni 10 batch invece di ogni batch
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(all_transitions))
+            
+            # Prepara i dati per questo batch
+            batch_data = all_transitions[start_idx:end_idx]
+            batch_returns = all_returns[start_idx:end_idx]
+            
+            # Separa osservazioni e azioni
+            batch_obs, batch_actions = zip(*batch_data)
+            
+            # Conversione efficiente in tensori
+            batch_actions_np = np.stack(batch_actions).astype(np.float32)
+            
+            # Trasferimento a GPU
+            obs_t = torch.tensor(batch_obs, dtype=torch.float32, device=device)
+            batch_actions_t = torch.tensor(batch_actions_np, dtype=torch.float32, device=device)
+            returns_t = torch.tensor(batch_returns, dtype=torch.float32, device=device)
+            
+            # Zero gradients
+            self.optimizer.zero_grad(set_to_none=True)
+            
+            # Forward pass
+            q_values = self.online_qnet(obs_t)
+            
+            # Calcolo vettoriale dei Q-values
+            q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
+            
+            # Loss e backward
+            loss = nn.MSELoss()(q_values_for_actions, returns_t)
+            loss.backward()
+            
+            # Clipping del gradiente per stabilità
+            torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
+            
+            # Optimizer step
+            self.optimizer.step()
+            
+            # Aggiorna epsilon
+            self.update_epsilon()
+            
+            # Sync target periodicamente
+            sync_counter += 1
+            if sync_counter >= sync_frequency:
+                self.sync_target()
+                sync_counter = 0
+            
+            # Libera memoria
+            del obs_t, batch_actions_t, returns_t, q_values, q_values_for_actions, loss
+        
+        # Garbage collection finale
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
+    @profile
     def store_episode_transition(self, transition):
         """
         Memorizza una transizione nell'episodic buffer.
         """
         # Aggiungi all'episodio corrente
         self.episodic_buffer.add_transition(transition)
+    
+    @profile
+    def end_episode(self):
+        """
+        Termina l'episodio corrente SENZA training.
+        Il training deve essere chiamato esplicitamente dopo questo metodo.
+        """
+        self.episodic_buffer.end_episode()
+        # Nota: rimosso il training automatico qui
+            
+    @profile
+    def start_episode(self):
+        """Inizia un nuovo episodio."""
+        self.episodic_buffer.start_episode()
     
     def sync_target(self):
         """Synchronizes the target network weights with the online network weights."""
@@ -342,10 +387,11 @@ class DQNAgent:
 # 4) Multi-agent training
 ############################################################
 
+@profile
 def train_agents(num_episodes=10):
     """
-    Esegue un training multi-agent combinando DQN, Monte Carlo ed Episodic.
-    Compatibile con la rappresentazione a matrice (80 dim).
+    Esegue un training multi-agent episodico.
+    Il training avviene solo alla fine di ogni episodio, con reward flat per tutte le mosse.
     """
     # Creiamo 2 agenti
     agent_team0 = DQNAgent(team_id=0)
@@ -358,24 +404,27 @@ def train_agents(num_episodes=10):
         agent_team1.load_checkpoint(CHECKPOINT_PATH+"_team1.pth")
 
     first_player = 0
-    global_step = 0  
+    global_step = 0
+    
+    # Per monitorare i tempi di esecuzione
+    episode_times = []
 
     for ep in range(num_episodes):
+        episode_start_time = time.time()
         print(f"\n=== Episodio {ep+1}, inizia player {first_player} ===")
+        
+        # Crea l'ambiente di gioco
         env = ScoponeEnvMA()
         env.current_player = first_player
 
         # Iniziamo un nuovo episodio per entrambi gli agenti
-        agent_team0.start_episode()
-        agent_team1.start_episode()
-        
-        # Tracciamo tutti i transitions per applicare Monte Carlo alla fine
-        team0_transitions = []
-        team1_transitions = []
+        agent_team0.episodic_buffer.start_episode()
+        agent_team1.episodic_buffer.start_episode()
 
         done = False
         obs_current = env._get_observation(env.current_player)
 
+        # Loop principale della partita
         while not done:
             cp = env.current_player
             team_id = 0 if cp in [0,2] else 1
@@ -386,137 +435,128 @@ def train_agents(num_episodes=10):
                 break
                 
             action = agent.pick_action(obs_current, valid_acts, env)
-
             next_obs, reward, done, info = env.step(action)
             global_step += 1
 
-            # Gestione della reward finale
-            if done and "team_rewards" in info:
-                team_rewards = info["team_rewards"]
-                
-                # Aggiorniamo le reward per entrambi i team
-                team0_reward = team_rewards[0]
-                team1_reward = team_rewards[1]
-                
-                # Creiamo transizioni finali per entrambi i team
-                team0_obs = env._get_observation(0)
-                team1_obs = env._get_observation(1)
-                
-                # Transizione finale per Team0
-                team0_final_transition = (
-                    team0_obs, np.zeros(80, dtype=np.float32), team0_reward,
-                    np.zeros_like(team0_obs), True, []
-                )
-                
-                # Transizione finale per Team1
-                team1_final_transition = (
-                    team1_obs, np.zeros(80, dtype=np.float32), team1_reward,
-                    np.zeros_like(team1_obs), True, []
-                )
-                
-                # Aggiungiamo le transizioni finali alle rispettive liste
-                team0_transitions.append(team0_final_transition)
-                team1_transitions.append(team1_final_transition)
-                
-                # Memorizzazione delle transizioni finali
-                agent_team0.store_episode_transition(team0_final_transition)
-                agent_team1.store_episode_transition(team1_final_transition)
+            # Durante il gioco, le mosse hanno reward=0 (sarà aggiornata alla fine in train_episodic_monte_carlo)
+            next_valid = env.get_valid_actions() if not done else []
+            transition = (obs_current, action, reward, next_obs, done, next_valid)
+            
+            # Memorizza la transizione nel buffer dell'agente del giocatore corrente
+            if team_id == 0:
+                agent_team0.episodic_buffer.add_transition(transition)
             else:
-                # Reward normale durante il gioco
-                next_valid = env.get_valid_actions() if not done else []
-                
-                # Crea la transizione
-                transition = (obs_current, action, reward, next_obs, done, next_valid)
-                
-                # Memorizza la transizione nell'agente del giocatore corrente
-                if team_id == 0:
-                    team0_transitions.append(transition)
-                    agent_team0.store_episode_transition(transition)
-                else:
-                    team1_transitions.append(transition)
-                    agent_team1.store_episode_transition(transition)
+                agent_team1.episodic_buffer.add_transition(transition)
             
-            # Training step standard (verrà usato solo se enabled)
-            agent.train()
-            
+            # Prepara per la prossima iterazione
             obs_current = next_obs
 
-        # Fine partita, terminiamo gli episodi
-        agent_team0.end_episode()
-        agent_team1.end_episode()
+        # Fine partita - Termina gli episodi
+        agent_team0.episodic_buffer.end_episode()
+        agent_team1.episodic_buffer.end_episode()
         
-        # Applicazione esplicita di Monte Carlo per entrambi i team
-        if team0_transitions:
-            monte_carlo_update_team(agent_team0, team0_transitions)
-        if team1_transitions:
-            monte_carlo_update_team(agent_team1, team1_transitions)
-        
+        # Ottieni le reward finali, se disponibili
+        team0_reward = 0.0
+        team1_reward = 0.0
         if "team_rewards" in info:
             team_rewards = info["team_rewards"]
+            team0_reward = team_rewards[0]
+            team1_reward = team_rewards[1]
             print(f"Team Rewards finali: {team_rewards}")
-
+        
+        # TRAINING ALLA FINE DELL'EPISODIO
+        print(f"Training alla fine dell'episodio {ep+1}...")
+        
+        # Train team 0 - la reward finale viene applicata a tutte le mosse internamente
+        if agent_team0.episodic_buffer.episodes:
+            # Ottieni l'ultimo episodio
+            last_episode_team0 = agent_team0.episodic_buffer.episodes[-1]
+            
+            # Se non ci sono transizioni, non fare training
+            if not last_episode_team0:
+                print("  Nessuna transizione per team 0, skip training")
+            else:
+                # Crea una copia dell'episodio con la reward finale aggiornata per tutte le mosse
+                # Questo è necessario perché vogliamo preservare le reward originali nell'episodio
+                training_episode_team0 = []
+                for obs, action, _, next_obs, done, next_valid in last_episode_team0:
+                    # Sostituisci la reward con la reward finale del team (flat)
+                    training_episode_team0.append((obs, action, team0_reward, next_obs, done, next_valid))
+                
+                print(f"  Training team 0 sull'ultimo episodio (reward={team0_reward})")
+                # Usa l'episodio con reward aggiornate per il training
+                agent_team0.train_episodic_monte_carlo(training_episode_team0)
+        
+        # Train team 1 - la reward finale viene applicata a tutte le mosse internamente
+        if agent_team1.episodic_buffer.episodes:
+            # Ottieni l'ultimo episodio
+            last_episode_team1 = agent_team1.episodic_buffer.episodes[-1]
+            
+            # Se non ci sono transizioni, non fare training
+            if not last_episode_team1:
+                print("  Nessuna transizione per team 1, skip training")
+            else:
+                # Crea una copia dell'episodio con la reward finale aggiornata per tutte le mosse
+                # Questo è necessario perché vogliamo preservare le reward originali nell'episodio
+                training_episode_team1 = []
+                for obs, action, _, next_obs, done, next_valid in last_episode_team1:
+                    # Sostituisci la reward con la reward finale del team (flat)
+                    training_episode_team1.append((obs, action, team1_reward, next_obs, done, next_valid))
+                
+                print(f"  Training team 1 sull'ultimo episodio (reward={team1_reward})")
+                # Usa l'episodio con reward aggiornate per il training
+                agent_team1.train_episodic_monte_carlo(training_episode_team1)
+        
+        # Occasionalmente, trainiamo anche su episodi precedenti
+        if ep % 5 == 0 and len(agent_team0.episodic_buffer.episodes) > 3:
+            print("  Training aggiuntivo su episodi passati per team 0")
+            prev_episodes = agent_team0.episodic_buffer.get_previous_episodes()
+            past_episodes = random.sample(prev_episodes, 
+                                        min(3, len(prev_episodes)))
+            for episode in past_episodes:
+                if episode:  # Verifica che l'episodio non sia vuoto
+                    agent_team0.train_episodic_monte_carlo(episode)
+        
+        if ep % 5 == 0 and len(agent_team1.episodic_buffer.episodes) > 3:
+            print("  Training aggiuntivo su episodi passati per team 1")
+            prev_episodes = agent_team1.episodic_buffer.get_previous_episodes()
+            past_episodes = random.sample(prev_episodes, 
+                                        min(3, len(prev_episodes)))
+            for episode in past_episodes:
+                if episode:  # Verifica che l'episodio non sia vuoto
+                    agent_team1.train_episodic_monte_carlo(episode)
+        
+        # Forza garbage collection per ridurre il consumo di memoria
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Calcola e registra il tempo dell'episodio
+        episode_time = time.time() - episode_start_time
+        episode_times.append(episode_time)
+        print(f"Episodio {ep+1} completato in {episode_time:.2f} secondi")
+        
+        # Prepara per il prossimo episodio
         first_player = (first_player + 1) % 4
 
     # Salviamo i checkpoint finali
     agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0.pth")
     agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1.pth")
-    print("=== Fine training con strategie combinate DQN + Monte Carlo + Episodic ===")
+    
+    print("=== Fine training ===")
+    print("\nTempi di esecuzione degli episodi:")
+    for i, t in enumerate(episode_times):
+        print(f"Episodio {i+1}: {t:.2f}s")
+    print(f"Tempo medio per episodio: {sum(episode_times)/len(episode_times):.2f}s")
 
-def monte_carlo_update_team(agent, transitions):
-    """Aggiornamento Monte Carlo ottimizzato per GPU"""
-    if not transitions:
-        return
-    
-    # Estrai la reward finale dall'ultima transizione
-    final_reward = transitions[-1][2] if transitions else 0.0
-    
-    # Usa lo stesso valore di reward per tutte le transizioni
-    returns = [final_reward] * len(transitions)
-    
-    # Elaborazione in batch anziché per singola transizione
-    batch_size = min(64, len(transitions))
-    num_batches = (len(transitions) + batch_size - 1) // batch_size
-    
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(transitions))
-        
-        batch_obs = []
-        batch_actions = []
-        batch_returns = []
-        
-        for i in range(start_idx, end_idx):
-            obs, action, _, _, _, _ = transitions[i]
-            G = returns[i]
-            
-            batch_obs.append(obs)
-            batch_actions.append(action)
-            batch_returns.append(G)
-        
-        # Converti in tensor e sposta su GPU
-        obs_t = torch.tensor(batch_obs, dtype=torch.float32).to(device)
-        batch_actions_t = [torch.tensor(a, dtype=torch.float32).to(device) for a in batch_actions]
-        returns_t = torch.tensor(batch_returns, dtype=torch.float32).to(device)
-        
-        # Calcola i Q-values correnti
-        agent.optimizer.zero_grad()
-        q_values = agent.online_qnet(obs_t)
-        
-        # Calcola i Q-values per le azioni scelte
-        q_values_for_actions = []
-        for i, action_t in enumerate(batch_actions_t):
-            q_value = torch.sum(q_values[i] * action_t)
-            q_values_for_actions.append(q_value)
-        
-        q_values_for_actions = torch.stack(q_values_for_actions)
-        
-        # Calcola loss e aggiorna i pesi
-        loss = nn.MSELoss()(q_values_for_actions, returns_t)
-        loss.backward()
-        agent.optimizer.step()
-        
-        # Aggiorna target periodicamente
-        agent.sync_target()
 
 if __name__ == "__main__":
-    train_agents(num_episodes=400)
+    # Esegui il training per pochi episodi per profilare
+    train_agents(num_episodes=20)
+    
+    # Stampa i risultati del profiling
+    global_profiler.print_stats()
+    
+    # Genera un report dettagliato e salvalo su file
+    report = global_profiler.generate_report("profiling_report.txt")
