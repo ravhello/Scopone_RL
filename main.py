@@ -503,31 +503,55 @@ def train_agents(num_episodes=10):
     agent_team0 = DQNAgent(team_id=0)
     agent_team1 = DQNAgent(team_id=1)
 
-    # Carica checkpoint con controlli aggiuntivi
-    team0_ckpt = CHECKPOINT_PATH+"_team0.pth"
-    team1_ckpt = CHECKPOINT_PATH+"_team1.pth"
+    # Funzione di utilità per trovare il checkpoint più recente
+    def find_latest_checkpoint(base_path, team_id):
+        """Trova il checkpoint più recente per un team specifico"""
+        dir_path = os.path.dirname(base_path)
+        base_name = os.path.basename(base_path)
+        
+        # Prima controlla se esiste il checkpoint senza numero episodio
+        standard_ckpt = f"{base_path}_team{team_id}.pth"
+        if os.path.isfile(standard_ckpt):
+            return standard_ckpt
+            
+        # Altrimenti cerca i checkpoint con numero episodio
+        if os.path.exists(dir_path):
+            # Pattern per i checkpoint con numero episodio
+            import fnmatch
+            pattern = f"{base_name}_team{team_id}_ep*.pth"
+            matching_files = [f for f in os.listdir(dir_path) if fnmatch.fnmatch(f, pattern)]
+            
+            if matching_files:
+                # Estrai il numero episodio e ordina per numero più alto
+                matching_files.sort(key=lambda x: int(x.split('_ep')[1].split('.pth')[0]), reverse=True)
+                return os.path.join(dir_path, matching_files[0])
+        
+        return None
     
-    print(f"Cercando checkpoint in: {team0_ckpt} e {team1_ckpt}")
+    # Carica checkpoint con logica migliorata
+    print(f"Cercando checkpoint più recenti per i team...")
     
     # Team 0
-    if os.path.isfile(team0_ckpt):
+    team0_ckpt = find_latest_checkpoint(CHECKPOINT_PATH, 0)
+    if team0_ckpt:
         try:
             print(f"Trovato checkpoint per team 0: {team0_ckpt}")
             agent_team0.load_checkpoint(team0_ckpt)
         except Exception as e:
             print(f"ERRORE nel caricamento del checkpoint team 0: {e}")
     else:
-        print(f"Nessun checkpoint trovato per team 0 in: {team0_ckpt}")
+        print(f"Nessun checkpoint trovato per team 0")
     
     # Team 1
-    if os.path.isfile(team1_ckpt):
+    team1_ckpt = find_latest_checkpoint(CHECKPOINT_PATH, 1)
+    if team1_ckpt:
         try:
             print(f"Trovato checkpoint per team 1: {team1_ckpt}")
             agent_team1.load_checkpoint(team1_ckpt)
         except Exception as e:
             print(f"ERRORE nel caricamento del checkpoint team 1: {e}")
     else:
-        print(f"Nessun checkpoint trovato per team 1 in: {team1_ckpt}")
+        print(f"Nessun checkpoint trovato per team 1")
 
     # Variabili di controllo
     first_player = 0
@@ -966,8 +990,8 @@ def train_agents(num_episodes=10):
             torch.cuda.memory_stats()  # Riorganizza allocazione
         
         # Traccia tempo di training
-        #train_time = time.time() - train_start_time
-        #train_times.append(train_time)
+        train_time = time.time() - train_start_time
+        train_times.append(train_time)
         #print(f"  Training completato in {train_time:.2f} secondi")
         
         # Monitoraggio memoria GPU
@@ -976,21 +1000,22 @@ def train_agents(num_episodes=10):
                   #f"{torch.cuda.memory_reserved()/1024**2:.1f}MB reserved")
         
         # Tempo totale episodio
-        #episode_time = time.time() - episode_start_time
-        #episode_times.append(episode_time)
+        episode_time = time.time() - episode_start_time
+        episode_times.append(episode_time)
         #print(f"Episodio {ep+1} completato in {episode_time:.2f} secondi")
         
-        # Salva checkpoint periodici
+        # Salva checkpoint periodici e checkpoint senza numero episodio
         if (ep + 1) % 1000 == 0 or ep == num_episodes - 1:
+            # Salva con numero episodio per tracciare la progressione
             agent_team0.save_checkpoint(f"{CHECKPOINT_PATH}_team0_ep{ep+1}.pth")
             agent_team1.save_checkpoint(f"{CHECKPOINT_PATH}_team1_ep{ep+1}.pth")
+            
+            # Salva anche senza numero episodio per facilitare la ripresa
+            agent_team0.save_checkpoint(f"{CHECKPOINT_PATH}_team0.pth")
+            agent_team1.save_checkpoint(f"{CHECKPOINT_PATH}_team1.pth")
         
         # Prepara per il prossimo episodio
         first_player = (first_player + 1) % 4
-
-    # Salva checkpoint finali
-    agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0.pth")
-    agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1.pth")
 
     # Verifica che i checkpoint siano stati salvati
     checkpoint_dir = os.path.dirname(CHECKPOINT_PATH)
