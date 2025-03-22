@@ -1,0 +1,4 @@
+/checkpoints
+/__pycache__
+all_code.py
+.pytest_cache

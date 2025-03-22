@@ -171,7 +171,7 @@ class QNetwork(nn.Module):
     
     @profile
     def forward(self, x):
-        # Assicurati che l'input sia sulla GPU
+        # Assicurati che l'input sia sulla GPU - ottimizzato
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float32, device=device)
         elif x.device != device:
@@ -190,7 +190,7 @@ class QNetwork(nn.Module):
         history = x[:, 169:10489]
         stats = x[:, 10489:]
         
-        # Processa ogni sezione
+        # Processa ogni sezione - versione in-place
         hand_table_features = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
         captured_features = F.relu(self.captured_processor[0](captured), inplace=True)
         history_features = F.relu(self.history_processor[0](history), inplace=True)
@@ -206,7 +206,7 @@ class QNetwork(nn.Module):
             stats_features
         ], dim=1)
         
-        # Elabora le features combinate
+        # Elabora le features combinate - versione in-place
         final_features = F.relu(self.combiner[0](combined), inplace=True)
         
         # Calcola i valori delle azioni
@@ -250,17 +250,40 @@ class DQNAgent:
         if random.random() < self.epsilon:
             return random.choice(valid_actions)
         else:
-            # MODIFICA: Converti tutti gli input in tensori GPU in un'unica operazione
-            valid_actions_t = torch.tensor(np.stack(valid_actions), 
-                                        dtype=torch.float32, device=device)
-            
-            with torch.no_grad():
-                # MODIFICA: Crea direttamente il tensore su GPU
-                obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                action_values = self.online_qnet(obs_t)
+            # OTTIMIZZAZIONE: Converti tutti gli input in tensori GPU in un'unica operazione
+            # e riusa il buffer pre-allocato se disponibile
+            if hasattr(self, 'valid_actions_buffer') and len(valid_actions) <= self.valid_actions_buffer.size(0):
+                valid_actions_t = self.valid_actions_buffer[:len(valid_actions)]
+                for i, va in enumerate(valid_actions):
+                    if isinstance(va, np.ndarray):
+                        valid_actions_t[i].copy_(torch.tensor(va, device=device))
+                    else:
+                        valid_actions_t[i].copy_(va)
+            else:
+                # Creazione del buffer se non esiste
+                if not hasattr(self, 'valid_actions_buffer') or len(valid_actions) > self.valid_actions_buffer.size(0):
+                    self.valid_actions_buffer = torch.zeros((max(100, len(valid_actions)), 80), 
+                                                        dtype=torch.float32, device=device)
+                valid_actions_t = torch.tensor(np.stack(valid_actions), 
+                                            dtype=torch.float32, device=device)
                 
-                # MODIFICA: Operazione interamente su GPU senza conversioni intermedie
-                q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
+            with torch.no_grad():
+                # OTTIMIZZAZIONE: Riusa il buffer per observation se possibile
+                if hasattr(self, 'obs_buffer'):
+                    obs_t = self.obs_buffer
+                    if isinstance(obs, np.ndarray):
+                        obs_t.copy_(torch.tensor(obs, device=device).unsqueeze(0))
+                    else:
+                        obs_t.copy_(obs.unsqueeze(0))
+                else:
+                    self.obs_buffer = torch.zeros((1, len(obs)), dtype=torch.float32, device=device)
+                    obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    
+                # OTTIMIZZAZIONE: Usa mixed precision per accelerare l'inferenza
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    action_values = self.online_qnet(obs_t)
+                    q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
+                
                 best_action_idx = torch.argmax(q_values).item()
             
             return valid_actions[best_action_idx]
@@ -268,7 +291,7 @@ class DQNAgent:
     @profile
     def train_episodic_monte_carlo(self, specific_episode=None):
         """
-        Addestramento Monte Carlo su episodi usando flat rewards con ottimizzazioni GPU avanzate.
+        Versione ottimizzata con buffers pre-allocati e mixed precision.
         """
         # Determina quali episodi processare
         if specific_episode is not None:
@@ -278,11 +301,17 @@ class DQNAgent:
         else:
             return  # Nessun episodio disponibile
         
-        # Prepara tutti i dati prima di processarli sulla GPU
-        all_obs = []
-        all_actions = []
-        all_returns = []
+        # OTTIMIZZAZIONE: Usa buffer pre-allocati se possibile
+        max_transitions = sum(len(episode) for episode in episodes_to_process)
         
+        # Crea o ridimensiona i buffer se necessario
+        if not hasattr(self, 'train_obs_buffer') or max_transitions > self.train_obs_buffer.size(0):
+            self.train_obs_buffer = torch.zeros((max_transitions, 10823), dtype=torch.float32, device=device)
+            self.train_actions_buffer = torch.zeros((max_transitions, 80), dtype=torch.float32, device=device)
+            self.train_returns_buffer = torch.zeros(max_transitions, dtype=torch.float32, device=device)
+        
+        # Riempi i buffer in modo efficiente
+        idx = 0
         for episode in episodes_to_process:
             if not episode:
                 continue
@@ -290,51 +319,32 @@ class DQNAgent:
             # Ottieni la reward finale dall'ultima transizione dell'episodio
             final_reward = episode[-1][2] if episode else 0.0
             
-            # Aggiungi tutte le transizioni, usando la stessa reward finale per tutte
             for obs, action, _, _, _, _ in episode:
-                all_obs.append(obs)
-                all_actions.append(action)
-                all_returns.append(final_reward)
+                # Copia direttamente nel buffer per evitare creazioni di tensori intermedie
+                if isinstance(obs, np.ndarray):
+                    self.train_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
+                else:
+                    self.train_obs_buffer[idx].copy_(obs)
+                    
+                if isinstance(action, np.ndarray):
+                    self.train_actions_buffer[idx].copy_(torch.tensor(action, device=device))
+                else:
+                    self.train_actions_buffer[idx].copy_(action)
+                    
+                self.train_returns_buffer[idx] = final_reward
+                idx += 1
         
-        if not all_obs:
+        if idx == 0:
             return  # Nessuna transizione da processare
         
-        # Converti tutti i dati in tensori GPU in un'unica operazione
-        try:
-            # Implementazione ottimizzata: stack diretto su GPU
-            all_obs_t = torch.tensor(np.stack(all_obs), dtype=torch.float32, device=device)
-            all_actions_t = torch.tensor(np.stack(all_actions), dtype=torch.float32, device=device)
-            all_returns_t = torch.tensor(all_returns, dtype=torch.float32, device=device)
-        except RuntimeError as e:
-            # Fallback in caso di out of memory: caricamento incrementale
-            print(f"GPU memory issue in tensor creation: {e}")
-            batch_size = 256
-            num_batches = (len(all_obs) + batch_size - 1) // batch_size
-            all_obs_t = []
-            all_actions_t = []
-            all_returns_t = []
-            
-            for i in range(num_batches):
-                start_idx = i * batch_size
-                end_idx = min(start_idx + batch_size, len(all_obs))
-                batch_obs = all_obs[start_idx:end_idx]
-                batch_actions = all_actions[start_idx:end_idx]
-                batch_returns = all_returns[start_idx:end_idx]
-                
-                all_obs_t.append(torch.tensor(np.stack(batch_obs), 
-                                            dtype=torch.float32, device=device))
-                all_actions_t.append(torch.tensor(np.stack(batch_actions), 
-                                            dtype=torch.float32, device=device))
-                all_returns_t.append(torch.tensor(batch_returns, 
-                                            dtype=torch.float32, device=device))
-            
-            all_obs_t = torch.cat(all_obs_t)
-            all_actions_t = torch.cat(all_actions_t)
-            all_returns_t = torch.cat(all_returns_t)
+        # Usa slices dei buffer per il training
+        all_obs_t = self.train_obs_buffer[:idx]
+        all_actions_t = self.train_actions_buffer[:idx]
+        all_returns_t = self.train_returns_buffer[:idx]
         
         # Aumenta batch_size per sfruttare meglio la GPU
-        batch_size = min(512, len(all_obs))  # Dimensione ottimizzata per GPU moderne
-        num_batches = (len(all_obs_t) + batch_size - 1) // batch_size
+        batch_size = min(512, idx)  # Dimensione ottimizzata per GPU moderne
+        num_batches = (idx + batch_size - 1) // batch_size
         
         # Riduci la frequenza di sync_target
         sync_counter = 0
@@ -344,62 +354,53 @@ class DQNAgent:
         total_loss = 0.0
         batch_count = 0
         
-        # Usa mixed precision in modo più efficiente con float16
+        # OTTIMIZZAZIONE: Usa mixed precision in modo più efficiente con float16
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, len(all_obs_t))
+                end_idx = min(start_idx + batch_size, idx)
                 
                 # Prendi slices dei tensori già sulla GPU (evita copie)
                 batch_obs_t = all_obs_t[start_idx:end_idx]
                 batch_actions_t = all_actions_t[start_idx:end_idx]
                 batch_returns_t = all_returns_t[start_idx:end_idx]
                 
-                # Zero gradients - usa set_to_none=True per maggiore efficienza di memoria
+                # OTTIMIZZAZIONE: Zero gradients - usa set_to_none=True per maggiore efficienza di memoria
                 self.optimizer.zero_grad(set_to_none=True)
                 
-                # Forward pass con kernel fusion dove possibile
+                # OTTIMIZZAZIONE: Forward pass con kernel fusion dove possibile
                 q_values = self.online_qnet(batch_obs_t)
                 q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
                 
-                # Loss con mixed precision - usa reduction='mean' per stabilità numerica
+                # OTTIMIZZAZIONE: Loss con mixed precision - usa reduction='mean' per stabilità numerica
                 loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
                 
                 # Traccia la loss per diagnostica
                 total_loss += loss.item()
                 batch_count += 1
                 
-                # Backward e optimizer step con gradient scaling per mixed precision
+                # OTTIMIZZAZIONE: Backward e optimizer step con gradient scaling per mixed precision
                 self.scaler.scale(loss).backward()
                 
-                # Clip gradient con una norma moderata per stabilità di training
+                # OTTIMIZZAZIONE: Clip gradient con una norma moderata per stabilità di training
                 torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
                 
-                # Optimizer step con scaling
+                # OTTIMIZZAZIONE: Optimizer step con scaling
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
                 # Aggiorna epsilon dopo ogni batch per avanzare il training
                 self.update_epsilon()
                 
-                # Sync target network periodicamente (non ad ogni batch)
+                # OTTIMIZZAZIONE: Sync target network periodicamente (non ad ogni batch)
                 sync_counter += 1
                 if sync_counter >= sync_frequency:
                     self.sync_target()
                     sync_counter = 0
                     
-                # Rilascia memoria GPU ogni 10 batch se necessario
+                # OTTIMIZZAZIONE: Rilascia memoria GPU periodicamente
                 if batch_idx % 10 == 0 and batch_idx > 0:
                     torch.cuda.empty_cache()
-        
-        # Stampa la loss media per diagnostica
-        if batch_count > 0:
-            avg_loss = total_loss / batch_count
-            print(f"  Training: Avg loss = {avg_loss:.6f}, Epsilon = {self.epsilon:.4f}")
-        
-        # Libera memoria in modo più aggressivo al termine
-        del all_obs_t, all_actions_t, all_returns_t
-        torch.cuda.empty_cache()
     
     @profile
     def store_episode_transition(self, transition):
@@ -438,14 +439,23 @@ class DQNAgent:
         self.train_steps += 1
 
     def save_checkpoint(self, filename):
-        """Salva il checkpoint tenendo conto della GPU"""
-        torch.save({
-            "online_state_dict": self.online_qnet.state_dict(),
-            "target_state_dict": self.target_qnet.state_dict(),
-            "epsilon": self.epsilon,
-            "train_steps": self.train_steps
-        }, filename)
-        print(f"[DQNAgent] Checkpoint saved: {filename}")
+        """Salva il checkpoint tenendo conto della GPU e assicura che la directory esista"""
+        # Crea la directory se non esiste
+        directory = os.path.dirname(filename)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+            print(f"[DQNAgent] Creata directory per checkpoint: {directory}")
+        
+        try:
+            torch.save({
+                "online_state_dict": self.online_qnet.state_dict(),
+                "target_state_dict": self.target_qnet.state_dict(),
+                "epsilon": self.epsilon,
+                "train_steps": self.train_steps
+            }, filename)
+            print(f"[DQNAgent] Checkpoint salvato: {filename}")
+        except Exception as e:
+            print(f"[DQNAgent] ERRORE nel salvataggio del checkpoint {filename}: {e}")
 
     def load_checkpoint(self, filename):
         """Carica il checkpoint tenendo conto della GPU"""
@@ -483,15 +493,41 @@ def train_agents(num_episodes=10):
         # Imposta allocator per ridurre frammentazione
         torch.cuda.memory_stats()
 
+    # Crea la directory dei checkpoint se non esiste
+    checkpoint_dir = os.path.dirname(CHECKPOINT_PATH)
+    if not os.path.exists(checkpoint_dir):
+        print(f"Creazione directory per checkpoint: {checkpoint_dir}")
+        os.makedirs(checkpoint_dir)
+    
     # Crea gli agenti
     agent_team0 = DQNAgent(team_id=0)
     agent_team1 = DQNAgent(team_id=1)
 
-    # Carica checkpoint se esistono
-    if os.path.isfile(CHECKPOINT_PATH+"_team0.pth"):
-        agent_team0.load_checkpoint(CHECKPOINT_PATH+"_team0.pth")
-    if os.path.isfile(CHECKPOINT_PATH+"_team1.pth"):
-        agent_team1.load_checkpoint(CHECKPOINT_PATH+"_team1.pth")
+    # Carica checkpoint con controlli aggiuntivi
+    team0_ckpt = CHECKPOINT_PATH+"_team0.pth"
+    team1_ckpt = CHECKPOINT_PATH+"_team1.pth"
+    
+    print(f"Cercando checkpoint in: {team0_ckpt} e {team1_ckpt}")
+    
+    # Team 0
+    if os.path.isfile(team0_ckpt):
+        try:
+            print(f"Trovato checkpoint per team 0: {team0_ckpt}")
+            agent_team0.load_checkpoint(team0_ckpt)
+        except Exception as e:
+            print(f"ERRORE nel caricamento del checkpoint team 0: {e}")
+    else:
+        print(f"Nessun checkpoint trovato per team 0 in: {team0_ckpt}")
+    
+    # Team 1
+    if os.path.isfile(team1_ckpt):
+        try:
+            print(f"Trovato checkpoint per team 1: {team1_ckpt}")
+            agent_team1.load_checkpoint(team1_ckpt)
+        except Exception as e:
+            print(f"ERRORE nel caricamento del checkpoint team 1: {e}")
+    else:
+        print(f"Nessun checkpoint trovato per team 1 in: {team1_ckpt}")
 
     # Variabili di controllo
     first_player = 0
@@ -955,6 +991,18 @@ def train_agents(num_episodes=10):
     # Salva checkpoint finali
     agent_team0.save_checkpoint(CHECKPOINT_PATH+"_team0.pth")
     agent_team1.save_checkpoint(CHECKPOINT_PATH+"_team1.pth")
+
+    # Verifica che i checkpoint siano stati salvati
+    checkpoint_dir = os.path.dirname(CHECKPOINT_PATH)
+    if os.path.exists(checkpoint_dir):
+        print("\nCheckpoint trovati nella directory:")
+        checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
+        for file in checkpoint_files:
+            file_path = os.path.join(checkpoint_dir, file)
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # dimensione in MB
+            print(f" - {file} ({file_size:.2f} MB)")
+    else:
+        print(f"\nATTENZIONE: La directory dei checkpoint {checkpoint_dir} non esiste!")
     
     # Report statistiche finali
     print("\n=== Fine training ===")
