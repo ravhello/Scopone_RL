@@ -7,7 +7,7 @@ import torch.optim as optim
 import random
 import collections
 import os
-from line_profiler import LineProfiler, profile, global_profiler
+#from line_profiler import LineProfiler, profile, global_profiler
 import time
 from tqdm import tqdm
 
@@ -169,7 +169,7 @@ class QNetwork(nn.Module):
             # Ottimizzazione per dimensioni di input fisse
             torch.backends.cudnn.benchmark = True
     
-    @profile
+    #@profile
     def forward(self, x):
         # Assicurati che l'input sia sulla GPU - ottimizzato
         if isinstance(x, np.ndarray):
@@ -234,7 +234,7 @@ class DQNAgent:
         torch.backends.cudnn.benchmark = True  # Ottimizzazione per dimensioni di input fisse
         self.scaler = torch.amp.GradScaler('cuda')  # Per mixed precision training
     
-    @profile
+    #@profile
     def pick_action(self, obs, valid_actions, env):
         """Epsilon-greedy ottimizzato per GPU"""
         if not valid_actions:
@@ -288,7 +288,7 @@ class DQNAgent:
             
             return valid_actions[best_action_idx]
     
-    @profile
+    #@profile
     def train_episodic_monte_carlo(self, specific_episode=None):
         """
         Versione ottimizzata con buffers pre-allocati e mixed precision.
@@ -402,7 +402,7 @@ class DQNAgent:
                 if batch_idx % 10 == 0 and batch_idx > 0:
                     torch.cuda.empty_cache()
     
-    @profile
+    #@profile
     def store_episode_transition(self, transition):
         """
         Memorizza una transizione nell'episodic buffer.
@@ -410,7 +410,7 @@ class DQNAgent:
         # Aggiungi all'episodio corrente
         self.episodic_buffer.add_transition(transition)
     
-    @profile
+    #@profile
     def end_episode(self):
         """
         Termina l'episodio corrente SENZA training.
@@ -419,7 +419,7 @@ class DQNAgent:
         self.episodic_buffer.end_episode()
         # Nota: rimosso il training automatico qui
             
-    @profile
+    #@profile
     def start_episode(self):
         """Inizia un nuovo episodio."""
         self.episodic_buffer.start_episode()
@@ -470,7 +470,7 @@ class DQNAgent:
 # 4) Multi-agent training
 ############################################################
 
-@profile
+#@profile
 def train_agents(num_episodes=10):
     """
     Esegue un training multi-agent episodico completamente ottimizzato per GPU.
@@ -1045,10 +1045,10 @@ def train_agents(num_episodes=10):
 
 if __name__ == "__main__":
     # Esegui il training per pochi episodi per profilare
-    train_agents(num_episodes=50000)
+    train_agents(num_episodes=200)
     
     # Stampa i risultati del profiling
-    global_profiler.print_stats()
+    #global_profiler.print_stats()
     
     # Genera un report dettagliato e salvalo su file
-    report = global_profiler.generate_report("profiling_report.txt")
+    #report = global_profiler.generate_report("profiling_report.txt")

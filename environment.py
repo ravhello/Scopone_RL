@@ -47,7 +47,7 @@ class ScoponeEnvMA(gym.Env):
         
         self.reset()
     
-    @profile
+    #@profile
     def get_valid_actions(self):
         """Versione ad alte prestazioni con cache efficiente"""
         start_time = time.time()
@@ -216,7 +216,7 @@ class ScoponeEnvMA(gym.Env):
             
             return next_obs, 0.0, False, {"last_move": move_info}
     
-    @profile
+    #@profile
     def _get_observation(self, player_id):
         """
         Versione ottimizzata per performance che utilizza caching aggressivo
