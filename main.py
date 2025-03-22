@@ -9,6 +9,7 @@ import collections
 import os
 from line_profiler import LineProfiler, profile, global_profiler
 import time
+from tqdm import tqdm
 
 # Configurazione GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,7 +50,7 @@ EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
 BATCH_SIZE = 128          # dimensione mini-batch
 REPLAY_SIZE = 10000      # capacità massima del replay buffer
 TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target
-CHECKPOINT_PATH = "scopone_checkpoint"
+CHECKPOINT_PATH = "/checkpoints/scopone_checkpoint"
 
 ############################################################
 # 1) Definiamo una classe EpisodicReplayBuffer
@@ -525,7 +526,18 @@ def train_agents(num_episodes=10):
     # Loop principale per episodi
     for ep in range(num_episodes):
         episode_start_time = time.time()
-        print(f"\n=== Episodio {ep+1}/{num_episodes}, inizia player {first_player} ===")
+
+        # If this is the first episode, create a progress bar
+        if ep == 0:
+            pbar = tqdm(total=num_episodes, desc="Training episodes")
+            
+        # Update progress bar with description that includes player info
+        pbar.set_description(f"Episode {ep+1}/{num_episodes} (Player {first_player})")
+        pbar.update(1)
+
+        # Close progress bar on last episode
+        if ep == num_episodes - 1:
+            pbar.close()
         
         # Crea ambiente e inizializza
         env = ScoponeEnvMA()
@@ -598,8 +610,8 @@ def train_agents(num_episodes=10):
         inference_times.append(inference_time)
         
         # Memoria usata dopo inferenza
-        if torch.cuda.is_available():
-            print(f"  Memoria GPU dopo inferenza: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocata")
+        #if torch.cuda.is_available():
+            #print(f"  Memoria GPU dopo inferenza: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocata")
 
         # Termina episodi e prepara per training
         agent_team0.end_episode()
@@ -612,10 +624,10 @@ def train_agents(num_episodes=10):
             team_rewards = info["team_rewards"]
             team0_reward = team_rewards[0]
             team1_reward = team_rewards[1]
-            print(f"  Team Rewards finali: {team_rewards}")
+            #print(f"  Team Rewards finali: {team_rewards}")
         
         # TRAINING ALLA FINE DELL'EPISODIO - Completamente ottimizzato per GPU
-        print(f"  Training alla fine dell'episodio {ep+1}...")
+        #print(f"  Training alla fine dell'episodio {ep+1}...")
         train_start_time = time.time()
         
         # OTTIMIZZAZIONE: Prepara batch direttamente su GPU
@@ -694,7 +706,7 @@ def train_agents(num_episodes=10):
         # OTTIMIZZAZIONE: Training con Mixed Precision
         # Team 0 training con batch preparato
         if team0_batch:
-            print(f"  Training team 0 sull'ultimo episodio (reward={team0_reward}, mosse={team0_transitions})")
+            #print(f"  Training team 0 sull'ultimo episodio (reward={team0_reward}, mosse={team0_transitions})")
             
             # Ottiene batch con dimensione ottimale
             team0_obs_t, team0_actions_t, team0_rewards_t = team0_batch
@@ -738,7 +750,7 @@ def train_agents(num_episodes=10):
         
         # Team 1 training con uguale logica ottimizzata
         if team1_batch:
-            print(f"  Training team 1 sull'ultimo episodio (reward={team1_reward}, mosse={team1_transitions})")
+            #print(f"  Training team 1 sull'ultimo episodio (reward={team1_reward}, mosse={team1_transitions})")
             
             team1_obs_t, team1_actions_t, team1_rewards_t = team1_batch
             
@@ -778,7 +790,7 @@ def train_agents(num_episodes=10):
         if ep % 5 == 0 and ep > 0:
             # Team 0 training su episodi passati
             if len(agent_team0.episodic_buffer.episodes) > 3:
-                print("  Training aggiuntivo su episodi passati per team 0")
+                #print("  Training aggiuntivo su episodi passati per team 0")
                 
                 # Seleziona episodi precedenti
                 prev_episodes = agent_team0.episodic_buffer.get_previous_episodes()
@@ -845,7 +857,7 @@ def train_agents(num_episodes=10):
             
             # Team 1 training con stessa logica ottimizzata
             if len(agent_team1.episodic_buffer.episodes) > 3:
-                print("  Training aggiuntivo su episodi passati per team 1")
+                #print("  Training aggiuntivo su episodi passati per team 1")
                 
                 prev_episodes = agent_team1.episodic_buffer.get_previous_episodes()
                 past_episodes = random.sample(prev_episodes, min(3, len(prev_episodes)))
@@ -918,19 +930,19 @@ def train_agents(num_episodes=10):
             torch.cuda.memory_stats()  # Riorganizza allocazione
         
         # Traccia tempo di training
-        train_time = time.time() - train_start_time
-        train_times.append(train_time)
-        print(f"  Training completato in {train_time:.2f} secondi")
+        #train_time = time.time() - train_start_time
+        #train_times.append(train_time)
+        #print(f"  Training completato in {train_time:.2f} secondi")
         
         # Monitoraggio memoria GPU
-        if torch.cuda.is_available():
-            print(f"  GPU memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocated, "
-                  f"{torch.cuda.memory_reserved()/1024**2:.1f}MB reserved")
+        #if torch.cuda.is_available():
+            #print(f"  GPU memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocated, "
+                  #f"{torch.cuda.memory_reserved()/1024**2:.1f}MB reserved")
         
         # Tempo totale episodio
-        episode_time = time.time() - episode_start_time
-        episode_times.append(episode_time)
-        print(f"Episodio {ep+1} completato in {episode_time:.2f} secondi")
+        #episode_time = time.time() - episode_start_time
+        #episode_times.append(episode_time)
+        #print(f"Episodio {ep+1} completato in {episode_time:.2f} secondi")
         
         # Salva checkpoint periodici
         if (ep + 1) % 100 == 0 or ep == num_episodes - 1:
