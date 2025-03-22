@@ -50,7 +50,7 @@ EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
 BATCH_SIZE = 128          # dimensione mini-batch
 REPLAY_SIZE = 10000      # capacità massima del replay buffer
 TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target
-CHECKPOINT_PATH = "/checkpoints/scopone_checkpoint"
+CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"
 
 ############################################################
 # 1) Definiamo una classe EpisodicReplayBuffer
@@ -945,7 +945,7 @@ def train_agents(num_episodes=10):
         #print(f"Episodio {ep+1} completato in {episode_time:.2f} secondi")
         
         # Salva checkpoint periodici
-        if (ep + 1) % 100 == 0 or ep == num_episodes - 1:
+        if (ep + 1) % 1000 == 0 or ep == num_episodes - 1:
             agent_team0.save_checkpoint(f"{CHECKPOINT_PATH}_team0_ep{ep+1}.pth")
             agent_team1.save_checkpoint(f"{CHECKPOINT_PATH}_team1_ep{ep+1}.pth")
         
