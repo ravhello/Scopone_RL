@@ -16,6 +16,17 @@ print(f"Using device: {device}")
 
 from environment import ScoponeEnvMA
 
+# Alla fine di ogni episodio
+# Forza garbage collection
+import gc
+gc.collect()
+if torch.cuda.is_available():
+    # Più aggressivo nel liberare la memoria
+    torch.cuda.empty_cache()
+    # Stampa statistiche memoria
+    print(f"  GPU memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+    print(f"  GPU memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB")
+
 # Parametri di rete e training
 LR = 1e-3
 EPSILON_START = 1.0
@@ -141,20 +152,27 @@ class QNetwork(nn.Module):
         if x.device != next(self.parameters()).device:
             x = x.to(device)
             
+        # Utilizza inplace operations dove possibile
+        import torch.nn.functional as F
+        
         # Processa l'intero input attraverso il backbone
-        backbone_features = self.backbone(x)
+        x1 = F.relu(self.backbone[0](x), inplace=True)
+        x2 = F.relu(self.backbone[2](x1), inplace=True)
+        x3 = F.relu(self.backbone[4](x2), inplace=True)
+        backbone_features = F.relu(self.backbone[6](x3), inplace=True)
         
         # Divide l'input in sezioni semantiche
         hand_table = x[:, :83]
         captured = x[:, 83:165]
         history = x[:, 169:10489]
-        stats = x[:, 10489:]  # L'indice non cambia, cambia solo la dimensione
+        stats = x[:, 10489:]
         
         # Processa ogni sezione
-        hand_table_features = self.hand_table_processor(hand_table)
-        captured_features = self.captured_processor(captured)
-        history_features = self.history_processor(history)
-        stats_features = self.stats_processor(stats)
+        hand_table_features = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
+        captured_features = F.relu(self.captured_processor[0](captured), inplace=True)
+        history_features = F.relu(self.history_processor[0](history), inplace=True)
+        history_features = F.relu(self.history_processor[2](history_features), inplace=True)
+        stats_features = F.relu(self.stats_processor[0](stats), inplace=True)
         
         # Combina tutte le features
         combined = torch.cat([
@@ -166,7 +184,7 @@ class QNetwork(nn.Module):
         ], dim=1)
         
         # Elabora le features combinate
-        final_features = self.combiner(combined)
+        final_features = F.relu(self.combiner[0](combined), inplace=True)
         
         # Calcola i valori delle azioni
         action_values = self.action_head(final_features)
@@ -180,18 +198,22 @@ class QNetwork(nn.Module):
 class DQNAgent:
     def __init__(self, team_id):
         self.team_id = team_id
-        self.online_qnet = QNetwork()  # Già spostato su GPU nell'inizializzazione
-        self.target_qnet = QNetwork()  # Già spostato su GPU nell'inizializzazione
+        self.online_qnet = QNetwork()
+        self.target_qnet = QNetwork()
         self.sync_target()
         
         self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR)
         self.epsilon = EPSILON_START
         self.train_steps = 0
         self.episodic_buffer = EpisodicReplayBuffer()
+        
+        # Aggiunte per ottimizzazione GPU
+        torch.backends.cudnn.benchmark = True  # Ottimizzazione per dimensioni di input fisse
+        self.scaler = torch.amp.GradScaler('cuda')  # Per mixed precision training
     
     @profile
     def pick_action(self, obs, valid_actions, env):
-        """Epsilon-greedy con gestione GPU"""
+        """Epsilon-greedy ottimizzato per GPU"""
         if not valid_actions:
             print("\n[DEBUG] Nessuna azione valida! Stato attuale:")
             print("  Current player:", env.current_player)
@@ -205,37 +227,30 @@ class DQNAgent:
         if random.random() < self.epsilon:
             return random.choice(valid_actions)
         else:
-            # Ottieni i valori Q per ogni azione - spostato su GPU
-            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+            # Crea un unico tensore per tutte le azioni valide
+            valid_actions_np = np.stack(valid_actions)
+            
+            # Sposta tutto su GPU una sola volta
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            valid_actions_t = torch.tensor(valid_actions_np, dtype=torch.float32, device=device)
+            
             with torch.no_grad():
+                # Calcola i valori Q per l'osservazione
                 action_values = self.online_qnet(obs_t)
-            
-            best_action = None
-            best_q_value = float('-inf')
-            
-            for action in valid_actions:
-                # Converti l'azione in tensor e spostala su GPU
-                action_t = torch.tensor(action, dtype=torch.float32).to(device)
                 
-                # Calcola il valore Q come prodotto scalare
-                q_value = torch.sum(action_values[0] * action_t).item()
+                # Calcola i valori Q per tutte le azioni valide simultaneamente
+                # [1, 80] x [n_actions, 80] -> [n_actions]
+                q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
                 
-                if q_value > best_q_value:
-                    best_q_value = q_value
-                    best_action = action
+                # Trova l'azione con il valore Q più alto
+                best_action_idx = torch.argmax(q_values).item()
             
-            return best_action
+            return valid_actions[best_action_idx]
     
     @profile
     def train_episodic_monte_carlo(self, specific_episode=None):
         """
-        Addestramento Monte Carlo su episodi usando flat rewards.
-        
-        - Se specific_episode è fornito, usa quell'episodio specifico
-        - Altrimenti, usa tutti gli episodi nel buffer
-        
-        La reward dell'ultima transizione dell'episodio viene applicata a tutte
-        le transizioni dell'episodio in modo flat (stesso valore per tutti).
+        Addestramento Monte Carlo su episodi usando flat rewards con ottimizzazioni GPU.
         """
         # Determina quali episodi processare
         if specific_episode is not None:
@@ -246,7 +261,8 @@ class DQNAgent:
             return  # Nessun episodio disponibile
         
         # Prepara tutti i dati prima di processarli
-        all_transitions = []
+        all_obs = []
+        all_actions = []
         all_returns = []
         
         for episode in episodes_to_process:
@@ -258,75 +274,70 @@ class DQNAgent:
             
             # Aggiungi tutte le transizioni, usando la stessa reward finale per tutte
             for obs, action, _, _, _, _ in episode:
-                all_transitions.append((obs, action))
-                all_returns.append(final_reward)  # Reward flat - stessa reward per tutte le transizioni
+                all_obs.append(obs)
+                all_actions.append(action)
+                all_returns.append(final_reward)
         
-        if not all_transitions:
+        if not all_obs:
             return  # Nessuna transizione da processare
         
+        # Converti a numpy array una sola volta
+        all_obs_np = np.stack(all_obs)
+        all_actions_np = np.stack(all_actions)
+        all_returns_np = np.array(all_returns)
+        
+        # Converti a tensor e sposta su GPU - una sola volta!
+        all_obs_t = torch.tensor(all_obs_np, dtype=torch.float32, device=device)
+        all_actions_t = torch.tensor(all_actions_np, dtype=torch.float32, device=device)
+        all_returns_t = torch.tensor(all_returns_np, dtype=torch.float32, device=device)
+        
         # Process in batch più grandi per sfruttare meglio la GPU
-        batch_size = min(256, len(all_transitions))
-        num_batches = (len(all_transitions) + batch_size - 1) // batch_size
+        batch_size = min(256, len(all_obs))
+        num_batches = (len(all_obs) + batch_size - 1) // batch_size
         
         # Riduci la frequenza di sync_target
         sync_counter = 0
-        sync_frequency = 10  # Esegui sync ogni 10 batch invece di ogni batch
+        sync_frequency = 10
         
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(all_transitions))
-            
-            # Prepara i dati per questo batch
-            batch_data = all_transitions[start_idx:end_idx]
-            batch_returns = all_returns[start_idx:end_idx]
-            
-            # Separa osservazioni e azioni
-            batch_obs, batch_actions = zip(*batch_data)
-            
-            # Conversione efficiente in tensori
-            batch_actions_np = np.stack(batch_actions).astype(np.float32)
-            
-            # Trasferimento a GPU
-            obs_t = torch.tensor(batch_obs, dtype=torch.float32, device=device)
-            batch_actions_t = torch.tensor(batch_actions_np, dtype=torch.float32, device=device)
-            returns_t = torch.tensor(batch_returns, dtype=torch.float32, device=device)
-            
-            # Zero gradients
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            # Forward pass
-            q_values = self.online_qnet(obs_t)
-            
-            # Calcolo vettoriale dei Q-values
-            q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
-            
-            # Loss e backward
-            loss = nn.MSELoss()(q_values_for_actions, returns_t)
-            loss.backward()
-            
-            # Clipping del gradiente per stabilità
-            torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
-            
-            # Optimizer step
-            self.optimizer.step()
-            
-            # Aggiorna epsilon
-            self.update_epsilon()
-            
-            # Sync target periodicamente
-            sync_counter += 1
-            if sync_counter >= sync_frequency:
-                self.sync_target()
-                sync_counter = 0
-            
-            # Libera memoria
-            del obs_t, batch_actions_t, returns_t, q_values, q_values_for_actions, loss
+        # Corretto: usa torch.amp.autocast invece di torch.cuda.amp.autocast
+        with torch.amp.autocast(device_type='cuda'):
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(all_obs))
+                
+                # Prendi slices dei tensori già sulla GPU
+                batch_obs_t = all_obs_t[start_idx:end_idx]
+                batch_actions_t = all_actions_t[start_idx:end_idx]
+                batch_returns_t = all_returns_t[start_idx:end_idx]
+                
+                # Zero gradients
+                self.optimizer.zero_grad(set_to_none=True)  # set_to_none=True è più veloce
+                
+                # Forward pass
+                q_values = self.online_qnet(batch_obs_t)
+                q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
+                
+                # Loss usando mixed precision
+                loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
+                
+                # Backward e optimizer step con gradient scaling
+                self.scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                # Aggiorna epsilon
+                self.update_epsilon()
+                
+                # Sync target periodicamente
+                sync_counter += 1
+                if sync_counter >= sync_frequency:
+                    self.sync_target()
+                    sync_counter = 0
         
-        # Garbage collection finale
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Libera memoria
+        del all_obs_t, all_actions_t, all_returns_t
+        torch.cuda.empty_cache()
     
     @profile
     def store_episode_transition(self, transition):
@@ -392,6 +403,7 @@ def train_agents(num_episodes=10):
     """
     Esegue un training multi-agent episodico.
     Il training avviene solo alla fine di ogni episodio, con reward flat per tutte le mosse.
+    Ottimizzato per GPU.
     """
     # Creiamo 2 agenti
     agent_team0 = DQNAgent(team_id=0)
@@ -408,6 +420,7 @@ def train_agents(num_episodes=10):
     
     # Per monitorare i tempi di esecuzione
     episode_times = []
+    train_times = []  # Tracciamento separato dei tempi di training
 
     for ep in range(num_episodes):
         episode_start_time = time.time()
@@ -438,7 +451,7 @@ def train_agents(num_episodes=10):
             next_obs, reward, done, info = env.step(action)
             global_step += 1
 
-            # Durante il gioco, le mosse hanno reward=0 (sarà aggiornata alla fine in train_episodic_monte_carlo)
+            # Durante il gioco, le mosse hanno reward=0
             next_valid = env.get_valid_actions() if not done else []
             transition = (obs_current, action, reward, next_obs, done, next_valid)
             
@@ -455,7 +468,7 @@ def train_agents(num_episodes=10):
         agent_team0.episodic_buffer.end_episode()
         agent_team1.episodic_buffer.end_episode()
         
-        # Ottieni le reward finali, se disponibili
+        # Ottieni le reward finali
         team0_reward = 0.0
         team1_reward = 0.0
         if "team_rewards" in info:
@@ -464,73 +477,114 @@ def train_agents(num_episodes=10):
             team1_reward = team_rewards[1]
             print(f"Team Rewards finali: {team_rewards}")
         
-        # TRAINING ALLA FINE DELL'EPISODIO
+        # TRAINING ALLA FINE DELL'EPISODIO - Ottimizzato per GPU
         print(f"Training alla fine dell'episodio {ep+1}...")
+        train_start_time = time.time()
         
-        # Train team 0 - la reward finale viene applicata a tutte le mosse internamente
+        # Team 0 training - pre-processamento batch
         if agent_team0.episodic_buffer.episodes:
             # Ottieni l'ultimo episodio
             last_episode_team0 = agent_team0.episodic_buffer.episodes[-1]
             
-            # Se non ci sono transizioni, non fare training
             if not last_episode_team0:
                 print("  Nessuna transizione per team 0, skip training")
             else:
-                # Crea una copia dell'episodio con la reward finale aggiornata per tutte le mosse
-                # Questo è necessario perché vogliamo preservare le reward originali nell'episodio
-                training_episode_team0 = []
-                for obs, action, _, next_obs, done, next_valid in last_episode_team0:
-                    # Sostituisci la reward con la reward finale del team (flat)
-                    training_episode_team0.append((obs, action, team0_reward, next_obs, done, next_valid))
-                
                 print(f"  Training team 0 sull'ultimo episodio (reward={team0_reward})")
-                # Usa l'episodio con reward aggiornate per il training
+                
+                # Usa zip per estrarre tutti i componenti in una volta sola
+                all_obs, all_actions, _, all_next_obs, all_dones, all_next_valids = zip(*last_episode_team0)
+                
+                # Pre-processa i dati in batch
+                all_obs_np = np.stack(all_obs)
+                all_actions_np = np.stack(all_actions)
+                
+                # Crea episodio di training con reward flat
+                training_episode_team0 = []
+                for i in range(len(last_episode_team0)):
+                    training_episode_team0.append((
+                        all_obs[i], 
+                        all_actions[i], 
+                        team0_reward,  # Reward flat
+                        all_next_obs[i],
+                        all_dones[i],
+                        all_next_valids[i]
+                    ))
+                
+                # Training con batch pre-processati
                 agent_team0.train_episodic_monte_carlo(training_episode_team0)
         
-        # Train team 1 - la reward finale viene applicata a tutte le mosse internamente
+        # Team 1 training - stessa logica
         if agent_team1.episodic_buffer.episodes:
-            # Ottieni l'ultimo episodio
             last_episode_team1 = agent_team1.episodic_buffer.episodes[-1]
             
-            # Se non ci sono transizioni, non fare training
             if not last_episode_team1:
                 print("  Nessuna transizione per team 1, skip training")
             else:
-                # Crea una copia dell'episodio con la reward finale aggiornata per tutte le mosse
-                # Questo è necessario perché vogliamo preservare le reward originali nell'episodio
-                training_episode_team1 = []
-                for obs, action, _, next_obs, done, next_valid in last_episode_team1:
-                    # Sostituisci la reward con la reward finale del team (flat)
-                    training_episode_team1.append((obs, action, team1_reward, next_obs, done, next_valid))
-                
                 print(f"  Training team 1 sull'ultimo episodio (reward={team1_reward})")
-                # Usa l'episodio con reward aggiornate per il training
+                
+                # Estrazione efficiente dei dati
+                all_obs, all_actions, _, all_next_obs, all_dones, all_next_valids = zip(*last_episode_team1)
+                
+                # Pre-processa i dati in batch
+                all_obs_np = np.stack(all_obs)
+                all_actions_np = np.stack(all_actions)
+                
+                # Crea episodio di training
+                training_episode_team1 = []
+                for i in range(len(last_episode_team1)):
+                    training_episode_team1.append((
+                        all_obs[i], 
+                        all_actions[i], 
+                        team1_reward,  # Reward flat
+                        all_next_obs[i],
+                        all_dones[i],
+                        all_next_valids[i]
+                    ))
+                
                 agent_team1.train_episodic_monte_carlo(training_episode_team1)
         
-        # Occasionalmente, trainiamo anche su episodi precedenti
+        # Training su episodi passati - stesso approccio
         if ep % 5 == 0 and len(agent_team0.episodic_buffer.episodes) > 3:
             print("  Training aggiuntivo su episodi passati per team 0")
             prev_episodes = agent_team0.episodic_buffer.get_previous_episodes()
-            past_episodes = random.sample(prev_episodes, 
-                                        min(3, len(prev_episodes)))
+            past_episodes = random.sample(prev_episodes, min(3, len(prev_episodes)))
+            
             for episode in past_episodes:
-                if episode:  # Verifica che l'episodio non sia vuoto
+                if episode and len(episode) > 0:
+                    # Pre-processing batch anche per episodi passati
+                    episode_obs, episode_actions, _, episode_next_obs, episode_dones, episode_next_valids = zip(*episode)
+                    # Preprocessing numpy
+                    _ = np.stack(episode_obs)
+                    _ = np.stack(episode_actions)
                     agent_team0.train_episodic_monte_carlo(episode)
         
         if ep % 5 == 0 and len(agent_team1.episodic_buffer.episodes) > 3:
             print("  Training aggiuntivo su episodi passati per team 1")
             prev_episodes = agent_team1.episodic_buffer.get_previous_episodes()
-            past_episodes = random.sample(prev_episodes, 
-                                        min(3, len(prev_episodes)))
+            past_episodes = random.sample(prev_episodes, min(3, len(prev_episodes)))
+            
             for episode in past_episodes:
-                if episode:  # Verifica che l'episodio non sia vuoto
+                if episode and len(episode) > 0:
+                    # Pre-processing batch anche per episodi passati
+                    episode_obs, episode_actions, _, episode_next_obs, episode_dones, episode_next_valids = zip(*episode)
+                    # Preprocessing numpy
+                    _ = np.stack(episode_obs)
+                    _ = np.stack(episode_actions)
                     agent_team1.train_episodic_monte_carlo(episode)
         
-        # Forza garbage collection per ridurre il consumo di memoria
+        # Traccia tempo di training
+        train_time = time.time() - train_start_time
+        train_times.append(train_time)
+        print(f"  Training completato in {train_time:.2f} secondi")
+        
+        # Gestione memoria GPU migliorata
         import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            # Monitoraggio memoria GPU
+            print(f"  GPU memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocated, "
+                  f"{torch.cuda.memory_reserved()/1024**2:.1f}MB reserved")
         
         # Calcola e registra il tempo dell'episodio
         episode_time = time.time() - episode_start_time
@@ -549,11 +603,13 @@ def train_agents(num_episodes=10):
     for i, t in enumerate(episode_times):
         print(f"Episodio {i+1}: {t:.2f}s")
     print(f"Tempo medio per episodio: {sum(episode_times)/len(episode_times):.2f}s")
+    print(f"Tempo medio per training: {sum(train_times)/len(train_times):.2f}s")
+    print(f"Percentuale di tempo in training: {sum(train_times)/sum(episode_times)*100:.1f}%")
 
 
 if __name__ == "__main__":
     # Esegui il training per pochi episodi per profilare
-    train_agents(num_episodes=20)
+    train_agents(num_episodes=50000)
     
     # Stampa i risultati del profiling
     global_profiler.print_stats()
