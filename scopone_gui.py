@@ -1864,6 +1864,15 @@ class GameScreen(BaseScreen):
         # Update animations
         self.update_animations()
         
+        # AGGIUNGERE QUESTO CODICE: Aggiorna local_player_id dal network se necessario
+        if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host"):
+            if self.app.network and self.app.network.player_id is not None:
+                if self.local_player_id != self.app.network.player_id:
+                    print(f"Aggiornamento player_id: da {self.local_player_id} a {self.app.network.player_id}")
+                    self.local_player_id = self.app.network.player_id
+                    # Aggiorna anche il nome del giocatore
+                    self.players[self.local_player_id].name = "You"
+        
         # Handle AI turns
         self.handle_ai_turns()
         
@@ -2003,8 +2012,8 @@ class GameScreen(BaseScreen):
         while self.app.network.message_queue:
             message = self.app.network.message_queue.popleft()
             self.messages.append(message)
-            # Limit messages to 5
-            if len(self.messages) > 5:
+            # Limit messages to 100
+            if len(self.messages) > 100:
                 self.messages.pop(0)
         
         # If host, check for moves and update game state
@@ -2016,6 +2025,12 @@ class GameScreen(BaseScreen):
                 if player_id != self.env.current_player:
                     continue
                     
+                # Decode the move to create animations
+                card_played, cards_captured = decode_action(move)
+                
+                # Create animations for the move
+                self.create_move_animations(card_played, cards_captured)
+                
                 # Make the move
                 try:
                     _, _, done, info = self.env.step(move)
@@ -2032,9 +2047,29 @@ class GameScreen(BaseScreen):
         
         # If client, update game state from network
         else:
+            # Salva lo stato attuale per rilevare i cambiamenti
+            old_state = None
+            if self.env and hasattr(self.env, 'game_state'):
+                old_state = self.env.game_state.copy() if self.env.game_state else None
+            
             if self.app.network.game_state:
                 # Update local game state
-                self.env.game_state = self.app.network.game_state
+                if self.env:
+                    self.env.game_state = self.app.network.game_state
+                    
+                    # Controlla se c'è stato un cambiamento e crea animazioni se necessario
+                    if old_state and old_state != self.env.game_state:
+                        # Verifica se è stato effettuato un movimento
+                        if old_state.get('table') != self.env.game_state.get('table') or \
+                        old_state.get('captured_squads') != self.env.game_state.get('captured_squads'):
+                            # Sblocca l'attesa se il giocatore stava aspettando
+                            self.waiting_for_other_player = False
+                            
+                            # Controlla se si tratta di una fine del gioco
+                            if all(len(self.env.game_state["hands"][p]) == 0 for p in range(4)):
+                                self.game_over = True
+                                from rewards import compute_final_score_breakdown
+                                self.final_breakdown = compute_final_score_breakdown(self.env.game_state)
     
     def check_game_over(self):
         """Check if the game is over"""
@@ -2076,7 +2111,17 @@ class GameScreen(BaseScreen):
             current_player = None
             mode = self.app.game_config.get("mode")
             
-            if mode == "team_vs_ai" and self.current_player_id == 2:
+            if mode == "online_multiplayer":
+                # In modalità online, usa il giocatore locale o il suo partner in base a chi ha il turno
+                if self.current_player_id == self.local_player_id:
+                    current_player = self.players[self.local_player_id]
+                elif mode == "team_vs_ai" and ((self.local_player_id == 0 and self.current_player_id == 2) or 
+                                            (self.local_player_id == 2 and self.current_player_id == 0)):
+                    current_player = self.players[self.current_player_id]
+                else:
+                    # Se non è il turno di nessun giocatore controllabile, usa il giocatore locale
+                    current_player = self.players[self.local_player_id]
+            elif mode == "team_vs_ai" and self.current_player_id == 2:
                 # Se è il turno del partner nel team, usa il giocatore 2
                 current_player = self.players[2]
             elif mode == "local_multiplayer":
@@ -2093,24 +2138,24 @@ class GameScreen(BaseScreen):
             if not hand:
                 return None
             
-            # Calculate horizontal spacing based on current dimensions
-            center_x = hand_rect.centerx
-            base_y = hand_rect.bottom - card_height
+            # Calcola la larghezza totale e la posizione iniziale per le carte
             card_spread = card_width * 0.7
+            total_width = (len(hand) - 1) * card_spread + card_width
+            start_x = hand_rect.centerx - total_width / 2
             
             for i, card in enumerate(hand):
-                # Calculate position with horizontal spacing only
-                x = center_x + (i - len(hand) // 2) * card_spread
+                # Calcola la posizione x per questa carta
+                x = start_x + i * card_spread
                 
                 # Check if position is within this card
-                card_rect = pygame.Rect(x, base_y, card_width, card_height)
+                card_rect = pygame.Rect(x, hand_rect.bottom - card_height, card_width, card_height)
                 if card_rect.collidepoint(pos):
                     return card
             
             return None
         
         elif area == "table":
-            # Il resto del codice per le carte sul tavolo rimane invariato
+            # Il codice per le carte sul tavolo rimane invariato
             table_cards = self.env.game_state["table"]
             
             if not table_cards:
@@ -2437,14 +2482,20 @@ class GameScreen(BaseScreen):
         card_width = int(width * 0.078)  # Must match the calculation in setup_layout
         card_height = int(card_width * 1.5)
         
-        # Calculate horizontal spacing based on hand size
+        # Get center of the player's hand area
         center_x = player.hand_rect.centerx
         base_y = player.hand_rect.bottom - card_height
         card_spread = card_width * 0.7
         
+        # Calcola la larghezza totale che occuperanno tutte le carte
+        total_width = (len(hand) - 1) * card_spread + card_width
+        
+        # Calcola la posizione iniziale per centrare il gruppo di carte
+        start_x = center_x - total_width / 2
+        
         for i, card in enumerate(hand):
-            # Calculate position with horizontal spacing only
-            x = center_x + (i - len(hand) // 2) * card_spread
+            # Calcola la posizione x per questa carta
+            x = start_x + i * card_spread
             
             # Get card image (rescaled for current window size)
             card_img = self.app.resources.get_card_image(card)
@@ -2911,14 +2962,29 @@ class GameScreen(BaseScreen):
     def is_current_player_controllable(self):
         """Verifica se il giocatore corrente può essere controllato dall'utente locale"""
         mode = self.app.game_config.get("mode")
-        if mode == "team_vs_ai":
+        
+        # Per le modalità online
+        if mode == "online_multiplayer":
+            # Se è il turno del giocatore locale
+            if self.current_player_id == self.local_player_id:
+                return True
+            # Se siamo in modalità team vs AI e il giocatore locale è nella stessa squadra del partner umano
+            if self.app.game_config.get("online_type") == "team_vs_ai":
+                # In Team vs AI: il giocatore 0 è partner del giocatore 2
+                if (self.local_player_id == 0 and self.current_player_id == 2) or \
+                (self.local_player_id == 2 and self.current_player_id == 0):
+                    return True
+            return False
+        
+        # Per le altre modalità
+        elif mode == "team_vs_ai":
             # In modalità team vs AI, entrambi i giocatori 0 e 2 sono controllabili
             return self.current_player_id in [0, 2]
         elif mode == "local_multiplayer":
             # In modalità 4 giocatori umani, tutti i giocatori sono controllabili quando è il loro turno
             return True
         else:
-            # Nelle altre modalità, segui la logica esistente
+            # Nelle altre modalità, solo il giocatore locale è controllabile
             return self.current_player_id == self.local_player_id
 
 class ScoponeApp:
