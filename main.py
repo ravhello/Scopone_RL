@@ -1045,7 +1045,7 @@ def train_agents(num_episodes=10):
 
 if __name__ == "__main__":
     # Esegui il training per pochi episodi per profilare
-    train_agents(num_episodes=200)
+    train_agents(num_episodes=200000)
     
     # Stampa i risultati del profiling
     #global_profiler.print_stats()

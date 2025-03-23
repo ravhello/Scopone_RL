@@ -8,6 +8,7 @@ import socket
 import pickle
 import time
 from collections import deque
+from layout import LayoutManager
 
 # Import game components
 from environment import ScoponeEnvMA
@@ -86,6 +87,76 @@ def format_card(card):
     prefix = f"{num:02d}"
     return f"{prefix}_{RANK_NAMES[rank]}_di_{SUIT_NAMES[suit]}"
 
+def get_local_ip():
+    """Ottiene l'indirizzo IP locale della macchina"""
+    try:
+        # Crea un socket temporaneo per ottenere l'IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Non serve una connessione reale
+        s.connect(('8.8.8.8', 1))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except:
+        return "127.0.0.1"  # Fallback su localhost
+
+class LoadingAnimation:
+    """Animazione di caricamento per quando si caricano i bot AI"""
+    def __init__(self, screen_width, screen_height):
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+        self.start_time = pygame.time.get_ticks()
+        self.dots = 0
+        self.dots_timer = 0
+        self.rotation = 0
+        
+    def update(self):
+        # Aggiorna la rotazione dell'animazione
+        current_time = pygame.time.get_ticks()
+        elapsed = current_time - self.start_time
+        self.rotation = (elapsed / 10) % 360
+        
+        # Aggiorna i puntini animati
+        if current_time - self.dots_timer > 500:  # Cambia puntini ogni 500ms
+            self.dots = (self.dots + 1) % 4
+            self.dots_timer = current_time
+    
+    def draw(self, surface, message=None):
+        # Crea un overlay semi-trasparente
+        overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))  # Nero semi-trasparente
+        surface.blit(overlay, (0, 0))
+        
+        # Disegna il cerchio rotante
+        center_x = self.screen_width // 2
+        center_y = self.screen_height // 2
+        radius = min(self.screen_width, self.screen_height) * 0.1
+        
+        # Disegna archi di cerchio rotanti
+        for i in range(8):
+            angle = self.rotation + i * 45
+            start_angle = math.radians(angle - 20)
+            end_angle = math.radians(angle + 20)
+            
+            # Calcola i punti dell'arco
+            color_intensity = 255 - (i * 20)  # Sfuma il colore
+            color = (color_intensity, color_intensity, 255)  # Blu che sfuma
+            
+            # Disegna un arco spesso
+            pygame.draw.arc(surface, color, 
+                           (center_x - radius, center_y - radius, radius*2, radius*2),
+                           start_angle, end_angle, width=int(radius*0.2))
+        
+        # Disegna il messaggio di caricamento
+        font = pygame.font.SysFont(None, int(self.screen_height * 0.04))
+        dots_text = "." * self.dots
+        if message is None:
+            message = "Caricamento bot AI in corso"
+        text = f"{message}{dots_text}"
+        text_surf = font.render(text, True, (255, 255, 255))
+        text_rect = text_surf.get_rect(center=(center_x, center_y + radius * 1.5))
+        surface.blit(text_surf, text_rect)
+        
 class Button:
     """Enhanced button with hover and click effects"""
     def __init__(self, x, y, width, height, text, color, text_color, 
@@ -394,7 +465,7 @@ class ResourceManager:
                 pass  # Silently fail if sound playback fails
 
 class NetworkManager:
-    """Manages network communication for multiplayer games"""
+    """Manages network communication for multiplayer games over the internet"""
     def __init__(self, is_host=False, host='localhost', port=5555):
         self.is_host = is_host
         self.host = host
@@ -406,14 +477,23 @@ class NetworkManager:
         self.game_state = None
         self.message_queue = deque()
         self.move_queue = deque()
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+        self.public_ip = None
         
     def start_server(self):
-        """Initialize server socket for host player"""
+        """Initialize server socket for host player with improved robustness"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.bind((self.host, self.port))
+            # Permettiamo il riuso dell'indirizzo per un riavvio più veloce del server
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Binding su tutte le interfacce (0.0.0.0) per accettare connessioni esterne
+            self.socket.bind(('0.0.0.0', self.port))
             self.socket.listen(4)  # Allow up to 4 connections
             self.connected = True
+            
+            # Ottieni l'IP pubblico per connessioni internet
+            self.public_ip = self.get_public_ip()
             
             # Start thread to accept connections
             threading.Thread(target=self.accept_connections, daemon=True).start()
@@ -423,18 +503,28 @@ class NetworkManager:
             return False
     
     def connect_to_server(self):
-        """Connect to the host server as a client"""
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.host, self.port))
-            self.connected = True
-            
-            # Start thread to receive game state updates
-            threading.Thread(target=self.receive_updates, daemon=True).start()
-            return True
-        except Exception as e:
-            print(f"Failed to connect to server: {e}")
-            return False
+        """Connect to the host server as a client with improved connection handling"""
+        self.reconnect_attempts = 0
+        while self.reconnect_attempts < self.max_reconnect_attempts:
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Impostiamo un timeout per la connessione
+                self.socket.settimeout(10)
+                self.socket.connect((self.host, self.port))
+                self.socket.settimeout(None)  # Reset timeout dopo la connessione
+                self.connected = True
+                
+                # Start thread to receive game state updates
+                threading.Thread(target=self.receive_updates, daemon=True).start()
+                return True
+            except Exception as e:
+                self.reconnect_attempts += 1
+                print(f"Tentativo {self.reconnect_attempts}/{self.max_reconnect_attempts} fallito: {e}")
+                if self.reconnect_attempts < self.max_reconnect_attempts:
+                    time.sleep(2)  # Attendi prima di riprovare
+        
+        print("Impossibile connettersi al server dopo multipli tentativi")
+        return False
     
     def accept_connections(self):
         """Accept connections from other players (for host)"""
@@ -606,6 +696,19 @@ class NetworkManager:
         self.socket = None
         self.clients = []
 
+    def get_public_ip(self):
+        """Get public IP address for internet play"""
+        try:
+            import urllib.request
+            # Usiamo un servizio che restituisce solo l'IP come testo puro
+            response = urllib.request.urlopen('https://api.ipify.org')
+            self.public_ip = response.read().decode('utf8')
+            return self.public_ip
+        except Exception as e:
+            print(f"Impossibile recuperare l'IP pubblico: {e}")
+            # Fallback su IP locale se non possiamo ottenere quello pubblico
+            return get_local_ip()
+
 class BaseScreen:
     """Base class for all game screens"""
     def __init__(self, app):
@@ -637,6 +740,12 @@ class GameModeScreen(BaseScreen):
     """Screen for selecting game mode"""
     def __init__(self, app):
         super().__init__(app)
+        
+        # Aggiungi stato di caricamento
+        self.loading = False
+        self.loading_animation = None
+        self.loading_start_time = 0
+        self.loading_message = ""
         
         # Background image
         self.bg_image = None  # Will be set in enter()
@@ -693,7 +802,7 @@ class GameModeScreen(BaseScreen):
             Button(center_x + 100, button_start_y + 5 * (button_height + button_spacing), 
                   150, 40, "Hard", HIGHLIGHT_RED, WHITE),
         ]
-        self.selected_difficulty = 1  # Default: Medium
+        self.selected_difficulty = 2  # Default: Hard
         
         # IP input for joining online games
         self.ip_input = ""
@@ -704,6 +813,10 @@ class GameModeScreen(BaseScreen):
         
         # Status message
         self.status_message = ""
+        
+        self.host_screen_active = False
+        self.online_mode_buttons = []
+        self.selected_online_mode = 0  # 0: 4 Players, 1: 2v2 with AI
     
     def enter(self):
         super().enter()
@@ -732,34 +845,34 @@ class GameModeScreen(BaseScreen):
         # Main game mode buttons
         self.buttons = [
             Button(center_x - button_width // 2, 
-                  button_start_y, 
-                  button_width, button_height,
-                  "Single Player (vs 3 AI)",
-                  DARK_BLUE, WHITE, font_size=int(height * 0.03)),
-                  
+                button_start_y, 
+                button_width, button_height,
+                "Single Player (vs 3 AI)",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                
             Button(center_x - button_width // 2, 
-                  button_start_y + button_height + button_spacing, 
-                  button_width, button_height,
-                  "2 Players (Team vs AI)",
-                  DARK_BLUE, WHITE, font_size=int(height * 0.03)),
-                  
+                button_start_y + button_height + button_spacing, 
+                button_width, button_height,
+                "2 Players (Team vs AI)",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                
             Button(center_x - button_width // 2, 
-                  button_start_y + 2 * (button_height + button_spacing), 
-                  button_width, button_height,
-                  "4 Players (Human vs Human)",
-                  DARK_BLUE, WHITE, font_size=int(height * 0.03)),
-                  
+                button_start_y + 2 * (button_height + button_spacing), 
+                button_width, button_height,
+                "4 Players (Human vs Human)",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                
             Button(center_x - button_width // 2, 
-                  button_start_y + 3 * (button_height + button_spacing), 
-                  button_width, button_height,
-                  "Host Online Game",
-                  DARK_BLUE, WHITE, font_size=int(height * 0.03)),
-                  
+                button_start_y + 3 * (button_height + button_spacing), 
+                button_width, button_height,
+                "Host Online Game",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                
             Button(center_x - button_width // 2, 
-                  button_start_y + 4 * (button_height + button_spacing), 
-                  button_width, button_height,
-                  "Join Online Game",
-                  DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                button_start_y + 4 * (button_height + button_spacing), 
+                button_width, button_height,
+                "Join Online Game",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
         ]
         
         # Difficulty selection buttons
@@ -768,20 +881,74 @@ class GameModeScreen(BaseScreen):
         
         self.difficulty_buttons = [
             Button(center_x - int(width * 0.25), button_start_y + 5 * (button_height + button_spacing), 
-                  diff_button_width, diff_button_height, "Easy", DARK_GREEN, WHITE, 
-                  font_size=int(height * 0.025)),
+                diff_button_width, diff_button_height, "Easy", DARK_GREEN, WHITE, 
+                font_size=int(height * 0.025)),
             Button(center_x - diff_button_width//2, button_start_y + 5 * (button_height + button_spacing), 
-                  diff_button_width, diff_button_height, "Medium", DARK_BLUE, WHITE, 
-                  font_size=int(height * 0.025)),
+                diff_button_width, diff_button_height, "Medium", DARK_BLUE, WHITE, 
+                font_size=int(height * 0.025)),
             Button(center_x + int(width * 0.1), button_start_y + 5 * (button_height + button_spacing), 
-                  diff_button_width, diff_button_height, "Hard", HIGHLIGHT_RED, WHITE, 
-                  font_size=int(height * 0.025)),
+                diff_button_width, diff_button_height, "Hard", HIGHLIGHT_RED, WHITE, 
+                font_size=int(height * 0.025)),
         ]
         
         # IP input for joining online games
         self.ip_input_rect = pygame.Rect(center_x - int(width * 0.15), 
-                                       button_start_y + 6 * (button_height + button_spacing),
-                                       int(width * 0.3), int(height * 0.05))
+                                    button_start_y + 6 * (button_height + button_spacing),
+                                    int(width * 0.3), int(height * 0.05))
+        
+        # NUOVA PARTE PER EVITARE SOVRAPPOSIZIONI
+        # Raccogliamo tutti gli elementi UI
+        ui_elements = []
+        
+        # Aggiungi tutti i bottoni principali (priorità 1)
+        for button in self.buttons:
+            ui_elements.append((button.rect, 1))
+        
+        # Aggiungi i bottoni di difficoltà (priorità 2)
+        for button in self.difficulty_buttons:
+            ui_elements.append((button.rect, 2))
+        
+        # Aggiungi la casella di input IP (priorità 3)
+        ui_elements.append((self.ip_input_rect, 3))
+        
+        # Usa il LayoutManager per riposizionare gli elementi evitando sovrapposizioni
+        from layout import LayoutManager
+        
+        # Riposiziona gli elementi mantenendo l'allineamento orizzontale dei bottoni principali
+        # ma permettendo spostamenti verticali per evitare sovrapposizioni
+        positioned_rects = []
+        
+        # Posiziona prima i bottoni principali in modo ordinato (mantieni x, ma aggiusta y se necessario)
+        for i, (rect, _) in enumerate([item for item in ui_elements if item[1] == 1]):
+            if i == 0:  # Il primo bottone mantiene la sua posizione originale
+                positioned_rects.append(rect)
+                continue
+                
+            # Per gli altri bottoni, verifica che non ci siano sovrapposizioni con i precedenti
+            test_rect = rect.copy()
+            
+            # Incrementa y finché non si trova una posizione senza sovrapposizioni
+            for distance in range(0, 500, 5):
+                test_rect.y = rect.y + distance
+                padded_rect = test_rect.inflate(5, 5)  # Aggiungi un piccolo padding
+                
+                if not any(LayoutManager.check_collision(padded_rect, pos_rect) for pos_rect in positioned_rects):
+                    rect.y = test_rect.y
+                    break
+                    
+            positioned_rects.append(rect)
+        
+        # Posiziona i bottoni di difficoltà e la casella di input IP
+        remaining_elements = [(rect, prio) for rect, prio in ui_elements if prio > 1]
+        new_rects = LayoutManager.arrange_elements(remaining_elements, width, height)
+        
+        # Aggiorna le posizioni dei rettangoli originali
+        rect_index = 0
+        for i, (rect, prio) in enumerate(ui_elements):
+            if prio > 1:  # Bottoni di difficoltà e input IP
+                rect.x = new_rects[rect_index].x
+                rect.y = new_rects[rect_index].y
+                rect_index += 1
     
     def handle_events(self, events):
         for event in events:
@@ -795,6 +962,31 @@ class GameModeScreen(BaseScreen):
                 # Check buttons
                 pos = pygame.mouse.get_pos()
                 
+                # Se siamo nella schermata di scelta della modalità online
+                if self.host_screen_active:
+                    # Controllo clic sui pulsanti delle modalità online
+                    for i, button in enumerate(self.online_mode_buttons):
+                        if button.is_clicked(pos):
+                            if i == 0 or i == 1:  # 4 Players o 2v2 with AI
+                                self.selected_online_mode = i
+                                # Ora non avviamo immediatamente il gioco in nessun caso,
+                                # aspettiamo che l'utente prema il pulsante Start
+                            elif i == 2:  # Back
+                                self.host_screen_active = False
+                    
+                    # Controllo clic sui pulsanti di difficoltà (solo per modalità Team vs AI)
+                    if self.selected_online_mode == 1 and hasattr(self, 'online_difficulty_buttons'):
+                        for i, btn in enumerate(self.online_difficulty_buttons):
+                            if btn.is_clicked(pos):
+                                self.selected_difficulty = i
+                    
+                    # Controllo clic sul pulsante Start
+                    if hasattr(self, 'start_button') and self.start_button.is_clicked(pos):
+                        self.host_online_game()
+                    
+                    return
+                
+                # Resto del codice per la schermata principale (invariato)
                 # Check if IP input box clicked
                 if self.ip_input_rect.collidepoint(pos):
                     self.ip_input_active = True
@@ -821,28 +1013,42 @@ class GameModeScreen(BaseScreen):
                     if len(self.ip_input) < 15:  # Limit input length
                         self.ip_input += event.unicode
     
+
     def handle_button_click(self, button_index):
         """Handle button clicks"""
         if button_index == 0:
-            # Single Player
-            self.done = True
-            self.next_screen = "game"
+            # Single Player - Mostra animazione di caricamento
+            self.loading = True
+            self.loading_animation = LoadingAnimation(self.app.window_width, self.app.window_height)
+            self.loading_start_time = pygame.time.get_ticks()
+            self.loading_message = "Caricamento bot AI in corso"
+            
+            # Configura il gioco ma non passare direttamente alla prossima schermata
             self.app.game_config = {
                 "mode": "single_player",
                 "human_players": 1,
                 "ai_players": 3,
                 "difficulty": self.selected_difficulty
             }
+            return
+            
         elif button_index == 1:
-            # 2 Players (Team)
-            self.done = True
-            self.next_screen = "game"
+            # 2 Players (Team) - Mostra animazione di caricamento
+            self.loading = True
+            self.loading_animation = LoadingAnimation(self.app.window_width, self.app.window_height)
+            self.loading_start_time = pygame.time.get_ticks()
+            self.loading_message = "Caricamento bot AI in corso"
+            
+            # Configura il gioco ma non passare direttamente alla prossima schermata
             self.app.game_config = {
                 "mode": "team_vs_ai",
                 "human_players": 2,
                 "ai_players": 2,
                 "difficulty": self.selected_difficulty
             }
+            return
+            
+        # Solo per le modalità senza bot, passa direttamente alla prossima schermata
         elif button_index == 2:
             # 4 Players (Local)
             self.done = True
@@ -853,8 +1059,9 @@ class GameModeScreen(BaseScreen):
                 "ai_players": 0
             }
         elif button_index == 3:
-            # Host Online Game
-            self.host_online_game()
+            # Host Online Game - ora mostra schermata di scelta
+            self.host_screen_active = True
+            self.setup_online_choice_buttons()
         elif button_index == 4:
             # Join Online Game
             if self.ip_input:
@@ -863,16 +1070,48 @@ class GameModeScreen(BaseScreen):
                 self.status_message = "Please enter an IP address"
     
     def host_online_game(self):
-        """Host an online game"""
+        """Host an online game with internet support"""
         self.app.network = NetworkManager(is_host=True)
         if self.app.network.start_server():
-            self.done = True
-            self.next_screen = "game"
-            self.app.game_config = {
-                "mode": "online_multiplayer",
-                "is_host": True,
-                "player_id": 0
-            }
+            # Ottieni sia l'IP locale che quello pubblico
+            local_ip = get_local_ip()
+            public_ip = self.app.network.public_ip
+            
+            # Mostra entrambi gli IP nello status message
+            self.status_message = f"Server attivo! LAN: {local_ip} | Internet: {public_ip} | Porta: 5555"
+            
+            # Aggiungi queste informazioni alla message queue in modo organizzato
+            if self.app.network:
+                self.app.network.message_queue.append("Server avviato con successo!")
+                self.app.network.message_queue.append(f"IP Locale (LAN): {local_ip}")
+                self.app.network.message_queue.append(f"IP Pubblico (Internet): {public_ip}")
+                self.app.network.message_queue.append("Per LAN: usa l'IP Locale")
+                self.app.network.message_queue.append("Per Internet: usa l'IP Pubblico + port forwarding (porta 5555)")
+
+            if self.selected_online_mode == 0:
+                # 4 Players (All Human)
+                self.done = True
+                self.next_screen = "game"
+                self.app.game_config = {
+                    "mode": "online_multiplayer",
+                    "is_host": True,
+                    "player_id": 0,
+                    "online_type": "all_human"
+                }
+            else:
+                # 2 vs 2 (Team vs AI) - Mostra animazione di caricamento
+                self.loading = True
+                self.loading_animation = LoadingAnimation(self.app.window_width, self.app.window_height)
+                self.loading_start_time = pygame.time.get_ticks()
+                self.loading_message = "Caricamento bot AI in corso"
+                
+                self.app.game_config = {
+                    "mode": "online_multiplayer",
+                    "is_host": True,
+                    "player_id": 0,
+                    "online_type": "team_vs_ai",
+                    "difficulty": self.selected_difficulty
+                }
         else:
             self.status_message = "Failed to start server"
     
@@ -900,6 +1139,92 @@ class GameModeScreen(BaseScreen):
         width = self.app.window_width
         height = self.app.window_height
         center_x = width // 2
+        
+        # Se siamo nella schermata di scelta della modalità online
+        if self.host_screen_active:
+            # Draw title
+            title_surf = self.title_font.render("Choose Online Mode", True, GOLD)
+            title_rect = title_surf.get_rect(center=(center_x, height * 0.15))
+            surface.blit(title_surf, title_rect)
+            
+            # Draw buttons
+            for i, button in enumerate(self.online_mode_buttons):
+                # Highlight selected button for game modes
+                if i < 2 and i == self.selected_online_mode:
+                    pygame.draw.rect(surface, GOLD, button.rect.inflate(6, 6), 3, border_radius=8)
+                button.draw(surface)
+            
+            # Draw instructions
+            if self.selected_online_mode == 0:
+                info_text = "You'll need 3 more human players to join"
+            else:
+                info_text = "You'll need 1 more human player to join (for your team)"
+            
+            info_surf = self.info_font.render(info_text, True, WHITE)
+            info_rect = info_surf.get_rect(center=(center_x, height - height * 0.15))
+            surface.blit(info_surf, info_rect)
+            
+            # Draw difficulty selection if we're doing Team vs AI
+            if self.selected_online_mode == 1:
+                difficulty_y = height - height * 0.25
+                difficulty_label = self.info_font.render("AI Difficulty:", True, WHITE)
+                label_rect = difficulty_label.get_rect(
+                    center=(center_x, difficulty_y)
+                )
+                surface.blit(difficulty_label, label_rect)
+                
+                # Ridisegna i pulsanti di difficoltà in una posizione diversa
+                diff_button_width = int(width * 0.12)
+                diff_button_height = int(height * 0.05)
+                diff_spacing = int(width * 0.02)
+                
+                diff_buttons_total_width = 3 * diff_button_width + 2 * diff_spacing
+                diff_start_x = center_x - diff_buttons_total_width // 2
+                
+                self.online_difficulty_buttons = []  # Resetta la lista
+                
+                for i, label in enumerate(["Easy", "Medium", "Hard"]):
+                    color = DARK_GREEN if i == 0 else DARK_BLUE if i == 1 else HIGHLIGHT_RED
+                    btn = Button(
+                        diff_start_x + i * (diff_button_width + diff_spacing),
+                        difficulty_y + label_rect.height + 10,
+                        diff_button_width, diff_button_height,
+                        label, color, WHITE,
+                        font_size=int(height * 0.025)
+                    )
+                    
+                    self.online_difficulty_buttons.append(btn)
+                    
+                    # Highlight selected difficulty
+                    if i == self.selected_difficulty:
+                        pygame.draw.rect(surface, GOLD, btn.rect.inflate(6, 6), 3, border_radius=8)
+                    btn.draw(surface)
+            
+            # Disegna il pulsante Start per ENTRAMBE le modalità
+            # Ma posizionalo più in basso per la modalità Team vs AI per non sovrapporsi ai pulsanti di difficoltà
+            start_button_width = int(width * 0.25)
+            start_button_height = int(height * 0.08)
+            
+            start_text = "Start Game"
+            # Aggiusta la posizione e il testo del pulsante in base alla modalità
+            if self.selected_online_mode == 0:  # 4 Players (All Human)
+                start_y = height - int(height * 0.1)
+            else:  # 2 vs 2 (Team vs AI)
+                start_y = height - int(height * 0.1)
+                
+            self.start_button = Button(
+                center_x - start_button_width // 2,
+                start_y,
+                start_button_width, start_button_height,
+                start_text,
+                DARK_GREEN, WHITE, font_size=int(height * 0.03)
+            )
+            
+            self.start_button.draw(surface)
+            
+            return
+        
+        # CODICE DELLA SCHERMATA PRINCIPALE:
         
         # Draw title
         title_surf = self.title_font.render("Scopone a Coppie", True, GOLD)
@@ -936,6 +1261,22 @@ class GameModeScreen(BaseScreen):
         ip_rect = ip_surf.get_rect(center=self.ip_input_rect.center)
         surface.blit(ip_surf, ip_rect)
         
+        # Aggiungi istruzioni per il gioco online nella schermata di join
+        if self.ip_input_active:
+            help_text = [
+                "Per giocare su internet:", 
+                "1. L'host deve configurare port forwarding sul router (porta 5555)",
+                "2. Inserisci l'IP pubblico dell'host (non l'IP locale)",
+                "3. Assicurati che non ci siano firewall che bloccano la porta 5555"
+            ]
+            
+            help_y = self.ip_input_rect.bottom + 15
+            for line in help_text:
+                help_surf = self.small_font.render(line, True, LIGHT_GRAY)
+                help_rect = help_surf.get_rect(left=self.ip_input_rect.left, top=help_y)
+                surface.blit(help_surf, help_rect)
+                help_y += 20
+        
         # Draw status message if any
         if self.status_message:
             status_surf = self.info_font.render(self.status_message, True, HIGHLIGHT_RED)
@@ -947,6 +1288,73 @@ class GameModeScreen(BaseScreen):
         info_surf = self.info_font.render(info_text, True, WHITE)
         info_rect = info_surf.get_rect(center=(center_x, height - height * 0.03))
         surface.blit(info_surf, info_rect)
+        
+        # Se siamo in stato di caricamento, disegna l'animazione sopra tutto
+        if self.loading:
+            self.loading_animation.draw(surface, self.loading_message)
+        
+    def setup_online_choice_buttons(self):
+        """Configura i pulsanti per la scelta della modalità online"""
+        width = self.app.window_width
+        height = self.app.window_height
+        center_x = width // 2
+        
+        button_width = int(width * 0.4)
+        button_height = int(height * 0.08)
+        button_spacing = int(height * 0.05)
+        
+        title_y = int(height * 0.25)
+        button_start_y = title_y + int(height * 0.15)
+        
+        self.online_mode_buttons = [
+            Button(center_x - button_width // 2,
+                button_start_y,
+                button_width, button_height,
+                "4 Players (All Human)",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                
+            Button(center_x - button_width // 2,
+                button_start_y + button_height + button_spacing,
+                button_width, button_height,
+                "2 vs 2 (Team vs AI)",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                
+            Button(center_x - button_width // 2,
+                button_start_y + 2 * (button_height + button_spacing),
+                button_width, button_height,
+                "Back",
+                HIGHLIGHT_RED, WHITE, font_size=int(height * 0.03))
+        ]
+        
+        # Aggiungiamo un pulsante Start separato per la modalità Team vs AI
+        start_button_width = int(width * 0.25)
+        self.start_button = Button(
+            center_x - start_button_width // 2,
+            height - int(height * 0.1),
+            start_button_width, button_height,
+            "Start Game",
+            DARK_GREEN, WHITE, font_size=int(height * 0.03)
+        )
+        
+        # Inizializza la lista per i pulsanti di difficoltà
+        self.online_difficulty_buttons = []
+        
+        
+    def update(self):
+        """Update screen state"""
+        if self.loading:
+            # Se siamo in stato di caricamento, aggiorna l'animazione
+            current_time = pygame.time.get_ticks()
+            elapsed = current_time - self.loading_start_time
+            
+            # Aggiorna l'animazione
+            self.loading_animation.update()
+            
+            # Dopo 2 secondi, completa il caricamento e vai alla schermata di gioco
+            if elapsed > 2000:  # 2 secondi di animazione
+                self.loading = False
+                self.done = True
+                self.next_screen = "game"
 
 class PlayerInfo:
     """Stores display information about a player"""
@@ -983,6 +1391,8 @@ class GameScreen(BaseScreen):
         self.ai_thinking = False
         self.ai_move_timer = 0
         self.messages = []
+        self.message_scroll_offset = 0  # Offset per lo scrolling dei messaggi
+        self.max_visible_messages = 5   # Numero massimo di messaggi visibili contemporaneamente
         
         # AI players
         self.ai_controllers = {}
@@ -1033,16 +1443,21 @@ class GameScreen(BaseScreen):
         self.game_over_button_rect = None
     
     def initialize_game(self):
-        """Initialize game environment and state"""
+        """Initialize game environment and state with random starting player"""
         config = self.app.game_config
         mode = config.get("mode", "single_player")
         
         # Set difficulty
-        self.ai_difficulty = config.get("difficulty", 1)
+        self.ai_difficulty = config.get("difficulty", 2)  # Default: Hard
         
         # Create game environment
         self.env = ScoponeEnvMA()
-        self.env.reset()
+        
+        # Imposta un giocatore iniziale casuale (0, 1, 2 o 3)
+        random_starter = random.randint(0, 3)
+        
+        # Resetta l'ambiente con il giocatore iniziale casuale
+        self.env.reset(starting_player=random_starter)
         
         # Set up AI controllers if needed
         if mode in ["single_player", "team_vs_ai"]:
@@ -1136,7 +1551,7 @@ class GameScreen(BaseScreen):
             self.players.append(player)
     
     def setup_layout(self):
-        """Set up the screen layout using relative positioning"""
+        """Set up the screen layout using a grid-based system with dedicated spaces for elements"""
         # Get current window dimensions
         width = self.app.window_width
         height = self.app.window_height
@@ -1146,16 +1561,23 @@ class GameScreen(BaseScreen):
             return
         
         # Calculate card dimensions based on window size
-        # This ensures cards scale proportionally with the window
         card_width = int(width * 0.078)  # ~8% of window width
         card_height = int(card_width * 1.5)  # Maintain aspect ratio
+        
+        # Store card dimensions as instance variables for use in other methods
+        self.card_width = card_width
+        self.card_height = card_height
         
         # Calculate the spacing and layout based on current window dimensions
         card_spread = card_width * 0.7  # Cards will overlap
         max_cards = 10
         hand_width = card_width + (max_cards - 1) * card_spread
         
-        # Table area (centered)
+        # -------------------------------------------------------------
+        # DEFINE THE GRID-BASED LAYOUT
+        # -------------------------------------------------------------
+        
+        # 1. Center: Table area (fixed in the center)
         table_width = width * 0.7
         table_height = height * 0.5
         self.table_rect = pygame.Rect(
@@ -1165,10 +1587,11 @@ class GameScreen(BaseScreen):
             table_height
         )
         
+        # 2. Player hands (fixed positions based on player locations)
         # Bottom player (0)
         self.players[0].hand_rect = pygame.Rect(
             width // 2 - hand_width // 2,
-            height - card_height - height * 0.03,  # 3% from bottom
+            height - card_height - height * 0.05,  # 5% from bottom
             hand_width,
             card_height
         )
@@ -1184,7 +1607,7 @@ class GameScreen(BaseScreen):
         # Top player (2)
         self.players[2].hand_rect = pygame.Rect(
             width // 2 - hand_width // 2,
-            height * 0.02,  # 2% from top
+            height * 0.05,  # 5% from top
             hand_width,
             card_height
         )
@@ -1197,109 +1620,134 @@ class GameScreen(BaseScreen):
             hand_width
         )
         
-        # Set player avatar areas
+        # -----------------------------------------------------
+        # CAPTURE PILES - Repositioned to avoid all player elements
+        # -----------------------------------------------------
+        pile_width = int(width * 0.12)
+        pile_height = int(height * 0.13)
+        
+        # Move piles to the corners that don't have player elements
+        # Team 0 pile - moved to top-center to avoid left player completely
+        pile0_x = width // 2 - pile_width - width * 0.10
+        pile0_y = height * 0.02 
+        
+        # Team 1 pile - moved to top-center to avoid left player completely
+        pile1_x = width // 2 + width * 0.10
+        pile1_y = height * 0.02
+        
+        # 4. UI Components
+        # These are positioned in specific grid cells to avoid overlaps
+        
+        # Calculate sizes based on screen dimensions
         avatar_size = int(height * 0.08)  # 8% of window height
-        
-        # Bottom player (0)
-        self.players[0].avatar_rect = pygame.Rect(
-            width // 2 - hand_width // 2 - avatar_size - width * 0.01,
-            height - avatar_size - height * 0.03,
-            avatar_size,
-            avatar_size
-        )
-        
-        # Left player (1)
-        self.players[1].avatar_rect = pygame.Rect(
-            width * 0.02,
-            height // 2 - hand_width // 2 - avatar_size - height * 0.01,
-            avatar_size,
-            avatar_size
-        )
-        
-        # Top player (2)
-        self.players[2].avatar_rect = pygame.Rect(
-            width // 2 - hand_width // 2 - avatar_size - width * 0.01,
-            height * 0.02,
-            avatar_size,
-            avatar_size
-        )
-        
-        # Right player (3)
-        self.players[3].avatar_rect = pygame.Rect(
-            width - avatar_size - width * 0.02,
-            height // 2 - hand_width // 2 - avatar_size - height * 0.01,
-            avatar_size,
-            avatar_size
-        )
-        
-        # Set player info areas
         info_width = int(width * 0.12)
         info_height = int(height * 0.05)
-        
-        # Bottom player (0)
-        self.players[0].info_rect = pygame.Rect(
-            width // 2 - hand_width // 2 - info_width - width * 0.01,
-            height - avatar_size - height * 0.03 - info_height - height * 0.01,
-            info_width,
-            info_height
-        )
-        
-        # Left player (1)
-        self.players[1].info_rect = pygame.Rect(
-            width * 0.02 + avatar_size + width * 0.01,
-            height // 2 - hand_width // 2 - avatar_size - height * 0.01,
-            info_width,
-            info_height
-        )
-        
-        # Top player (2)
-        self.players[2].info_rect = pygame.Rect(
-            width // 2 - hand_width // 2 - info_width - width * 0.01,
-            height * 0.02 + avatar_size + height * 0.01,
-            info_width,
-            info_height
-        )
-        
-        # Right player (3)
-        self.players[3].info_rect = pygame.Rect(
-            width - avatar_size - width * 0.02 - info_width - width * 0.01,
-            height // 2 - hand_width // 2 - avatar_size - height * 0.01,
-            info_width,
-            info_height
-        )
-        
-        # Buttons with relative positioning
         button_width = int(width * 0.14)
         button_height = int(height * 0.06)
         
-        self.confirm_button = Button(width - button_width - width * 0.02, 
-                                height - button_height - height * 0.02, 
-                                button_width, button_height,
-                                "Play Card", 
-                                (0, 150, 0), WHITE)
+        # -----------------------------------------------
+        # BUTTON PLACEMENT - Fixed positions in corners
+        # -----------------------------------------------
         
-        self.new_game_button = Button(width * 0.02, height * 0.02, 
-                                    button_width, button_height,
-                                    "New Game", 
-                                    DARK_BLUE, WHITE)
+        # New Game button - moved to extreme top-left corner
+        self.new_game_button = Button(
+            width * 0.01,  # Far left
+            height * 0.01,  # Far top
+            button_width, 
+            button_height,
+            "New Game", 
+            DARK_BLUE, WHITE
+        )
         
-        # Message log with relative positioning
-        self.message_log_rect = pygame.Rect(width * 0.02, 
-                                        height - height * 0.17, 
-                                        width * 0.25, 
-                                        height * 0.15)
+        # Play Card button - moved to extreme bottom-right corner
+        # Check bottom player's hand position to avoid overlap
+        bottom_player_right = self.players[0].hand_rect.right
+        bottom_player_left = self.players[0].hand_rect.left
+        screen_center_x = width / 2
         
-        # Update font sizes
+        # Position button either to the far right (if player hand is centered/left)
+        # or to the far left (if player hand extends right)
+        if bottom_player_right < screen_center_x + width * 0.2:
+            # Player hand doesn't extend to right side - place button at far right
+            button_x = width - button_width - width * 0.01
+        else:
+            # Player hand extends to right - place button at far left
+            button_x = width * 0.01
+            
+        self.confirm_button = Button(
+            button_x,
+            height - button_height - height * 0.01,  # Far bottom
+            button_width, 
+            button_height,
+            "Play Card", 
+            (0, 150, 0), WHITE
+        )
+        
+        # Message log - top right corner
+        self.message_log_rect = pygame.Rect(
+            width - width * 0.25 - width * 0.02,  # Right side with margin
+            height * 0.05,  # Near top
+            width * 0.25, 
+            height * 0.18
+        )
+        
+        # -----------------------------------------------------
+        # PLAYER AVATARS & INFO - Aligned with their hands
+        # -----------------------------------------------------
+        
+        # Bottom player (0) - avatar to the far left of hand
+        self.players[0].avatar_rect = pygame.Rect(
+            max(width * 0.01, self.players[0].hand_rect.left - avatar_size - width * 0.07),  # Further left, with minimum bound
+            self.players[0].hand_rect.centery - avatar_size // 2,
+            avatar_size,
+            avatar_size
+        )
+        
+        # Left player (1) - avatar to the right of the hand instead of above
+        # (to avoid overlap with the pile in the top-left)
+        self.players[1].avatar_rect = pygame.Rect(
+            self.players[1].hand_rect.right + width * 0.02,  # Right of hand
+            self.players[1].hand_rect.centery - avatar_size // 2,  # Centered vertically
+            avatar_size,
+            avatar_size
+        )
+        
+        # Top player (2) - avatar to the LEFT of hand instead of right
+        # to avoid overlapping with the message log
+        self.players[2].avatar_rect = pygame.Rect(
+            self.players[2].hand_rect.left - avatar_size - width * 0.02,  # Left of hand
+            self.players[2].hand_rect.centery - avatar_size // 2,
+            avatar_size,
+            avatar_size
+        )
+        
+        # Right player (3) - avatar to the LEFT of hand (invece che sotto)
+        # per evitare che sia fuori dallo schermo
+        self.players[3].avatar_rect = pygame.Rect(
+            self.players[3].hand_rect.left - avatar_size - width * 0.02,  # Left of hand
+            self.players[3].hand_rect.centery - avatar_size // 2,
+            avatar_size,
+            avatar_size
+        )
+        
+        # Info boxes - no longer needed since we display info in the avatar
+        # but keep them for compatibility
+        self.players[0].info_rect = self.players[0].avatar_rect.copy()
+        self.players[1].info_rect = self.players[1].avatar_rect.copy()
+        self.players[2].info_rect = self.players[2].avatar_rect.copy()
+        self.players[3].info_rect = self.players[3].avatar_rect.copy()
+        
+        # Update fonts based on screen dimensions
         self.title_font = pygame.font.SysFont(None, int(height * 0.042))
         self.info_font = pygame.font.SysFont(None, int(height * 0.031))
         self.small_font = pygame.font.SysFont(None, int(height * 0.023))
         
-        # Update the CARD_WIDTH and CARD_HEIGHT global constants for the current display
+        # Update global card size constants - needed for compatibility with existing code
         global CARD_WIDTH, CARD_HEIGHT
         CARD_WIDTH = card_width
         CARD_HEIGHT = card_height
         
-        # Rescale card images for the new size
+        # Resize card images
         self.app.resources.rescale_card_images(card_width, card_height)
     
     def update_player_hands(self):
@@ -1324,6 +1772,16 @@ class GameScreen(BaseScreen):
                 pygame.quit()
                 sys.exit()
             
+            # Controllo per il pulsante "New Game" anche in attesa di altri giocatori
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                pos = pygame.mouse.get_pos()
+                
+                # Check buttons
+                if self.new_game_button.is_clicked(pos):
+                    self.done = True
+                    self.next_screen = "mode"
+                    return
+            
             # Ignore input if game is over or waiting for other player
             if self.game_over or self.waiting_for_other_player or self.ai_thinking:
                 if self.game_over and event.type == pygame.MOUSEBUTTONDOWN:
@@ -1334,10 +1792,10 @@ class GameScreen(BaseScreen):
                         self.next_screen = "mode"
                 continue
             
-            # Check if it's local player's turn
-            if self.env.current_player != self.local_player_id:
+            # Check if current player is controllable
+            if not self.is_current_player_controllable():
                 continue
-                
+                    
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
@@ -1366,6 +1824,22 @@ class GameScreen(BaseScreen):
                     else:
                         self.selected_table_cards.add(table_card)
                     self.app.resources.play_sound("card_pickup")
+            # Aggiungi gestione scrolling per i messaggi
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                pos = pygame.mouse.get_pos()
+                
+                # Verifica clic sui pulsanti di scrolling
+                if hasattr(self, 'scroll_up_rect') and self.scroll_up_rect.collidepoint(pos):
+                    self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
+                elif hasattr(self, 'scroll_down_rect') and self.scroll_down_rect.collidepoint(pos):
+                    self.message_scroll_offset += 1  # Limite controllato in draw_message_log
+                
+                # Verifica scrolling con rotella del mouse quando il cursore è sopra il message log
+                if hasattr(self, 'scrollbar_rect') and self.message_log_rect.collidepoint(pos):
+                    if event.button == 4:  # Scroll up
+                        self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
+                    elif event.button == 5:  # Scroll down
+                        self.message_scroll_offset += 1  # Limite controllato in draw_message_log
     
     def update(self):
         """Update game state"""
@@ -1388,6 +1862,80 @@ class GameScreen(BaseScreen):
         # Check for game over
         if self.env and not self.game_over:
             self.check_game_over()
+        
+        # Gestione dello stato del server in modalità online
+        if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
+            online_type = self.app.game_config.get("online_type", "all_human")
+            ip_address = get_local_ip()
+            
+            if online_type == "all_human":
+                # In modalità "All Human" serve aspettare 3 giocatori umani
+                needed_players = 3
+                if self.app.network and len(self.app.network.clients) < needed_players:
+                    # Aggiorna il messaggio con il numero di giocatori connessi
+                    connected_count = len(self.app.network.clients)
+                    self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+                    
+                    # In attesa di altri giocatori, blocca il gioco finché non si connettono tutti
+                    self.waiting_for_other_player = True
+                elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
+                    # Tutti i giocatori sono connessi, sblocca il gioco
+                    self.waiting_for_other_player = False
+                    self.status_message = "Tutti i giocatori sono connessi. Inizia il gioco!"
+            
+            elif online_type == "team_vs_ai":
+                # In modalità "Team vs AI" serve aspettare solo 1 giocatore umano
+                needed_players = 1
+                if self.app.network and len(self.app.network.clients) < needed_players:
+                    # Aggiorna il messaggio con il numero di giocatori connessi
+                    connected_count = len(self.app.network.clients)
+                    self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+                    
+                    # In attesa di altri giocatori, blocca il gioco finché non si connettono tutti
+                    self.waiting_for_other_player = True
+                elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
+                    # Configura i giocatori AI per la squadra avversaria (giocatori 1 e 3)
+                    self.setup_team_vs_ai_online()
+                    # Sblocca il gioco
+                    self.waiting_for_other_player = False
+                    self.status_message = "Partner connesso. Inizia il gioco!"
+        
+        while self.app.network.message_queue:
+            message = self.app.network.message_queue.popleft()
+            self.messages.append(message)
+                    
+    def setup_team_vs_ai_online(self):
+        """Configura i giocatori AI per la modalità Team vs AI online"""
+        # Configura i giocatori AI per la squadra avversaria (giocatori 1 e 3)
+        difficulty = self.app.game_config.get("difficulty", 1)
+        
+        # Crea i controller AI per i giocatori 1 e 3
+        for player_id in [1, 3]:
+            # I giocatori AI appartengono al team 1
+            team_id = 1
+            self.ai_controllers[player_id] = DQNAgent(team_id=team_id)
+            
+            # Carica il checkpoint se disponibile
+            checkpoint_path = f"scopone_checkpoint_team{team_id}.pth"
+            if os.path.exists(checkpoint_path):
+                self.ai_controllers[player_id].load_checkpoint(checkpoint_path)
+            
+            # Imposta il livello di casualità in base alla difficoltà
+            if difficulty == 0:  # Easy
+                self.ai_controllers[player_id].epsilon = 0.3
+            elif difficulty == 1:  # Medium
+                self.ai_controllers[player_id].epsilon = 0.1
+            else:  # Hard
+                self.ai_controllers[player_id].epsilon = 0.01
+            
+            # Aggiorna lo stato dei giocatori
+            self.players[player_id].is_ai = True
+            self.players[player_id].name = f"AI {player_id}"
+        
+        # Aggiorna lo stato del giocatore partner
+        self.players[2].is_human = True
+        self.players[2].is_ai = False
+        self.players[2].name = "Partner"
     
     def update_animations(self):
         """Update and clean up animations"""
@@ -1421,8 +1969,21 @@ class GameScreen(BaseScreen):
                 self.ai_thinking = False
     
     def handle_network_updates(self):
-        """Handle network updates for online games"""
-        if not self.app.network or not self.app.network.connected:
+        """Handle network updates for online games with reconnection support"""
+        if not self.app.network:
+            return
+            
+        # Se la connessione è caduta, prova a riconnettersi
+        if not self.app.network.connected:
+            self.status_message = "Connessione persa. Tentativo di riconnettersi..."
+            
+            # Per i client (non per l'host), prova a riconnettersi
+            if not self.app.network.is_host:
+                if self.app.network.connect_to_server():
+                    self.status_message = "Riconnessione avvenuta con successo!"
+                else:
+                    self.status_message = "Impossibile riconnettersi al server."
+                    self.waiting_for_other_player = True
             return
             
         # Check for new messages
@@ -1498,10 +2059,23 @@ class GameScreen(BaseScreen):
         card_height = int(card_width * 1.5)
         
         if area == "hand":
-            # Check local player's hand
-            local_player = self.players[self.local_player_id]
-            hand = local_player.hand_cards
-            hand_rect = local_player.hand_rect
+            # Determina quale giocatore è attualmente controllabile
+            current_player = None
+            mode = self.app.game_config.get("mode")
+            
+            if mode == "team_vs_ai" and self.current_player_id == 2:
+                # Se è il turno del partner nel team, usa il giocatore 2
+                current_player = self.players[2]
+            elif mode == "local_multiplayer":
+                # In modalità 4 giocatori, usa il giocatore corrente
+                current_player = self.players[self.current_player_id]
+            else:
+                # Altrimenti usa il giocatore locale
+                current_player = self.players[self.local_player_id]
+            
+            # Usa le carte del giocatore corrente
+            hand = current_player.hand_cards
+            hand_rect = current_player.hand_rect
             
             if not hand:
                 return None
@@ -1523,7 +2097,7 @@ class GameScreen(BaseScreen):
             return None
         
         elif area == "table":
-            # Check table cards
+            # Il resto del codice per le carte sul tavolo rimane invariato
             table_cards = self.env.game_state["table"]
             
             if not table_cards:
@@ -1547,6 +2121,11 @@ class GameScreen(BaseScreen):
     
     def try_make_move(self):
         """Try to make a move with the selected cards"""
+        # Assicurati che sia il turno di un giocatore controllabile
+        if not self.is_current_player_controllable():
+            self.status_message = "Non è il tuo turno"
+            return False
+            
         if not self.selected_hand_card:
             self.status_message = "Select a card from your hand first"
             return False
@@ -1756,8 +2335,8 @@ class GameScreen(BaseScreen):
         # Draw buttons
         self.new_game_button.draw(surface)
         
-        # Draw confirm button if it's local player's turn
-        if self.env and self.env.current_player == self.local_player_id and not self.game_over:
+        # Draw confirm button if current player is controllable
+        if self.env and self.is_current_player_controllable() and not self.game_over:
             self.confirm_button.draw(surface)
         
         # Draw message log
@@ -1773,14 +2352,29 @@ class GameScreen(BaseScreen):
             self.draw_player_info(surface, player)
             
             # Draw hand
-            if player.player_id == self.local_player_id:
+            mode = self.app.game_config.get("mode")
+            is_controllable = False
+            
+            if mode == "team_vs_ai":
+                is_controllable = (player.player_id == self.local_player_id or 
+                                (player.player_id == 2 and self.current_player_id == 2))
+            elif mode == "local_multiplayer":
+                is_controllable = (player.player_id == self.current_player_id)
+            else:
+                is_controllable = (player.player_id == self.local_player_id)
+            
+            if is_controllable:
                 self.draw_player_hand(surface, player)
             else:
                 self.draw_player_hidden_hand(surface, player)
     
     def draw_player_info(self, surface, player):
-        """Draw player information box"""
-        # Draw avatar background
+        """Draw player information within the existing avatar box"""
+        # Get screen dimensions
+        width = self.app.window_width
+        height = self.app.window_height
+        
+        # Draw avatar background (team-colored box)
         avatar_color = LIGHT_BLUE if player.team_id == 0 else HIGHLIGHT_RED
         pygame.draw.rect(surface, avatar_color, player.avatar_rect, border_radius=10)
         
@@ -1788,26 +2382,36 @@ class GameScreen(BaseScreen):
         if player.player_id == self.current_player_id:
             pygame.draw.rect(surface, GOLD, player.avatar_rect.inflate(6, 6), 3, border_radius=12)
         
-        # Draw player name
+        # Calculate text positions inside the avatar box
+        # Create a smaller font for fitting text in the box
+        info_font = pygame.font.SysFont(None, int(height * 0.022))
+        
+        # Player name at top
         name_text = player.name
         if player.is_ai:
             name_text += " (AI)"
         
-        name_surf = self.small_font.render(name_text, True, WHITE)
-        name_rect = name_surf.get_rect(center=player.avatar_rect.center)
+        name_surf = info_font.render(name_text, True, WHITE)
+        name_rect = name_surf.get_rect(
+            midtop=(player.avatar_rect.centerx, player.avatar_rect.top + 5)
+        )
         surface.blit(name_surf, name_rect)
         
-        # Draw card count
-        count_text = f"Cards: {len(player.hand_cards)}"
-        count_surf = self.small_font.render(count_text, True, WHITE)
-        count_rect = count_surf.get_rect(midtop=(player.avatar_rect.centerx, player.avatar_rect.bottom + 5))
-        surface.blit(count_surf, count_rect)
-        
-        # Draw team info
+        # Team info in middle
         team_text = f"Team {player.team_id}"
-        team_surf = self.small_font.render(team_text, True, WHITE)
-        team_rect = team_surf.get_rect(midbottom=(player.avatar_rect.centerx, player.avatar_rect.top - 5))
+        team_surf = info_font.render(team_text, True, WHITE)
+        team_rect = team_surf.get_rect(
+            center=(player.avatar_rect.centerx, player.avatar_rect.centery)
+        )
         surface.blit(team_surf, team_rect)
+        
+        # Card count at bottom
+        count_text = f"Cards: {len(player.hand_cards)}"
+        count_surf = info_font.render(count_text, True, WHITE)
+        count_rect = count_surf.get_rect(
+            midbottom=(player.avatar_rect.centerx, player.avatar_rect.bottom - 5)
+        )
+        surface.blit(count_surf, count_rect)
     
     def draw_player_hand(self, surface, player):
         """Draw the local player's hand with card faces visible and no rotation"""
@@ -1924,23 +2528,29 @@ class GameScreen(BaseScreen):
             surface.blit(card_img, card_rect)
     
     def draw_capture_piles(self, surface):
-        """Draw the capture piles for each team"""
+        """Draw the capture piles for each team with updated positioning"""
         if not self.env:
             return
-            
+                
         captured = self.env.game_state["captured_squads"]
         width = self.app.window_width
         height = self.app.window_height
         
-        # Draw team 0 pile
-        team0_count = len(captured[0])
-        pile0_x = int(width * 0.02)
-        pile0_y = int(height * 0.5 - height * 0.15)
+        # Calculate pile positions based on the updated layout
+        # Top center positioning
+        pile0_x = width // 2 - int(width * 0.22)  # Left of center
+        pile0_y = height * 0.02                   # Top
         pile_width = int(width * 0.12)
         pile_height = int(height * 0.13)
         
-        # Draw pile background
-        pygame.draw.rect(surface, DARK_BLUE, 
+        pile1_x = width // 2 + int(width * 0.10)  # Right of center
+        pile1_y = height * 0.02                   # Top
+        
+        # Draw team 0 pile with team-specific color
+        team0_count = len(captured[0])
+        
+        # Draw pile background - BLUE for team 0
+        pygame.draw.rect(surface, LIGHT_BLUE, 
                         (pile0_x, pile0_y, pile_width, pile_height), 
                         border_radius=5)
         
@@ -1961,16 +2571,14 @@ class GameScreen(BaseScreen):
             mini_height = int(height * 0.08)
             mini_card = pygame.Surface((mini_width, mini_height))
             mini_card.fill(WHITE)
-            pygame.draw.rect(mini_card, LIGHT_BLUE, (0, 0, mini_width, mini_height), 2)
+            pygame.draw.rect(mini_card, DARK_BLUE, (0, 0, mini_width, mini_height), 2)
             surface.blit(mini_card, (x, y))
         
-        # Draw team 1 pile
+        # Draw team 1 pile with team-specific color
         team1_count = len(captured[1])
-        pile1_x = int(width * 0.02)
-        pile1_y = int(height * 0.5 + height * 0.02)
         
-        # Draw pile background
-        pygame.draw.rect(surface, DARK_BLUE, 
+        # Draw pile background - RED for team 1
+        pygame.draw.rect(surface, HIGHLIGHT_RED, 
                         (pile1_x, pile1_y, pile_width, pile_height), 
                         border_radius=5)
         
@@ -1991,7 +2599,7 @@ class GameScreen(BaseScreen):
             mini_height = int(height * 0.08)
             mini_card = pygame.Surface((mini_width, mini_height))
             mini_card.fill(WHITE)
-            pygame.draw.rect(mini_card, HIGHLIGHT_RED, (0, 0, mini_width, mini_height), 2)
+            pygame.draw.rect(mini_card, DARK_RED if 'DARK_RED' in globals() else (139, 0, 0), (0, 0, mini_width, mini_height), 2)
             surface.blit(mini_card, (x, y))
     
     def draw_animations(self, surface):
@@ -2058,7 +2666,7 @@ class GameScreen(BaseScreen):
                 surface.blit(diff_surf, diff_rect)
     
     def draw_message_log(self, surface):
-        """Draw message log"""
+        """Draw message log with scrolling support"""
         # Draw background
         pygame.draw.rect(surface, DARK_BLUE, self.message_log_rect, border_radius=5)
         pygame.draw.rect(surface, LIGHT_BLUE, self.message_log_rect, 2, border_radius=5)
@@ -2068,15 +2676,110 @@ class GameScreen(BaseScreen):
         title_rect = title_surf.get_rect(midtop=(self.message_log_rect.centerx, self.message_log_rect.top + 5))
         surface.blit(title_surf, title_rect)
         
-        # Draw messages
-        msg_y = self.message_log_rect.top + 25
+        # Calcola area utile per i messaggi
+        content_rect = pygame.Rect(
+            self.message_log_rect.left + 5,
+            self.message_log_rect.top + 25,
+            self.message_log_rect.width - 30,  # Spazio per la scrollbar
+            self.message_log_rect.height - 30
+        )
+        
+        # Recupera tutti i messaggi (non limitandoli più a 5)
+        all_messages = []
+        
+        # Se siamo in modalità online e host, mostriamo istruzioni di connessione
+        if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
+            # Mostra istruzioni per connettere altri giocatori in modo più chiaro
+            local_ip = get_local_ip()
+            public_ip = self.app.network.public_ip if hasattr(self.app.network, 'public_ip') else "N/A"
+            
+            all_messages.append(("Per giocare in LAN:", GOLD))
+            all_messages.append((f"IP Locale: {local_ip}", WHITE))
+            all_messages.append(("Per giocare su Internet:", GOLD))
+            all_messages.append((f"IP Pubblico: {public_ip}", WHITE))
+            all_messages.append(("Porta: 5555", WHITE))
+            
+            # Mostra quanti giocatori sono necessari in base alla modalità
+            online_type = self.app.game_config.get("online_type", "all_human")
+            if online_type == "all_human":
+                all_messages.append(("Attendo 3 giocatori", GOLD))
+            else:  # "team_vs_ai"
+                all_messages.append(("Attendo 1 partner", GOLD))
+        
+        # Aggiungi tutti i messaggi dal log
         for msg in self.messages:
-            msg_surf = self.small_font.render(msg, True, WHITE)
-            # Truncate if too long
-            if msg_surf.get_width() > self.message_log_rect.width - 20:
-                msg_surf = self.small_font.render(msg[:30] + "...", True, WHITE)
-            surface.blit(msg_surf, (self.message_log_rect.left + 10, msg_y))
-            msg_y += 20
+            all_messages.append((msg, WHITE))
+        
+        # Calcola il massimo numero di messaggi visibili nell'area
+        msg_height = int(self.app.window_height * 0.023) + 5  # Altezza font + spaziatura
+        max_visible = min(len(all_messages), int(content_rect.height / msg_height))
+        
+        # Limita lo scrolling
+        total_messages = len(all_messages)
+        max_offset = max(0, total_messages - max_visible)
+        self.message_scroll_offset = min(max_offset, max(0, self.message_scroll_offset))
+        
+        # Disegna i messaggi visibili
+        for i in range(max_visible):
+            idx = i + self.message_scroll_offset
+            if idx < len(all_messages):
+                msg_text, msg_color = all_messages[idx]
+                msg_surf = self.small_font.render(msg_text, True, msg_color)
+                
+                # Tronca se troppo lungo
+                if msg_surf.get_width() > content_rect.width - 10:
+                    truncated = msg_text[:30] + "..."
+                    msg_surf = self.small_font.render(truncated, True, msg_color)
+                
+                y_pos = content_rect.top + i * msg_height
+                surface.blit(msg_surf, (content_rect.left, y_pos))
+        
+        # Disegna la scrollbar se necessaria
+        if total_messages > max_visible:
+            scrollbar_rect = pygame.Rect(
+                self.message_log_rect.right - 20,
+                content_rect.top,
+                15,
+                content_rect.height
+            )
+            pygame.draw.rect(surface, LIGHT_GRAY, scrollbar_rect, border_radius=7)
+            
+            # Calcola la posizione e dimensione del cursore di scorrimento
+            thumb_height = max(30, scrollbar_rect.height * max_visible / total_messages)
+            thumb_pos = scrollbar_rect.top + (scrollbar_rect.height - thumb_height) * self.message_scroll_offset / max_offset
+            
+            thumb_rect = pygame.Rect(
+                scrollbar_rect.left,
+                thumb_pos,
+                scrollbar_rect.width,
+                thumb_height
+            )
+            pygame.draw.rect(surface, WHITE, thumb_rect, border_radius=7)
+            
+            # Disegna pulsanti di scorrimento
+            up_arrow = pygame.Rect(scrollbar_rect.left, scrollbar_rect.top - 20, 15, 15)
+            down_arrow = pygame.Rect(scrollbar_rect.left, scrollbar_rect.bottom + 5, 15, 15)
+            
+            pygame.draw.rect(surface, LIGHT_GRAY, up_arrow, border_radius=3)
+            pygame.draw.rect(surface, LIGHT_GRAY, down_arrow, border_radius=3)
+            
+            # Disegna triangoli per le frecce
+            pygame.draw.polygon(surface, WHITE, [
+                (up_arrow.centerx, up_arrow.top + 3),
+                (up_arrow.left + 3, up_arrow.bottom - 3),
+                (up_arrow.right - 3, up_arrow.bottom - 3)
+            ])
+            
+            pygame.draw.polygon(surface, WHITE, [
+                (down_arrow.centerx, down_arrow.bottom - 3),
+                (down_arrow.left + 3, down_arrow.top + 3),
+                (down_arrow.right - 3, down_arrow.top + 3)
+            ])
+            
+            # Salva i rettangoli per il rilevamento dei clic
+            self.scroll_up_rect = up_arrow
+            self.scroll_down_rect = down_arrow
+            self.scrollbar_rect = scrollbar_rect
     
     def draw_game_over(self, surface):
         """Draw responsive game over screen with results"""
@@ -2191,6 +2894,19 @@ class GameScreen(BaseScreen):
         
         # Store button rect for click detection
         self.game_over_button_rect = new_game_button.rect
+        
+    def is_current_player_controllable(self):
+        """Verifica se il giocatore corrente può essere controllato dall'utente locale"""
+        mode = self.app.game_config.get("mode")
+        if mode == "team_vs_ai":
+            # In modalità team vs AI, entrambi i giocatori 0 e 2 sono controllabili
+            return self.current_player_id in [0, 2]
+        elif mode == "local_multiplayer":
+            # In modalità 4 giocatori umani, tutti i giocatori sono controllabili quando è il loro turno
+            return True
+        else:
+            # Nelle altre modalità, segui la logica esistente
+            return self.current_player_id == self.local_player_id
 
 class ScoponeApp:
     """Main application class"""
@@ -2198,7 +2914,22 @@ class ScoponeApp:
         pygame.init()
         pygame.display.set_caption("Scopone a Coppie")
         
-        # Cambia questa linea
+        # Ottieni le dimensioni dello schermo
+        display_info = pygame.display.Info()
+        available_width = display_info.current_w
+        available_height = display_info.current_h
+        
+        # Imposta dimensioni massime che non superino lo schermo
+        # Usa una piccola riduzione (90%) per lasciare spazio per la barra delle applicazioni
+        max_width = min(1024, int(available_width * 0.9))
+        max_height = min(768, int(available_height * 0.9))
+        
+        # Aggiorna le costanti globali
+        global SCREEN_WIDTH, SCREEN_HEIGHT
+        SCREEN_WIDTH = max_width
+        SCREEN_HEIGHT = max_height
+        
+        # Impostazioni della finestra
         flags = pygame.RESIZABLE
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
         self.window_width = SCREEN_WIDTH
