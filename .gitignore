@@ -2,3 +2,5 @@ checkpoints/
 __pycache__/
 all_code.py
 .pytest_cache/
+scopone_checkpoint_team0.pth
+scopone_checkpoint_team1.pth
