@@ -808,9 +808,9 @@ class GameModeScreen(BaseScreen):
         # IP input for joining online games
         self.ip_input = ""
         self.ip_input_active = False
-        self.ip_input_rect = pygame.Rect(center_x - 150, 
-                                       button_start_y + 6 * (button_height + button_spacing), 
-                                       300, 40)
+        self.ip_input_rect = pygame.Rect(center_x - 225,  # Centered based on new width
+                                    button_start_y + 6 * (button_height + button_spacing), 
+                                    450, 40)  # Wider input field
         
         # Status message
         self.status_message = ""
@@ -894,9 +894,9 @@ class GameModeScreen(BaseScreen):
         ]
         
         # IP input for joining online games
-        self.ip_input_rect = pygame.Rect(center_x - int(width * 0.15), 
+        self.ip_input_rect = pygame.Rect(center_x - int(width * 0.225),  # Centered based on new width
                                     button_start_y + 6 * (button_height + button_spacing),
-                                    int(width * 0.3), int(height * 0.05))
+                                    int(width * 0.45), int(height * 0.05))  # Wider input field
         
         # NUOVA PARTE PER EVITARE SOVRAPPOSIZIONI
         # Raccogliamo tutti gli elementi UI
@@ -1012,7 +1012,7 @@ class GameModeScreen(BaseScreen):
                 elif event.key == pygame.K_BACKSPACE:
                     self.ip_input = self.ip_input[:-1]
                 else:
-                    if len(self.ip_input) < 15:  # Limit input length
+                    if len(self.ip_input) < 25:  # Increased limit for longer IP addresses or hostnames
                         self.ip_input += event.unicode
     
 
@@ -1070,6 +1070,8 @@ class GameModeScreen(BaseScreen):
                 self.join_online_game()
             else:
                 self.status_message = "Please enter an IP address"
+                # Make the IP input active to focus it after showing the error
+                self.ip_input_active = True
     
     def host_online_game(self):
         """Host an online game with internet support"""
@@ -1256,9 +1258,16 @@ class GameModeScreen(BaseScreen):
         ip_color = LIGHT_BLUE if self.ip_input_active else DARK_BLUE
         pygame.draw.rect(surface, ip_color, self.ip_input_rect, border_radius=5)
         pygame.draw.rect(surface, WHITE, self.ip_input_rect, 2, border_radius=5)
-        
-        # Draw IP input text
-        ip_text = self.ip_input if self.ip_input else "Enter IP to join"
+
+        # Draw IP input text - MODIFIED PART
+        if self.status_message and "Please enter an IP address" in self.status_message:
+            # When there's an error about IP address, show nothing in the input box
+            ip_text = ""
+            # We'll let the red status message communicate the error
+        else:
+            # Normal display behavior
+            ip_text = self.ip_input if self.ip_input else "Enter IP to join"
+
         ip_surf = self.info_font.render(ip_text, True, WHITE)
         ip_rect = ip_surf.get_rect(center=self.ip_input_rect.center)
         surface.blit(ip_surf, ip_rect)
@@ -1902,9 +1911,11 @@ class GameScreen(BaseScreen):
                     self.waiting_for_other_player = False
                     self.status_message = "Partner connesso. Inizia il gioco!"
         
-        while self.app.network.message_queue:
-            message = self.app.network.message_queue.popleft()
-            self.messages.append(message)
+        # Add a null check before accessing network attributes
+        if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network:
+            while self.app.network.message_queue:
+                message = self.app.network.message_queue.popleft()
+                self.messages.append(message)
                     
     def setup_team_vs_ai_online(self):
         """Configura i giocatori AI per la modalità Team vs AI online"""
