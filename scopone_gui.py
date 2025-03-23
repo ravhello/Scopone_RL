@@ -754,6 +754,7 @@ class GameModeScreen(BaseScreen):
         center_x = SCREEN_WIDTH // 2
         self.title_font = pygame.font.SysFont(None, 72)
         self.info_font = pygame.font.SysFont(None, 24)
+        self.small_font = pygame.font.SysFont(None, 18)  # Add this line to define small_font
         
         # Buttons
         button_width = 400
@@ -834,6 +835,7 @@ class GameModeScreen(BaseScreen):
         # Update font sizes based on window dimensions
         self.title_font = pygame.font.SysFont(None, int(height * 0.09))  # ~9% of height
         self.info_font = pygame.font.SysFont(None, int(height * 0.03))   # ~3% of height
+        self.small_font = pygame.font.SysFont(None, int(height * 0.023))  # Add this line for small_font
         
         # Button dimensions and positioning
         center_x = width // 2
