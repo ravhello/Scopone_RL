@@ -680,6 +680,10 @@ class NetworkManager:
                 else:
                     state_copy[key] = value
         
+        # NUOVO: Aggiungi informazioni sui giocatori AI
+        if 'online_type' in state_copy and state_copy['online_type'] == 'team_vs_ai':
+            state_copy['ai_players'] = [1, 3]  # In modalità team vs AI, i giocatori 1 e 3 sono sempre AI
+        
         # Create the message with the full state
         message = {
             "type": "game_state", 
@@ -689,6 +693,7 @@ class NetworkManager:
         # Log what we're sending
         print(f"Host broadcasting state: Current player = {state_copy.get('current_player', 'unknown')}")
         print(f"Table cards: {state_copy.get('table', [])}")
+        print(f"Online type: {state_copy.get('online_type', 'unknown')}")
         
         try:
             # Use a larger buffer for the pickle to accommodate larger game states
@@ -1580,47 +1585,60 @@ class GameScreen(BaseScreen):
         config = self.app.game_config
         mode = config.get("mode", "single_player")
         
+        # Reset player info
         self.players = []
         
+        # Determina se siamo in modalità team vs AI online
+        is_online_team_vs_ai = (mode == "online_multiplayer" and 
+                            config.get("online_type") == "team_vs_ai")
+        
+        # Se siamo client, otteniamo le informazioni sulle AI dal game state
+        ai_players = []
+        if not config.get("is_host", False) and self.app.network and self.app.network.game_state:
+            ai_players = self.app.network.game_state.get('ai_players', [])
+        elif is_online_team_vs_ai:
+            # Se siamo host, sappiamo già quali sono le AI
+            ai_players = [1, 3]
+        
+        # Imposta i giocatori
         for player_id in range(4):
-            # MODIFICA: Gestisci la logica del team in base alla modalità di gioco
-            if mode == "online_multiplayer" and config.get("online_type") == "team_vs_ai":
-                # Nella modalità team vs AI online, gli ID 0 e 2 sono umani (team 0), 1 e 3 sono AI (team 1)
-                team_id = 0 if player_id in [0, 2] else 1
+            # Determina il team_id
+            # Le squadre sono sempre: [0, 2] = team 0, [1, 3] = team 1
+            team_id = 0 if player_id in [0, 2] else 1
+            
+            # Determina se il giocatore è umano o AI
+            if mode == "single_player":
+                is_human = (player_id == 0)
+                is_ai = not is_human
+            elif mode == "team_vs_ai":
                 is_human = player_id in [0, 2]
-                is_ai = player_id in [1, 3]
-                
-                # Imposta il nome appropriato
-                if player_id == self.local_player_id:
-                    name = "You"
-                elif player_id == 0 or player_id == 2:
-                    name = "Partner" if player_id != self.local_player_id else "You"
-                else:
-                    name = f"AI {player_id}"
-            else:
-                # Logica originale per le altre modalità
-                team_id = 0 if player_id in [0, 2] else 1
-                
-                if mode == "single_player":
-                    is_human = (player_id == 0)
-                    is_ai = not is_human
-                    name = "You" if is_human else f"AI {player_id}"
-                elif mode == "team_vs_ai":
-                    is_human = player_id in [0, 2]
-                    is_ai = not is_human
-                    if is_human:
-                        name = "You" if player_id == 0 else "Partner"
-                    else:
-                        name = f"AI {player_id}"
-                elif mode == "local_multiplayer":
+                is_ai = not is_human
+            elif mode == "local_multiplayer":
+                is_human = True
+                is_ai = False
+            elif mode == "online_multiplayer":
+                # Per la modalità online, determina in base al tipo
+                if is_online_team_vs_ai:
+                    is_human = player_id not in ai_players
+                    is_ai = player_id in ai_players
+                else:  # All human
                     is_human = True
                     is_ai = False
-                    name = f"Player {player_id}"
-                elif mode == "online_multiplayer":
-                    is_human = (player_id == self.local_player_id)
-                    is_ai = False
-                    name = "You" if is_human else f"Player {player_id}"
             
+            # Determina il nome del giocatore
+            if is_human:
+                if player_id == self.local_player_id:
+                    name = "You"
+                elif is_online_team_vs_ai and player_id in [0, 2] and player_id != self.local_player_id:
+                    name = "Partner"
+                elif mode == "team_vs_ai" and player_id == 2:
+                    name = "Partner"
+                else:
+                    name = f"Player {player_id}"
+            else:  # AI
+                name = f"AI {player_id}"
+            
+            # Crea l'oggetto PlayerInfo
             player = PlayerInfo(
                 player_id=player_id,
                 name=name,
@@ -1629,11 +1647,16 @@ class GameScreen(BaseScreen):
                 is_ai=is_ai
             )
             
+            # Aggiungi alla lista
             self.players.append(player)
         
-        # For online multiplayer - set up player perspective mapping
+        # Configura la prospettiva visuale per il multiplayer online
         if mode == "online_multiplayer":
             self.setup_player_perspective()
+        
+        # Debug: stampa informazioni sui giocatori
+        for player in self.players:
+            print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
 
     def setup_player_perspective(self):
         """Set up visualization for different client perspectives
@@ -1907,7 +1930,7 @@ class GameScreen(BaseScreen):
                         self.message_scroll_offset += 1
     
     def update(self):
-        """Update game state"""
+        """Update game state with improvements for online play"""
         # Update player hands from game state
         self.update_player_hands()
         
@@ -1918,23 +1941,22 @@ class GameScreen(BaseScreen):
         # Update animations
         self.update_animations()
         
-        # AGGIUNGERE QUESTO CODICE: Aggiorna local_player_id dal network se necessario
+        # Aggiorna local_player_id dal network se necessario
         if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host"):
             if self.app.network and self.app.network.player_id is not None:
                 old_player_id = self.local_player_id
                 if self.local_player_id != self.app.network.player_id:
                     print(f"Aggiornamento player_id: da {self.local_player_id} a {self.app.network.player_id}")
                     self.local_player_id = self.app.network.player_id
-                    # Aggiorna anche il nome del giocatore
-                    self.players[self.local_player_id].name = "You"
                     
-                    # If player ID changed, recalculate visual positions
+                    # Aggiorna i giocatori in caso di cambio ID
                     if old_player_id != self.local_player_id:
+                        # Riaggiorna player info, prospettiva e layout
+                        self.setup_players()
                         self.setup_player_perspective()
-                        # Force layout recalculation with new perspective
                         self.setup_layout()
         
-        # Handle AI turns
+        # Handle AI turns (solo il server lo fa in modalità online)
         self.handle_ai_turns()
         
         # Handle network updates
@@ -1980,8 +2002,16 @@ class GameScreen(BaseScreen):
                     # Sblocca il gioco
                     self.waiting_for_other_player = False
                     self.status_message = "Partner connesso. Inizia il gioco!"
+                    
+                    # NUOVO: Trasmette immediatamente lo stato al client per sincronizzare le informazioni
+                    if self.app.network:
+                        self.app.network.game_state = self.env.game_state.copy()
+                        self.app.network.game_state['online_type'] = 'team_vs_ai'
+                        self.app.network.game_state['ai_players'] = [1, 3]
+                        self.app.network.game_state['current_player'] = self.env.current_player
+                        self.app.network.broadcast_game_state()
         
-        # Add a null check before accessing network attributes
+        # Process messages from network
         if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network:
             while self.app.network.message_queue:
                 message = self.app.network.message_queue.popleft()
@@ -2035,6 +2065,12 @@ class GameScreen(BaseScreen):
         # Check if it's AI's turn
         current_player = self.players[self.current_player_id]
         
+        # In modalità online, solo l'host gestisce le mosse delle AI
+        is_online = self.app.game_config.get("mode") == "online_multiplayer"
+        if is_online and not self.app.game_config.get("is_host", False):
+            # I client non fanno nulla, riceveranno aggiornamenti dall'host
+            return
+        
         if current_player.is_ai and not self.ai_thinking:
             # Start AI thinking timer
             self.ai_thinking = True
@@ -2052,7 +2088,7 @@ class GameScreen(BaseScreen):
                 self.ai_thinking = False
     
     def handle_network_updates(self):
-        """Completely revamped network update handling with more reliable state processing"""
+        """Network update handling with improved state synchronization"""
         if not self.app.network:
             return
         
@@ -2104,7 +2140,11 @@ class GameScreen(BaseScreen):
                             self.final_breakdown = info["score_breakdown"]
                     
                     # Prepare a deep copy of the game state for broadcasting
+                    # MODIFICA: Assicurati di mantenere le informazioni sulla modalità e sulle AI
+                    online_type = self.app.game_config.get("online_type")
                     self.app.network.game_state = self.env.game_state.copy()
+                    if online_type:
+                        self.app.network.game_state['online_type'] = online_type
                     
                     # Add the current player to the state
                     self.app.network.game_state['current_player'] = self.env.current_player
@@ -2135,13 +2175,26 @@ class GameScreen(BaseScreen):
                 new_state = {k: v.copy() if isinstance(v, dict) or isinstance(v, list) else v 
                             for k, v in self.app.network.game_state.items()}
                 
-                # Extract and remove current player from game state
+                # Extract special fields from game state
                 new_current_player = new_state.pop('current_player', None)
+                online_type = new_state.get('online_type')
+                ai_players = new_state.get('ai_players', [])
                 
                 # Debug output
                 print(f"Client received state:")
                 print(f"  Current player: {new_current_player}")
+                print(f"  Online type: {online_type}")
+                print(f"  AI players: {ai_players}")
                 print(f"  Table cards: {new_state.get('table', [])}")
+                
+                # NUOVO: Aggiorna la configurazione della partita con le informazioni ricevute
+                if online_type and 'online_type' not in self.app.game_config:
+                    print(f"Updating game config with online_type: {online_type}")
+                    self.app.game_config['online_type'] = online_type
+                    
+                    # Riconfigura i giocatori in base al tipo di partita
+                    self.setup_players()
+                    self.setup_layout()
                 
                 # Apply the new state to the environment
                 if self.env:
@@ -2807,8 +2860,8 @@ class GameScreen(BaseScreen):
                 base_y = hand_rect.top
             
             # Debug output
-            print(f"Drawing hand for player {player.player_id} at visual pos {visual_pos}. Cards: {len(hand)}")
-            print(f"Hand rect: {hand_rect}, Start X: {start_x}, Base Y: {base_y}")
+            #print(f"Drawing hand for player {player.player_id} at visual pos {visual_pos}. Cards: {len(hand)}")
+            #print(f"Hand rect: {hand_rect}, Start X: {start_x}, Base Y: {base_y}")
             
             for i, card in enumerate(hand):
                 # Calculate x position for this card
@@ -3340,15 +3393,17 @@ class GameScreen(BaseScreen):
             # Se è il turno del giocatore locale
             if self.current_player_id == self.local_player_id:
                 return True
-            # Se siamo in modalità team vs AI e il giocatore locale è nella stessa squadra del partner umano
-            if self.app.game_config.get("online_type") == "team_vs_ai":
-                # MODIFICA: Controlla la squadra invece degli ID specifici
-                local_team = self.players[self.local_player_id].team_id if self.local_player_id < len(self.players) else None
-                current_team = self.players[self.current_player_id].team_id if self.current_player_id < len(self.players) else None
                 
-                # I giocatori della stessa squadra possono controllare i turni l'uno dell'altro
-                if local_team is not None and local_team == current_team and local_team == 0:
-                    return True
+            # Se siamo in modalità team vs AI
+            if self.app.game_config.get("online_type") == "team_vs_ai":
+                # Verifica se siamo nella stessa squadra del giocatore corrente
+                local_player = next((p for p in self.players if p.player_id == self.local_player_id), None)
+                current_player = next((p for p in self.players if p.player_id == self.current_player_id), None)
+                
+                if local_player and current_player:
+                    # Controlla se apparteniamo alla stessa squadra (team 0) e non è un'AI
+                    return (local_player.team_id == current_player.team_id == 0 and not current_player.is_ai)
+            
             return False
         
         # Per le altre modalità
