@@ -528,12 +528,28 @@ class NetworkManager:
     
     def accept_connections(self):
         """Accept connections from other players (for host)"""
-        while len(self.clients) < 3:  # Wait for 3 more players
+        # Ottieni la configurazione
+        is_team_vs_ai = False
+        if hasattr(self, 'game_state') and self.game_state:
+            # Controlla se siamo in modalità team vs AI
+            is_team_vs_ai = self.game_state.get('online_type') == 'team_vs_ai'
+        
+        # Numero di client attesi in base alla modalità
+        expected_clients = 1 if is_team_vs_ai else 3
+        
+        while len(self.clients) < expected_clients:  # Aspetta i client necessari
             try:
                 client, addr = self.socket.accept()
-                player_id = len(self.clients) + 1  # Assign player ID (host is 0)
                 
-                # Send player ID to client
+                # Assegna player_id in base alla modalità di gioco
+                if is_team_vs_ai:
+                    # In modalità team vs AI, assegna direttamente l'ID 2 al primo client (partner umano)
+                    player_id = 2
+                else:
+                    # Nelle altre modalità, assegna ID progressivi (1, 2, 3)
+                    player_id = len(self.clients) + 1
+                
+                # Invia player ID al client
                 client.sendall(pickle.dumps({"type": "player_id", "id": player_id}))
                 
                 self.clients.append((client, player_id))
@@ -548,7 +564,7 @@ class NetworkManager:
                 self.message_queue.append(f"Player {player_id} connected")
                 
                 # If all players connected, start the game
-                if len(self.clients) == 3:
+                if len(self.clients) == expected_clients:
                     self.message_queue.append("All players connected, starting game...")
                     self.broadcast_start_game()
             except Exception as e:
@@ -1148,6 +1164,12 @@ class GameModeScreen(BaseScreen):
                     "online_type": "team_vs_ai",
                     "difficulty": self.selected_difficulty
                 }
+                
+                # NUOVO: Passa la configurazione al network manager
+                if hasattr(self.app, 'network') and self.app.network:
+                    self.app.network.game_state = {
+                        'online_type': 'team_vs_ai'
+                    }
         else:
             self.status_message = "Failed to start server"
     
@@ -1561,27 +1583,43 @@ class GameScreen(BaseScreen):
         self.players = []
         
         for player_id in range(4):
-            team_id = 0 if player_id in [0, 2] else 1
-            
-            if mode == "single_player":
-                is_human = (player_id == 0)
-                is_ai = not is_human
-                name = "You" if is_human else f"AI {player_id}"
-            elif mode == "team_vs_ai":
+            # MODIFICA: Gestisci la logica del team in base alla modalità di gioco
+            if mode == "online_multiplayer" and config.get("online_type") == "team_vs_ai":
+                # Nella modalità team vs AI online, gli ID 0 e 2 sono umani (team 0), 1 e 3 sono AI (team 1)
+                team_id = 0 if player_id in [0, 2] else 1
                 is_human = player_id in [0, 2]
-                is_ai = not is_human
-                if is_human:
-                    name = "You" if player_id == 0 else "Partner"
+                is_ai = player_id in [1, 3]
+                
+                # Imposta il nome appropriato
+                if player_id == self.local_player_id:
+                    name = "You"
+                elif player_id == 0 or player_id == 2:
+                    name = "Partner" if player_id != self.local_player_id else "You"
                 else:
                     name = f"AI {player_id}"
-            elif mode == "local_multiplayer":
-                is_human = True
-                is_ai = False
-                name = f"Player {player_id}"
-            elif mode == "online_multiplayer":
-                is_human = (player_id == self.local_player_id)
-                is_ai = False
-                name = "You" if is_human else f"Player {player_id}"
+            else:
+                # Logica originale per le altre modalità
+                team_id = 0 if player_id in [0, 2] else 1
+                
+                if mode == "single_player":
+                    is_human = (player_id == 0)
+                    is_ai = not is_human
+                    name = "You" if is_human else f"AI {player_id}"
+                elif mode == "team_vs_ai":
+                    is_human = player_id in [0, 2]
+                    is_ai = not is_human
+                    if is_human:
+                        name = "You" if player_id == 0 else "Partner"
+                    else:
+                        name = f"AI {player_id}"
+                elif mode == "local_multiplayer":
+                    is_human = True
+                    is_ai = False
+                    name = f"Player {player_id}"
+                elif mode == "online_multiplayer":
+                    is_human = (player_id == self.local_player_id)
+                    is_ai = False
+                    name = "You" if is_human else f"Player {player_id}"
             
             player = PlayerInfo(
                 player_id=player_id,
@@ -3304,9 +3342,12 @@ class GameScreen(BaseScreen):
                 return True
             # Se siamo in modalità team vs AI e il giocatore locale è nella stessa squadra del partner umano
             if self.app.game_config.get("online_type") == "team_vs_ai":
-                # In Team vs AI: il giocatore 0 è partner del giocatore 2
-                if (self.local_player_id == 0 and self.current_player_id == 2) or \
-                (self.local_player_id == 2 and self.current_player_id == 0):
+                # MODIFICA: Controlla la squadra invece degli ID specifici
+                local_team = self.players[self.local_player_id].team_id if self.local_player_id < len(self.players) else None
+                current_team = self.players[self.current_player_id].team_id if self.current_player_id < len(self.players) else None
+                
+                # I giocatori della stessa squadra possono controllare i turni l'uno dell'altro
+                if local_team is not None and local_team == current_team and local_team == 0:
                     return True
             return False
         
