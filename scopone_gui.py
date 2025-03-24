@@ -1672,6 +1672,17 @@ class GameScreen(BaseScreen):
             print("Warning: local_player_id is None, using default perspective mapping")
             return  # Keep default mapping until player ID is assigned
         
+        # NUOVO: Special case for player ID 1 client in team vs AI mode
+        if (self.app.game_config.get("mode") == "online_multiplayer" and 
+            self.app.game_config.get("online_type") == "team_vs_ai" and 
+            not self.app.game_config.get("is_host", False) and self.local_player_id == 1):
+            print("Forced perspective for player ID 1 client")
+            # Put player ID 1 at visual position 0 (bottom)
+            self.visual_positions = [3, 0, 1, 2]  # Maps logical_player_id -> visual_position
+            print(f"Visual positions mapping: {self.visual_positions}")
+            print(f"Local player {self.local_player_id} is at visual position {self.visual_positions[self.local_player_id]}")
+            return
+        
         # Calculate the rotation needed based on local player ID
         # If player is player_id 0: no change
         # If player is player_id 1: rotate 90 degrees counterclockwise (player sees themselves at bottom)
@@ -3576,14 +3587,20 @@ class GameScreen(BaseScreen):
         # FIX CRITICO: Se siamo in modalità team vs AI online e siamo client con ID 1
         # dobbiamo correggerlo per renderlo parte del team 0
         if mode == "online_multiplayer" and self.app.game_config.get("online_type") == "team_vs_ai":
-            if self.local_player_id == 1:  # Se siamo il client con ID sbagliato
+            if not self.app.game_config.get("is_host", False) and self.local_player_id == 1:  # Se siamo il client con ID sbagliato
                 print("Correzione speciale per il client con ID 1 in team vs AI")
                 # Forza il giocatore a essere nel team 0 come partner
                 for player in self.players:
                     if player.player_id == 1:
                         player.team_id = 0
                         player.is_ai = False
+                        player.name = "You"
                         print(f"Corretto player {player.player_id} - ora Team {player.team_id}, AI: {player.is_ai}")
+                
+                # NUOVO: Se è il turno del giocatore 1, e siamo il giocatore 1, allora è il nostro turno
+                if self.current_player_id == 1:
+                    print("È il turno del giocatore locale (ID 1)")
+                    return True
         
         # Per le modalità online
         if mode == "online_multiplayer":
