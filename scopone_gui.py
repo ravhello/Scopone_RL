@@ -224,9 +224,10 @@ class Button:
         return self.rect.collidepoint(pos)
 
 class CardAnimation:
-    """Class for card movement animations"""
+    """Class for card movement animations with phase tracking"""
     def __init__(self, card, start_pos, end_pos, duration, delay=0, 
-                 scale_start=1.0, scale_end=1.0, rotation_start=0, rotation_end=0):
+                 scale_start=1.0, scale_end=1.0, rotation_start=0, rotation_end=0,
+                 animation_type="play"):
         self.card = card
         self.start_pos = start_pos
         self.end_pos = end_pos
@@ -236,6 +237,7 @@ class CardAnimation:
         self.scale_end = scale_end
         self.rotation_start = rotation_start
         self.rotation_end = rotation_end
+        self.animation_type = animation_type  # "play" per carta giocata, "capture" per cattura
         
         self.current_frame = -delay
         self.done = False
@@ -330,24 +332,37 @@ class ResourceManager:
         self.original_card_images = {}
         self.original_card_backs = {}
         
-        # Load card backs first (one for each team)
+        # Try to load retro.jpg first
         try:
-            back_blue = pygame.image.load(os.path.join(folder, "card_back_blue.jpg"))
-            back_red = pygame.image.load(os.path.join(folder, "card_back_red.jpg"))
-            self.original_card_backs[0] = back_blue
-            self.original_card_backs[1] = back_red
-            self.card_backs[0] = pygame.transform.scale(back_blue, (CARD_WIDTH, CARD_HEIGHT))
-            self.card_backs[1] = pygame.transform.scale(back_red, (CARD_WIDTH, CARD_HEIGHT))
-        except:
-            # Create default card backs if images not found
-            back_blue = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
-            back_blue.fill(LIGHT_BLUE)
-            back_red = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
-            back_red.fill(HIGHLIGHT_RED)
-            self.original_card_backs[0] = back_blue
-            self.original_card_backs[1] = back_red
-            self.card_backs[0] = back_blue
-            self.card_backs[1] = back_red
+            retro = pygame.image.load(os.path.join(folder, "retro.jpg"))
+            # Use the same retro for both teams
+            self.original_card_backs[0] = retro
+            self.original_card_backs[1] = retro
+            self.card_backs[0] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
+            self.card_backs[1] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
+            print("Caricato retro.jpg per dorso carte")
+        except Exception as e:
+            print(f"Errore caricamento retro.jpg: {e}")
+            # If retro.jpg not found, try team-specific backs
+            try:
+                back_blue = pygame.image.load(os.path.join(folder, "card_back_blue.jpg"))
+                back_red = pygame.image.load(os.path.join(folder, "card_back_red.jpg"))
+                self.original_card_backs[0] = back_blue
+                self.original_card_backs[1] = back_red
+                self.card_backs[0] = pygame.transform.scale(back_blue, (CARD_WIDTH, CARD_HEIGHT))
+                self.card_backs[1] = pygame.transform.scale(back_red, (CARD_WIDTH, CARD_HEIGHT))
+                print("Caricati card_back_blue.jpg e card_back_red.jpg per dorso carte")
+            except:
+                # Create default card backs if images not found
+                back_blue = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
+                back_blue.fill(LIGHT_BLUE)
+                back_red = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
+                back_red.fill(HIGHLIGHT_RED)
+                self.original_card_backs[0] = back_blue
+                self.original_card_backs[1] = back_red
+                self.card_backs[0] = back_blue
+                self.card_backs[1] = back_red
+                print("Creati dorsi default per le carte")
         
         # Load all card images
         for r in possible_ranks:
@@ -480,6 +495,8 @@ class NetworkManager:
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         self.public_ip = None
+        self.connection_in_progress = False  # Add this line to track connection attempts
+        self.connection_start_time = 0  # Add this line to track when connection started
         
     def start_server(self):
         """Initialize server socket for host player with improved robustness"""
@@ -505,25 +522,52 @@ class NetworkManager:
     def connect_to_server(self):
         """Connect to the host server as a client with improved connection handling"""
         self.reconnect_attempts = 0
-        while self.reconnect_attempts < self.max_reconnect_attempts:
+        self.connection_start_time = time.time()  # Track when we started connecting
+        self.connection_in_progress = True
+        
+        # Start connection in a separate thread
+        threading.Thread(target=self._connect_async, daemon=True).start()
+        return True  # Return immediately - connection status will be updated asynchronously
+    
+    def _connect_async(self):
+        """Perform connection attempts in a background thread"""
+        while self.reconnect_attempts < self.max_reconnect_attempts and self.connection_in_progress:
             try:
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Impostiamo un timeout per la connessione
-                self.socket.settimeout(10)
+                # Set a shorter timeout for faster failure detection
+                self.socket.settimeout(2)
                 self.socket.connect((self.host, self.port))
-                self.socket.settimeout(None)  # Reset timeout dopo la connessione
+                self.socket.settimeout(None)  # Reset timeout after connection
                 self.connected = True
+                
+                # Add a success message to the queue
+                self.message_queue.append(f"Connected to {self.host}")
                 
                 # Start thread to receive game state updates
                 threading.Thread(target=self.receive_updates, daemon=True).start()
-                return True
+                self.connection_in_progress = False
+                return
             except Exception as e:
                 self.reconnect_attempts += 1
-                print(f"Tentativo {self.reconnect_attempts}/{self.max_reconnect_attempts} fallito: {e}")
-                if self.reconnect_attempts < self.max_reconnect_attempts:
-                    time.sleep(2)  # Attendi prima di riprovare
+                self.message_queue.append(f"Connection attempt {self.reconnect_attempts} failed")
+                print(f"Attempt {self.reconnect_attempts}/{self.max_reconnect_attempts} failed: {e}")
+                
+                # Sleep briefly before retrying
+                time.sleep(1)
         
-        print("Impossibile connettersi al server dopo multipli tentativi")
+        # Connection failed after all attempts
+        self.connection_in_progress = False
+        self.message_queue.append(f"Failed to connect to {self.host} after {self.reconnect_attempts} attempts")
+        print(f"Could not connect to server after {self.max_reconnect_attempts} attempts")
+
+    def check_connection_timeout(self, timeout_seconds=5):
+        """Check if the connection attempt has timed out"""
+        if self.connection_in_progress:
+            elapsed = time.time() - self.connection_start_time
+            if elapsed > timeout_seconds:
+                self.connection_in_progress = False
+                self.message_queue.append(f"Connection attempt timed out after {int(elapsed)} seconds")
+                return True
         return False
     
     def accept_connections(self):
@@ -868,6 +912,7 @@ class GameModeScreen(BaseScreen):
         self.ip_input_rect = pygame.Rect(center_x - 225,  # Centered based on new width
                                     button_start_y + 6 * (button_height + button_spacing), 
                                     450, 40)  # Wider input field
+        self.join_button = None
         
         # Status message
         self.status_message = ""
@@ -926,12 +971,6 @@ class GameModeScreen(BaseScreen):
                 button_width, button_height,
                 "Host Online Game",
                 DARK_BLUE, WHITE, font_size=int(height * 0.03)),
-                
-            Button(center_x - button_width // 2, 
-                button_start_y + 4 * (button_height + button_spacing), 
-                button_width, button_height,
-                "Join Online Game",
-                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
         ]
         
         # Difficulty selection buttons
@@ -939,21 +978,38 @@ class GameModeScreen(BaseScreen):
         diff_button_height = int(height * 0.05)
         
         self.difficulty_buttons = [
-            Button(center_x - int(width * 0.25), button_start_y + 5 * (button_height + button_spacing), 
+            Button(center_x - int(width * 0.25), button_start_y + 4 * (button_height + button_spacing), 
                 diff_button_width, diff_button_height, "Easy", DARK_GREEN, WHITE, 
                 font_size=int(height * 0.025)),
-            Button(center_x - diff_button_width//2, button_start_y + 5 * (button_height + button_spacing), 
+            Button(center_x - diff_button_width//2, button_start_y + 4 * (button_height + button_spacing), 
                 diff_button_width, diff_button_height, "Medium", DARK_BLUE, WHITE, 
                 font_size=int(height * 0.025)),
-            Button(center_x + int(width * 0.1), button_start_y + 5 * (button_height + button_spacing), 
+            Button(center_x + int(width * 0.1), button_start_y + 4 * (button_height + button_spacing), 
                 diff_button_width, diff_button_height, "Hard", HIGHLIGHT_RED, WHITE, 
                 font_size=int(height * 0.025)),
         ]
         
         # IP input for joining online games
-        self.ip_input_rect = pygame.Rect(center_x - int(width * 0.225),  # Centered based on new width
-                                    button_start_y + 6 * (button_height + button_spacing),
-                                    int(width * 0.45), int(height * 0.05))  # Wider input field
+        self.ip_input_rect = pygame.Rect(
+            center_x - int(width * 0.225),
+            button_start_y + 5 * (button_height + button_spacing),  # Change from 6 to 5
+            int(width * 0.3),  # Already set to correct width
+            int(height * 0.05)
+        )
+
+        # Add join button next to the IP input field
+        join_button_width = int(width * 0.15)
+        join_button_height = int(height * 0.05)
+        self.join_button = Button(
+            self.ip_input_rect.right + int(width * 0.02),
+            self.ip_input_rect.top,
+            join_button_width,
+            join_button_height,
+            "Join Game",
+            DARK_BLUE,
+            WHITE,
+            font_size=int(height * 0.025)
+        )
         
         # NUOVA PARTE PER EVITARE SOVRAPPOSIZIONI
         # Raccogliamo tutti gli elementi UI
@@ -1061,6 +1117,10 @@ class GameModeScreen(BaseScreen):
                 for i, button in enumerate(self.difficulty_buttons):
                     if button.is_clicked(pos):
                         self.selected_difficulty = i
+                        
+                # Check if join button is clicked
+                if hasattr(self, 'join_button') and self.join_button and self.join_button.is_clicked(pos):
+                    self.join_online_game()
             
             elif event.type == pygame.KEYDOWN and self.ip_input_active:
                 if event.key == pygame.K_RETURN:
@@ -1126,9 +1186,9 @@ class GameModeScreen(BaseScreen):
             if self.ip_input:
                 self.join_online_game()
             else:
-                self.status_message = "Please enter an IP address"
-                # Make the IP input active to focus it after showing the error
+                # Instead of setting a status message, just activate the input
                 self.ip_input_active = True
+                # No status message is needed
     
     def host_online_game(self):
         """Host an online game with internet support"""
@@ -1188,20 +1248,16 @@ class GameModeScreen(BaseScreen):
                     }
     
     def join_online_game(self):
-        """Join an online game"""
+        """Join an online game with timeout handling"""
+        # Use localhost if no IP entered
         host = self.ip_input if self.ip_input else "localhost"
         self.app.network = NetworkManager(is_host=False, host=host)
         
-        if self.app.network.connect_to_server():
-            self.done = True
-            self.next_screen = "game"
-            self.app.game_config = {
-                "mode": "online_multiplayer",
-                "is_host": False,
-                "player_id": None  # Will be set by server
-            }
-        else:
-            self.status_message = f"Failed to connect to {host}"
+        # Start connection attempt
+        self.app.network.connect_to_server()
+        
+        # Show status message
+        self.status_message = f"Connecting to {host}..."
     
     def draw(self, surface):
         # Draw background
@@ -1322,30 +1378,35 @@ class GameModeScreen(BaseScreen):
                 pygame.draw.rect(surface, GOLD, button.rect.inflate(6, 6), 3, border_radius=8)
             button.draw(surface)
         
-        # Draw IP input box
+        # Draw IP input box with appropriate colors
         ip_color = LIGHT_BLUE if self.ip_input_active else DARK_BLUE
         pygame.draw.rect(surface, ip_color, self.ip_input_rect, border_radius=5)
         pygame.draw.rect(surface, WHITE, self.ip_input_rect, 2, border_radius=5)
 
-        # Draw IP input text - MODIFIED PART
-        if self.status_message and "Please enter an IP address" in self.status_message:
-            # When there's an error about IP address, show nothing in the input box
-            ip_text = ""
-            # We'll let the red status message communicate the error
+        # Draw IP input text with contextual placeholder
+        if not self.ip_input and self.status_message and "Please enter an IP address" in self.status_message:
+            # Show error directly in the input field with error color
+            ip_text = "Please enter an IP address"
+            text_color = HIGHLIGHT_RED
         else:
-            # Normal display behavior
+            # Normal behavior (show IP or placeholder)
             ip_text = self.ip_input if self.ip_input else "Enter IP to join"
+            text_color = WHITE
 
-        ip_surf = self.info_font.render(ip_text, True, WHITE)
+        ip_surf = self.info_font.render(ip_text, True, text_color)
         ip_rect = ip_surf.get_rect(center=self.ip_input_rect.center)
         surface.blit(ip_surf, ip_rect)
-        
+
+        # Draw join button (ADD THIS CODE)
+        if hasattr(self, 'join_button') and self.join_button:
+            self.join_button.draw(surface)
+
         # Aggiungi istruzioni per il gioco online nella schermata di join
         if self.ip_input_active:
             help_text = [
                 "Per giocare su internet:", 
                 "1. L'host deve configurare port forwarding sul router (porta 5555)",
-                "2. Inserisci l'IP pubblico dell'host (non l'IP locale)",
+                "2. Inserisci l'IP pubblico dell'host (o l'IP locale se sei sulla stessa rete)",
                 "3. Assicurati che non ci siano firewall che bloccano la porta 5555"
             ]
             
@@ -1357,7 +1418,7 @@ class GameModeScreen(BaseScreen):
                 help_y += 20
         
         # Draw status message if any
-        if self.status_message:
+        if self.status_message and "Please enter an IP address" not in self.status_message:
             status_surf = self.info_font.render(self.status_message, True, HIGHLIGHT_RED)
             status_rect = status_surf.get_rect(center=(center_x, height - height * 0.07))
             surface.blit(status_surf, status_rect)
@@ -1420,7 +1481,26 @@ class GameModeScreen(BaseScreen):
         
         
     def update(self):
-        """Update screen state"""
+        """Update screen state with connection timeout handling"""
+        # Check for network connection timeout
+        if hasattr(self.app, 'network') and self.app.network and self.app.network.connection_in_progress:
+            # Show connecting message with dots animation
+            dots = "." * ((pygame.time.get_ticks() // 500) % 4)
+            self.status_message = f"Connecting to {self.app.network.host}{dots}"
+            
+            # Check if connection succeeded or timed out
+            if self.app.network.connected:
+                self.done = True
+                self.next_screen = "game"
+                self.app.game_config = {
+                    "mode": "online_multiplayer",
+                    "is_host": False,
+                    "player_id": None  # Will be set by server
+                }
+            elif self.app.network.check_connection_timeout(5):  # 5-second timeout
+                self.status_message = f"Failed to connect to {self.app.network.host}"
+        
+        # Original update code continues here...
         if self.loading:
             # Se siamo in stato di caricamento, aggiorna l'animazione
             current_time = pygame.time.get_ticks()
@@ -1505,6 +1585,32 @@ class GameScreen(BaseScreen):
         
         # Game over button (for click detection)
         self.game_over_button_rect = None
+        
+        # Add connection loss tracking variables
+        self.connection_lost = False
+        self.reconnect_start_time = 0
+        self.exit_button = None
+        self.reconnection_attempts = 0
+        self.max_reconnection_time = 60  # 60 seconds (1 minute) timeout
+        
+    def create_exit_button(self):
+        """Create a prominent exit button when connection is lost"""
+        width = self.app.window_width
+        height = self.app.window_height
+        
+        button_width = int(width * 0.2)
+        button_height = int(height * 0.06)
+        
+        self.exit_button = Button(
+            width // 2 - button_width // 2,
+            height * 0.1,
+            button_width,
+            button_height,
+            "Exit Game",
+            HIGHLIGHT_RED,
+            WHITE,
+            font_size=int(height * 0.03)
+        )
     
     def enter(self):
         super().enter()
@@ -1888,13 +1994,22 @@ class GameScreen(BaseScreen):
                 player.set_hand([])
     
     def handle_events(self, events):
-        """Handle pygame events with improved card selection logic"""
+        """Handle pygame events with connection loss recovery"""
         for event in events:
             if event.type == pygame.QUIT:
                 self.done = True
                 self.next_screen = None
                 pygame.quit()
                 sys.exit()
+            
+            # Check exit button when connection is lost
+            if self.connection_lost and self.exit_button:
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    pos = pygame.mouse.get_pos()
+                    if self.exit_button.is_clicked(pos):
+                        self.done = True
+                        self.next_screen = "mode"
+                        return
             
             # Always check for the "New Game" button
             if event.type == pygame.MOUSEBUTTONDOWN:
@@ -1962,7 +2077,7 @@ class GameScreen(BaseScreen):
                         self.message_scroll_offset += 1
     
     def update(self):
-        """Update game state with improvements for online play"""
+        """Update game state with improved animation handling"""
         # Update player hands from game state
         self.update_player_hands()
         
@@ -1971,83 +2086,175 @@ class GameScreen(BaseScreen):
             self.current_player_id = self.env.current_player
         
         # Update animations
-        self.update_animations()
+        active_animations = self.update_animations()
         
-        # Aggiorna local_player_id dal network se necessario
-        if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host"):
-            if self.app.network and self.app.network.player_id is not None:
-                old_player_id = self.local_player_id
-                if self.local_player_id != self.app.network.player_id:
-                    print(f"Aggiornamento player_id: da {self.local_player_id} a {self.app.network.player_id}")
-                    self.local_player_id = self.app.network.player_id
-                    
-                    # Aggiorna i giocatori in caso di cambio ID
-                    if old_player_id != self.local_player_id:
-                        # Riaggiorna player info, prospettiva e layout
-                        self.setup_players()
-                        self.setup_player_perspective()
-                        self.setup_layout()
-        
-        # Handle AI turns (solo il server lo fa in modalità online)
-        self.handle_ai_turns()
-        
-        # Handle network updates
-        self.handle_network_updates()
-        
-        # Check for game over
-        if self.env and not self.game_over:
-            self.check_game_over()
-        
-        # Gestione dello stato del server in modalità online
-        if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
-            online_type = self.app.game_config.get("online_type", "all_human")
-            ip_address = get_local_ip()
+        # NUOVO: gestione delle fasi di animazione
+        if hasattr(self, 'waiting_for_animation') and self.waiting_for_animation:
+            # Controlliamo se l'animazione della carta giocata è completata
+            played_card_animation_done = True
+            for anim in self.animations:
+                # Se ci sono ancora animazioni della prima fase (carta giocata che va sul tavolo)
+                # con delay = 0, allora la prima fase non è terminata
+                if anim.delay == 0 and not anim.done:
+                    played_card_animation_done = False
+                    break
             
-            if online_type == "all_human":
-                # In modalità "All Human" serve aspettare 3 giocatori umani
-                needed_players = 3
-                if self.app.network and len(self.app.network.clients) < needed_players:
-                    # Aggiorna il messaggio con il numero di giocatori connessi
-                    connected_count = len(self.app.network.clients)
-                    self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+            if played_card_animation_done:
+                # La carta giocata ha raggiunto il tavolo, ora possiamo aggiornare lo stato del gioco
+                if hasattr(self, 'pending_action') and self.pending_action is not None:
+                    print("Animazione carta giocata completata, ora aggiorno lo stato del gioco")
                     
-                    # In attesa di altri giocatori, blocca il gioco finché non si connettono tutti
-                    self.waiting_for_other_player = True
-                elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
-                    # Tutti i giocatori sono connessi, sblocca il gioco
-                    self.waiting_for_other_player = False
-                    self.status_message = "Tutti i giocatori sono connessi. Inizia il gioco!"
-            
-            elif online_type == "team_vs_ai":
-                # In modalità "Team vs AI" serve aspettare solo 1 giocatore umano
-                needed_players = 1
-                if self.app.network and len(self.app.network.clients) < needed_players:
-                    # Aggiorna il messaggio con il numero di giocatori connessi
-                    connected_count = len(self.app.network.clients)
-                    self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+                    # Esegui la mossa sull'ambiente
+                    _, _, done, info = self.env.step(self.pending_action)
                     
-                    # In attesa di altri giocatori, blocca il gioco finché non si connettono tutti
-                    self.waiting_for_other_player = True
-                elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
-                    # Configura i giocatori AI per la squadra avversaria (giocatori 1 e 3)
-                    self.setup_team_vs_ai_online()
-                    # Sblocca il gioco
-                    self.waiting_for_other_player = False
-                    self.status_message = "Partner connesso. Inizia il gioco!"
+                    # IMPORTANTE: Dopo l'aggiornamento dello stato, resettiamo le carte nascoste visivamente
+                    # poiché ora sono state effettivamente rimosse dallo stato del gioco
+                    if hasattr(self, 'visually_hidden_cards'):
+                        self.visually_hidden_cards = {}
                     
-                    # NUOVO: Trasmette immediatamente lo stato al client per sincronizzare le informazioni
-                    if self.app.network:
-                        self.app.network.game_state = self.env.game_state.copy()
-                        self.app.network.game_state['online_type'] = 'team_vs_ai'
-                        self.app.network.game_state['ai_players'] = [1, 3]
-                        self.app.network.game_state['current_player'] = self.env.current_player
-                        self.app.network.broadcast_game_state()
+                    # Se il gioco è finito, imposta lo stato finale
+                    if done:
+                        self.game_over = True
+                        if "score_breakdown" in info:
+                            self.final_breakdown = info["score_breakdown"]
+                    
+                    # Reset degli stati di animazione
+                    self.waiting_for_animation = False
+                    self.pending_action = None
+                    
+                    # Aggiorna lo stato del gioco per la modalità online (se necessario)
+                    if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
+                        if hasattr(self.app, 'network') and self.app.network:
+                            online_type = self.app.game_config.get("online_type")
+                            self.app.network.game_state = self.env.game_state.copy()
+                            if online_type:
+                                self.app.network.game_state['online_type'] = online_type
+                                if online_type == "team_vs_ai":
+                                    self.app.network.game_state['ai_players'] = [1, 3]
+                            
+                            self.app.network.game_state['current_player'] = self.env.current_player
+                            self.app.network.broadcast_game_state()
         
-        # Process messages from network
-        if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network:
-            while self.app.network.message_queue:
-                message = self.app.network.message_queue.popleft()
-                self.messages.append(message)
+        # Check for connection loss in online mode
+        if (self.app.game_config.get("mode") == "online_multiplayer" and 
+                self.app.network and not self.app.network.connected):
+            
+            # If connection was just lost
+            if not self.connection_lost:
+                self.connection_lost = True
+                self.reconnect_start_time = time.time()
+                self.create_exit_button()
+                self.status_message = "Connection to host lost. Attempting to reconnect..."
+                self.reconnection_attempts = 0
+                self.app.resources.play_sound("card_pickup")  # Alert sound
+            
+            # Check if we should attempt reconnection
+            current_time = time.time()
+            elapsed = current_time - self.reconnect_start_time
+            
+            # Try to reconnect every 5 seconds
+            if elapsed > self.reconnection_attempts * 5 and not self.app.network.connection_in_progress:
+                self.reconnection_attempts += 1
+                # Start async reconnection attempt
+                self.app.network.connection_in_progress = True
+                self.app.network.connection_start_time = time.time()
+                threading.Thread(target=self.app.network._connect_async, daemon=True).start()
+            
+            # If reconnection successful
+            if self.app.network.connected:
+                self.connection_lost = False
+                self.status_message = "Reconnected to host!"
+                self.exit_button = None
+                # Request fresh game state
+                if self.app.network.is_host:
+                    self.app.network.broadcast_game_state()
+            
+            # If timeout reached (1 minute)
+            elif elapsed > self.max_reconnection_time:
+                self.status_message = "Connection timeout. Returning to main menu..."
+                # Exit after a short delay
+                pygame.time.delay(2000)
+                self.done = True
+                self.next_screen = "mode"
+        
+        # Continue with regular updates if connection is fine
+        if not self.connection_lost:
+        
+            # Aggiorna local_player_id dal network se necessario
+            if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host"):
+                if self.app.network and self.app.network.player_id is not None:
+                    old_player_id = self.local_player_id
+                    if self.local_player_id != self.app.network.player_id:
+                        print(f"Aggiornamento player_id: da {self.local_player_id} a {self.app.network.player_id}")
+                        self.local_player_id = self.app.network.player_id
+                        
+                        # Aggiorna i giocatori in caso di cambio ID
+                        if old_player_id != self.local_player_id:
+                            # Riaggiorna player info, prospettiva e layout
+                            self.setup_players()
+                            self.setup_player_perspective()
+                            self.setup_layout()
+            
+            # Handle AI turns (solo il server lo fa in modalità online)
+            self.handle_ai_turns()
+            
+            # Handle network updates
+            self.handle_network_updates()
+            
+            # Check for game over
+            if self.env and not self.game_over:
+                self.check_game_over()
+            
+            # Gestione dello stato del server in modalità online
+            if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
+                online_type = self.app.game_config.get("online_type", "all_human")
+                ip_address = get_local_ip()
+                
+                if online_type == "all_human":
+                    # In modalità "All Human" serve aspettare 3 giocatori umani
+                    needed_players = 3
+                    if self.app.network and len(self.app.network.clients) < needed_players:
+                        # Aggiorna il messaggio con il numero di giocatori connessi
+                        connected_count = len(self.app.network.clients)
+                        self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+                        
+                        # In attesa di altri giocatori, blocca il gioco finché non si connettono tutti
+                        self.waiting_for_other_player = True
+                    elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
+                        # Tutti i giocatori sono connessi, sblocca il gioco
+                        self.waiting_for_other_player = False
+                        self.status_message = "Tutti i giocatori sono connessi. Inizia il gioco!"
+                
+                elif online_type == "team_vs_ai":
+                    # In modalità "Team vs AI" serve aspettare solo 1 giocatore umano
+                    needed_players = 1
+                    if self.app.network and len(self.app.network.clients) < needed_players:
+                        # Aggiorna il messaggio con il numero di giocatori connessi
+                        connected_count = len(self.app.network.clients)
+                        self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+                        
+                        # In attesa di altri giocatori, blocca il gioco finché non si connettono tutti
+                        self.waiting_for_other_player = True
+                    elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
+                        # Configura i giocatori AI per la squadra avversaria (giocatori 1 e 3)
+                        self.setup_team_vs_ai_online()
+                        # Sblocca il gioco
+                        self.waiting_for_other_player = False
+                        self.status_message = "Partner connesso. Inizia il gioco!"
+                        
+                        # NUOVO: Trasmette immediatamente lo stato al client per sincronizzare le informazioni
+                        if self.app.network:
+                            self.app.network.game_state = self.env.game_state.copy()
+                            self.app.network.game_state['online_type'] = 'team_vs_ai'
+                            self.app.network.game_state['ai_players'] = [1, 3]
+                            self.app.network.game_state['current_player'] = self.env.current_player
+                            self.app.network.broadcast_game_state()
+            
+            # Process messages from network
+            if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network:
+                while self.app.network.message_queue:
+                    message = self.app.network.message_queue.popleft()
+                    self.messages.append(message)
                     
     def setup_team_vs_ai_online(self):
         """Configurazione robusta dei giocatori per la modalità Team vs AI online"""
@@ -2113,11 +2320,17 @@ class GameScreen(BaseScreen):
             print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
     
     def update_animations(self):
-        """Update and clean up animations"""
+        """Update and clean up animations, return True if animations are active"""
+        active_animations = False
+        
         # Update existing animations
         for anim in self.animations[:]:
             if anim.update():
                 self.animations.remove(anim)
+            else:
+                active_animations = True
+        
+        return active_animations
     
     def handle_ai_turns(self):
         """Handle turns for AI-controlled players"""
@@ -2322,7 +2535,6 @@ class GameScreen(BaseScreen):
                     # CRITICAL: Update player hands after applying the state
                     self.update_player_hands()
 
-    # Update detect_and_animate_changes to handle more cases
     def detect_and_animate_changes(self, old_state, new_state, old_current_player=None):
         """Improved change detection for more reliable animations"""
         # Skip if states are invalid
@@ -2350,10 +2562,14 @@ class GameScreen(BaseScreen):
                 return
         
         # If no explicit move info was provided, try to detect the move
-        # Find the likely player who made the move (previous turn)
-        likely_player = old_current_player if old_current_player is not None else self.current_player_id
+        # Find cards that disappeared from the table (likely captured)
+        captured_cards = []
+        for card in old_table:
+            if card not in new_table:
+                captured_cards.append(card)
+                print(f"Card {card} was likely captured from the table")
         
-        # Find played card - card that moved from a hand to the table
+        # Find the card that was played (appeared on table or disappeared from hand)
         played_card = None
         player_id = None
         
@@ -2372,66 +2588,47 @@ class GameScreen(BaseScreen):
             for card in old_hand:
                 if card not in new_hand:
                     print(f"Card {card} removed from player {p_id}'s hand")
-                    # Check if this card appeared on the table
-                    if any(card == table_card for table_card in new_table) and not any(card == table_card for table_card in old_table):
+                    
+                    # This is likely the played card
+                    if not played_card:
                         played_card = card
                         player_id = p_id
-                        print(f"Card {card} was played to the table by player {p_id}")
-                        break
+                        print(f"Card {card} was likely played by player {p_id}")
         
-        # Find captured cards - cards that were on the old table but not on the new table
-        captured_cards = []
-        for card in old_table:
-            if not any(card == table_card for table_card in new_table):
-                captured_cards.append(card)
-                print(f"Card {card} was captured from the table")
-        
-        # New cards that appeared on the table
-        new_cards = []
-        for card in new_table:
-            if not any(card == table_card for table_card in old_table):
-                new_cards.append(card)
-                print(f"New card {card} appeared on the table")
-        
-        # Scenario 1: If we found both a played card and captures
+        # If we found a played card and player, create animations
         if played_card and player_id is not None:
-            print(f"Detected play + capture: Player {player_id} played {played_card} and captured {captured_cards}")
+            print(f"Creating animations for detected play: Player {player_id} played {played_card} and captured {captured_cards}")
             self.create_move_animations(played_card, captured_cards, player_id)
             self.app.resources.play_sound("card_play")
-        
-        # Scenario 2: Only captures detected (played card might be missed)
-        elif captured_cards and not played_card:
-            print(f"Detected only captures: {captured_cards}")
-            # Use the most likely player who made the move
-            self.animate_captures_only(captured_cards, likely_player)
-            self.app.resources.play_sound("card_play")
-        
-        # Scenario 3: Only new cards detected (no captures)
-        elif new_cards and not captured_cards:
-            print(f"Detected only new cards: {new_cards}")
-            # Animate each new card appearing
-            for card in new_cards:
-                self.animate_card_appearance(card)
-        
-        # When nothing specific is detected, but we know there was a change
-        elif old_table != new_table:
-            print("Table changed, but could not determine specific changes")
-            # Force a refresh animation
-            self.animate_table_refresh(new_table)
-        
-        # NEW: When table was empty and still is, but the player changed
-        elif not old_table and not new_table and old_current_player != self.current_player_id:
-            print(f"Turn changed from player {old_current_player} to {self.current_player_id} with empty table")
-            # No specific animation needed for turn change
+        # If only captures detected, animate them
+        elif captured_cards:
+            # Use most likely player (previous turn player)
+            likely_player = old_current_player if old_current_player is not None else self.current_player_id
             
-            # CRITICAL: notify the player if it's their turn now
-            if self.current_player_id == self.local_player_id:
-                self.status_message = "It's your turn!"
-                self.app.resources.play_sound("card_pickup")
-                # Reset selections when it becomes the player's turn
-                self.selected_hand_card = None
-                self.selected_table_cards.clear()
-
+            # Find cards that suddenly appeared on the table (likely the played card)
+            new_cards = [card for card in new_table if card not in old_table]
+            played_card = new_cards[0] if new_cards else None
+            
+            if played_card:
+                print(f"Creating animations for partial detection: Player {likely_player} played {played_card} and captured {captured_cards}")
+                self.create_move_animations(played_card, captured_cards, likely_player)
+            else:
+                print(f"Creating animations for captures only: {captured_cards}")
+                self.animate_captures_only(captured_cards, likely_player)
+            
+            self.app.resources.play_sound("card_play")
+        # If only new cards on table, animate their appearance
+        elif old_table != new_table:
+            new_cards = [card for card in new_table if card not in old_table]
+            if new_cards:
+                print(f"Animating appearance of new cards: {new_cards}")
+                for card in new_cards:
+                    self.animate_card_appearance(card)
+                self.app.resources.play_sound("card_play")
+            else:
+                print("Table changed, but could not determine specific changes")
+                self.animate_table_refresh(new_table)
+            
     # Add a method to animate table refresh for when specific changes can't be determined
     def animate_table_refresh(self, table_cards):
         """Animate a refresh of all table cards to ensure they're visible"""
@@ -2468,7 +2665,7 @@ class GameScreen(BaseScreen):
         """Animate cards being captured without showing a played card"""
         if not captured_cards:
             return
-            
+                
         player = self.players[player_id]
         team_id = player.team_id
         
@@ -2480,19 +2677,53 @@ class GameScreen(BaseScreen):
         card_width = int(width * 0.078)
         table_center = self.table_rect.center
         
+        # Get current table
+        table_cards = self.env.game_state["table"] if self.env else []
+        
+        # Create a complete list of cards to determine positions
+        all_table_cards = table_cards.copy()
+        # Add captured cards to the list if they're not already there
         for card in captured_cards:
-            # Start from table center
+            if card not in all_table_cards:
+                all_table_cards.append(card)
+        
+        # Calculate layout for all cards
+        max_spacing = self.table_rect.width * 0.8 / max(len(all_table_cards), 1)
+        card_spacing = min(card_width * 1.1, max_spacing)
+        start_x = self.table_rect.centerx - (len(all_table_cards) * card_spacing) // 2
+        table_y = self.table_rect.centery - CARD_HEIGHT // 2
+        
+        # Animate each captured card with staggered timing
+        for i, card in enumerate(captured_cards):
+            # Try to find the correct starting position
+            try:
+                # Find card position in all_table_cards
+                card_index = all_table_cards.index(card)
+                card_x = start_x + card_index * card_spacing
+                start_pos = (card_x + CARD_WIDTH // 2, table_y + CARD_HEIGHT // 2)
+            except ValueError:
+                # Fallback to table center if card not found
+                start_pos = table_center
+            
+            # Add slight variation to end position
+            end_x = pile_pos[0] + random.randint(-5, 5)
+            end_y = pile_pos[1] + random.randint(-5, 5)
+            varied_end_pos = (end_x, end_y)
+            
+            # Create animation with staggered delay
             capture_anim = CardAnimation(
                 card=card,
-                start_pos=table_center,
-                end_pos=pile_pos,
+                start_pos=start_pos,
+                end_pos=varied_end_pos,
                 duration=25,
+                delay=i * 5,  # Staggered delay
                 scale_start=1.0,
                 scale_end=0.8,
                 rotation_start=0,
-                rotation_end=0
+                rotation_end=random.randint(-10, 10)  # Slight random rotation
             )
             self.animations.append(capture_anim)
+            print(f"Created capture-only animation for card {card}")
 
     def animate_card_appearance(self, card):
         """Animate a card appearing on the table"""
@@ -2640,7 +2871,7 @@ class GameScreen(BaseScreen):
             return None
     
     def try_make_move(self):
-        """Try to make a move with the selected cards"""
+        """Try to make a move with the selected cards with improved handling"""
         # Debug: mostra informazioni sulla mossa
         print(f"Tentativo di mossa - giocatore corrente: {self.current_player_id}, controllabile: {self.is_current_player_controllable()}")
         print(f"Carta selezionata: {self.selected_hand_card}, carte tavolo: {self.selected_table_cards}")
@@ -2654,21 +2885,11 @@ class GameScreen(BaseScreen):
             self.status_message = "Select a card from your hand first"
             return False
         
-        # NUOVO: Debug per verificare le mani dei giocatori
-        print(f"Mani dei giocatori: {self.env.game_state.get('hands', {}).keys()}")
-        print(f"Mano locale: {self.env.game_state.get('hands', {}).get(self.local_player_id, [])}")
-        
         # Encode the action
         action_vec = encode_action(self.selected_hand_card, list(self.selected_table_cards))
         
-        # Verifico che l'azione sia valida stampando tutte le azioni valide
+        # Verifica che l'azione sia valida
         valid_actions = self.env.get_valid_actions()
-        print(f"Azioni valide: {len(valid_actions)}")
-        
-        # Debug delle azioni valide
-        for i, valid_act in enumerate(valid_actions[:5]):  # Mostra solo le prime 5 per brevità
-            card, captured = decode_action(valid_act)
-            print(f"  Azione {i}: carta={card}, catture={captured}")
         
         valid_action = None
         for valid_act in valid_actions:
@@ -2681,42 +2902,30 @@ class GameScreen(BaseScreen):
             self.status_message = "Invalid move. Try again."
             return False
         
+        # Get the card played and cards captured for animation
+        card_played, cards_captured = decode_action(valid_action)
+        
         # Make the move
         try:
             # If online multiplayer, send move to server/other players
             if self.app.game_config.get("mode") == "online_multiplayer":
-                print(f"Invio mossa: {valid_action}")
-                # CRUCIALE: stampa la decodifica dell'azione
-                card_play, card_captures = decode_action(valid_action)
-                print(f"Decodifica: carta giocata={card_play}, catture={card_captures}")
-                
                 self.app.network.send_move(valid_action)
                 if not self.app.network.is_host:
                     # Client waits for server to update game state
                     self.waiting_for_other_player = True
-                    # NUOVO: Notifica l'utente
                     self.status_message = "Mossa inviata, in attesa di conferma..."
-                    print("In attesa di conferma dal server...")
                     return True
             
-            # IMPORTANTE: Debug mode per logging
-            print(f"Esecuzione mossa locale: {valid_action}")
-            print(f"Giocatore corrente: {self.current_player_id}")
-            
-            # Create animations for the move
-            self.create_move_animations(self.selected_hand_card, self.selected_table_cards)
-            
-            # Execute the move
-            _, _, done, info = self.env.step(valid_action)
+            # IMPORTANTE: Creiamo le animazioni che ora rimuovono automaticamente la carta dalla mano
+            self.create_move_animations(card_played, cards_captured)
             
             # Play sound
             self.app.resources.play_sound("card_play")
             
-            # If game is over, set final state
-            if done:
-                self.game_over = True
-                if "score_breakdown" in info:
-                    self.final_breakdown = info["score_breakdown"]
+            # FASE 1: Attendiamo che l'animazione della carta giocata arrivi sul tavolo
+            # prima di completare l'aggiornamento dello stato del gioco
+            self.waiting_for_animation = True
+            self.pending_action = valid_action
             
             # Reset selection
             self.selected_hand_card = None
@@ -2732,7 +2941,7 @@ class GameScreen(BaseScreen):
 
     
     def make_ai_move(self):
-        """Make a move for the current AI player with improved online sync"""
+        """Make a move for the current AI player with improved animation sequencing"""
         current_player = self.players[self.current_player_id]
         
         if not current_player.is_ai or self.current_player_id not in self.ai_controllers:
@@ -2758,66 +2967,46 @@ class GameScreen(BaseScreen):
         print(f"AI {self.current_player_id} plays {card_played} and captures {cards_captured}")
         
         try:
-            # Create animations
+            # FASE 1: Create animations for the played card
             self.create_move_animations(card_played, cards_captured)
-            
-            # Execute the action
-            _, _, done, info = self.env.step(action)
-            
-            # NUOVO: Se siamo l'host in multiplayer, aggiorna e trasmetti lo stato
-            if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
-                # Prepara una copia dello stato di gioco per la trasmissione
-                online_type = self.app.game_config.get("online_type")
-                self.app.network.game_state = self.env.game_state.copy()
-                if online_type:
-                    self.app.network.game_state['online_type'] = online_type
-                    self.app.network.game_state['ai_players'] = [1, 3]  # Nella modalità team vs AI, i giocatori 1 e 3 sono sempre AI
-                
-                # Aggiungi il giocatore corrente allo stato
-                self.app.network.game_state['current_player'] = self.env.current_player
-                
-                # Aggiungi informazioni sulla mossa appena eseguita
-                self.app.network.game_state['last_move'] = {
-                    'player': self.current_player_id,
-                    'card_played': card_played,
-                    'cards_captured': cards_captured
-                }
-                
-                # Trasmetti lo stato aggiornato a tutti i client
-                self.app.network.broadcast_game_state()
-                
-                # Messaggio di diagnostica
-                table_cards = self.env.game_state.get("table", [])
-                print(f"Host broadcasting after AI move - table cards: {table_cards}")
             
             # Play sound
             self.app.resources.play_sound("card_play")
             
-            # Update game state if game is over
-            if done:
-                self.game_over = True
-                if "score_breakdown" in info:
-                    self.final_breakdown = info["score_breakdown"]
-        
+            # FASE 2: Impostiamo l'attesa per l'animazione e salviamo l'azione da completare
+            self.waiting_for_animation = True
+            self.pending_action = action
+            
         except Exception as e:
             print(f"Error making AI move: {e}")
             import traceback
             traceback.print_exc()
     
     def create_move_animations(self, card_played, cards_captured, source_player_id=None):
-        """Create animations for a move"""
+        """Create animations for a move with improved positioning - solo approccio visivo"""
         # Get player ID - use current player if no source player specified
         player_id = source_player_id if source_player_id is not None else self.current_player_id
         current_player = self.players[player_id]
         
+        # *** MODIFICA: Non modifichiamo più direttamente lo stato del gioco ***
+        # Invece, memorizziamo la carta in una lista di carte visivamente nascoste
+        if not hasattr(self, 'visually_hidden_cards'):
+            self.visually_hidden_cards = {}
+        
+        # Aggiungiamo la carta alle carte nascoste di questo giocatore
+        if player_id not in self.visually_hidden_cards:
+            self.visually_hidden_cards[player_id] = []
+        self.visually_hidden_cards[player_id].append(card_played)
+        
         # Start position depends on player position
         if player_id == self.local_player_id:
             # Calculate position in hand
+            hand_rect = current_player.hand_rect
             hand = current_player.hand_cards
+            
+            # Cerca la posizione della carta nella mano per un'animazione più precisa
             try:
                 card_index = hand.index(card_played)
-                hand_rect = current_player.hand_rect
-                
                 # Calculate position with current dimensions
                 width = self.app.window_width
                 card_width = int(width * 0.078)
@@ -2826,42 +3015,32 @@ class GameScreen(BaseScreen):
                 
                 # Calculate position
                 start_x = center_x + (card_index - len(hand) // 2) * card_spread
-                start_y = hand_rect.bottom - CARD_HEIGHT
-                
-                start_pos = (start_x + CARD_WIDTH // 2, start_y + CARD_HEIGHT // 2)
+                if self.get_visual_position(player_id) == 0:  # Bottom player
+                    start_y = hand_rect.bottom - card_width * 1.5
+                    start_pos = (start_x + card_width // 2, start_y + card_width * 1.5 // 2)
+                else:
+                    # Adjust for other positions
+                    start_pos = hand_rect.center
             except ValueError:
-                # Card not found in hand (should not happen)
-                start_pos = current_player.hand_rect.center
+                # Card not found in hand (fallback)
+                start_pos = hand_rect.center
         else:
             # Card comes from another player's hand
             start_pos = current_player.hand_rect.center
         
-        # Calculate table center for destination
+        # Determina la posizione finale della carta giocata in base alle carte da catturare
         table_center = self.table_rect.center
+        end_pos = table_center  # Default: centro del tavolo
         
-        # Create animation for played card
-        played_anim = CardAnimation(
-            card=card_played,
-            start_pos=start_pos,
-            end_pos=table_center,
-            duration=20,
-            scale_start=1.0,
-            scale_end=1.0,
-            rotation_start=0,
-            rotation_end=0  # No rotation
-        )
-        self.animations.append(played_anim)
-        
-        # Create animations for captured cards
-        table_cards = self.env.game_state["table"]
-        
-        # Calculate card positions in table layout with current dimensions
-        if table_cards or cards_captured:
+        # Se ci sono carte da catturare, calcoliamo una posizione che si sovrappone solo parzialmente
+        if cards_captured:
+            # Calcola le posizioni delle carte sul tavolo
             width = self.app.window_width
             card_width = int(width * 0.078)
+            card_height = int(card_width * 1.5)
+            table_cards = self.env.game_state["table"] if self.env else []
             
-            # We need to calculate positions for captured cards that might no longer be on the table
-            # Use the current table plus captured cards to determine original positions
+            # Trova la posizione della prima carta da catturare
             original_table = table_cards.copy()
             for card in cards_captured:
                 if card not in original_table:
@@ -2870,45 +3049,205 @@ class GameScreen(BaseScreen):
             max_spacing = self.table_rect.width * 0.8 / max(len(original_table), 1)
             card_spacing = min(card_width * 1.1, max_spacing)
             start_x = self.table_rect.centerx - (len(original_table) * card_spacing) // 2
-            table_y = self.table_rect.centery - CARD_HEIGHT // 2
+            table_y = self.table_rect.centery - card_height // 2
             
+            # Trova la carta da catturare più a sinistra o usa una posizione predefinita
+            leftmost_card_index = float('inf')
+            for card in cards_captured:
+                try:
+                    idx = original_table.index(card)
+                    if idx < leftmost_card_index:
+                        leftmost_card_index = idx
+                except ValueError:
+                    pass
+            
+            if leftmost_card_index != float('inf'):
+                # Carta più a sinistra trovata, posiziona la carta giocata in modo che si sovrapponga parzialmente
+                card_x = start_x + leftmost_card_index * card_spacing
+                # Sovrapponi solo per il 50% della larghezza della carta (metà carta)
+                end_pos = (card_x - card_width * 0.25, table_y + card_height / 2)
+            
+            print(f"Posizione finale della carta giocata: {end_pos}")
+        
+        # FASE 1: Create animation for played card with NO DELAY
+        played_anim = CardAnimation(
+            card=card_played,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            duration=20,
+            delay=0,
+            scale_start=1.0,
+            scale_end=1.0,
+            rotation_start=0,
+            rotation_end=0,
+            animation_type="play"
+        )
+        self.animations.append(played_anim)
+        
+        # FASE 2: Create animations for captured cards WITH DELAY
+        if cards_captured:
             # Calculate pile position for the capturing team
             team_id = current_player.team_id
             pile_pos = (self.app.window_width * 0.05, self.app.window_height // 2 + (team_id * 0.2 - 0.1) * self.app.window_height)
             
-            for card in cards_captured:
+            # MIGLIORAMENTO: Calcola posizioni sfalsate per le carte catturate per la fase di animazione
+            # Crea un layout sfalsato per le carte catturate, con sovrapposizione del 50%
+            card_width = int(self.app.window_width * 0.078)
+            staggered_offset = card_width * 0.5  # 50% della larghezza della carta
+            
+            # NUOVO: Aggiungi animazione anche per la carta catturante (dalla sua posizione sul tavolo fino al mazzo)
+            # La carta catturante sarà all'index 0 nella formazione sfalsata
+            intermediate_x = end_pos[0]
+            intermediate_y = end_pos[1]
+            # Leggera variazione nella posizione finale
+            capturing_end_x = pile_pos[0] + random.randint(-5, 5)
+            capturing_end_y = pile_pos[1] + random.randint(-5, 5)
+            
+            # Animazione verso il mazzo per la carta catturante
+            capturing_anim = CardAnimation(
+                card=card_played,
+                start_pos=end_pos,  # Posizione finale della prima animazione
+                end_pos=(capturing_end_x, capturing_end_y),
+                duration=25,
+                delay=45,  # Si muove insieme alle carte catturate
+                scale_start=1.0,
+                scale_end=0.8,
+                rotation_start=0,
+                rotation_end=random.randint(-10, 10),
+                animation_type="capture"
+            )
+            self.animations.append(capturing_anim)
+            print(f"  Created animation for capturing card {card_played}")
+            
+            # Animate all captured cards with delay
+            for i, card in enumerate(cards_captured):
                 try:
                     # Find card position in the original table
                     card_index = original_table.index(card)
                     card_x = start_x + card_index * card_spacing
                     card_pos = (card_x + CARD_WIDTH // 2, table_y + CARD_HEIGHT // 2)
                     
-                    capture_anim = CardAnimation(
+                    # Calcola posizione intermedia sfalsata per l'animazione
+                    # La carta catturante è già posizionata in end_pos
+                    # Le carte catturate si posizionano con uno sfalsamento progressivo
+                    intermediate_x = end_pos[0] + (i + 1) * staggered_offset
+                    intermediate_y = end_pos[1]
+                    intermediate_pos = (intermediate_x, intermediate_y)
+                    
+                    # Add slight variation to end position for visual appeal
+                    end_x = pile_pos[0] + random.randint(-5, 5)
+                    end_y = pile_pos[1] + random.randint(-5, 5) + i * 5  # Sfalsamento verticale aggiuntivo
+                    varied_end_pos = (end_x, end_y)
+                    
+                    # NUOVO: prima creiamo un'animazione verso la posizione intermedia (raggruppamento sfalsato)
+                    group_anim = CardAnimation(
                         card=card,
                         start_pos=card_pos,
-                        end_pos=pile_pos,
+                        end_pos=intermediate_pos,
+                        duration=20,
+                        delay=20,  # Parte dopo che la carta giocata è arrivata a destinazione
+                        scale_start=1.0,
+                        scale_end=1.0,
+                        rotation_start=0,
+                        rotation_end=0,
+                        animation_type="group"
+                    )
+                    self.animations.append(group_anim)
+                    
+                    # Poi creiamo l'animazione verso il mazzo di cattura
+                    capture_anim = CardAnimation(
+                        card=card,
+                        start_pos=intermediate_pos,
+                        end_pos=varied_end_pos,
                         duration=25,
-                        delay=25,  # Longer delay to ensure played card is shown first
+                        delay=45 + i * 3,  # Ritardo aggiuntivo dopo il raggruppamento
                         scale_start=1.0,
                         scale_end=0.8,
                         rotation_start=0,
-                        rotation_end=0  # No rotation
+                        rotation_end=random.randint(-10, 10),
+                        animation_type="capture"
                     )
                     self.animations.append(capture_anim)
+                    print(f"  Created animation for captured card {card}")
                 except ValueError:
-                    # Card not found on table (should not happen)
-                    print(f"Warning: Could not find card {card} in original table")
+                    # Fallback con posizioni sfalsate
+                    intermediate_x = end_pos[0] + (i + 1) * staggered_offset
+                    intermediate_y = end_pos[1]
+                    intermediate_pos = (intermediate_x, intermediate_y)
+                    
+                    # Aggiungi variazioni alla posizione finale
+                    end_x = pile_pos[0] + random.randint(-5, 5)
+                    end_y = pile_pos[1] + random.randint(-5, 5) + i * 5
+                    varied_end_pos = (end_x, end_y)
+                    
+                    # Prima animazione (raggruppamento sfalsato)
+                    group_anim = CardAnimation(
+                        card=card,
+                        start_pos=table_center,
+                        end_pos=intermediate_pos,
+                        duration=20,
+                        delay=20,
+                        scale_start=1.0,
+                        scale_end=1.0,
+                        rotation_start=0,
+                        rotation_end=0,
+                        animation_type="group"
+                    )
+                    self.animations.append(group_anim)
+                    
+                    # Seconda animazione (verso il mazzo)
+                    capture_anim = CardAnimation(
+                        card=card,
+                        start_pos=intermediate_pos,
+                        end_pos=varied_end_pos,
+                        duration=25,
+                        delay=45 + i * 3,
+                        scale_start=1.0,
+                        scale_end=0.8,
+                        rotation_start=0,
+                        rotation_end=random.randint(-10, 10),
+                        animation_type="capture"
+                    )
+                    self.animations.append(capture_anim)
     
     def draw(self, surface):
-        """Draw the game screen"""
+        """Draw the game screen with connection loss indicators"""
         # Draw background
         surface.blit(self.app.resources.background, (0, 0))
         
+        # Draw connection loss overlay and exit button if needed
+        if self.connection_lost:
+            # Draw semi-transparent overlay
+            overlay = pygame.Surface((self.app.window_width, self.app.window_height), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 100))  # Semi-transparent black
+            surface.blit(overlay, (0, 0))
+            
+            # Draw exit button
+            if self.exit_button:
+                self.exit_button.draw(surface)
+            
+            # Draw reconnection status
+            elapsed = time.time() - self.reconnect_start_time
+            remaining = max(0, self.max_reconnection_time - elapsed)
+            
+            # Create animated dots
+            dots = "." * ((pygame.time.get_ticks() // 500) % 4)
+            
+            # Draw reconnection message
+            reconnect_text = f"Attempting to reconnect{dots} ({int(remaining)}s remaining)"
+            text_surf = self.info_font.render(reconnect_text, True, HIGHLIGHT_RED)
+            text_rect = text_surf.get_rect(
+                midbottom=(self.app.window_width // 2, 
+                        self.exit_button.rect.top - 10 if self.exit_button else self.app.window_height * 0.15)
+            )
+            surface.blit(text_surf, text_rect)
+        
+        # Continue with regular drawing
         # Draw table
         pygame.draw.ellipse(surface, TABLE_GREEN, 
-                           self.table_rect.inflate(50, 30))
+                        self.table_rect.inflate(50, 30))
         pygame.draw.ellipse(surface, DARK_GREEN, 
-                           self.table_rect.inflate(50, 30), 5)
+                        self.table_rect.inflate(50, 30), 5)
         
         # Draw players
         self.draw_players(surface)
@@ -2943,23 +3282,33 @@ class GameScreen(BaseScreen):
         """Draw all players' hands and info with proper perspective handling"""
         for player in self.players:
             self.draw_player_info(surface, player)
-            
+                
             # Determine if player's hand should be visible
             mode = self.app.game_config.get("mode")
+            is_online = mode == "online_multiplayer"
             
-            # Always show local player's hand
-            if player.player_id == self.local_player_id:
-                self.draw_player_hand(surface, player)
+            # Regole per determinare se mostrare la mano di un giocatore
+            show_hand = False
             
-            # For team_vs_ai, show partner's hand when it's their turn
-            elif mode == "team_vs_ai" and player.player_id == 2 and self.current_player_id == 2:
+            # Regola 1: Online - mostra SOLO la mano del giocatore locale, mai quelle degli altri
+            if is_online:
+                show_hand = (player.player_id == self.local_player_id)
+            
+            # Regola 2: In modalità locale (sia 4 giocatori che team vs AI), mostra tutte le mani
+            elif mode == "local_multiplayer":
+                show_hand = True
+            
+            # Regola 3: In team vs AI locale, mostra le mani di entrambi i membri del team (0 e 2)
+            elif mode == "team_vs_ai" and player.player_id in [0, 2]:
+                show_hand = True
+            
+            # Regola 4: In single player, mostra solo la mano del giocatore 0
+            elif mode == "single_player" and player.player_id == 0:
+                show_hand = True
+            
+            # Disegna la mano appropriata (visibile o nascosta)
+            if show_hand:
                 self.draw_player_hand(surface, player)
-                
-            # For local multiplayer, show current player's hand
-            elif mode == "local_multiplayer" and player.player_id == self.current_player_id:
-                self.draw_player_hand(surface, player)
-                
-            # Otherwise show hidden hand
             else:
                 self.draw_player_hidden_hand(surface, player)
     
@@ -3009,9 +3358,21 @@ class GameScreen(BaseScreen):
         surface.blit(count_surf, count_rect)
     
     def draw_player_hand(self, surface, player):
-        """Draw the player's hand with card faces visible and properly centered"""
+        """Draw the player's hand with card faces visible and properly centered - modified to hide visually removed cards"""
         hand = player.hand_cards
         if not hand:
+            return
+        
+        # MODIFICA: Controlla se ci sono carte da nascondere visivamente
+        visually_hidden = []
+        if hasattr(self, 'visually_hidden_cards') and player.player_id in self.visually_hidden_cards:
+            visually_hidden = self.visually_hidden_cards[player.player_id]
+        
+        # Create a filtered hand without visually hidden cards
+        visible_hand = [card for card in hand if card not in visually_hidden]
+        
+        # If no visible cards, exit early
+        if not visible_hand:
             return
         
         # Calculate the current card width based on window size
@@ -3026,38 +3387,44 @@ class GameScreen(BaseScreen):
         # Display variables depend on whether this is horizontal or vertical orientation
         is_horizontal = visual_pos in [0, 2]  # Bottom or top
         
+        # Border parameters
+        border_thickness = 1  # Sottile bordo nero
+        border_radius = 8     # Angoli smussati
+        
         if is_horizontal:
             # Horizontal hand layout (bottom or top)
             center_x = hand_rect.centerx
             card_spread = card_width * 0.7
-            total_width = (len(hand) - 1) * card_spread + card_width
+            total_width = (len(visible_hand) - 1) * card_spread + card_width
             start_x = center_x - (total_width / 2)
             
             # Y position depends on whether it's top or bottom
             if visual_pos == 0:  # Bottom
                 base_y = hand_rect.bottom - card_height
+                rotation = 0  # No rotation for bottom player
             else:  # Top
                 base_y = hand_rect.top
+                rotation = 180  # Rotate 180 degrees for top player
             
-            # Debug output
-            #print(f"Drawing hand for player {player.player_id} at visual pos {visual_pos}. Cards: {len(hand)}")
-            #print(f"Hand rect: {hand_rect}, Start X: {start_x}, Base Y: {base_y}")
-            
-            for i, card in enumerate(hand):
+            for i, card in enumerate(visible_hand):
                 # Calculate x position for this card
                 x = start_x + i * card_spread
                 
                 # Get card image
                 card_img = self.app.resources.get_card_image(card)
                 
-                # Create card rect
-                card_rect = pygame.Rect(x, base_y, card_width, card_height)
+                # Rotate card image
+                if rotation != 0:
+                    card_img = pygame.transform.rotate(card_img, rotation)
+                
+                # Get rect for the card
+                card_rect = card_img.get_rect(center=(x + card_width/2, base_y + card_height/2))
                 
                 # Highlight selected card
                 if card == self.selected_hand_card:
                     # Draw selection border
                     highlight_rect = card_rect.copy()
-                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=5)
+                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=border_radius + 3)
                     
                     # Raise selected card for bottom player, lower for top player
                     if visual_pos == 0:
@@ -3065,36 +3432,53 @@ class GameScreen(BaseScreen):
                     else:
                         card_rect.move_ip(0, 15)
                 
-                # Draw card
-                surface.blit(card_img, card_rect)
+                # Create a version of the card with rounded corners
+                rounded_card = pygame.Surface(card_img.get_size(), pygame.SRCALPHA)
+                rounded_card.fill((0, 0, 0, 0))  # Transparent background
+                
+                # Draw rounded rectangle on the surface
+                pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
+                                border_radius=border_radius)
+                
+                # Use the rounded rectangle as a mask for the card
+                rounded_card.blit(card_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+                
+                # Draw card with border
+                pygame.draw.rect(surface, BLACK, card_rect.inflate(2, 2), border_radius=border_radius)
+                surface.blit(rounded_card, card_rect)
         else:
             # Vertical hand layout (left or right)
             center_y = hand_rect.centery
             card_spread = card_height * 0.4  # Less overlap for vertical cards
-            total_height = (len(hand) - 1) * card_spread + card_height
+            total_height = (len(visible_hand) - 1) * card_spread + card_height
             start_y = center_y - (total_height / 2)
             
             # X position depends on whether it's left or right
             if visual_pos == 1:  # Left
                 base_x = hand_rect.left
+                rotation = 270  # Rotate 270 degrees for left player
             else:  # Right
                 base_x = hand_rect.right - card_width
+                rotation = 90  # Rotate 90 degrees for right player
             
-            for i, card in enumerate(hand):
+            for i, card in enumerate(visible_hand):
                 # Calculate y position for this card
                 y = start_y + i * card_spread
                 
                 # Get card image
                 card_img = self.app.resources.get_card_image(card)
                 
-                # Create card rect
-                card_rect = pygame.Rect(base_x, y, card_width, card_height)
+                # Rotate card image
+                card_img = pygame.transform.rotate(card_img, rotation)
+                
+                # Get rect for the rotated card
+                card_rect = card_img.get_rect(center=(base_x + card_width/2, y + card_height/2))
                 
                 # Highlight selected card
                 if card == self.selected_hand_card:
                     # Draw selection border
                     highlight_rect = card_rect.copy()
-                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=5)
+                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=border_radius + 3)
                     
                     # Move selected card outward
                     if visual_pos == 1:
@@ -3102,11 +3486,23 @@ class GameScreen(BaseScreen):
                     else:
                         card_rect.move_ip(-15, 0)
                 
-                # Draw card
-                surface.blit(card_img, card_rect)
+                # Create a version of the card with rounded corners
+                rounded_card = pygame.Surface(card_img.get_size(), pygame.SRCALPHA)
+                rounded_card.fill((0, 0, 0, 0))  # Transparent background
+                
+                # Draw rounded rectangle on the surface
+                pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
+                                border_radius=border_radius)
+                
+                # Use the rounded rectangle as a mask for the card
+                rounded_card.blit(card_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+                
+                # Draw card with border
+                pygame.draw.rect(surface, BLACK, card_rect.inflate(2, 2), border_radius=border_radius)
+                surface.blit(rounded_card, card_rect)
     
     def draw_player_hidden_hand(self, surface, player):
-        """Draw another player's hand with card backs"""
+        """Draw another player's hand with card backs rotated toward the table center"""
         hand = player.hand_cards
         if not hand:
             return
@@ -3114,38 +3510,107 @@ class GameScreen(BaseScreen):
         # Get card back image for this player's team
         card_back = self.app.resources.get_card_back(player.team_id)
         
-        # Left or right player (vertical layout)
-        if player.player_id in [1, 3]:
-            # Calculate positions
-            card_spacing = min(20, player.hand_rect.height / len(hand))
-            start_y = player.hand_rect.centery - (len(hand) * card_spacing) // 2
-            
-            for i in range(len(hand)):
-                y = start_y + i * card_spacing
-                
-                # Rotate card back for vertical display
-                rotated_back = pygame.transform.rotate(card_back, 90)
-                
-                # Draw card back
-                surface.blit(rotated_back, (player.hand_rect.x, y))
+        # Calculate the current card width based on window size
+        width = self.app.window_width
+        card_width = int(width * 0.078)
+        card_height = int(card_width * 1.5)
         
-        # Top or bottom player (horizontal layout)
-        else:
-            # Calculate positions
-            card_spacing = min(20, player.hand_rect.width / len(hand))
-            start_x = player.hand_rect.centerx - (len(hand) * card_spacing) // 2
+        # Get visual position of the player
+        visual_pos = self.get_visual_position(player.player_id)
+        hand_rect = player.hand_rect
+        
+        # Horizontal vs vertical layout
+        is_horizontal = visual_pos in [0, 2]  # Bottom or top
+        
+        # Get table center for rotation reference
+        table_center = self.table_rect.center
+        
+        # Border parameters
+        border_thickness = 1  # Sottile bordo nero
+        border_radius = 8     # Angoli smussati
+        
+        if is_horizontal:
+            # Horizontal hand layout (bottom or top)
+            card_spread = card_width * 0.7  # Cards overlap horizontally
+            total_width = (len(hand) - 1) * card_spread + card_width
+            start_x = hand_rect.centerx - total_width / 2
+            
+            # Y position depends on whether it's top or bottom
+            if visual_pos == 0:  # Bottom
+                base_y = hand_rect.bottom - card_height
+                rotation = 0  # No rotation for bottom player
+            else:  # Top
+                base_y = hand_rect.top
+                rotation = 180  # Rotate 180 degrees for top player
             
             for i in range(len(hand)):
-                x = start_x + i * card_spacing
+                # Calculate x position for this card
+                x = start_x + i * card_spread
                 
-                # Draw card back
-                surface.blit(card_back, (x, player.hand_rect.y))
+                # Rotate card back appropriately
+                rotated_back = pygame.transform.rotate(card_back, rotation)
+                
+                # Get rect for the rotated card
+                card_rect = rotated_back.get_rect(center=(x + card_width/2, base_y + card_height/2))
+                
+                # Create a version of the card with rounded corners
+                rounded_card = pygame.Surface(rotated_back.get_size(), pygame.SRCALPHA)
+                rounded_card.fill((0, 0, 0, 0))  # Transparent background
+                
+                # Draw rounded rectangle on the surface
+                pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
+                                border_radius=border_radius)
+                
+                # Use the rounded rectangle as a mask for the card
+                rounded_card.blit(rotated_back, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+                
+                # Draw card with border
+                pygame.draw.rect(surface, BLACK, card_rect.inflate(2, 2), border_radius=border_radius)
+                surface.blit(rounded_card, card_rect)
+        else:
+            # Vertical hand layout (left or right)
+            card_spread = card_height * 0.4  # Less overlap for vertical cards
+            total_height = (len(hand) - 1) * card_spread + card_height
+            start_y = hand_rect.centery - total_height / 2
+            
+            # X position depends on whether it's left or right
+            if visual_pos == 1:  # Left
+                base_x = hand_rect.left
+                rotation = 270  # Rotate 270 degrees for left player
+            else:  # Right
+                base_x = hand_rect.right - card_width
+                rotation = 90  # Rotate 90 degrees for right player
+            
+            for i in range(len(hand)):
+                # Calculate y position for this card
+                y = start_y + i * card_spread
+                
+                # Rotate card back appropriately
+                rotated_back = pygame.transform.rotate(card_back, rotation)
+                
+                # Get rect for the rotated card
+                card_rect = rotated_back.get_rect(center=(base_x + card_width/2, y + card_height/2))
+                
+                # Create a version of the card with rounded corners
+                rounded_card = pygame.Surface(rotated_back.get_size(), pygame.SRCALPHA)
+                rounded_card.fill((0, 0, 0, 0))  # Transparent background
+                
+                # Draw rounded rectangle on the surface
+                pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
+                                border_radius=border_radius)
+                
+                # Use the rounded rectangle as a mask for the card
+                rounded_card.blit(rotated_back, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+                
+                # Draw card with border
+                pygame.draw.rect(surface, BLACK, card_rect.inflate(2, 2), border_radius=border_radius)
+                surface.blit(rounded_card, card_rect)
     
     def draw_table_cards(self, surface):
-        """Draw the cards on the table without any rotation"""
+        """Draw the cards on the table without any rotation but with rounded corners and border"""
         if not self.env:
             return
-                
+                    
         table_cards = self.env.game_state["table"]
         if not table_cards:
             # Draw "No cards on table" text
@@ -3158,6 +3623,10 @@ class GameScreen(BaseScreen):
         width = self.app.window_width
         card_width = int(width * 0.078)
         card_height = int(card_width * 1.5)
+        
+        # Border parameters
+        border_thickness = 1  # Sottile bordo nero
+        border_radius = 8     # Angoli smussati
         
         # Calculate positions for table layout - use table width to determine spacing
         max_spacing = self.table_rect.width * 0.8 / max(len(table_cards), 1)
@@ -3176,10 +3645,22 @@ class GameScreen(BaseScreen):
             
             # Highlight selected table cards
             if card in self.selected_table_cards:
-                pygame.draw.rect(surface, HIGHLIGHT_RED, card_rect.inflate(10, 10), 3, border_radius=5)
+                pygame.draw.rect(surface, HIGHLIGHT_RED, card_rect.inflate(10, 10), 3, border_radius=border_radius + 3)
             
-            # Draw card (without rotation)
-            surface.blit(card_img, card_rect)
+            # Create a version of the card with rounded corners
+            rounded_card = pygame.Surface(card_img.get_size(), pygame.SRCALPHA)
+            rounded_card.fill((0, 0, 0, 0))  # Transparent background
+            
+            # Draw rounded rectangle on the surface
+            pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
+                            border_radius=border_radius)
+            
+            # Use the rounded rectangle as a mask for the card
+            rounded_card.blit(card_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            
+            # Draw card with border
+            pygame.draw.rect(surface, BLACK, card_rect.inflate(2, 2), border_radius=border_radius)
+            surface.blit(rounded_card, card_rect)
     
     def draw_capture_piles(self, surface):
         """Draw the capture piles for each team with updated positioning"""
@@ -3257,11 +3738,15 @@ class GameScreen(BaseScreen):
             surface.blit(mini_card, (x, y))
     
     def draw_animations(self, surface):
-        """Draw all active card animations"""
+        """Draw all active card animations with rounded corners and borders"""
+        # Border parameters
+        border_thickness = 1  # Sottile bordo nero
+        border_radius = 8     # Angoli smussati
+        
         for anim in self.animations:
             if anim.current_frame < 0:
                 continue  # Animation in delay phase
-            
+                
             # Get card image
             card_img = self.app.resources.get_card_image(anim.card)
             
@@ -3279,9 +3764,23 @@ class GameScreen(BaseScreen):
             # Get current position
             pos = anim.get_current_pos()
             
-            # Draw card centered at position
+            # Create rect centered at position
             rect = rotated_img.get_rect(center=pos)
-            surface.blit(rotated_img, rect)
+            
+            # Create a version of the card with rounded corners
+            rounded_card = pygame.Surface(rotated_img.get_size(), pygame.SRCALPHA)
+            rounded_card.fill((0, 0, 0, 0))  # Transparent background
+            
+            # Draw rounded rectangle on the surface
+            pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
+                            border_radius=border_radius)
+            
+            # Use the rounded rectangle as a mask for the card
+            rounded_card.blit(rotated_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            
+            # Draw card with border
+            pygame.draw.rect(surface, BLACK, rect.inflate(2, 2), border_radius=border_radius)
+            surface.blit(rounded_card, rect)
     
     def draw_status_info(self, surface):
         """Draw game status information with emphasis on player turn"""
@@ -3569,13 +4068,13 @@ class GameScreen(BaseScreen):
         mode = self.app.game_config.get("mode")
         
         # Log per debugging
-        print(f"### VERIFICA CONTROLLO GIOCATORE ###")
-        print(f"Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
-        print(f"Modalità: {mode}, Tipo online: {self.app.game_config.get('online_type')}")
+        #print(f"### VERIFICA CONTROLLO GIOCATORE ###")
+        #print(f"Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
+        #print(f"Modalità: {mode}, Tipo online: {self.app.game_config.get('online_type')}")
         
         # Caso base: sempre controllabile se è il proprio turno
         if self.current_player_id == self.local_player_id:
-            print("È il turno del giocatore locale")
+            #print("È il turno del giocatore locale")
             return True
         
         # Altre modalità di gioco
@@ -3705,11 +4204,11 @@ class ScoponeApp:
         self.window_width, self.window_height = size
         
         # Debug print
-        print(f"Resized window to: {self.window_width}x{self.window_height}")
+        #print(f"Resized window to: {self.window_width}x{self.window_height}")
         
         # Scale background image from the original
         if hasattr(self.resources, 'original_background') and self.resources.original_background:
-            print("Scaling background from original image")
+            #print("Scaling background from original image")
             # Force the background to scale from the original image
             # Use smoothscale for better quality
             self.resources.background = pygame.transform.smoothscale(
