@@ -642,18 +642,50 @@ class NetworkManager:
                 self.connected = False
     
     def broadcast_game_state(self):
-        """Broadcast current game state to all clients (host only)"""
+        """Enhanced broadcast method with more reliable state transmission"""
         if not self.is_host:
             return
             
-        message = {"type": "game_state", "state": self.game_state}
-        data = pickle.dumps(message)
+        # Create a deep copy of the game state to avoid reference issues
+        state_copy = {}
+        if self.game_state:
+            # Manually copy the state to ensure it's a complete deep copy
+            for key, value in self.game_state.items():
+                if isinstance(value, dict):
+                    state_copy[key] = {}
+                    for k, v in value.items():
+                        # Handle nested lists (like hands)
+                        if isinstance(v, list):
+                            state_copy[key][k] = [item.copy() if isinstance(item, list) else item for item in v]
+                        else:
+                            state_copy[key][k] = v
+                elif isinstance(value, list):
+                    state_copy[key] = [item.copy() if isinstance(item, list) else item for item in value]
+                else:
+                    state_copy[key] = value
         
-        for client, _ in self.clients:
-            try:
-                client.sendall(data)
-            except:
-                pass  # Client probably disconnected
+        # Create the message with the full state
+        message = {
+            "type": "game_state", 
+            "state": state_copy,
+        }
+        
+        # Log what we're sending
+        print(f"Host broadcasting state: Current player = {state_copy.get('current_player', 'unknown')}")
+        print(f"Table cards: {state_copy.get('table', [])}")
+        
+        try:
+            # Use a larger buffer for the pickle to accommodate larger game states
+            data = pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            for client, _ in self.clients:
+                try:
+                    # Send data with confirmation
+                    client.sendall(data)
+                except Exception as e:
+                    print(f"Error sending to client: {e}")
+        except Exception as e:
+            print(f"Error serializing game state: {e}")
     
     def broadcast_start_game(self):
         """Broadcast game start signal to all clients (host only)"""
@@ -1982,89 +2014,98 @@ class GameScreen(BaseScreen):
                 self.ai_thinking = False
     
     def handle_network_updates(self):
-        """Improved network update handling with better state synchronization"""
+        """Completely revamped network update handling with more reliable state processing"""
         if not self.app.network:
             return
-                
-        # Handle connection loss with reconnection attempt
+        
+        # Handle connection loss
         if not self.app.network.connected:
-            self.status_message = "Connessione persa. Tentativo di riconnettersi..."
-            
-            # For clients (not host), try to reconnect
+            self.status_message = "Connection lost. Attempting to reconnect..."
             if not self.app.network.is_host:
                 if self.app.network.connect_to_server():
-                    self.status_message = "Riconnessione avvenuta con successo!"
+                    self.status_message = "Reconnected successfully!"
                 else:
-                    self.status_message = "Impossibile riconnettersi al server."
+                    self.status_message = "Failed to reconnect."
                     self.waiting_for_other_player = True
             return
-                
-        # Process new messages
+        
+        # Process messages
         while self.app.network.message_queue:
             message = self.app.network.message_queue.popleft()
             self.messages.append(message)
-            # Limit messages to 100
             if len(self.messages) > 100:
                 self.messages.pop(0)
         
-        # If host, check for moves and update game state
+        # Host logic: process moves and broadcast state
         if self.app.network.is_host:
+            # Process any queued moves
             while self.app.network.move_queue:
                 player_id, move = self.app.network.move_queue.popleft()
                 
-                # Skip if not player's turn
+                # Verify it's the player's turn
                 if player_id != self.env.current_player:
+                    print(f"Ignoring move from player {player_id}, it's player {self.env.current_player}'s turn")
                     continue
-                        
-                # Decode the move to create animations
-                card_played, cards_captured = decode_action(move)
                 
-                # Create animations for the move
-                self.create_move_animations(card_played, cards_captured)
-                
-                # Make the move
+                # Execute the move and create animations
                 try:
+                    # Decode the move
+                    card_played, cards_captured = decode_action(move)
+                    print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
+                    
+                    # Create animations for the move
+                    self.create_move_animations(card_played, cards_captured, player_id)
+                    
+                    # Execute the move in the environment
                     _, _, done, info = self.env.step(move)
+                    
+                    # Update game state if game is over
                     if done:
                         self.game_over = True
                         if "score_breakdown" in info:
                             self.final_breakdown = info["score_breakdown"]
+                    
+                    # Prepare a deep copy of the game state for broadcasting
+                    self.app.network.game_state = self.env.game_state.copy()
+                    
+                    # Add the current player to the state
+                    self.app.network.game_state['current_player'] = self.env.current_player
+                    
+                    # Use the enhanced broadcast method
+                    self.app.network.broadcast_game_state()
+                    
+                    # Play a sound effect
+                    self.app.resources.play_sound("card_play")
+                    
                 except Exception as e:
                     print(f"Error processing move: {e}")
-                
-                # Broadcast updated game state including current player
-                self.app.network.game_state = self.env.game_state.copy()  # Make a deep copy
-                # Add current player to the game state for synchronization
-                self.app.network.game_state['current_player'] = self.env.current_player
-                
-                # Log the state
-                print(f"Host: Broadcasting state update - Current player: {self.env.current_player}")
-                print(f"Table cards: {self.env.game_state.get('table', [])}")
-                
-                self.app.network.broadcast_game_state()
+                    import traceback
+                    traceback.print_exc()
         
-        # If client, update game state from network
+        # Client logic: update local state from network
         else:
-            # Save current state to detect changes
-            old_state = None
-            old_current_player = None
-            if self.env and hasattr(self.env, 'game_state'):
-                old_state = self.env.game_state.copy() if self.env.game_state else None
-                old_current_player = self.env.current_player if hasattr(self.env, 'current_player') else None
-            
             if self.app.network.game_state:
-                # Store the new game state - make a deep copy to avoid reference issues
-                new_state = self.app.network.game_state.copy()
+                # Keep a copy of old state for comparison
+                old_state = None
+                old_current_player = None
+                if self.env and hasattr(self.env, 'game_state'):
+                    old_state = {k: v.copy() if isinstance(v, dict) or isinstance(v, list) else v 
+                                for k, v in self.env.game_state.items()} if self.env.game_state else None
+                    old_current_player = self.env.current_player if hasattr(self.env, 'current_player') else None
                 
-                # Extract and remove current player from game state if present
+                # Get the new state from the network
+                new_state = {k: v.copy() if isinstance(v, dict) or isinstance(v, list) else v 
+                            for k, v in self.app.network.game_state.items()}
+                
+                # Extract and remove current player from game state
                 new_current_player = new_state.pop('current_player', None)
                 
-                # Log the received state
-                print(f"Client: Received state update")
-                print(f"New current player: {new_current_player}")
-                print(f"Table cards: {new_state.get('table', [])}")
+                # Debug output
+                print(f"Client received state:")
+                print(f"  Current player: {new_current_player}")
+                print(f"  Table cards: {new_state.get('table', [])}")
                 
-                # Update local game state
+                # Apply the new state to the environment
                 if self.env:
                     self.env.game_state = new_state
                     
@@ -2072,48 +2113,51 @@ class GameScreen(BaseScreen):
                     if new_current_player is not None:
                         self.env.current_player = new_current_player
                         self.current_player_id = new_current_player
-                        print(f"Updated current player to {new_current_player} (I am {self.local_player_id})")
                         
-                        # Update UI to show it's this player's turn
+                        # Handle turn notifications
                         if new_current_player == self.local_player_id:
                             self.status_message = "It's your turn!"
-                            # Play a sound to notify the player
                             self.app.resources.play_sound("card_pickup")
+                            # Reset selections when it becomes the player's turn
+                            self.selected_hand_card = None
+                            self.selected_table_cards.clear()
                     
-                    # Check if there was a state change and create animations if needed
+                    # Check for card movements and update visuals
                     if old_state and old_state != new_state:
-                        print("State change detected! Checking for new cards/captures...")
+                        # Check if anything significant changed
+                        changed = (
+                            old_state.get('table') != new_state.get('table') or
+                            old_state.get('captured_squads') != new_state.get('captured_squads') or
+                            old_current_player != new_current_player
+                        )
                         
-                        # Check if cards were played or captured
-                        if old_state.get('table') != new_state.get('table') or \
-                        old_state.get('captured_squads') != new_state.get('captured_squads') or \
-                        old_current_player != new_current_player:
-                            
-                            # Compare tables to identify played card and captured cards
-                            self.detect_and_animate_changes(old_state, new_state)
-                            
-                            # Unlock waiting state if player was waiting
+                        if changed:
+                            # Generate animations for changes
+                            self.detect_and_animate_changes(old_state, new_state, old_current_player)
                             self.waiting_for_other_player = False
                         
-                        # Check if game is over
-                        if all(len(new_state["hands"][p]) == 0 for p in range(4)):
+                        # Check for game over
+                        if all(len(new_state["hands"].get(p, [])) == 0 for p in range(4)):
                             self.game_over = True
                             from rewards import compute_final_score_breakdown
                             self.final_breakdown = compute_final_score_breakdown(new_state)
 
-    
-    def detect_and_animate_changes(self, old_state, new_state):
-        """Enhanced method to detect and animate card changes with better debugging"""
-        # Skip if no old state
+    # Update detect_and_animate_changes to handle more cases
+    def detect_and_animate_changes(self, old_state, new_state, old_current_player=None):
+        """Improved change detection for more reliable animations"""
+        # Skip if states are invalid
         if not old_state or not new_state:
             return
         
-        # Get tables
+        # Get table states
         old_table = old_state.get('table', [])
         new_table = new_state.get('table', [])
         
-        print(f"Old table: {old_table}")
+        print(f"Detecting changes: Old table: {old_table}")
         print(f"New table: {new_table}")
+        
+        # Find the likely player who made the move (previous turn)
+        likely_player = old_current_player if old_current_player is not None else self.current_player_id
         
         # Find played card - card that moved from a hand to the table
         played_card = None
@@ -2124,62 +2168,94 @@ class GameScreen(BaseScreen):
             old_hand = old_state.get('hands', {}).get(p_id, [])
             new_hand = new_state.get('hands', {}).get(p_id, [])
             
-            # Skip if hands are the same
-            if old_hand == new_hand:
+            # Skip if hands are the same or missing
+            if not old_hand or not new_hand or old_hand == new_hand:
                 continue
                 
-            print(f"Player {p_id} hand change detected:")
-            print(f"  Old hand: {old_hand}")
-            print(f"  New hand: {new_hand}")
+            print(f"Player {p_id} hand changed: {old_hand} -> {new_hand}")
             
-            # Look for cards in old hand but not in new hand
+            # Look for cards that disappeared from a hand
             for card in old_hand:
                 if card not in new_hand:
-                    print(f"Card {card} was removed from player {p_id}'s hand")
-                    # Possible played card - card could be on the table or taken
-                    if card in new_table and card not in old_table:
+                    print(f"Card {card} removed from player {p_id}'s hand")
+                    # Check if this card appeared on the table
+                    if any(card == table_card for table_card in new_table) and not any(card == table_card for table_card in old_table):
                         played_card = card
                         player_id = p_id
                         print(f"Card {card} was played to the table by player {p_id}")
+                        break
         
         # Find captured cards - cards that were on the old table but not on the new table
         captured_cards = []
         for card in old_table:
-            if card not in new_table:
+            if not any(card == table_card for table_card in new_table):
                 captured_cards.append(card)
                 print(f"Card {card} was captured from the table")
         
-        if played_card:
-            print(f"MOVE DETECTED: Player {player_id} played {played_card} and captured {captured_cards}")
-            
-            # Create animation for the played card and captures
-            self.create_move_animations(played_card, captured_cards, player_id)
-            
-            # Play sound
-            self.app.resources.play_sound("card_play")
-        elif captured_cards:
-            # Handle case where we only see captures but not the played card
-            print(f"CAPTURE DETECTED: {len(captured_cards)} cards were captured, but couldn't determine who played")
-            
-            # Determine the most likely player who made the move (the one whose turn changed)
-            old_current_player = old_state.get('current_player', None)
-            new_current_player = new_state.get('current_player', None)
-            
-            if old_current_player is not None and new_current_player is not None:
-                capturing_player = old_current_player
-                print(f"Assuming player {capturing_player} made the capture (turn changed from {old_current_player} to {new_current_player})")
-                
-                # Create a simple table animation for the captures
-                self.animate_captures_only(captured_cards, capturing_player)
+        # New cards that appeared on the table
+        new_cards = []
+        for card in new_table:
+            if not any(card == table_card for table_card in old_table):
+                new_cards.append(card)
+                print(f"New card {card} appeared on the table")
         
-        # Also check for added cards to the table with no clear source
-        new_table_cards = [card for card in new_table if card not in old_table]
-        if new_table_cards and not played_card:
-            print(f"NEW CARDS ON TABLE: {new_table_cards}")
-            
-            # Show a simple animation for these cards appearing
-            for card in new_table_cards:
+        # Scenario 1: If we found both a played card and captures
+        if played_card and player_id is not None:
+            print(f"Detected play + capture: Player {player_id} played {played_card} and captured {captured_cards}")
+            self.create_move_animations(played_card, captured_cards, player_id)
+            self.app.resources.play_sound("card_play")
+        
+        # Scenario 2: Only captures detected (played card might be missed)
+        elif captured_cards and not played_card:
+            print(f"Detected only captures: {captured_cards}")
+            # Use the most likely player who made the move
+            self.animate_captures_only(captured_cards, likely_player)
+            self.app.resources.play_sound("card_play")
+        
+        # Scenario 3: Only new cards detected (no captures)
+        elif new_cards and not captured_cards:
+            print(f"Detected only new cards: {new_cards}")
+            # Animate each new card appearing
+            for card in new_cards:
                 self.animate_card_appearance(card)
+        
+        # When nothing specific is detected, but we know there was a change
+        elif old_table != new_table:
+            print("Table changed, but could not determine specific changes")
+            # Force a refresh animation
+            self.animate_table_refresh(new_table)
+
+    # Add a method to animate table refresh for when specific changes can't be determined
+    def animate_table_refresh(self, table_cards):
+        """Animate a refresh of all table cards to ensure they're visible"""
+        if not table_cards:
+            return
+        
+        # Create a short animation for each card on the table
+        # This helps ensure the client sees all cards properly
+        table_center = self.table_rect.center
+        
+        for card in table_cards:
+            # Start slightly below the table and move to center
+            start_x = table_center[0] + random.randint(-20, 20)
+            start_y = table_center[1] + random.randint(-20, 20)
+            
+            # End positions scattered around center
+            end_x = table_center[0] + random.randint(-10, 10)
+            end_y = table_center[1] + random.randint(-10, 10)
+            
+            # Create short animation
+            appear_anim = CardAnimation(
+                card=card,
+                start_pos=(start_x, start_y),
+                end_pos=(end_x, end_y),
+                duration=10,
+                scale_start=0.95,
+                scale_end=1.0,
+                rotation_start=0,
+                rotation_end=0
+            )
+            self.animations.append(appear_anim)
 
     def animate_captures_only(self, captured_cards, player_id):
         """Animate cards being captured without showing a played card"""
