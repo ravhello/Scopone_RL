@@ -2022,6 +2022,21 @@ class GameScreen(BaseScreen):
                     
     def setup_team_vs_ai_online(self):
         """Migliora la configurazione dei giocatori AI per la modalità Team vs AI online"""
+        print("\nConfigurando Team vs AI - online")
+        print(f"Local player ID: {self.local_player_id}")
+        
+        # NUOVO: Correzione per il client che ha ricevuto ID 1
+        if not self.app.game_config.get("is_host", False) and self.local_player_id == 1:
+            print("Correzione per il client con ID 1 - dovrebbe essere nel team 0")
+            # Correggi l'ID locale per considerarlo parte del team 0
+            self.players[1].team_id = 0 
+            self.players[1].is_ai = False
+            self.players[1].name = "You"
+            
+            # Correggi anche gli ID dei giocatori AI
+            self.players[3].is_ai = True
+            self.players[3].name = "AI 3"
+        
         # Configura i giocatori AI per la squadra avversaria (giocatori 1 e 3)
         difficulty = self.app.game_config.get("difficulty", 1)
         
@@ -2039,7 +2054,14 @@ class GameScreen(BaseScreen):
         print("Setting up AI controllers for online team vs AI mode")
         
         # Crea i controller AI per i giocatori 1 e 3
-        for player_id in [1, 3]:
+        ai_player_ids = [1, 3]
+        
+        # Se il client ha ID 1, crea controller solo per il giocatore 3
+        if not self.app.game_config.get("is_host", False) and self.local_player_id == 1:
+            print("CLIENT: Creando solo il controller AI per il giocatore 3")
+            ai_player_ids = [3]
+        
+        for player_id in ai_player_ids:
             # I giocatori AI appartengono al team 1
             team_id = 1
             self.ai_controllers[player_id] = DQNAgent(team_id=team_id)
@@ -2065,7 +2087,13 @@ class GameScreen(BaseScreen):
             self.players[player_id].name = f"AI {player_id}"
         
         # Aggiorna lo stato del giocatore partner
-        partner_id = 2 if self.local_player_id == 0 else 0
+        if self.app.game_config.get("is_host", False):
+            # Se siamo host (ID 0), il partner è ID 2
+            partner_id = 2
+        else:
+            # Se siamo client, il partner è l'host (ID 0)
+            partner_id = 0
+        
         if partner_id < len(self.players):
             self.players[partner_id].is_human = True
             self.players[partner_id].is_ai = False
@@ -2073,11 +2101,13 @@ class GameScreen(BaseScreen):
         
         # NUOVO: Invia un messaggio per confermare l'avvenuta configurazione
         if self.app.network:
-            self.app.network.message_queue.append("AI players configured: 1 and 3 are AI")
+            self.app.network.message_queue.append("Human team: players 0 and 2 (or you)")
+            self.app.network.message_queue.append("AI team: players 1 and 3")
         
-        # Stampa debug
+        # Stampa debug finale
+        print("\nConfigurazione finale dei giocatori:")
         for player in self.players:
-            print(f"Updated player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
+            print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
     
     def update_animations(self):
         """Update and clean up animations"""
@@ -2608,22 +2638,36 @@ class GameScreen(BaseScreen):
     
     def try_make_move(self):
         """Try to make a move with the selected cards"""
+        # Debug: mostra informazioni sulla mossa
+        print(f"Tentativo di mossa - giocatore corrente: {self.current_player_id}, controllabile: {self.is_current_player_controllable()}")
+        print(f"Carta selezionata: {self.selected_hand_card}, carte tavolo: {self.selected_table_cards}")
+        
         # Assicurati che sia il turno di un giocatore controllabile
         if not self.is_current_player_controllable():
             self.status_message = "Non è il tuo turno"
             return False
-            
+                
         if not self.selected_hand_card:
             self.status_message = "Select a card from your hand first"
             return False
         
+        # NUOVO: Debug per verificare le mani dei giocatori
+        print(f"Mani dei giocatori: {self.env.game_state.get('hands', {}).keys()}")
+        print(f"Mano locale: {self.env.game_state.get('hands', {}).get(self.local_player_id, [])}")
+        
         # Encode the action
         action_vec = encode_action(self.selected_hand_card, list(self.selected_table_cards))
         
-        # Verify it's a valid action
+        # Verifico che l'azione sia valida stampando tutte le azioni valide
         valid_actions = self.env.get_valid_actions()
-        valid_action = None
+        print(f"Azioni valide: {len(valid_actions)}")
         
+        # Debug delle azioni valide
+        for i, valid_act in enumerate(valid_actions[:5]):  # Mostra solo le prime 5 per brevità
+            card, captured = decode_action(valid_act)
+            print(f"  Azione {i}: carta={card}, catture={captured}")
+        
+        valid_action = None
         for valid_act in valid_actions:
             card, captured = decode_action(valid_act)
             if card == self.selected_hand_card and set(captured) == self.selected_table_cards:
@@ -2638,11 +2682,23 @@ class GameScreen(BaseScreen):
         try:
             # If online multiplayer, send move to server/other players
             if self.app.game_config.get("mode") == "online_multiplayer":
+                print(f"Invio mossa: {valid_action}")
+                # CRUCIALE: stampa la decodifica dell'azione
+                card_play, card_captures = decode_action(valid_action)
+                print(f"Decodifica: carta giocata={card_play}, catture={card_captures}")
+                
                 self.app.network.send_move(valid_action)
                 if not self.app.network.is_host:
                     # Client waits for server to update game state
                     self.waiting_for_other_player = True
+                    # NUOVO: Notifica l'utente
+                    self.status_message = "Mossa inviata, in attesa di conferma..."
+                    print("In attesa di conferma dal server...")
                     return True
+            
+            # IMPORTANTE: Debug mode per logging
+            print(f"Esecuzione mossa locale: {valid_action}")
+            print(f"Giocatore corrente: {self.current_player_id}")
             
             # Create animations for the move
             self.create_move_animations(self.selected_hand_card, self.selected_table_cards)
@@ -2666,8 +2722,11 @@ class GameScreen(BaseScreen):
             return True
         except Exception as e:
             print(f"Error making move: {e}")
+            import traceback
+            traceback.print_exc()
             self.status_message = "Error making move"
             return False
+
     
     def make_ai_move(self):
         """Make a move for the current AI player with improved online sync"""
@@ -3506,12 +3565,28 @@ class GameScreen(BaseScreen):
         """Verifica se il giocatore corrente può essere controllato dall'utente locale"""
         mode = self.app.game_config.get("mode")
         
+        # Debug info per troubleshooting
+        print(f"Verifica controllo - Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
+        print(f"Modalità: {mode}, Online type: {self.app.game_config.get('online_type')}")
+        
+        if self.current_player_id == self.local_player_id:
+            print("È il turno del giocatore locale")
+            return True
+        
+        # FIX CRITICO: Se siamo in modalità team vs AI online e siamo client con ID 1
+        # dobbiamo correggerlo per renderlo parte del team 0
+        if mode == "online_multiplayer" and self.app.game_config.get("online_type") == "team_vs_ai":
+            if self.local_player_id == 1:  # Se siamo il client con ID sbagliato
+                print("Correzione speciale per il client con ID 1 in team vs AI")
+                # Forza il giocatore a essere nel team 0 come partner
+                for player in self.players:
+                    if player.player_id == 1:
+                        player.team_id = 0
+                        player.is_ai = False
+                        print(f"Corretto player {player.player_id} - ora Team {player.team_id}, AI: {player.is_ai}")
+        
         # Per le modalità online
         if mode == "online_multiplayer":
-            # Se è il turno del giocatore locale
-            if self.current_player_id == self.local_player_id:
-                return True
-                
             # Se siamo in modalità team vs AI
             if self.app.game_config.get("online_type") == "team_vs_ai":
                 # Verifica se siamo nella stessa squadra del giocatore corrente
@@ -3519,8 +3594,21 @@ class GameScreen(BaseScreen):
                 current_player = next((p for p in self.players if p.player_id == self.current_player_id), None)
                 
                 if local_player and current_player:
-                    # Controlla se apparteniamo alla stessa squadra (team 0) e non è un'AI
-                    return (local_player.team_id == current_player.team_id == 0 and not current_player.is_ai)
+                    print(f"Local: team={local_player.team_id}, AI={local_player.is_ai}")
+                    print(f"Current: team={current_player.team_id}, AI={current_player.is_ai}")
+                    
+                    # CORREZIONE: Consideriamo il giocatore 1 come umano nel team 0 quando è il client
+                    is_same_team = local_player.team_id == current_player.team_id
+                    is_human_player = not current_player.is_ai
+                    
+                    if is_same_team and is_human_player:
+                        print("Controllabile: stesso team umano")
+                        return True
+                    
+                    # WORKAROUND: Se il giocatore locale è ID 1 e il corrente è ID 0, permetti il controllo
+                    if local_player.player_id == 1 and current_player.player_id == 0:
+                        print("Workaround: Il client con ID 1 può controllare l'host con ID 0")
+                        return True
             
             return False
         
