@@ -1522,7 +1522,7 @@ class GameScreen(BaseScreen):
                     self.ai_controllers[player_id].epsilon = 0.01
     
     def setup_players(self):
-        """Set up player info objects"""
+        """Set up player info objects with improved perspective handling"""
         config = self.app.game_config
         mode = config.get("mode", "single_player")
         
@@ -1560,9 +1560,44 @@ class GameScreen(BaseScreen):
             )
             
             self.players.append(player)
+        
+        # For online multiplayer - set up player perspective mapping
+        if mode == "online_multiplayer":
+            self.setup_player_perspective()
+
+    def setup_player_perspective(self):
+        """Set up visualization for different client perspectives
+        So each client sees their hand at the bottom (position 0)"""
+        if not hasattr(self, 'visual_positions'):
+            self.visual_positions = [0, 1, 2, 3]  # Default mapping
+        
+        # Check if local_player_id is None (not yet set by server)
+        if self.local_player_id is None:
+            print("Warning: local_player_id is None, using default perspective mapping")
+            return  # Keep default mapping until player ID is assigned
+        
+        # Calculate the rotation needed based on local player ID
+        # If player is player_id 0: no change
+        # If player is player_id 1: rotate 90 degrees counterclockwise (player sees themselves at bottom)
+        # If player is player_id 2: rotate 180 degrees (player sees themselves at bottom)
+        # If player is player_id 3: rotate 90 degrees clockwise (player sees themselves at bottom)
+        
+        # Calculate shifted positions
+        rotation_steps = self.local_player_id
+        self.visual_positions = [(i - rotation_steps) % 4 for i in range(4)]
+        
+        # Print visual positions mapping for debugging
+        print(f"Visual positions mapping: {self.visual_positions}")
+        print(f"Local player {self.local_player_id} is at visual position {self.visual_positions[self.local_player_id]}")
+
+    def get_visual_position(self, logical_player_id):
+        """Convert logical player ID to visual position based on client perspective"""
+        if not hasattr(self, 'visual_positions') or self.local_player_id is None:
+            return logical_player_id  # Use default mapping if no visual positions set yet
+        return self.visual_positions[logical_player_id]
     
     def setup_layout(self):
-        """Set up the screen layout using a grid-based system with dedicated spaces for elements"""
+        """Set up the screen layout with proper perspective handling for network play"""
         # Get current window dimensions
         width = self.app.window_width
         height = self.app.window_height
@@ -1584,11 +1619,7 @@ class GameScreen(BaseScreen):
         max_cards = 10
         hand_width = card_width + (max_cards - 1) * card_spread
         
-        # -------------------------------------------------------------
-        # DEFINE THE GRID-BASED LAYOUT
-        # -------------------------------------------------------------
-        
-        # 1. Center: Table area (fixed in the center)
+        # Center table area
         table_width = width * 0.7
         table_height = height * 0.5
         self.table_rect = pygame.Rect(
@@ -1598,69 +1629,86 @@ class GameScreen(BaseScreen):
             table_height
         )
         
-        # 2. Player hands (fixed positions based on player locations)
-        # Bottom player (0)
-        self.players[0].hand_rect = pygame.Rect(
-            width // 2 - hand_width // 2,
-            height - card_height - height * 0.05,  # 5% from bottom
-            hand_width,
-            card_height
-        )
+        # Player hand positions, adjusting for network perspective
+        hand_positions = [
+            # Bottom player
+            pygame.Rect(
+                width // 2 - hand_width // 2,
+                height - card_height - height * 0.05,  # 5% from bottom
+                hand_width,
+                card_height
+            ),
+            # Left player
+            pygame.Rect(
+                width * 0.02,  # 2% from left
+                height // 2 - hand_width // 2,
+                card_height,  # Swapped for vertical layout
+                hand_width
+            ),
+            # Top player
+            pygame.Rect(
+                width // 2 - hand_width // 2,
+                height * 0.05,  # 5% from top
+                hand_width,
+                card_height
+            ),
+            # Right player
+            pygame.Rect(
+                width - card_height - width * 0.02,  # 2% from right
+                height // 2 - hand_width // 2,
+                card_height,  # Swapped for vertical layout
+                hand_width
+            )
+        ]
         
-        # Left player (1)
-        self.players[1].hand_rect = pygame.Rect(
-            width * 0.02,  # 2% from left
-            height // 2 - hand_width // 2,
-            card_height,  # Swapped for vertical layout
-            hand_width
-        )
+        # Assign hand rectangles based on visual position
+        for player in self.players:
+            visual_pos = self.get_visual_position(player.player_id)
+            player.hand_rect = hand_positions[visual_pos]
+            
+            # For debugging
+            if player.player_id == self.local_player_id:
+                print(f"Player {player.player_id} (You) is at visual position {visual_pos}")
         
-        # Top player (2)
-        self.players[2].hand_rect = pygame.Rect(
-            width // 2 - hand_width // 2,
-            height * 0.05,  # 5% from top
-            hand_width,
-            card_height
-        )
+        # Avatar positions relative to hands
+        avatar_size = int(height * 0.08)
         
-        # Right player (3)
-        self.players[3].hand_rect = pygame.Rect(
-            width - card_height - width * 0.02,  # 2% from right
-            height // 2 - hand_width // 2,
-            card_height,  # Swapped for vertical layout
-            hand_width
-        )
+        for player in self.players:
+            visual_pos = self.get_visual_position(player.player_id)
+            
+            if visual_pos == 0:  # Bottom player - avatar to the left
+                player.avatar_rect = pygame.Rect(
+                    max(width * 0.01, player.hand_rect.left - avatar_size - width * 0.07),
+                    player.hand_rect.centery - avatar_size // 2,
+                    avatar_size, avatar_size
+                )
+            elif visual_pos == 1:  # Left player - avatar to the right
+                player.avatar_rect = pygame.Rect(
+                    player.hand_rect.right + width * 0.02,
+                    player.hand_rect.centery - avatar_size // 2,
+                    avatar_size, avatar_size
+                )
+            elif visual_pos == 2:  # Top player - avatar to the left
+                player.avatar_rect = pygame.Rect(
+                    player.hand_rect.left - avatar_size - width * 0.02,
+                    player.hand_rect.centery - avatar_size // 2,
+                    avatar_size, avatar_size
+                )
+            elif visual_pos == 3:  # Right player - avatar to the left
+                player.avatar_rect = pygame.Rect(
+                    player.hand_rect.left - avatar_size - width * 0.02,
+                    player.hand_rect.centery - avatar_size // 2,
+                    avatar_size, avatar_size
+                )
+                
+            # Set info rect as the same as avatar rect for compatibility
+            player.info_rect = player.avatar_rect.copy()
         
-        # -----------------------------------------------------
-        # CAPTURE PILES - Repositioned to avoid all player elements
-        # -----------------------------------------------------
-        pile_width = int(width * 0.12)
-        pile_height = int(height * 0.13)
-        
-        # Move piles to the corners that don't have player elements
-        # Team 0 pile - moved to top-center to avoid left player completely
-        pile0_x = width // 2 - pile_width - width * 0.10
-        pile0_y = height * 0.02 
-        
-        # Team 1 pile - moved to top-center to avoid left player completely
-        pile1_x = width // 2 + width * 0.10
-        pile1_y = height * 0.02
-        
-        # 4. UI Components
-        # These are positioned in specific grid cells to avoid overlaps
-        
-        # Calculate sizes based on screen dimensions
-        avatar_size = int(height * 0.08)  # 8% of window height
-        info_width = int(width * 0.12)
-        info_height = int(height * 0.05)
+        # UI elements and other layout elements - similar to original
         button_width = int(width * 0.14)
         button_height = int(height * 0.06)
         
-        # -----------------------------------------------
-        # BUTTON PLACEMENT - Fixed positions in corners
-        # -----------------------------------------------
-        
-        # New Game button - moved to extreme top-left corner
+        # New Game button - top-left corner
         self.new_game_button = Button(
             width * 0.01,  # Far left
             height * 0.01,  # Far top
@@ -1670,24 +1718,10 @@ class GameScreen(BaseScreen):
             DARK_BLUE, WHITE
         )
         
-        # Play Card button - moved to extreme bottom-right corner
-        # Check bottom player's hand position to avoid overlap
-        bottom_player_right = self.players[0].hand_rect.right
-        bottom_player_left = self.players[0].hand_rect.left
-        screen_center_x = width / 2
-        
-        # Position button either to the far right (if player hand is centered/left)
-        # or to the far left (if player hand extends right)
-        if bottom_player_right < screen_center_x + width * 0.2:
-            # Player hand doesn't extend to right side - place button at far right
-            button_x = width - button_width - width * 0.01
-        else:
-            # Player hand extends to right - place button at far left
-            button_x = width * 0.01
-            
+        # Play Card button - bottom-right corner
         self.confirm_button = Button(
-            button_x,
-            height - button_height - height * 0.01,  # Far bottom
+            width - button_width - width * 0.01,
+            height - button_height - height * 0.01,
             button_width, 
             button_height,
             "Play Card", 
@@ -1696,64 +1730,18 @@ class GameScreen(BaseScreen):
         
         # Message log - top right corner
         self.message_log_rect = pygame.Rect(
-            width - width * 0.25 - width * 0.02,  # Right side with margin
-            height * 0.05,  # Near top
+            width - width * 0.25 - width * 0.02,
+            height * 0.05,
             width * 0.25, 
             height * 0.18
         )
-        
-        # -----------------------------------------------------
-        # PLAYER AVATARS & INFO - Aligned with their hands
-        # -----------------------------------------------------
-        
-        # Bottom player (0) - avatar to the far left of hand
-        self.players[0].avatar_rect = pygame.Rect(
-            max(width * 0.01, self.players[0].hand_rect.left - avatar_size - width * 0.07),  # Further left, with minimum bound
-            self.players[0].hand_rect.centery - avatar_size // 2,
-            avatar_size,
-            avatar_size
-        )
-        
-        # Left player (1) - avatar to the right of the hand instead of above
-        # (to avoid overlap with the pile in the top-left)
-        self.players[1].avatar_rect = pygame.Rect(
-            self.players[1].hand_rect.right + width * 0.02,  # Right of hand
-            self.players[1].hand_rect.centery - avatar_size // 2,  # Centered vertically
-            avatar_size,
-            avatar_size
-        )
-        
-        # Top player (2) - avatar to the LEFT of hand instead of right
-        # to avoid overlapping with the message log
-        self.players[2].avatar_rect = pygame.Rect(
-            self.players[2].hand_rect.left - avatar_size - width * 0.02,  # Left of hand
-            self.players[2].hand_rect.centery - avatar_size // 2,
-            avatar_size,
-            avatar_size
-        )
-        
-        # Right player (3) - avatar to the LEFT of hand (invece che sotto)
-        # per evitare che sia fuori dallo schermo
-        self.players[3].avatar_rect = pygame.Rect(
-            self.players[3].hand_rect.left - avatar_size - width * 0.02,  # Left of hand
-            self.players[3].hand_rect.centery - avatar_size // 2,
-            avatar_size,
-            avatar_size
-        )
-        
-        # Info boxes - no longer needed since we display info in the avatar
-        # but keep them for compatibility
-        self.players[0].info_rect = self.players[0].avatar_rect.copy()
-        self.players[1].info_rect = self.players[1].avatar_rect.copy()
-        self.players[2].info_rect = self.players[2].avatar_rect.copy()
-        self.players[3].info_rect = self.players[3].avatar_rect.copy()
         
         # Update fonts based on screen dimensions
         self.title_font = pygame.font.SysFont(None, int(height * 0.042))
         self.info_font = pygame.font.SysFont(None, int(height * 0.031))
         self.small_font = pygame.font.SysFont(None, int(height * 0.023))
         
-        # Update global card size constants - needed for compatibility with existing code
+        # Update global card size constants
         global CARD_WIDTH, CARD_HEIGHT
         CARD_WIDTH = card_width
         CARD_HEIGHT = card_height
@@ -1775,7 +1763,7 @@ class GameScreen(BaseScreen):
                 player.set_hand([])
     
     def handle_events(self, events):
-        """Handle pygame events"""
+        """Handle pygame events with improved card selection logic"""
         for event in events:
             if event.type == pygame.QUIT:
                 self.done = True
@@ -1783,17 +1771,16 @@ class GameScreen(BaseScreen):
                 pygame.quit()
                 sys.exit()
             
-            # Controllo per il pulsante "New Game" anche in attesa di altri giocatori
+            # Always check for the "New Game" button
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
-                # Check buttons
                 if self.new_game_button.is_clicked(pos):
                     self.done = True
                     self.next_screen = "mode"
                     return
             
-            # Ignore input if game is over or waiting for other player
+            # Ignore input during specific game states
             if self.game_over or self.waiting_for_other_player or self.ai_thinking:
                 if self.game_over and event.type == pygame.MOUSEBUTTONDOWN:
                     # Check if new game button is clicked in game over screen
@@ -1810,15 +1797,11 @@ class GameScreen(BaseScreen):
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
-                # Check buttons
-                if self.new_game_button.is_clicked(pos):
-                    self.done = True
-                    self.next_screen = "mode"
-                
-                elif self.confirm_button.is_clicked(pos):
+                # Process confirm button
+                if self.confirm_button.is_clicked(pos):
                     self.try_make_move()
                 
-                # Check hand cards
+                # Check hand cards with visual perspective aware logic
                 hand_card = self.get_card_at_position(pos, area="hand")
                 if hand_card:
                     if hand_card == self.selected_hand_card:
@@ -1835,22 +1818,23 @@ class GameScreen(BaseScreen):
                     else:
                         self.selected_table_cards.add(table_card)
                     self.app.resources.play_sound("card_pickup")
-            # Aggiungi gestione scrolling per i messaggi
+            
+            # Handle message log scrolling
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
-                # Verifica clic sui pulsanti di scrolling
+                # Check scroll button clicks
                 if hasattr(self, 'scroll_up_rect') and self.scroll_up_rect.collidepoint(pos):
                     self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
                 elif hasattr(self, 'scroll_down_rect') and self.scroll_down_rect.collidepoint(pos):
-                    self.message_scroll_offset += 1  # Limite controllato in draw_message_log
+                    self.message_scroll_offset += 1  # Limit is checked in draw_message_log
                 
-                # Verifica scrolling con rotella del mouse quando il cursore è sopra il message log
+                # Check mouse wheel scrolling over message log
                 if hasattr(self, 'scrollbar_rect') and self.message_log_rect.collidepoint(pos):
                     if event.button == 4:  # Scroll up
                         self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
                     elif event.button == 5:  # Scroll down
-                        self.message_scroll_offset += 1  # Limite controllato in draw_message_log
+                        self.message_scroll_offset += 1
     
     def update(self):
         """Update game state"""
@@ -1867,11 +1851,18 @@ class GameScreen(BaseScreen):
         # AGGIUNGERE QUESTO CODICE: Aggiorna local_player_id dal network se necessario
         if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host"):
             if self.app.network and self.app.network.player_id is not None:
+                old_player_id = self.local_player_id
                 if self.local_player_id != self.app.network.player_id:
                     print(f"Aggiornamento player_id: da {self.local_player_id} a {self.app.network.player_id}")
                     self.local_player_id = self.app.network.player_id
                     # Aggiorna anche il nome del giocatore
                     self.players[self.local_player_id].name = "You"
+                    
+                    # If player ID changed, recalculate visual positions
+                    if old_player_id != self.local_player_id:
+                        self.setup_player_perspective()
+                        # Force layout recalculation with new perspective
+                        self.setup_layout()
         
         # Handle AI turns
         self.handle_ai_turns()
@@ -1991,15 +1982,15 @@ class GameScreen(BaseScreen):
                 self.ai_thinking = False
     
     def handle_network_updates(self):
-        """Handle network updates for online games with reconnection support"""
+        """Handle network updates for online games with improved state synchronization"""
         if not self.app.network:
             return
             
-        # Se la connessione è caduta, prova a riconnettersi
+        # Handle connection loss with reconnection attempt
         if not self.app.network.connected:
             self.status_message = "Connessione persa. Tentativo di riconnettersi..."
             
-            # Per i client (non per l'host), prova a riconnettersi
+            # For clients (not host), try to reconnect
             if not self.app.network.is_host:
                 if self.app.network.connect_to_server():
                     self.status_message = "Riconnessione avvenuta con successo!"
@@ -2008,7 +1999,7 @@ class GameScreen(BaseScreen):
                     self.waiting_for_other_player = True
             return
             
-        # Check for new messages
+        # Process new messages
         while self.app.network.message_queue:
             message = self.app.network.message_queue.popleft()
             self.messages.append(message)
@@ -2041,35 +2032,114 @@ class GameScreen(BaseScreen):
                 except Exception as e:
                     print(f"Error processing move: {e}")
                 
-                # Broadcast updated game state
+                # Broadcast updated game state including current player
                 self.app.network.game_state = self.env.game_state
+                # Add current player to the game state for synchronization
+                self.app.network.game_state['current_player'] = self.env.current_player
                 self.app.network.broadcast_game_state()
         
         # If client, update game state from network
         else:
-            # Salva lo stato attuale per rilevare i cambiamenti
+            # Save current state to detect changes
             old_state = None
+            old_current_player = None
             if self.env and hasattr(self.env, 'game_state'):
                 old_state = self.env.game_state.copy() if self.env.game_state else None
+                old_current_player = self.env.current_player if hasattr(self.env, 'current_player') else None
             
             if self.app.network.game_state:
+                # Store the new game state
+                new_state = self.app.network.game_state
+                
+                # Extract and remove current player from game state if present
+                new_current_player = new_state.pop('current_player', None)
+                
                 # Update local game state
                 if self.env:
-                    self.env.game_state = self.app.network.game_state
+                    self.env.game_state = new_state
                     
-                    # Controlla se c'è stato un cambiamento e crea animazioni se necessario
-                    if old_state and old_state != self.env.game_state:
-                        # Verifica se è stato effettuato un movimento
-                        if old_state.get('table') != self.env.game_state.get('table') or \
-                        old_state.get('captured_squads') != self.env.game_state.get('captured_squads'):
-                            # Sblocca l'attesa se il giocatore stava aspettando
-                            self.waiting_for_other_player = False
+                    # Update current player if provided
+                    if new_current_player is not None:
+                        self.env.current_player = new_current_player
+                        self.current_player_id = new_current_player
+                        print(f"Updated current player to {new_current_player}")
+                    
+                    # Check if there was a state change and create animations if needed
+                    if old_state and old_state != new_state:
+                        # Check if cards were played or captured
+                        if old_state.get('table') != new_state.get('table') or \
+                        old_state.get('captured_squads') != new_state.get('captured_squads') or \
+                        old_current_player != new_current_player:
+                        
+                            # Compare tables to identify played card and captured cards
+                            self.detect_and_animate_changes(old_state, new_state)
                             
-                            # Controlla se si tratta di una fine del gioco
-                            if all(len(self.env.game_state["hands"][p]) == 0 for p in range(4)):
-                                self.game_over = True
-                                from rewards import compute_final_score_breakdown
-                                self.final_breakdown = compute_final_score_breakdown(self.env.game_state)
+                            # Unlock waiting state if player was waiting
+                            self.waiting_for_other_player = False
+                        
+                        # Check if game is over
+                        if all(len(new_state["hands"][p]) == 0 for p in range(4)):
+                            self.game_over = True
+                            from rewards import compute_final_score_breakdown
+                            self.final_breakdown = compute_final_score_breakdown(new_state)
+
+    
+    def detect_and_animate_changes(self, old_state, new_state):
+        """Enhanced version to better detect and animate changes"""
+        # Skip if no old state
+        if not old_state or not new_state:
+            return
+        
+        # Get tables
+        old_table = old_state.get('table', [])
+        new_table = new_state.get('table', [])
+        
+        # Find played card - card that moved from a hand to the table
+        played_card = None
+        player_id = None
+        
+        # Check each player's hand for a card that disappeared
+        for p_id in range(4):
+            old_hand = old_state.get('hands', {}).get(p_id, [])
+            new_hand = new_state.get('hands', {}).get(p_id, [])
+            
+            # Convert lists to sets for easier comparison
+            old_hand_set = set(tuple(card) for card in old_hand)
+            new_hand_set = set(tuple(card) for card in new_hand)
+            
+            # Find cards that were in old hand but not in new hand
+            missing_cards = old_hand_set - new_hand_set
+            
+            for card in missing_cards:
+                card = list(card)  # Convert back to list for further processing
+                # Check if this card appeared on the table
+                if card in new_table and card not in old_table:
+                    played_card = card
+                    player_id = p_id
+                    break
+        
+        # Find captured cards - cards that were on the old table but not on the new table
+        captured_cards = []
+        for card in old_table:
+            if card not in new_table:
+                captured_cards.append(card)
+        
+        if played_card:
+            print(f"Detected move: Player {player_id} played {played_card} and captured {captured_cards}")
+            
+            # Only create animations if the player who moved is not the local player
+            # (local player animations are created when they make the move)
+            if player_id != self.local_player_id:
+                # Create animation for the played card and captures
+                self.create_move_animations(played_card, captured_cards, player_id)
+                
+                # Play sound
+                self.app.resources.play_sound("card_play")
+        else:
+            print("Changes detected but couldn't determine the exact move")
+            # Log table changes for debugging
+            print(f"Old table: {old_table}")
+            print(f"New table: {new_table}")
     
     def check_game_over(self):
         """Check if the game is over"""
@@ -2101,61 +2171,79 @@ class GameScreen(BaseScreen):
                 self.status_message = "It's a tie!"
     
     def get_card_at_position(self, pos, area="hand"):
-        """Get the card at a specific position in hand or on table using current dimensions"""
+        """Get the card at a position with visual perspective handling"""
         width = self.app.window_width
-        card_width = int(width * 0.078)  # ~8% of window width
+        card_width = int(width * 0.078)
         card_height = int(card_width * 1.5)
         
         if area == "hand":
-            # Determina quale giocatore è attualmente controllabile
+            # Determine active player based on game mode and turn
             current_player = None
             mode = self.app.game_config.get("mode")
             
-            if mode == "online_multiplayer":
-                # In modalità online, usa il giocatore locale o il suo partner in base a chi ha il turno
-                if self.current_player_id == self.local_player_id:
-                    current_player = self.players[self.local_player_id]
-                elif mode == "team_vs_ai" and ((self.local_player_id == 0 and self.current_player_id == 2) or 
-                                            (self.local_player_id == 2 and self.current_player_id == 0)):
-                    current_player = self.players[self.current_player_id]
-                else:
-                    # Se non è il turno di nessun giocatore controllabile, usa il giocatore locale
-                    current_player = self.players[self.local_player_id]
-            elif mode == "team_vs_ai" and self.current_player_id == 2:
-                # Se è il turno del partner nel team, usa il giocatore 2
-                current_player = self.players[2]
-            elif mode == "local_multiplayer":
-                # In modalità 4 giocatori, usa il giocatore corrente
+            # For all modes, start with the current player whose turn it is
+            if self.is_current_player_controllable():
                 current_player = self.players[self.current_player_id]
             else:
-                # Altrimenti usa il giocatore locale
+                # If not controllable, just check the local player's hand
                 current_player = self.players[self.local_player_id]
             
-            # Usa le carte del giocatore corrente
+            # Get the player's hand and hand area
             hand = current_player.hand_cards
             hand_rect = current_player.hand_rect
             
             if not hand:
                 return None
             
-            # Calcola la larghezza totale e la posizione iniziale per le carte
-            card_spread = card_width * 0.7
-            total_width = (len(hand) - 1) * card_spread + card_width
-            start_x = hand_rect.centerx - total_width / 2
+            # Get visual position of the player
+            visual_pos = self.get_visual_position(current_player.player_id)
+            is_horizontal = visual_pos in [0, 2]  # Bottom or top
             
-            for i, card in enumerate(hand):
-                # Calcola la posizione x per questa carta
-                x = start_x + i * card_spread
+            if is_horizontal:
+                # Horizontal hand (bottom or top player)
+                card_spread = card_width * 0.7
+                total_width = (len(hand) - 1) * card_spread + card_width
+                start_x = hand_rect.centerx - total_width / 2
                 
-                # Check if position is within this card
-                card_rect = pygame.Rect(x, hand_rect.bottom - card_height, card_width, card_height)
-                if card_rect.collidepoint(pos):
-                    return card
+                # Y position depends on visual position
+                if visual_pos == 0:  # Bottom
+                    base_y = hand_rect.bottom - card_height
+                else:  # Top
+                    base_y = hand_rect.top
+                
+                for i, card in enumerate(hand):
+                    # Calculate x position for this card
+                    x = start_x + i * card_spread
+                    
+                    # Check if position is within this card
+                    card_rect = pygame.Rect(x, base_y, card_width, card_height)
+                    if card_rect.collidepoint(pos):
+                        return card
+            else:
+                # Vertical hand (left or right player)
+                card_spread = card_height * 0.4
+                total_height = (len(hand) - 1) * card_spread + card_height
+                start_y = hand_rect.centery - total_height / 2
+                
+                # X position depends on visual position
+                if visual_pos == 1:  # Left
+                    base_x = hand_rect.left
+                else:  # Right
+                    base_x = hand_rect.right - card_width
+                
+                for i, card in enumerate(hand):
+                    # Calculate y position for this card
+                    y = start_y + i * card_spread
+                    
+                    # Check if position is within this card
+                    card_rect = pygame.Rect(base_x, y, card_width, card_height)
+                    if card_rect.collidepoint(pos):
+                        return card
             
             return None
-        
+            
         elif area == "table":
-            # Il codice per le carte sul tavolo rimane invariato
+            # Table cards are centered and don't change with perspective
             table_cards = self.env.game_state["table"]
             
             if not table_cards:
@@ -2278,13 +2366,14 @@ class GameScreen(BaseScreen):
             if "score_breakdown" in info:
                 self.final_breakdown = info["score_breakdown"]
     
-    def create_move_animations(self, card_played, cards_captured):
+    def create_move_animations(self, card_played, cards_captured, source_player_id=None):
         """Create animations for a move"""
-        # Get current player
-        current_player = self.players[self.current_player_id]
+        # Get player ID - use current player if no source player specified
+        player_id = source_player_id if source_player_id is not None else self.current_player_id
+        current_player = self.players[player_id]
         
         # Start position depends on player position
-        if current_player.player_id == self.local_player_id:
+        if player_id == self.local_player_id:
             # Calculate position in hand
             hand = current_player.hand_cards
             try:
@@ -2329,13 +2418,20 @@ class GameScreen(BaseScreen):
         table_cards = self.env.game_state["table"]
         
         # Calculate card positions in table layout with current dimensions
-        if table_cards:
+        if table_cards or cards_captured:
             width = self.app.window_width
             card_width = int(width * 0.078)
             
-            max_spacing = self.table_rect.width * 0.8 / max(len(table_cards), 1)
+            # We need to calculate positions for captured cards that might no longer be on the table
+            # Use the current table plus captured cards to determine original positions
+            original_table = table_cards.copy()
+            for card in cards_captured:
+                if card not in original_table:
+                    original_table.append(card)
+            
+            max_spacing = self.table_rect.width * 0.8 / max(len(original_table), 1)
             card_spacing = min(card_width * 1.1, max_spacing)
-            start_x = self.table_rect.centerx - (len(table_cards) * card_spacing) // 2
+            start_x = self.table_rect.centerx - (len(original_table) * card_spacing) // 2
             table_y = self.table_rect.centery - CARD_HEIGHT // 2
             
             # Calculate pile position for the capturing team
@@ -2344,7 +2440,8 @@ class GameScreen(BaseScreen):
             
             for card in cards_captured:
                 try:
-                    card_index = table_cards.index(card)
+                    # Find card position in the original table
+                    card_index = original_table.index(card)
                     card_x = start_x + card_index * card_spacing
                     card_pos = (card_x + CARD_WIDTH // 2, table_y + CARD_HEIGHT // 2)
                     
@@ -2353,7 +2450,7 @@ class GameScreen(BaseScreen):
                         start_pos=card_pos,
                         end_pos=pile_pos,
                         duration=25,
-                        delay=5,  # Short delay after played card
+                        delay=25,  # Longer delay to ensure played card is shown first
                         scale_start=1.0,
                         scale_end=0.8,
                         rotation_start=0,
@@ -2362,7 +2459,7 @@ class GameScreen(BaseScreen):
                     self.animations.append(capture_anim)
                 except ValueError:
                     # Card not found on table (should not happen)
-                    pass
+                    print(f"Warning: Could not find card {card} in original table")
     
     def draw(self, surface):
         """Draw the game screen"""
@@ -2405,24 +2502,26 @@ class GameScreen(BaseScreen):
             self.draw_game_over(surface)
     
     def draw_players(self, surface):
-        """Draw all players' hands and info"""
+        """Draw all players' hands and info with proper perspective handling"""
         for player in self.players:
             self.draw_player_info(surface, player)
             
-            # Draw hand
+            # Determine if player's hand should be visible
             mode = self.app.game_config.get("mode")
-            is_controllable = False
             
-            if mode == "team_vs_ai":
-                is_controllable = (player.player_id == self.local_player_id or 
-                                (player.player_id == 2 and self.current_player_id == 2))
-            elif mode == "local_multiplayer":
-                is_controllable = (player.player_id == self.current_player_id)
-            else:
-                is_controllable = (player.player_id == self.local_player_id)
-            
-            if is_controllable:
+            # Always show local player's hand
+            if player.player_id == self.local_player_id:
                 self.draw_player_hand(surface, player)
+            
+            # For team_vs_ai, show partner's hand when it's their turn
+            elif mode == "team_vs_ai" and player.player_id == 2 and self.current_player_id == 2:
+                self.draw_player_hand(surface, player)
+                
+            # For local multiplayer, show current player's hand
+            elif mode == "local_multiplayer" and player.player_id == self.current_player_id:
+                self.draw_player_hand(surface, player)
+                
+            # Otherwise show hidden hand
             else:
                 self.draw_player_hidden_hand(surface, player)
     
@@ -2472,48 +2571,101 @@ class GameScreen(BaseScreen):
         surface.blit(count_surf, count_rect)
     
     def draw_player_hand(self, surface, player):
-        """Draw the local player's hand with card faces visible and no rotation"""
+        """Draw the player's hand with card faces visible and properly centered"""
         hand = player.hand_cards
         if not hand:
             return
         
         # Calculate the current card width based on window size
         width = self.app.window_width
-        card_width = int(width * 0.078)  # Must match the calculation in setup_layout
+        card_width = int(width * 0.078)
         card_height = int(card_width * 1.5)
         
-        # Get center of the player's hand area
-        center_x = player.hand_rect.centerx
-        base_y = player.hand_rect.bottom - card_height
-        card_spread = card_width * 0.7
+        # Get position based on visual perspective
+        visual_pos = self.get_visual_position(player.player_id)
+        hand_rect = player.hand_rect
         
-        # Calcola la larghezza totale che occuperanno tutte le carte
-        total_width = (len(hand) - 1) * card_spread + card_width
+        # Display variables depend on whether this is horizontal or vertical orientation
+        is_horizontal = visual_pos in [0, 2]  # Bottom or top
         
-        # Calcola la posizione iniziale per centrare il gruppo di carte
-        start_x = center_x - total_width / 2
-        
-        for i, card in enumerate(hand):
-            # Calcola la posizione x per questa carta
-            x = start_x + i * card_spread
+        if is_horizontal:
+            # Horizontal hand layout (bottom or top)
+            center_x = hand_rect.centerx
+            card_spread = card_width * 0.7
+            total_width = (len(hand) - 1) * card_spread + card_width
+            start_x = center_x - (total_width / 2)
             
-            # Get card image (rescaled for current window size)
-            card_img = self.app.resources.get_card_image(card)
+            # Y position depends on whether it's top or bottom
+            if visual_pos == 0:  # Bottom
+                base_y = hand_rect.bottom - card_height
+            else:  # Top
+                base_y = hand_rect.top
             
-            # Create card rect (no rotation)
-            card_rect = pygame.Rect(x, base_y, card_width, card_height)
+            # Debug output
+            print(f"Drawing hand for player {player.player_id} at visual pos {visual_pos}. Cards: {len(hand)}")
+            print(f"Hand rect: {hand_rect}, Start X: {start_x}, Base Y: {base_y}")
             
-            # Highlight selected card
-            if card == self.selected_hand_card:
-                # Draw selection border
-                highlight_rect = card_rect.copy()
-                pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=5)
+            for i, card in enumerate(hand):
+                # Calculate x position for this card
+                x = start_x + i * card_spread
                 
-                # Raise the selected card
-                card_rect.move_ip(0, -15)
+                # Get card image
+                card_img = self.app.resources.get_card_image(card)
+                
+                # Create card rect
+                card_rect = pygame.Rect(x, base_y, card_width, card_height)
+                
+                # Highlight selected card
+                if card == self.selected_hand_card:
+                    # Draw selection border
+                    highlight_rect = card_rect.copy()
+                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=5)
+                    
+                    # Raise selected card for bottom player, lower for top player
+                    if visual_pos == 0:
+                        card_rect.move_ip(0, -15)
+                    else:
+                        card_rect.move_ip(0, 15)
+                
+                # Draw card
+                surface.blit(card_img, card_rect)
+        else:
+            # Vertical hand layout (left or right)
+            center_y = hand_rect.centery
+            card_spread = card_height * 0.4  # Less overlap for vertical cards
+            total_height = (len(hand) - 1) * card_spread + card_height
+            start_y = center_y - (total_height / 2)
             
-            # Draw card
-            surface.blit(card_img, card_rect)
+            # X position depends on whether it's left or right
+            if visual_pos == 1:  # Left
+                base_x = hand_rect.left
+            else:  # Right
+                base_x = hand_rect.right - card_width
+            
+            for i, card in enumerate(hand):
+                # Calculate y position for this card
+                y = start_y + i * card_spread
+                
+                # Get card image
+                card_img = self.app.resources.get_card_image(card)
+                
+                # Create card rect
+                card_rect = pygame.Rect(base_x, y, card_width, card_height)
+                
+                # Highlight selected card
+                if card == self.selected_hand_card:
+                    # Draw selection border
+                    highlight_rect = card_rect.copy()
+                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=5)
+                    
+                    # Move selected card outward
+                    if visual_pos == 1:
+                        card_rect.move_ip(15, 0)
+                    else:
+                        card_rect.move_ip(-15, 0)
+                
+                # Draw card
+                surface.blit(card_img, card_rect)
     
     def draw_player_hidden_hand(self, surface, player):
         """Draw another player's hand with card backs"""
