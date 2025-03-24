@@ -1133,6 +1133,13 @@ class GameModeScreen(BaseScreen):
     def host_online_game(self):
         """Host an online game with internet support"""
         self.app.network = NetworkManager(is_host=True)
+        
+        # CORREZIONE: Imposta il game_state PRIMA di avviare il server
+        if self.selected_online_mode == 1:  # Team vs AI
+            self.app.network.game_state = {
+                'online_type': 'team_vs_ai'
+            }
+        
         if self.app.network.start_server():
             # Ottieni sia l'IP locale che quello pubblico
             local_ip = get_local_ip()
@@ -1174,13 +1181,11 @@ class GameModeScreen(BaseScreen):
                     "difficulty": self.selected_difficulty
                 }
                 
-                # NUOVO: Passa la configurazione al network manager
+                # Questa riga è ora ridondante ma la mantengo per sicurezza
                 if hasattr(self.app, 'network') and self.app.network:
                     self.app.network.game_state = {
                         'online_type': 'team_vs_ai'
                     }
-        else:
-            self.status_message = "Failed to start server"
     
     def join_online_game(self):
         """Join an online game"""
