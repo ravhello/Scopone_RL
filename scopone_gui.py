@@ -2252,13 +2252,13 @@ class GameScreen(BaseScreen):
                 new_current_player = new_state.pop('current_player', None)
                 
                 # Debug output of critical components
-                print(f"Client received state:")
-                print(f"  Current player: {new_current_player}")
-                print(f"  Online type: {new_state.get('online_type')}")
-                print(f"  AI players: {new_state.get('ai_players', [])}")
-                print(f"  Table cards: {new_state.get('table', [])}")
-                print(f"  Last move: {new_state.get('last_move')}")
-                print(f"  Hands: {new_state.get('hands', {}).keys()}")
+                #print(f"Client received state:")
+                #print(f"  Current player: {new_current_player}")
+                #print(f"  Online type: {new_state.get('online_type')}")
+                #print(f"  AI players: {new_state.get('ai_players', [])}")
+                #print(f"  Table cards: {new_state.get('table', [])}")
+                #print(f"  Last move: {new_state.get('last_move')}")
+                #print(f"  Hands: {new_state.get('hands', {}).keys()}")
                 
                 # IMPORTANT: Ensure we have our hand
                 if self.local_player_id is not None and 'hands' in new_state:
@@ -3569,13 +3569,13 @@ class GameScreen(BaseScreen):
         mode = self.app.game_config.get("mode")
         
         # Log per debugging
-        print(f"### VERIFICA CONTROLLO GIOCATORE ###")
-        print(f"Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
-        print(f"Modalità: {mode}, Tipo online: {self.app.game_config.get('online_type')}")
+        #print(f"### VERIFICA CONTROLLO GIOCATORE ###")
+        #print(f"Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
+        #print(f"Modalità: {mode}, Tipo online: {self.app.game_config.get('online_type')}")
         
         # Caso base: sempre controllabile se è il proprio turno
         if self.current_player_id == self.local_player_id:
-            print("È il turno del giocatore locale")
+            #print("È il turno del giocatore locale")
             return True
         
         # Altre modalità di gioco
