@@ -1673,24 +1673,8 @@ class GameScreen(BaseScreen):
             print("Warning: local_player_id is None, using default perspective mapping")
             return  # Keep default mapping until player ID is assigned
         
-        # NUOVO: Special case for player ID 1 client in team vs AI mode
-        if (self.app.game_config.get("mode") == "online_multiplayer" and 
-            self.app.game_config.get("online_type") == "team_vs_ai" and 
-            not self.app.game_config.get("is_host", False) and self.local_player_id == 1):
-            print("Forced perspective for player ID 1 client")
-            # Put player ID 1 at visual position 0 (bottom)
-            self.visual_positions = [3, 0, 1, 2]  # Maps logical_player_id -> visual_position
-            print(f"Visual positions mapping: {self.visual_positions}")
-            print(f"Local player {self.local_player_id} is at visual position {self.visual_positions[self.local_player_id]}")
-            return
-        
-        # Calculate the rotation needed based on local player ID
-        # If player is player_id 0: no change
-        # If player is player_id 1: rotate 90 degrees counterclockwise (player sees themselves at bottom)
-        # If player is player_id 2: rotate 180 degrees (player sees themselves at bottom)
-        # If player is player_id 3: rotate 90 degrees clockwise (player sees themselves at bottom)
-        
-        # Calculate shifted positions
+        # Ogni giocatore vede se stesso in basso (posizione 0)
+        # Il calcolo è semplice: shiftiamo le posizioni in base all'ID locale
         rotation_steps = self.local_player_id
         self.visual_positions = [(i - rotation_steps) % 4 for i in range(4)]
         
@@ -2037,7 +2021,7 @@ class GameScreen(BaseScreen):
         print("\nConfigurando Team vs AI - online")
         print(f"Local player ID: {self.local_player_id}")
         
-        # In modalità team vs AI:
+        # In modalità team vs AI la configurazione è SEMPRE:
         # - Giocatori 0 e 2 sono umani (team 0)
         # - Giocatori 1 e 3 sono AI (team 1)
         
@@ -2045,18 +2029,12 @@ class GameScreen(BaseScreen):
         self.players[0].team_id = 0
         self.players[0].is_human = True
         self.players[0].is_ai = False
+        self.players[0].name = "You" if self.local_player_id == 0 else "Partner"
         
         self.players[2].team_id = 0
         self.players[2].is_human = True
         self.players[2].is_ai = False
-        
-        # Assegna i nomi corretti in base al giocatore locale
-        if self.local_player_id == 0:
-            self.players[0].name = "You"
-            self.players[2].name = "Partner"
-        elif self.local_player_id == 2:
-            self.players[0].name = "Partner"
-            self.players[2].name = "You"
+        self.players[2].name = "You" if self.local_player_id == 2 else "Partner"
         
         # Configura i giocatori AI
         self.players[1].team_id = 1
@@ -2069,11 +2047,11 @@ class GameScreen(BaseScreen):
         self.players[3].is_ai = True
         self.players[3].name = "AI 3"
         
-        # Configura i controller AI solo per i giocatori 1 e 3
+        # Configura solo i controller AI necessari
         ai_player_ids = [1, 3]
         difficulty = self.app.game_config.get("difficulty", 1)
         
-        # Crea i controller AI per i giocatori 1 e 3 se non esistono già
+        # Crea i controller AI per i giocatori 1 e 3
         for player_id in ai_player_ids:
             if player_id not in self.ai_controllers:
                 self.ai_controllers[player_id] = DQNAgent(team_id=1)
@@ -3562,61 +3540,22 @@ class GameScreen(BaseScreen):
         print(f"Verifica controllo - Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
         print(f"Modalità: {mode}, Online type: {self.app.game_config.get('online_type')}")
         
+        # Se è il proprio turno, è sempre controllabile
         if self.current_player_id == self.local_player_id:
             print("È il turno del giocatore locale")
             return True
-        
-        # FIX CRITICO: Se siamo in modalità team vs AI online e siamo client con ID 1
-        # dobbiamo correggerlo per renderlo parte del team 0
-        if mode == "online_multiplayer" and self.app.game_config.get("online_type") == "team_vs_ai":
-            if not self.app.game_config.get("is_host", False) and self.local_player_id == 1:  # Se siamo il client con ID sbagliato
-                print("Correzione speciale per il client con ID 1 in team vs AI")
-                # Forza il giocatore a essere nel team 0 come partner
-                for player in self.players:
-                    if player.player_id == 1:
-                        player.team_id = 0
-                        player.is_ai = False
-                        player.name = "You"
-                        print(f"Corretto player {player.player_id} - ora Team {player.team_id}, AI: {player.is_ai}")
-                
-                # NUOVO: Se è il turno del giocatore 1, e siamo il giocatore 1, allora è il nostro turno
-                if self.current_player_id == 1:
-                    print("È il turno del giocatore locale (ID 1)")
-                    return True
-        
+            
         # Per le modalità online
         if mode == "online_multiplayer":
-            # Se siamo in modalità team vs AI
-            if self.app.game_config.get("online_type") == "team_vs_ai":
-                # Verifica se siamo nella stessa squadra del giocatore corrente
-                local_player = next((p for p in self.players if p.player_id == self.local_player_id), None)
-                current_player = next((p for p in self.players if p.player_id == self.current_player_id), None)
-                
-                if local_player and current_player:
-                    print(f"Local: team={local_player.team_id}, AI={local_player.is_ai}")
-                    print(f"Current: team={current_player.team_id}, AI={current_player.is_ai}")
-                    
-                    # CORREZIONE: Consideriamo il giocatore 1 come umano nel team 0 quando è il client
-                    is_same_team = local_player.team_id == current_player.team_id
-                    is_human_player = not current_player.is_ai
-                    
-                    if is_same_team and is_human_player:
-                        print("Controllabile: stesso team umano")
-                        return True
-                    
-                    # WORKAROUND: Se il giocatore locale è ID 1 e il corrente è ID 0, permetti il controllo
-                    if local_player.player_id == 1 and current_player.player_id == 0:
-                        print("Workaround: Il client con ID 1 può controllare l'host con ID 0")
-                        return True
-            
+            # Per tutti i giochi online, solo il proprio giocatore può giocare le proprie carte
             return False
         
         # Per le altre modalità
         elif mode == "team_vs_ai":
-            # In modalità team vs AI, entrambi i giocatori 0 e 2 sono controllabili
+            # In modalità team vs AI, entrambi i giocatori 0 e 2 sono controllabili localmente
             return self.current_player_id in [0, 2]
         elif mode == "local_multiplayer":
-            # In modalità 4 giocatori umani, tutti i giocatori sono controllabili quando è il loro turno
+            # In modalità 4 giocatori umani, tutti i giocatori sono controllabili nel proprio turno
             return True
         else:
             # Nelle altre modalità, solo il giocatore locale è controllabile
