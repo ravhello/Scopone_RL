@@ -1663,8 +1663,7 @@ class GameScreen(BaseScreen):
             print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
 
     def setup_player_perspective(self):
-        """Set up visualization for different client perspectives
-        So each client sees their hand at the bottom (position 0)"""
+        """Set up visualization for different client perspectives"""
         if not hasattr(self, 'visual_positions'):
             self.visual_positions = [0, 1, 2, 3]  # Default mapping
         
@@ -1673,20 +1672,49 @@ class GameScreen(BaseScreen):
             print("Warning: local_player_id is None, using default perspective mapping")
             return  # Keep default mapping until player ID is assigned
         
+        # IMPORTANTE: Stampa debug prima del calcolo
+        print(f"CALCOLO POSIZIONI VISUALI PER GIOCATORE {self.local_player_id}")
+        
         # Ogni giocatore vede se stesso in basso (posizione 0)
-        # Il calcolo è semplice: shiftiamo le posizioni in base all'ID locale
         rotation_steps = self.local_player_id
         self.visual_positions = [(i - rotation_steps) % 4 for i in range(4)]
         
-        # Print visual positions mapping for debugging
-        print(f"Visual positions mapping: {self.visual_positions}")
-        print(f"Local player {self.local_player_id} is at visual position {self.visual_positions[self.local_player_id]}")
+        # CRUCIALE: Verifica per il giocatore 2 in modalità team vs AI
+        if (self.local_player_id == 2 and 
+            self.app.game_config.get("mode") == "online_multiplayer" and 
+            self.app.game_config.get("online_type") == "team_vs_ai"):
+            # Forza la mappatura corretta per il giocatore 2 (cliente)
+            correct_mapping = [2, 3, 0, 1]  # [0->2, 1->3, 2->0, 3->1]
+            if self.visual_positions != correct_mapping:
+                print("CORREZIONE CRITICA: Mappatura visuale forzata per il giocatore 2!")
+                self.visual_positions = correct_mapping
+        
+        # Stampa dettagliata per debugging
+        print(f"MAPPATURA VISUALE FINALE: {self.visual_positions}")
+        print(f"Giocatore locale {self.local_player_id} posizionato in {self.visual_positions[self.local_player_id]}")
+        for i in range(4):
+            print(f"  Giocatore {i} mostrato in posizione {self.visual_positions[i]}")
+        
+        # BLOCCA la mappatura visuale per evitare modifiche successive
+        setattr(self, '_visual_mapping_locked', True)
 
     def get_visual_position(self, logical_player_id):
         """Convert logical player ID to visual position based on client perspective"""
         if not hasattr(self, 'visual_positions') or self.local_player_id is None:
             return logical_player_id  # Use default mapping if no visual positions set yet
-        return self.visual_positions[logical_player_id]
+            
+        # CRUCIALE: Verifica se qualcuno sta cercando di modificare il mapping
+        if hasattr(self, '_visual_mapping_locked') and getattr(self, '_visual_mapping_locked'):
+            # Stampa un avviso solo la prima volta
+            if not hasattr(self, '_warned_about_mapping'):
+                print(f"ATTENZIONE: Tentativo di accesso al mapping visuale bloccato")
+                setattr(self, '_warned_about_mapping', True)
+        
+        # Stampa di debug ad ogni chiamata
+        result = self.visual_positions[logical_player_id]
+        print(f"get_visual_position({logical_player_id}) => {result}")
+        
+        return result
     
     def setup_layout(self):
         """Set up the screen layout with proper perspective handling for network play"""
@@ -2017,15 +2045,15 @@ class GameScreen(BaseScreen):
                 self.messages.append(message)
                     
     def setup_team_vs_ai_online(self):
-        """Configurazione semplificata dei giocatori per la modalità Team vs AI online"""
-        print("\nConfigurando Team vs AI - online")
-        print(f"Local player ID: {self.local_player_id}")
+        """Configurazione robusta dei giocatori per la modalità Team vs AI online"""
+        print("\n### CONFIGURAZIONE TEAM VS AI ONLINE ###")
+        print(f"ID giocatore locale: {self.local_player_id}")
         
-        # In modalità team vs AI la configurazione è SEMPRE:
-        # - Giocatori 0 e 2 sono umani (team 0)
-        # - Giocatori 1 e 3 sono AI (team 1)
+        # Configurazione fissa per squadre e ruoli
+        # Team 0 (umani): giocatori 0 e 2
+        # Team 1 (AI): giocatori 1 e 3
         
-        # Configura i giocatori umani
+        # Configura giocatori umani
         self.players[0].team_id = 0
         self.players[0].is_human = True
         self.players[0].is_ai = False
@@ -2036,7 +2064,7 @@ class GameScreen(BaseScreen):
         self.players[2].is_ai = False
         self.players[2].name = "You" if self.local_player_id == 2 else "Partner"
         
-        # Configura i giocatori AI
+        # Configura giocatori AI
         self.players[1].team_id = 1
         self.players[1].is_human = False
         self.players[1].is_ai = True
@@ -2047,22 +2075,21 @@ class GameScreen(BaseScreen):
         self.players[3].is_ai = True
         self.players[3].name = "AI 3"
         
-        # Configura solo i controller AI necessari
+        # Configura AI controllers
         ai_player_ids = [1, 3]
         difficulty = self.app.game_config.get("difficulty", 1)
         
-        # Crea i controller AI per i giocatori 1 e 3
         for player_id in ai_player_ids:
             if player_id not in self.ai_controllers:
                 self.ai_controllers[player_id] = DQNAgent(team_id=1)
                 
-                # Carica il checkpoint se disponibile
+                # Carica checkpoint se disponibile
                 checkpoint_path = f"scopone_checkpoint_team1.pth"
                 if os.path.exists(checkpoint_path):
-                    print(f"Loading checkpoint for AI player {player_id}")
+                    print(f"Caricamento checkpoint per AI player {player_id}")
                     self.ai_controllers[player_id].load_checkpoint(checkpoint_path)
                 
-                # Imposta il livello di casualità in base alla difficoltà
+                # Imposta epsilon in base alla difficoltà
                 if difficulty == 0:  # Easy
                     self.ai_controllers[player_id].epsilon = 0.3
                 elif difficulty == 1:  # Medium
@@ -2070,12 +2097,12 @@ class GameScreen(BaseScreen):
                 else:  # Hard
                     self.ai_controllers[player_id].epsilon = 0.01
         
-        # Conferma la configurazione completata
+        # Annuncio configurazione
         if self.app.network:
             self.app.network.message_queue.append("TEAM UMANO: giocatori 0 e 2")
             self.app.network.message_queue.append("TEAM AI: giocatori 1 e 3")
         
-        # Stampa debug finale
+        # Stampa configurazione finale
         print("\nConfigurazione finale dei giocatori:")
         for player in self.players:
             print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
@@ -3533,32 +3560,31 @@ class GameScreen(BaseScreen):
         self.game_over_button_rect = new_game_button.rect
         
     def is_current_player_controllable(self):
-        """Verifica se il giocatore corrente può essere controllato dall'utente locale"""
+        """Verifica robusta per il controllo del giocatore corrente"""
         mode = self.app.game_config.get("mode")
         
-        # Debug info per troubleshooting
-        print(f"Verifica controllo - Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
-        print(f"Modalità: {mode}, Online type: {self.app.game_config.get('online_type')}")
+        # Log per debugging
+        print(f"### VERIFICA CONTROLLO GIOCATORE ###")
+        print(f"Giocatore corrente: {self.current_player_id}, Locale: {self.local_player_id}")
+        print(f"Modalità: {mode}, Tipo online: {self.app.game_config.get('online_type')}")
         
-        # Se è il proprio turno, è sempre controllabile
+        # Caso base: sempre controllabile se è il proprio turno
         if self.current_player_id == self.local_player_id:
             print("È il turno del giocatore locale")
             return True
-            
-        # Per le modalità online
-        if mode == "online_multiplayer":
-            # Per tutti i giochi online, solo il proprio giocatore può giocare le proprie carte
-            return False
         
-        # Per le altre modalità
+        # Altre modalità di gioco
+        if mode == "online_multiplayer":
+            # Online: mai controllare giocatori diversi da sé stessi
+            return False
         elif mode == "team_vs_ai":
-            # In modalità team vs AI, entrambi i giocatori 0 e 2 sono controllabili localmente
+            # Locale team vs AI: controllo dei giocatori 0 e 2
             return self.current_player_id in [0, 2]
         elif mode == "local_multiplayer":
-            # In modalità 4 giocatori umani, tutti i giocatori sono controllabili nel proprio turno
+            # Modalità locale: tutti controllabili
             return True
         else:
-            # Nelle altre modalità, solo il giocatore locale è controllabile
+            # Altre modalità: solo giocatore locale
             return self.current_player_id == self.local_player_id
 
 class ScoponeApp:
