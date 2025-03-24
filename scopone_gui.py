@@ -543,8 +543,12 @@ class NetworkManager:
                 
                 # Assegna player_id in base alla modalità di gioco
                 if is_team_vs_ai:
-                    # In modalità team vs AI, assegna direttamente l'ID 2 al primo client (partner umano)
-                    player_id = 2
+                    # MODIFICA: In modalità team vs AI, assegna l'ID 1 al client
+                    # Poi lo tratteremo come un giocatore del team 0
+                    player_id = 1
+                    
+                    # Aggiunta di un messaggio di log
+                    print(f"Modalità team vs AI: assegnato ID {player_id} al client")
                 else:
                     # Nelle altre modalità, assegna ID progressivi (1, 2, 3)
                     player_id = len(self.clients) + 1
@@ -2036,24 +2040,74 @@ class GameScreen(BaseScreen):
         print("\nConfigurando Team vs AI - online")
         print(f"Local player ID: {self.local_player_id}")
         
-        # NUOVO: Correzione per il client che ha ricevuto ID 1
+        # MODIFICA: Correzione più robusta per il client con ID 1
         if not self.app.game_config.get("is_host", False) and self.local_player_id == 1:
-            print("Correzione per il client con ID 1 - dovrebbe essere nel team 0")
-            # Correggi l'ID locale per considerarlo parte del team 0
-            self.players[1].team_id = 0 
+            print("CORREZIONE CRITICA per il client con ID 1 - team 0")
+            # Correggiamo in modo più aggressivo tutti i giocatori nel team giusto
+            
+            # Il client (player 1) è nel team 0 e umano
+            self.players[1].team_id = 0
             self.players[1].is_ai = False
             self.players[1].name = "You"
             
-            # Correggi anche gli ID dei giocatori AI
+            # L'host (player 0) è anche nel team 0
+            self.players[0].team_id = 0
+            self.players[0].is_human = True
+            self.players[0].is_ai = False
+            self.players[0].name = "Partner"
+            
+            # Le AI sono nel team 1
+            self.players[2].team_id = 1
+            self.players[2].is_human = False
+            self.players[2].is_ai = True
+            self.players[2].name = "AI 2"
+            
+            self.players[3].team_id = 1
+            self.players[3].is_human = False
             self.players[3].is_ai = True
             self.players[3].name = "AI 3"
+            
+            # Solo il giocatore 3 dovrebbe avere un AI controller
+            ai_player_ids = [3]
+            
+            print("Sistema di team completamente riconfigurato per client ID 1:")
+            for player in self.players:
+                print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
+        elif self.app.game_config.get("is_host", False):
+            # Configurazione host - comunque riorganizziamo in modo esplicito
+            print("Configurazione server - assicuriamo team corretti")
+            
+            # I giocatori 0 e 1 sono nel team 0 (umani)
+            self.players[0].team_id = 0
+            self.players[0].is_human = True
+            self.players[0].is_ai = False
+            self.players[0].name = "You" 
+            
+            self.players[1].team_id = 0
+            self.players[1].is_human = True
+            self.players[1].is_ai = False
+            self.players[1].name = "Partner"
+            
+            # I giocatori 2 e 3 sono nel team 1 (AI)
+            self.players[2].team_id = 1
+            self.players[2].is_human = False
+            self.players[2].is_ai = True
+            self.players[2].name = "AI 2"
+            
+            self.players[3].team_id = 1
+            self.players[3].is_human = False
+            self.players[3].is_ai = True
+            self.players[3].name = "AI 3"
+            
+            # Le AI sono 2 e 3
+            ai_player_ids = [2, 3]
         
-        # Configura i giocatori AI per la squadra avversaria (giocatori 1 e 3)
+        # Configura i giocatori AI per la squadra avversaria
         difficulty = self.app.game_config.get("difficulty", 1)
         
         # Verifica che gli AI controller non esistano già
         need_setup = False
-        for player_id in [1, 3]:
+        for player_id in ai_player_ids:
             if player_id not in self.ai_controllers:
                 need_setup = True
                 break
@@ -2062,15 +2116,7 @@ class GameScreen(BaseScreen):
             print("AI controllers already set up")
             return
         
-        print("Setting up AI controllers for online team vs AI mode")
-        
-        # Crea i controller AI per i giocatori 1 e 3
-        ai_player_ids = [1, 3]
-        
-        # Se il client ha ID 1, crea controller solo per il giocatore 3
-        if not self.app.game_config.get("is_host", False) and self.local_player_id == 1:
-            print("CLIENT: Creando solo il controller AI per il giocatore 3")
-            ai_player_ids = [3]
+        print(f"Setting up AI controllers for online team vs AI mode: {ai_player_ids}")
         
         for player_id in ai_player_ids:
             # I giocatori AI appartengono al team 1
@@ -2092,28 +2138,11 @@ class GameScreen(BaseScreen):
                 self.ai_controllers[player_id].epsilon = 0.1
             else:  # Hard
                 self.ai_controllers[player_id].epsilon = 0.01
-            
-            # Aggiorna lo stato dei giocatori
-            self.players[player_id].is_ai = True
-            self.players[player_id].name = f"AI {player_id}"
-        
-        # Aggiorna lo stato del giocatore partner
-        if self.app.game_config.get("is_host", False):
-            # Se siamo host (ID 0), il partner è ID 2
-            partner_id = 2
-        else:
-            # Se siamo client, il partner è l'host (ID 0)
-            partner_id = 0
-        
-        if partner_id < len(self.players):
-            self.players[partner_id].is_human = True
-            self.players[partner_id].is_ai = False
-            self.players[partner_id].name = "Partner"
         
         # NUOVO: Invia un messaggio per confermare l'avvenuta configurazione
         if self.app.network:
-            self.app.network.message_queue.append("Human team: players 0 and 2 (or you)")
-            self.app.network.message_queue.append("AI team: players 1 and 3")
+            self.app.network.message_queue.append("TEAM UMANO: giocatori 0 e 1")
+            self.app.network.message_queue.append("TEAM AI: giocatori 2 e 3")
         
         # Stampa debug finale
         print("\nConfigurazione finale dei giocatori:")
