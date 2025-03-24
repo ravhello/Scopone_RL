@@ -2465,13 +2465,13 @@ class GameScreen(BaseScreen):
                 new_current_player = new_state.pop('current_player', None)
                 
                 # Debug output of critical components
-                print(f"Client received state:")
-                print(f"  Current player: {new_current_player}")
-                print(f"  Online type: {new_state.get('online_type')}")
-                print(f"  AI players: {new_state.get('ai_players', [])}")
-                print(f"  Table cards: {new_state.get('table', [])}")
-                print(f"  Last move: {new_state.get('last_move')}")
-                print(f"  Hands: {new_state.get('hands', {}).keys()}")
+                #print(f"Client received state:")
+                #print(f"  Current player: {new_current_player}")
+                #print(f"  Online type: {new_state.get('online_type')}")
+                #print(f"  AI players: {new_state.get('ai_players', [])}")
+                #print(f"  Table cards: {new_state.get('table', [])}")
+                #print(f"  Last move: {new_state.get('last_move')}")
+                #print(f"  Hands: {new_state.get('hands', {}).keys()}")
                 
                 # IMPORTANT: Ensure we have our hand
                 if self.local_player_id is not None and 'hands' in new_state:
