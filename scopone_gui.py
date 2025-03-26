@@ -831,7 +831,8 @@ class BaseScreen:
     
     def enter(self):
         """Called when entering this screen"""
-        super().enter()
+        # Rimuovi la chiamata a super().enter() che causa l'errore
+        self.done = False  # Questo è ciò che dovrebbe fare il metodo enter della classe base
         
         # Initialize game based on config
         self.initialize_game()
