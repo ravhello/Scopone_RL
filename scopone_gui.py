@@ -530,9 +530,10 @@ class NetworkManager:
         return True  # Return immediately - connection status will be updated asynchronously
     
     def _connect_async(self):
-        """Perform connection attempts in a background thread"""
+        """Perform connection attempts in a background thread with improved handling"""
         while self.reconnect_attempts < self.max_reconnect_attempts and self.connection_in_progress:
             try:
+                print(f"Tentativo di connessione {self.reconnect_attempts+1} a {self.host}:{self.port}...")
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 # Set a shorter timeout for faster failure detection
                 self.socket.settimeout(2)
@@ -542,9 +543,12 @@ class NetworkManager:
                 
                 # Add a success message to the queue
                 self.message_queue.append(f"Connected to {self.host}")
+                print(f"Connessione stabilita con {self.host}:{self.port}")
                 
-                # Start thread to receive game state updates
-                threading.Thread(target=self.receive_updates, daemon=True).start()
+                # Avvia un thread separato per ricevere aggiornamenti dal server
+                print("Avvio thread per ricezione dati...")
+                threading.Thread(target=self.receive_data_from_server, daemon=True).start()
+                
                 self.connection_in_progress = False
                 return
             except Exception as e:
@@ -554,11 +558,78 @@ class NetworkManager:
                 
                 # Sleep briefly before retrying
                 time.sleep(1)
-        
+            
         # Connection failed after all attempts
         self.connection_in_progress = False
         self.message_queue.append(f"Failed to connect to {self.host} after {self.reconnect_attempts} attempts")
         print(f"Could not connect to server after {self.max_reconnect_attempts} attempts")
+
+
+    # Aggiungiamo un nuovo metodo dedicato alla ricezione dei dati
+    def receive_data_from_server(self):
+        """Riceve dati dal server in modo continuo"""
+        print("Thread di ricezione dati avviato")
+        try:
+            while self.connected:
+                try:
+                    # Ricevi i dati
+                    data = self.socket.recv(8192)  # Buffer grande per lo stato di gioco
+                    if not data:
+                        print("Connessione chiusa dal server - nessun dato ricevuto")
+                        break
+                    
+                    # Elabora i dati ricevuti
+                    message = pickle.loads(data)
+                    message_type = message.get("type", "unknown")
+                    print(f"Ricevuto messaggio di tipo: {message_type}")
+                    
+                    # Processa diversi tipi di messaggio
+                    if message_type == "player_id":
+                        self.player_id = message["id"]
+                        print(f"Assegnato ID giocatore: {self.player_id}")
+                        self.message_queue.append(f"Sei il giocatore {self.player_id}")
+                    
+                    elif message_type == "game_state":
+                        print("Ricevuto aggiornamento dello stato di gioco")
+                        self.game_state = message["state"]
+                        # Controlla se ci sono informazioni aggiuntive
+                        if 'current_player' in message:
+                            print(f"Giocatore corrente: {message['current_player']}")
+                        
+                    elif message_type == "start_game":
+                        print("Ricevuto segnale di inizio gioco")
+                        self.message_queue.append("Il gioco sta iniziando!")
+                    
+                    elif message_type == "chat":
+                        player_id = message.get("player_id", "?")
+                        text = message.get("text", "")
+                        self.message_queue.append(f"Player {player_id}: {text}")
+                    
+                    else:
+                        print(f"Ricevuto messaggio di tipo sconosciuto: {message_type}")
+                    
+                except socket.timeout:
+                    # Timeout, continua a provare
+                    continue
+                except ConnectionResetError:
+                    print("Connessione resettata dal peer")
+                    break
+                except Exception as e:
+                    print(f"Errore nella ricezione dati: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Breve pausa prima di riprovare
+                    time.sleep(0.5)
+        
+        except Exception as e:
+            print(f"Errore fatale nel thread di ricezione: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            print("Thread di ricezione dati terminato")
+            self.connected = False
+            self.message_queue.append("Disconnesso dal server")
 
     def check_connection_timeout(self, timeout_seconds=5):
         """Check if the connection attempt has timed out"""
@@ -637,31 +708,76 @@ class NetworkManager:
                 time.sleep(0.5)
     
     def handle_client(self, client_socket, player_id):
-        """Handle communication with a specific client"""
+        """Handle communication with a specific client with improved reliability"""
+        print(f"Iniziata gestione client per giocatore {player_id}")
+        
+        # Invia nuovamente l'ID giocatore per sicurezza
+        try:
+            welcome_message = {"type": "player_id", "id": player_id}
+            client_socket.sendall(pickle.dumps(welcome_message))
+            print(f"ID giocatore {player_id} inviato nuovamente al client")
+            
+            # Invia anche lo stato corrente del gioco se disponibile
+            if self.game_state:
+                state_message = {"type": "game_state", "state": self.game_state}
+                if hasattr(self, 'env') and hasattr(self.env, 'current_player'):
+                    state_message["current_player"] = self.env.current_player
+                client_socket.sendall(pickle.dumps(state_message))
+                print(f"Stato di gioco inviato al giocatore {player_id}")
+            
+            # Invia un segnale di start_game esplicito
+            start_message = {"type": "start_game"}
+            client_socket.sendall(pickle.dumps(start_message))
+            print(f"Segnale di inizio gioco inviato al giocatore {player_id}")
+            
+        except Exception as e:
+            print(f"Errore nell'invio dati iniziali al client {player_id}: {e}")
+        
+        # Loop principale per la gestione dei messaggi dal client
         while self.connected:
             try:
-                # Receive data
+                # Ricevi dati
                 data = client_socket.recv(4096)
                 if not data:
+                    print(f"Client {player_id} disconnesso - nessun dato ricevuto")
                     break
                     
                 message = pickle.loads(data)
                 
-                # Process different message types
+                # Processa diversi tipi di messaggio
                 if message["type"] == "move":
-                    # Add move to queue for processing
+                    # Aggiungi mossa alla coda per l'elaborazione
                     self.move_queue.append((player_id, message["move"]))
+                    print(f"Ricevuta mossa dal giocatore {player_id}")
                 elif message["type"] == "chat":
-                    # Add chat message to queue
+                    # Aggiungi messaggio chat alla coda
                     self.message_queue.append(f"Player {player_id}: {message['text']}")
+                    print(f"Ricevuto messaggio chat dal giocatore {player_id}")
+                elif message["type"] == "request_state":
+                    # Il client richiede lo stato aggiornato
+                    print(f"Giocatore {player_id} ha richiesto lo stato aggiornato")
+                    if self.game_state:
+                        client_socket.sendall(pickle.dumps({
+                            "type": "game_state", 
+                            "state": self.game_state
+                        }))
                 
-            except Exception as e:
-                print(f"Error handling client {player_id}: {e}")
+            except ConnectionResetError:
+                print(f"Connessione con il client {player_id} resettata")
                 break
+            except Exception as e:
+                print(f"Errore nella gestione del client {player_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Breve pausa prima di continuare
+                time.sleep(0.5)
         
-        # Client disconnected
-        print(f"Player {player_id} disconnected")
-        self.message_queue.append(f"Player {player_id} disconnected")
+        # Client disconnesso
+        print(f"Player {player_id} disconnesso")
+        self.message_queue.append(f"Player {player_id} disconnesso")
+        
+        # Rimuovi il client dalla lista
+        self.clients = [(c, pid) for c, pid in self.clients if pid != player_id]
     
     def receive_updates(self):
         """Receive game state updates from server (for clients)"""
@@ -1501,42 +1617,51 @@ class GameModeScreen(BaseScreen):
         
         
     def update(self):
-        """Update screen state with connection timeout handling"""
-        # Check for network connection timeout
-        if hasattr(self.app, 'network') and self.app.network and self.app.network.connection_in_progress:
-            # Show connecting message with dots animation
-            dots = "." * ((pygame.time.get_ticks() // 500) % 4)
-            self.status_message = f"Connecting to {self.app.network.host}{dots}"
+        """Update screen state with improved connection handling"""
+        # Check for network connection status
+        if hasattr(self.app, 'network') and self.app.network:
+            # Stampa di debug per verificare lo stato della connessione
+            if hasattr(self, '_last_debug_time') and pygame.time.get_ticks() - self._last_debug_time > 1000:
+                print(f"DEBUG connessione: connected={self.app.network.connected}, player_id={self.app.network.player_id}")
+                self._last_debug_time = pygame.time.get_ticks()
+            else:
+                if not hasattr(self, '_last_debug_time'):
+                    self._last_debug_time = pygame.time.get_ticks()
             
-            # Check if connection succeeded or timed out
-            if self.app.network.connected:
-                # CAMBIO IMPORTANTE: Solo transicionar cuando se haya recibido un player_id válido
-                if self.app.network.player_id is not None:
-                    print(f"Conexión exitosa con ID de jugador: {self.app.network.player_id}")
-                    self.done = True
-                    self.next_screen = "game"
-                    self.app.game_config = {
-                        "mode": "online_multiplayer",
-                        "is_host": False,
-                        "player_id": self.app.network.player_id
-                    }
-                else:
-                    # Todavía esperando el ID del jugador
-                    self.status_message = f"Connected to {self.app.network.host}, waiting for player assignment..."
-            elif self.app.network.check_connection_timeout(10):  # Aumentado a 10 segundos
-                self.status_message = f"Failed to connect to {self.app.network.host}"
+            # Verifica se il network è connesso e l'ID del giocatore è stato assegnato
+            if self.app.network.connected and self.app.network.player_id is not None:
+                print(f"Cliente pronto per iniziare: ID giocatore = {self.app.network.player_id}")
+                
+                # Imposta il flag done a True per passare alla schermata di gioco
+                self.done = True
+                self.next_screen = "game"
+                self.app.game_config = {
+                    "mode": "online_multiplayer",
+                    "is_host": False,
+                    "player_id": self.app.network.player_id
+                }
+                return
+            
+            # Se in attesa di connessione, mostra messaggio animato
+            if self.app.network.connection_in_progress and not self.app.network.connected:
+                dots = "." * ((pygame.time.get_ticks() // 500) % 4)
+                self.status_message = f"Connecting to {self.app.network.host}{dots}"
+                
+                # Check timeout
+                if self.app.network.check_connection_timeout(10):  # 10 secondi di timeout
+                    self.status_message = f"Failed to connect to {self.app.network.host}"
         
-        # Original update code continues here...
+        # Il resto del codice original update...
         if self.loading:
-            # Si estamos en estado de carga, actualiza la animación
+            # Se siamo in stato di caricamento, aggiorna l'animazione
             current_time = pygame.time.get_ticks()
             elapsed = current_time - self.loading_start_time
             
-            # Actualiza la animación
+            # Aggiorna l'animazione
             self.loading_animation.update()
             
-            # Después de 2 segundos, completa la carga y va a la pantalla de juego
-            if elapsed > 2000:  # 2 segundos de animación
+            # Dopo 2 secondi, completa il caricamento e vai alla schermata di gioco
+            if elapsed > 2000:  # 2 secondi di animazione
                 self.loading = False
                 self.done = True
                 self.next_screen = "game"
@@ -1849,7 +1974,7 @@ class GameScreen(BaseScreen):
         
         # Stampa di debug ad ogni chiamata
         result = self.visual_positions[logical_player_id]
-        print(f"get_visual_position({logical_player_id}) => {result}")
+        #print(f"get_visual_position({logical_player_id}) => {result}")
         
         return result
     
