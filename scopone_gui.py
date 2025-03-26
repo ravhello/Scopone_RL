@@ -1823,7 +1823,7 @@ class GameScreen(BaseScreen):
         
         # Stampa di debug ad ogni chiamata
         result = self.visual_positions[logical_player_id]
-        print(f"get_visual_position({logical_player_id}) => {result}")
+        #print(f"get_visual_position({logical_player_id}) => {result}")
         
         return result
     
@@ -2088,41 +2088,48 @@ class GameScreen(BaseScreen):
         # Update animations
         active_animations = self.update_animations()
         
-        # NUOVO: gestione delle fasi di animazione
+        # FIXED: Handling of animation phases
         if hasattr(self, 'waiting_for_animation') and self.waiting_for_animation:
-            # Controlliamo se l'animazione della carta giocata è completata
+            # Check if played card animation is completed
             played_card_animation_done = True
             for anim in self.animations:
-                # Se ci sono ancora animazioni della prima fase (carta giocata che va sul tavolo)
-                # con delay = 0, allora la prima fase non è terminata
+                # If there are still first phase animations (played card going to table)
+                # with delay = 0, then the first phase isn't complete
                 if anim.delay == 0 and not anim.done:
                     played_card_animation_done = False
                     break
             
             if played_card_animation_done:
-                # La carta giocata ha raggiunto il tavolo, ora possiamo aggiornare lo stato del gioco
+                # Played card has reached the table, now update game state
                 if hasattr(self, 'pending_action') and self.pending_action is not None:
                     print("Animazione carta giocata completata, ora aggiorno lo stato del gioco")
                     
-                    # Esegui la mossa sull'ambiente
-                    _, _, done, info = self.env.step(self.pending_action)
+                    # CRITICAL FIX: Verify the action is valid for the current player before executing
+                    card_played, _ = decode_action(self.pending_action)
+                    current_player_hand = self.env.game_state["hands"].get(self.env.current_player, [])
                     
-                    # IMPORTANTE: Dopo l'aggiornamento dello stato, resettiamo le carte nascoste visivamente
-                    # poiché ora sono state effettivamente rimosse dallo stato del gioco
+                    if card_played in current_player_hand:
+                        # Execute the move on the environment
+                        _, _, done, info = self.env.step(self.pending_action)
+                        
+                        # If game is finished, set final state
+                        if done:
+                            self.game_over = True
+                            if "score_breakdown" in info:
+                                self.final_breakdown = info["score_breakdown"]
+                    else:
+                        # The card is no longer valid - this can happen if turn changed while animation was playing
+                        print(f"WARNING: Card {card_played} not in player {self.env.current_player}'s hand - skipping action")
+                    
+                    # IMPORTANT: After updating state, reset hidden cards visually
                     if hasattr(self, 'visually_hidden_cards'):
                         self.visually_hidden_cards = {}
                     
-                    # Se il gioco è finito, imposta lo stato finale
-                    if done:
-                        self.game_over = True
-                        if "score_breakdown" in info:
-                            self.final_breakdown = info["score_breakdown"]
-                    
-                    # Reset degli stati di animazione
+                    # Reset animation states
                     self.waiting_for_animation = False
                     self.pending_action = None
                     
-                    # Aggiorna lo stato del gioco per la modalità online (se necessario)
+                    # Update game state for online mode (if needed)
                     if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
                         if hasattr(self.app, 'network') and self.app.network:
                             online_type = self.app.game_config.get("online_type")
