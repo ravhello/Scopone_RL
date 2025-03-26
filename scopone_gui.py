@@ -2714,11 +2714,25 @@ class GameScreen(BaseScreen):
                     # SOLUZIONE CRUCIALE: Aggiorna il turno corrente con quello ricevuto dal server
                     if new_current_player is not None:
                         prev_player = self.env.current_player if hasattr(self.env, 'current_player') else None
-                        print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
+                        
+                        # Verifica se il giocatore è cambiato
+                        player_changed = prev_player != new_current_player
+                        
+                        # Throttling degli aggiornamenti
+                        current_time = time.time()
+                        if not hasattr(self, 'last_turn_update_time'):
+                            self.last_turn_update_time = 0
+                        
+                        # Aggiorna e stampa solo se è passato abbastanza tempo o se il giocatore è cambiato
+                        if player_changed or (current_time - self.last_turn_update_time) > 0.5:  # 2 volte al secondo (0.5s)
+                            print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
+                            self.last_turn_update_time = current_time
+                        
+                        # Aggiorna sempre lo stato interno
                         self.env.current_player = new_current_player
                         self.current_player_id = new_current_player
                         
-                        # Notify player if it's their turn now
+                        # Notify player if it's their turn now (questa parte rimane invariata)
                         if prev_player != new_current_player and new_current_player == self.local_player_id:
                             self.status_message = "It's your turn!"
                             self.app.resources.play_sound("card_pickup")
