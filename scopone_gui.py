@@ -1660,14 +1660,13 @@ class GameScreen(BaseScreen):
         # Reimposta il seed random per il resto del programma
         random.seed()  # Ripristina casualità per il resto del gioco
         
-        # Set up AI controllers if needed
-        if mode in ["single_player", "team_vs_ai"]:
+        # Set up AI controllers if needed - MODIFIED LINE BELOW
+        if mode in ["single_player", "team_vs_ai"] or (mode == "online_multiplayer" and config.get("online_type") == "team_vs_ai" and config.get("is_host", False)):
             self.setup_ai_controllers()
         
         # Set up player ID (for online games)
         if mode == "online_multiplayer":
             self.local_player_id = config.get("player_id", 0)
-
     
     def setup_ai_controllers(self):
         """Set up AI controllers based on game mode"""
