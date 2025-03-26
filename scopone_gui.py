@@ -2300,7 +2300,7 @@ class GameScreen(BaseScreen):
         self.players[3].is_ai = True
         self.players[3].name = "AI 3"
         
-        # Configura AI controllers
+        # IMPORTANTE: CONFIGURA AI PLAYERS SIA PER HOST CHE CLIENT
         ai_player_ids = [1, 3]
         difficulty = self.app.game_config.get("difficulty", 1)
         
@@ -2321,6 +2321,11 @@ class GameScreen(BaseScreen):
                     self.ai_controllers[player_id].epsilon = 0.1
                 else:  # Hard
                     self.ai_controllers[player_id].epsilon = 0.01
+        
+        # AGGIUNGERE QUESTE RIGHE:
+        # Aggiorna il game_config con le informazioni corrette
+        self.app.game_config["online_type"] = "team_vs_ai"
+        self.app.game_config["ai_players"] = ai_player_ids
         
         # Annuncio configurazione
         if self.app.network:
@@ -2349,7 +2354,7 @@ class GameScreen(BaseScreen):
         """Handle turns for AI-controlled players"""
         if not self.env or self.game_over or self.animations:
             return
-            
+                
         # Check if it's AI's turn
         current_player = self.players[self.current_player_id]
         
@@ -2359,19 +2364,26 @@ class GameScreen(BaseScreen):
             # I client non fanno nulla, riceveranno aggiornamenti dall'host
             return
         
-        if current_player.is_ai and not self.ai_thinking:
+        # Aggiunta debug per verificare stato turno AI
+        if current_player.is_ai:
+            print(f"È il turno di AI {self.current_player_id}, thinking={self.ai_thinking}, controller exists={self.current_player_id in self.ai_controllers}")
+        
+        # Verifica anche se il giocatore è configurato come AI e ha un controller
+        if current_player.is_ai and self.current_player_id in self.ai_controllers and not self.ai_thinking:
             # Start AI thinking timer
             self.ai_thinking = True
             self.ai_move_timer = pygame.time.get_ticks()
             self.status_message = f"{current_player.name} is thinking..."
+            print(f"AI {self.current_player_id} ha iniziato a pensare")
             return
-            
+                
         # Process AI move after a delay
         if self.ai_thinking:
             current_time = pygame.time.get_ticks()
             # Adjust delay based on difficulty (faster for hard, slower for easy)
             delay = 2000 if self.ai_difficulty == 0 else 1000 if self.ai_difficulty == 1 else 500
             if current_time - self.ai_move_timer > delay:
+                print(f"Esecuzione mossa AI {self.current_player_id}")
                 self.make_ai_move()
                 self.ai_thinking = False
     
