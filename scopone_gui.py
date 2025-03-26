@@ -1238,16 +1238,13 @@ class GameModeScreen(BaseScreen):
                     "is_host": True,
                     "player_id": 0,
                     "online_type": "team_vs_ai",
-                    "difficulty": self.selected_difficulty,
-                    # ADD THIS LINE: Force AI players flag before game screen is entered
-                    "ai_players": [1, 3]  
+                    "difficulty": self.selected_difficulty
                 }
                 
                 # Questa riga è ora ridondante ma la mantengo per sicurezza
                 if hasattr(self.app, 'network') and self.app.network:
                     self.app.network.game_state = {
-                        'online_type': 'team_vs_ai',
-                        'ai_players': [1, 3]  # ADD THIS LINE
+                        'online_type': 'team_vs_ai'
                     }
     
     def join_online_game(self):
@@ -1663,13 +1660,29 @@ class GameScreen(BaseScreen):
         # Reimposta il seed random per il resto del programma
         random.seed()  # Ripristina casualità per il resto del gioco
         
-        # Set up AI controllers if needed - MODIFIED LINE BELOW
-        if mode in ["single_player", "team_vs_ai"] or (mode == "online_multiplayer" and config.get("online_type") == "team_vs_ai" and config.get("is_host", False)):
+        # Set up AI controllers if needed
+        if mode in ["single_player", "team_vs_ai"]:
             self.setup_ai_controllers()
+        # CORREZIONE: Aggiunto supporto per AI controllers nella modalità online team vs AI (solo host)
+        elif mode == "online_multiplayer" and config.get("online_type") == "team_vs_ai" and config.get("is_host", False):
+            for player_id in [1, 3]:
+                self.ai_controllers[player_id] = DQNAgent(team_id=1)
+                # Load checkpoint if available
+                checkpoint_path = "scopone_checkpoint_team1.pth"
+                if os.path.exists(checkpoint_path):
+                    self.ai_controllers[player_id].load_checkpoint(checkpoint_path)
+                # Set exploration rate based on difficulty
+                if self.ai_difficulty == 0:  # Easy
+                    self.ai_controllers[player_id].epsilon = 0.3
+                elif self.ai_difficulty == 1:  # Medium
+                    self.ai_controllers[player_id].epsilon = 0.1
+                else:  # Hard
+                    self.ai_controllers[player_id].epsilon = 0.01
         
         # Set up player ID (for online games)
         if mode == "online_multiplayer":
             self.local_player_id = config.get("player_id", 0)
+
     
     def setup_ai_controllers(self):
         """Set up AI controllers based on game mode"""
@@ -1726,18 +1739,13 @@ class GameScreen(BaseScreen):
         is_online_team_vs_ai = (mode == "online_multiplayer" and 
                             config.get("online_type") == "team_vs_ai")
         
-        # CRITICAL FIX: Use ai_players from config if available
-        if is_online_team_vs_ai and config.get("is_host", False):
-            ai_players = config.get("ai_players", [1, 3])  # Use config or default to [1, 3]
-            print(f"HOST SETUP: Using AI players from config: {ai_players}")
-        elif is_online_team_vs_ai:
-            # Always assume players 1 and 3 are AI in team vs AI mode
-            ai_players = [1, 3]
-            print(f"CLIENT SETUP: Assuming AI players: {ai_players}")
-        elif not config.get("is_host", False) and self.app.network and self.app.network.game_state:
+        # Se siamo client, otteniamo le informazioni sulle AI dal game state
+        ai_players = []
+        if not config.get("is_host", False) and self.app.network and self.app.network.game_state:
             ai_players = self.app.network.game_state.get('ai_players', [])
-        else:
-            ai_players = []
+        elif is_online_team_vs_ai:
+            # Se siamo host, sappiamo già quali sono le AI
+            ai_players = [1, 3]
         
         # Imposta i giocatori
         for player_id in range(4):
@@ -1760,8 +1768,6 @@ class GameScreen(BaseScreen):
                 if is_online_team_vs_ai:
                     is_human = player_id not in ai_players
                     is_ai = player_id in ai_players
-                    # Debug per verificare la configurazione
-                    print(f"SETUP: Player {player_id}: team {team_id}, is_ai: {is_ai}")
                 else:  # All human
                     is_human = True
                     is_ai = False
@@ -1790,6 +1796,14 @@ class GameScreen(BaseScreen):
             
             # Aggiungi alla lista
             self.players.append(player)
+        
+        # Configura la prospettiva visuale per il multiplayer online
+        if mode == "online_multiplayer":
+            self.setup_player_perspective()
+        
+        # Debug: stampa informazioni sui giocatori
+        for player in self.players:
+            print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
 
     def setup_player_perspective(self):
         """Set up visualization for different client perspectives"""
@@ -2425,34 +2439,11 @@ class GameScreen(BaseScreen):
         # Check if it's AI's turn
         current_player = self.players[self.current_player_id]
         
-        # Debug output to trace AI turn handling
-        if current_player.is_ai:
-            print(f"AI turn detected: Player {self.current_player_id}, Controller exists: {self.current_player_id in self.ai_controllers}")
-        
         # In modalità online, solo l'host gestisce le mosse delle AI
         is_online = self.app.game_config.get("mode") == "online_multiplayer"
         if is_online and not self.app.game_config.get("is_host", False):
             # I client non fanno nulla, riceveranno aggiornamenti dall'host
             return
-        
-        # Auto-setup AI controller if needed for team vs AI mode
-        if current_player.is_ai and self.current_player_id not in self.ai_controllers:
-            print(f"Auto-creating AI controller for player {self.current_player_id}")
-            self.ai_controllers[self.current_player_id] = DQNAgent(team_id=current_player.team_id)
-            
-            # Load checkpoint if available
-            checkpoint_path = f"scopone_checkpoint_team{current_player.team_id}.pth"
-            if os.path.exists(checkpoint_path):
-                self.ai_controllers[self.current_player_id].load_checkpoint(checkpoint_path)
-            
-            # Set exploration rate based on difficulty
-            difficulty = self.ai_difficulty
-            if difficulty == 0:  # Easy
-                self.ai_controllers[self.current_player_id].epsilon = 0.3
-            elif difficulty == 1:  # Medium
-                self.ai_controllers[self.current_player_id].epsilon = 0.1
-            else:  # Hard
-                self.ai_controllers[self.current_player_id].epsilon = 0.01
         
         if current_player.is_ai and not self.ai_thinking:
             # Start AI thinking timer
