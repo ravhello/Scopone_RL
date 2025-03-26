@@ -2218,6 +2218,10 @@ class GameScreen(BaseScreen):
             if self.env and not self.game_over:
                 self.check_game_over()
             
+            # CORREZIONE: Forza la configurazione del team vs AI all'inizio del gioco
+            is_online_team_vs_ai = (self.app.game_config.get("mode") == "online_multiplayer" and 
+                                    self.app.game_config.get("online_type") == "team_vs_ai")
+            
             # Gestione dello stato del server in modalità online
             if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
                 online_type = self.app.game_config.get("online_type", "all_human")
@@ -2262,6 +2266,41 @@ class GameScreen(BaseScreen):
                             self.app.network.game_state['ai_players'] = [1, 3]
                             self.app.network.game_state['current_player'] = self.env.current_player
                             self.app.network.broadcast_game_state()
+                            
+                            # CORREZIONE: Broadcast immediato dopo la configurazione
+                            print("Trasmissione stato dopo setup Team vs AI")
+                            self.app.network.broadcast_game_state()
+            
+            # CORREZIONE: Assicura che anche il client configuri correttamente i giocatori AI
+            elif is_online_team_vs_ai and not self.app.game_config.get("is_host"):
+                # Controllo se i giocatori AI sono già configurati
+                ai_players_configured = any(player.is_ai for player in self.players)
+                
+                # Se non ancora configurati, configura i giocatori AI
+                if not ai_players_configured:
+                    print("Client: configurazione giocatori AI")
+                    # Gli stessi passaggi di setup_team_vs_ai_online() ma per il client
+                    # Configura giocatori umani
+                    self.players[0].team_id = 0
+                    self.players[0].is_human = True
+                    self.players[0].is_ai = False
+                    self.players[0].name = "Partner" if self.local_player_id == 2 else "You"
+                    
+                    self.players[2].team_id = 0
+                    self.players[2].is_human = True
+                    self.players[2].is_ai = False
+                    self.players[2].name = "You" if self.local_player_id == 2 else "Partner"
+                    
+                    # Configura giocatori AI
+                    self.players[1].team_id = 1
+                    self.players[1].is_human = False
+                    self.players[1].is_ai = True
+                    self.players[1].name = "AI 1"
+                    
+                    self.players[3].team_id = 1
+                    self.players[3].is_human = False
+                    self.players[3].is_ai = True
+                    self.players[3].name = "AI 3"
             
             # Process messages from network
             if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network:
@@ -2300,7 +2339,7 @@ class GameScreen(BaseScreen):
         self.players[3].is_ai = True
         self.players[3].name = "AI 3"
         
-        # IMPORTANTE: CONFIGURA AI PLAYERS SIA PER HOST CHE CLIENT
+        # Configura AI controllers
         ai_player_ids = [1, 3]
         difficulty = self.app.game_config.get("difficulty", 1)
         
@@ -2321,11 +2360,6 @@ class GameScreen(BaseScreen):
                     self.ai_controllers[player_id].epsilon = 0.1
                 else:  # Hard
                     self.ai_controllers[player_id].epsilon = 0.01
-        
-        # AGGIUNGERE QUESTE RIGHE:
-        # Aggiorna il game_config con le informazioni corrette
-        self.app.game_config["online_type"] = "team_vs_ai"
-        self.app.game_config["ai_players"] = ai_player_ids
         
         # Annuncio configurazione
         if self.app.network:
@@ -2354,7 +2388,7 @@ class GameScreen(BaseScreen):
         """Handle turns for AI-controlled players"""
         if not self.env or self.game_over or self.animations:
             return
-                
+            
         # Check if it's AI's turn
         current_player = self.players[self.current_player_id]
         
@@ -2364,26 +2398,19 @@ class GameScreen(BaseScreen):
             # I client non fanno nulla, riceveranno aggiornamenti dall'host
             return
         
-        # Aggiunta debug per verificare stato turno AI
-        if current_player.is_ai:
-            print(f"È il turno di AI {self.current_player_id}, thinking={self.ai_thinking}, controller exists={self.current_player_id in self.ai_controllers}")
-        
-        # Verifica anche se il giocatore è configurato come AI e ha un controller
-        if current_player.is_ai and self.current_player_id in self.ai_controllers and not self.ai_thinking:
+        if current_player.is_ai and not self.ai_thinking:
             # Start AI thinking timer
             self.ai_thinking = True
             self.ai_move_timer = pygame.time.get_ticks()
             self.status_message = f"{current_player.name} is thinking..."
-            print(f"AI {self.current_player_id} ha iniziato a pensare")
             return
-                
+            
         # Process AI move after a delay
         if self.ai_thinking:
             current_time = pygame.time.get_ticks()
             # Adjust delay based on difficulty (faster for hard, slower for easy)
             delay = 2000 if self.ai_difficulty == 0 else 1000 if self.ai_difficulty == 1 else 500
             if current_time - self.ai_move_timer > delay:
-                print(f"Esecuzione mossa AI {self.current_player_id}")
                 self.make_ai_move()
                 self.ai_thinking = False
     
