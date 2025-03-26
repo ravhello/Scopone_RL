@@ -241,20 +241,45 @@ class CardAnimation:
         
         self.current_frame = -delay
         self.done = False
+        
+        # Aggiungiamo un log quando creiamo una nuova animazione con delay
+        #if delay > 0:
+            #print(f"DEBUG: Creata animazione {animation_type} per carta {card} con delay {delay}")
     
     def update(self):
+        """Aggiorna lo stato dell'animazione e restituisce True se completata"""
+        # Se siamo in fase di delay, decrementa il contatore
         if self.current_frame < 0:
+            # Debug per tracciare il delay
+            #if self.current_frame == -1:
+                #print(f"DEBUG: Animazione {self.animation_type} per carta {self.card} inizia (ultimo frame di delay)")
+            #elif self.current_frame % 10 == 0:  # Log ogni 10 frame per non intasare la console
+                #print(f"DEBUG: Animazione {self.animation_type} per carta {self.card} in delay: {-self.current_frame} frame rimanenti")
+                
             self.current_frame += 1
             return False
             
+        # Se abbiamo superato la durata, segna come completata
         if self.current_frame >= self.duration:
-            self.done = True
+            # Se non era già segnata come completata, stampa un log
+            if not self.done:
+                #print(f"DEBUG: Animazione {self.animation_type} per carta {self.card} completata")
+                self.done = True
             return True
             
+        # Altrimenti, incrementa il frame e continua l'animazione
         self.current_frame += 1
+        
+        # Debug per tracciare l'animazione attiva
+        #if self.current_frame == 0:
+            #print(f"DEBUG: Animazione {self.animation_type} per carta {self.card} iniziata attivamente")
+        #elif self.current_frame == self.duration - 1:
+            #print(f"DEBUG: Animazione {self.animation_type} per carta {self.card} al penultimo frame")
+            
         return False
     
     def get_current_pos(self):
+        """Calcola la posizione corrente in base al progresso dell'animazione"""
         if self.current_frame < 0:
             return self.start_pos
             
@@ -271,6 +296,7 @@ class CardAnimation:
         return (x, y)
     
     def get_current_scale(self):
+        """Calcola la scala corrente in base al progresso dell'animazione"""
         if self.current_frame < 0:
             return self.scale_start
             
@@ -281,6 +307,7 @@ class CardAnimation:
         return self.scale_start + (self.scale_end - self.scale_start) * progress
     
     def get_current_rotation(self):
+        """Calcola la rotazione corrente in base al progresso dell'animazione"""
         if self.current_frame < 0:
             return self.rotation_start
             
@@ -340,7 +367,7 @@ class ResourceManager:
             self.original_card_backs[1] = retro
             self.card_backs[0] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
             self.card_backs[1] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
-            print("Caricato retro.jpg per dorso carte")
+            #print("Caricato retro.jpg per dorso carte")
         except Exception as e:
             print(f"Errore caricamento retro.jpg: {e}")
             # If retro.jpg not found, try team-specific backs
@@ -2222,25 +2249,24 @@ class GameScreen(BaseScreen):
         if self.env:
             self.current_player_id = self.env.current_player
         
+        # Debug: stampa numero di animazioni attive
+        if hasattr(self, 'animations') and self.animations:
+            #print(f"Animazioni attive: {len(self.animations)}")
+            for idx, anim in enumerate(self.animations[:5]):  # Mostra solo le prime 5 per brevità
+                status = "ritardo" if anim.current_frame < 0 else "attiva" if not anim.done else "completata"
+                #print(f"  Anim {idx}: carta {anim.card}, tipo {anim.animation_type}, stato {status}, frame {anim.current_frame}/{anim.duration}")
+        
         # Update animations
         active_animations = self.update_animations()
         
         # FIXED: Handling of animation phases
         if hasattr(self, 'waiting_for_animation') and self.waiting_for_animation:
-            # Check if played card animation is completed
-            played_card_animation_done = True
-            for anim in self.animations:
-                # If there are still first phase animations (played card going to table)
-                # with delay = 0, then the first phase isn't complete
-                if anim.delay == 0 and not anim.done:
-                    played_card_animation_done = False
-                    break
-            
-            if played_card_animation_done:
-                # Played card has reached the table, now update game state
+            # Check if all animations are completed
+            if not self.animations:  # No active animations means all are completed
+                #print("Tutte le animazioni completate, ora aggiorno lo stato del gioco")
+                
+                # Check for pending action and execute it
                 if hasattr(self, 'pending_action') and self.pending_action is not None:
-                    print("Animazione carta giocata completata, ora aggiorno lo stato del gioco")
-                    
                     # CRITICAL FIX: Verify the action is valid for the current player before executing
                     card_played, _ = decode_action(self.pending_action)
                     current_player_hand = self.env.game_state["hands"].get(self.env.current_player, [])
@@ -2549,9 +2575,38 @@ class GameScreen(BaseScreen):
         """Update and clean up animations, return True if animations are active"""
         active_animations = False
         
+        # NUOVO: Assicurati che esista il set di carte in movimento
+        if not hasattr(self, 'cards_in_motion'):
+            self.cards_in_motion = set()
+        
         # Update existing animations
         for anim in self.animations[:]:
-            if anim.update():
+            # Verifica se questa è un'animazione di inizio movimento
+            if anim.animation_type == "start_motion" and anim.current_frame == 0:
+                # Aggiungi la carta al set delle carte in movimento
+                self.cards_in_motion.add(anim.card)
+                #print(f"Carta {anim.card} aggiunta al set di carte in movimento")
+            
+            # Verifica se questa è un'animazione di cattura che termina
+            if anim.animation_type == "capture" and anim.current_frame == anim.duration - 1:
+                # Rimuovi la carta dal set delle carte in movimento
+                if anim.card in self.cards_in_motion:
+                    self.cards_in_motion.remove(anim.card)
+                    #print(f"Carta {anim.card} rimossa dal set di carte in movimento")
+            
+            # Debug dettagliato
+            #if hasattr(anim, 'card') and hasattr(anim, 'animation_type') and hasattr(anim, 'current_frame'):
+                # Debug solo per frame specifici
+                #if anim.current_frame == 0 or anim.current_frame == anim.duration - 1:
+                    #print(f"Animazione {anim.animation_type} per carta {anim.card}: frame {anim.current_frame}/{anim.duration}")
+            
+            # Aggiorna animazione
+            is_completed = anim.update()
+            
+            # Rimuovi solo se completata
+            if is_completed:
+                #if hasattr(anim, 'card'):
+                    #print(f"Animazione completata per carta {anim.card}, tipo {anim.animation_type}")
                 self.animations.remove(anim)
             else:
                 active_animations = True
@@ -2623,7 +2678,7 @@ class GameScreen(BaseScreen):
                 try:
                     # Decode the move
                     card_played, cards_captured = decode_action(move)
-                    print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
+                    #print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
                     
                     # Create animations for the move
                     self.create_move_animations(card_played, cards_captured, player_id)
@@ -3130,8 +3185,8 @@ class GameScreen(BaseScreen):
     def try_make_move(self):
         """Try to make a move with the selected cards with improved handling"""
         # Debug: mostra informazioni sulla mossa
-        print(f"Tentativo di mossa - giocatore corrente: {self.current_player_id}, controllabile: {self.is_current_player_controllable()}")
-        print(f"Carta selezionata: {self.selected_hand_card}, carte tavolo: {self.selected_table_cards}")
+        #print(f"Tentativo di mossa - giocatore corrente: {self.current_player_id}, controllabile: {self.is_current_player_controllable()}")
+        #print(f"Carta selezionata: {self.selected_hand_card}, carte tavolo: {self.selected_table_cards}")
         
         # Assicurati che sia il turno di un giocatore controllabile
         if not self.is_current_player_controllable():
@@ -3221,7 +3276,7 @@ class GameScreen(BaseScreen):
         card_played, cards_captured = decode_action(action)
         
         # Print detailed information about the move
-        print(f"AI {self.current_player_id} plays {card_played} and captures {cards_captured}")
+        #print(f"AI {self.current_player_id} plays {card_played} and captures {cards_captured}")
         
         try:
             # FASE 1: Create animations for the played card
@@ -3240,7 +3295,7 @@ class GameScreen(BaseScreen):
             traceback.print_exc()
     
     def create_move_animations(self, card_played, cards_captured, source_player_id=None):
-        """Create animations for a move with improved positioning - solo approccio visivo"""
+        """Create animations for a move with improved positioning"""
         # Get player ID - use current player if no source player specified
         player_id = source_player_id if source_player_id is not None else self.current_player_id
         current_player = self.players[player_id]
@@ -3254,6 +3309,10 @@ class GameScreen(BaseScreen):
         if player_id not in self.visually_hidden_cards:
             self.visually_hidden_cards[player_id] = []
         self.visually_hidden_cards[player_id].append(card_played)
+        
+        # NUOVO: Inizializza il set di carte in movimento se non esiste
+        if not hasattr(self, 'cards_in_motion'):
+            self.cards_in_motion = set()
         
         # Start position depends on player position
         if player_id == self.local_player_id:
@@ -3324,14 +3383,22 @@ class GameScreen(BaseScreen):
                 # Sovrapponi solo per il 50% della larghezza della carta (metà carta)
                 end_pos = (card_x - card_width * 0.25, table_y + card_height / 2)
             
-            print(f"Posizione finale della carta giocata: {end_pos}")
+            #print(f"Posizione finale della carta giocata: {end_pos}")
         
-        # FASE 1: Create animation for played card with NO DELAY
-        played_anim = CardAnimation(
+        # NUOVA SEQUENZA DI ANIMAZIONE A TRE FASI
+        
+        # Parametri animazione
+        hand_to_table_duration = 15   # Durata della prima fase (mano -> tavolo)
+        plateau_duration = 30         # Durata della pausa sul tavolo
+        capture_duration = 25         # Durata della fase di cattura
+        inter_card_delay = 10         # Delay tra le carte nella fase di cattura
+        
+        # FASE 1: Animazione della carta dalla mano al tavolo
+        hand_to_table = CardAnimation(
             card=card_played,
             start_pos=start_pos,
             end_pos=end_pos,
-            duration=20,
+            duration=hand_to_table_duration,
             delay=0,
             scale_start=1.0,
             scale_end=1.0,
@@ -3339,133 +3406,101 @@ class GameScreen(BaseScreen):
             rotation_end=0,
             animation_type="play"
         )
-        self.animations.append(played_anim)
+        self.animations.append(hand_to_table)
+        #print(f"Creata animazione mano->tavolo per carta {card_played}")
         
-        # FASE 2: Create animations for captured cards WITH DELAY
+        # Se ci sono carte da catturare, crea le animazioni di cattura
         if cards_captured:
             # Calculate pile position for the capturing team
             team_id = current_player.team_id
             pile_pos = (self.app.window_width * 0.05, self.app.window_height // 2 + (team_id * 0.2 - 0.1) * self.app.window_height)
             
-            # MIGLIORAMENTO: Calcola posizioni sfalsate per le carte catturate per la fase di animazione
-            # Crea un layout sfalsato per le carte catturate, con sovrapposizione del 50%
-            card_width = int(self.app.window_width * 0.078)
-            staggered_offset = card_width * 0.5  # 50% della larghezza della carta
-            
-            # NUOVO: Aggiungi animazione anche per la carta catturante (dalla sua posizione sul tavolo fino al mazzo)
-            # La carta catturante sarà all'index 0 nella formazione sfalsata
-            intermediate_x = end_pos[0]
-            intermediate_y = end_pos[1]
-            # Leggera variazione nella posizione finale
-            capturing_end_x = pile_pos[0] + random.randint(-5, 5)
-            capturing_end_y = pile_pos[1] + random.randint(-5, 5)
-            
-            # Animazione verso il mazzo per la carta catturante
-            capturing_anim = CardAnimation(
+            # FASE 2: NUOVO - Animazione esplicita di "plateau" per mantenere la carta visibile
+            # Questa animazione mantiene la carta ferma nella stessa posizione per tutto il tempo del plateau
+            plateau_anim = CardAnimation(
                 card=card_played,
-                start_pos=end_pos,  # Posizione finale della prima animazione
-                end_pos=(capturing_end_x, capturing_end_y),
-                duration=25,
-                delay=45,  # Si muove insieme alle carte catturate
+                start_pos=end_pos,     # Stessa posizione di fine della prima animazione
+                end_pos=end_pos,       # Stessa posizione (non si muove)
+                duration=plateau_duration,
+                delay=hand_to_table_duration,  # Inizia subito dopo la prima animazione
                 scale_start=1.0,
-                scale_end=0.8,
+                scale_end=1.0,
                 rotation_start=0,
-                rotation_end=random.randint(-10, 10),
-                animation_type="capture"
+                rotation_end=0,
+                animation_type="plateau"  # Nuovo tipo di animazione
             )
-            self.animations.append(capturing_anim)
-            print(f"  Created animation for capturing card {card_played}")
+            self.animations.append(plateau_anim)
+            #print(f"Creata animazione di plateau per carta {card_played}")
             
-            # Animate all captured cards with delay
-            for i, card in enumerate(cards_captured):
+            # FASE 3: Animazioni dal tavolo al mazzetto
+            # Il tempo totale trascorso finora è hand_to_table_duration + plateau_duration
+            total_time = hand_to_table_duration + plateau_duration
+            
+            # Creiamo una lista di tutte le carte coinvolte nella cattura, inclusa la carta catturante
+            all_capture_cards = [card_played] + list(cards_captured)
+            card_width = int(self.app.window_width * 0.078)
+            
+            # Calcola posizioni di partenza per tutte le carte
+            starting_positions = {}
+            starting_positions[card_played] = end_pos  # La carta catturante parte dalla sua posizione sul tavolo
+            
+            # Calcola le posizioni delle carte sul tavolo
+            for card in cards_captured:
                 try:
                     # Find card position in the original table
                     card_index = original_table.index(card)
                     card_x = start_x + card_index * card_spacing
                     card_pos = (card_x + CARD_WIDTH // 2, table_y + CARD_HEIGHT // 2)
-                    
-                    # Calcola posizione intermedia sfalsata per l'animazione
-                    # La carta catturante è già posizionata in end_pos
-                    # Le carte catturate si posizionano con uno sfalsamento progressivo
-                    intermediate_x = end_pos[0] + (i + 1) * staggered_offset
-                    intermediate_y = end_pos[1]
-                    intermediate_pos = (intermediate_x, intermediate_y)
-                    
-                    # Add slight variation to end position for visual appeal
-                    end_x = pile_pos[0] + random.randint(-5, 5)
-                    end_y = pile_pos[1] + random.randint(-5, 5) + i * 5  # Sfalsamento verticale aggiuntivo
-                    varied_end_pos = (end_x, end_y)
-                    
-                    # NUOVO: prima creiamo un'animazione verso la posizione intermedia (raggruppamento sfalsato)
-                    group_anim = CardAnimation(
-                        card=card,
-                        start_pos=card_pos,
-                        end_pos=intermediate_pos,
-                        duration=20,
-                        delay=20,  # Parte dopo che la carta giocata è arrivata a destinazione
-                        scale_start=1.0,
-                        scale_end=1.0,
-                        rotation_start=0,
-                        rotation_end=0,
-                        animation_type="group"
-                    )
-                    self.animations.append(group_anim)
-                    
-                    # Poi creiamo l'animazione verso il mazzo di cattura
-                    capture_anim = CardAnimation(
-                        card=card,
-                        start_pos=intermediate_pos,
-                        end_pos=varied_end_pos,
-                        duration=25,
-                        delay=45 + i * 3,  # Ritardo aggiuntivo dopo il raggruppamento
-                        scale_start=1.0,
-                        scale_end=0.8,
-                        rotation_start=0,
-                        rotation_end=random.randint(-10, 10),
-                        animation_type="capture"
-                    )
-                    self.animations.append(capture_anim)
-                    print(f"  Created animation for captured card {card}")
+                    starting_positions[card] = card_pos
                 except ValueError:
-                    # Fallback con posizioni sfalsate
-                    intermediate_x = end_pos[0] + (i + 1) * staggered_offset
-                    intermediate_y = end_pos[1]
-                    intermediate_pos = (intermediate_x, intermediate_y)
-                    
-                    # Aggiungi variazioni alla posizione finale
-                    end_x = pile_pos[0] + random.randint(-5, 5)
-                    end_y = pile_pos[1] + random.randint(-5, 5) + i * 5
-                    varied_end_pos = (end_x, end_y)
-                    
-                    # Prima animazione (raggruppamento sfalsato)
-                    group_anim = CardAnimation(
-                        card=card,
-                        start_pos=table_center,
-                        end_pos=intermediate_pos,
-                        duration=20,
-                        delay=20,
-                        scale_start=1.0,
-                        scale_end=1.0,
-                        rotation_start=0,
-                        rotation_end=0,
-                        animation_type="group"
-                    )
-                    self.animations.append(group_anim)
-                    
-                    # Seconda animazione (verso il mazzo)
-                    capture_anim = CardAnimation(
-                        card=card,
-                        start_pos=intermediate_pos,
-                        end_pos=varied_end_pos,
-                        duration=25,
-                        delay=45 + i * 3,
-                        scale_start=1.0,
-                        scale_end=0.8,
-                        rotation_start=0,
-                        rotation_end=random.randint(-10, 10),
-                        animation_type="capture"
-                    )
-                    self.animations.append(capture_anim)
+                    # Fallback con posizione centrale
+                    starting_positions[card] = table_center
+            
+            # Ora creiamo le animazioni di cattura per ciascuna carta
+            for i, card in enumerate(all_capture_cards):
+                # Leggera variazione nella posizione finale per evitare sovrapposizione
+                staggered_offset = card_width * 0.3  # Ridotto per evitare sovrapposizioni eccessive
+                end_x = pile_pos[0] + random.randint(-5, 5) + i * staggered_offset
+                end_y = pile_pos[1] + random.randint(-5, 5) + i * 3
+                varied_end_pos = (end_x, end_y)
+                
+                # Calcola il delay per questa carta
+                # Base: tempo totale trascorso finora + delay incrementale
+                card_delay = total_time + i * inter_card_delay
+                
+                #print(f"Carta {card} - delay cattura: {card_delay} frame")
+                
+                # NUOVO: Aggiungi la carta al set di carte in movimento quando inizia l'animazione
+                # Creiamo un'animazione speciale "start_motion" che aggiungerà la carta a cards_in_motion
+                motion_start_anim = CardAnimation(
+                    card=card,
+                    start_pos=starting_positions[card],  # Stessa posizione di partenza
+                    end_pos=starting_positions[card],    # Stessa posizione (non si muove)
+                    duration=1,                          # Dura solo 1 frame
+                    delay=card_delay,                    # Stesso delay dell'animazione di cattura
+                    scale_start=1.0,
+                    scale_end=1.0,
+                    rotation_start=0,
+                    rotation_end=0,
+                    animation_type="start_motion"        # Tipo speciale per tracciare l'inizio del movimento
+                )
+                self.animations.append(motion_start_anim)
+                
+                # Crea l'animazione con il delay calcolato
+                capture_anim = CardAnimation(
+                    card=card,
+                    start_pos=starting_positions[card],
+                    end_pos=varied_end_pos,
+                    duration=capture_duration,
+                    delay=card_delay,  # Usa il delay calcolato
+                    scale_start=1.0,
+                    scale_end=0.8,
+                    rotation_start=0,
+                    rotation_end=random.randint(-10, 10),
+                    animation_type="capture"
+                )
+                self.animations.append(capture_anim)
+                #print(f"  Creata animazione tavolo->mazzetto per carta {card} con delay {card_delay}")
     
     def draw(self, surface):
         """Draw the game screen with connection loss indicators"""
@@ -3876,6 +3911,10 @@ class GameScreen(BaseScreen):
             surface.blit(text_surf, text_rect)
             return
         
+        # NUOVO: Assicurati che esista il set di carte in movimento
+        if not hasattr(self, 'cards_in_motion'):
+            self.cards_in_motion = set()
+        
         # Get the current card size based on window size
         width = self.app.window_width
         card_width = int(width * 0.078)
@@ -3892,6 +3931,10 @@ class GameScreen(BaseScreen):
         y = self.table_rect.centery - card_height // 2
         
         for i, card in enumerate(table_cards):
+            # NUOVO: Salta la carta se è nel set delle carte in movimento
+            if card in self.cards_in_motion:
+                continue
+                
             x = start_x + i * card_spacing
             
             # Get card image
