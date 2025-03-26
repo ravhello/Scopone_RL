@@ -2446,190 +2446,190 @@ class GameScreen(BaseScreen):
                 self.make_ai_move()
                 self.ai_thinking = False
     
-def handle_network_updates(self):
-    """Network update handling with improved state synchronization"""
-    if not self.app.network:
-        return
-    
-    # Host logic: process moves and broadcast state
-    if self.app.network.is_host:
-        # SOLUZIONE: Assicuriamo che il client sappia sempre chi sia il giocatore corrente
-        if hasattr(self, 'initial_sync_done') and not self.initial_sync_done:
-            print("SYNC: Invio sincronizzazione iniziale al client")
-            self.app.network.game_state = self.env.game_state.copy()
-            self.app.network.game_state['current_player'] = self.env.current_player
-            
-            # Se siamo in modalità team_vs_ai, aggiungi informazioni specifiche
-            if self.app.game_config.get("online_type") == "team_vs_ai":
-                self.app.network.game_state['online_type'] = 'team_vs_ai'
-                self.app.network.game_state['ai_players'] = [1, 3]
-            
-            # Broadcast immediato
-            self.app.network.broadcast_game_state()
-            self.initial_sync_done = True
+    def handle_network_updates(self):
+        """Network update handling with improved state synchronization"""
+        if not self.app.network:
+            return
         
-        # Process any queued moves
-        while self.app.network.move_queue:
-            player_id, move = self.app.network.move_queue.popleft()
-            
-            # Verify it's the player's turn
-            if player_id != self.env.current_player:
-                print(f"Ignoring move from player {player_id}, it's player {self.env.current_player}'s turn")
-                continue
-            
-            # Execute the move and create animations
-            try:
-                # Decode the move
-                card_played, cards_captured = decode_action(move)
-                print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
-                
-                # Create animations for the move
-                self.create_move_animations(card_played, cards_captured, player_id)
-                
-                # Execute the move in the environment
-                _, _, done, info = self.env.step(move)
-                
-                # Update game state if game is over
-                if done:
-                    self.game_over = True
-                    if "score_breakdown" in info:
-                        self.final_breakdown = info["score_breakdown"]
-                
-                # ENHANCED: Prepare a deep copy of the game state for broadcasting
-                online_type = self.app.game_config.get("online_type")
+        # Host logic: process moves and broadcast state
+        if self.app.network.is_host:
+            # SOLUZIONE: Assicuriamo che il client sappia sempre chi sia il giocatore corrente
+            if hasattr(self, 'initial_sync_done') and not self.initial_sync_done:
+                print("SYNC: Invio sincronizzazione iniziale al client")
                 self.app.network.game_state = self.env.game_state.copy()
-                if online_type:
-                    self.app.network.game_state['online_type'] = online_type
-                    self.app.network.game_state['ai_players'] = [1, 3]  # In team vs AI mode, players 1 and 3 are always AI
-                
-                # Add the current player to the state
                 self.app.network.game_state['current_player'] = self.env.current_player
                 
-                # Add information about the move that was just made
-                self.app.network.game_state['last_move'] = {
-                    'player': player_id,
-                    'card_played': card_played,
-                    'cards_captured': cards_captured
-                }
+                # Se siamo in modalità team_vs_ai, aggiungi informazioni specifiche
+                if self.app.game_config.get("online_type") == "team_vs_ai":
+                    self.app.network.game_state['online_type'] = 'team_vs_ai'
+                    self.app.network.game_state['ai_players'] = [1, 3]
                 
-                # Use the enhanced broadcast method
+                # Broadcast immediato
                 self.app.network.broadcast_game_state()
-                
-                # Play a sound effect
-                self.app.resources.play_sound("card_play")
-                
-                # NEW: Diagnostic message
-                table_cards = self.env.game_state.get("table", [])
-                print(f"Host broadcasting after player move - Current player: {self.env.current_player}, Table: {table_cards}")
-                
-            except Exception as e:
-                print(f"Error processing move: {e}")
-                import traceback
-                traceback.print_exc()
-    
-    # Client logic: update local state from network
-    else:
-        if self.app.network.game_state:
-            # Keep a copy of old state for comparison
-            old_state = None
-            old_current_player = None
-            if self.env and hasattr(self.env, 'game_state'):
-                old_state = {k: v.copy() if isinstance(v, dict) or isinstance(v, list) else v 
-                            for k, v in self.env.game_state.items()} if self.env.game_state else None
-                old_current_player = self.env.current_player if hasattr(self.env, 'current_player') else None
+                self.initial_sync_done = True
             
-            # Get the new state from the network
-            new_state = {k: v.copy() if isinstance(v, dict) or isinstance(v, list) else v 
-                        for k, v in self.app.network.game_state.items()}
-            
-            # Extract special fields from game state
-            new_current_player = new_state.pop('current_player', None)
-            
-            # Debug output of critical components - ABILITATO PER DEBUG
-            print(f"Client received state update:")
-            print(f"  Current player: {new_current_player}")
-            print(f"  Online type: {new_state.get('online_type')}")
-            print(f"  AI players: {new_state.get('ai_players', [])}")
-            
-            # SOLUZIONE CRUCIALE: Applica configurazione AI se ne abbiamo bisogno
-            ai_players = new_state.get('ai_players', [])
-            if ai_players and new_state.get('online_type') == 'team_vs_ai':
-                print("SYNC: Applicazione configurazione team_vs_ai dal server")
-                self.app.game_config['online_type'] = 'team_vs_ai'
+            # Process any queued moves
+            while self.app.network.move_queue:
+                player_id, move = self.app.network.move_queue.popleft()
                 
-                # Configura i giocatori AI (1 e 3)
-                for player_id in ai_players:
-                    if player_id < len(self.players):
-                        player = self.players[player_id]
-                        player.is_human = False
-                        player.is_ai = True
-                        player.team_id = 1  # Team 1 (AI)
-                        player.name = f"AI {player_id}"
+                # Verify it's the player's turn
+                if player_id != self.env.current_player:
+                    print(f"Ignoring move from player {player_id}, it's player {self.env.current_player}'s turn")
+                    continue
                 
-                # Assicurati che i giocatori umani (0 e 2) siano configurati correttamente
-                for player_id in [0, 2]:
-                    if player_id < len(self.players):
-                        player = self.players[player_id]
-                        player.is_human = True
-                        player.is_ai = False
-                        player.team_id = 0  # Team 0 (umano)
-                        # Nomi appropriati in base all'ID locale
-                        if player_id == self.local_player_id:
-                            player.name = "You"
-                        else:
-                            player.name = "Partner"
-                
-                # Stampa configurazione finale
-                print("\nConfigurazione giocatori dopo sync:")
-                for player in self.players:
-                    print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
-            
-            # Apply the new state to the environment
-            if self.env:
-                # Store hands before updating state to ensure local player's hand is preserved
-                local_hand = None
-                if self.local_player_id is not None and 'hands' in new_state:
-                    if self.local_player_id in new_state['hands']:
-                        local_hand = new_state['hands'][self.local_player_id]
-                
-                # Apply the new state
-                self.env.game_state = new_state
-                
-                # CRITICAL: Ensure the local player's hand is preserved and correctly updated
-                if local_hand is not None:
-                    if 'hands' not in self.env.game_state:
-                        self.env.game_state['hands'] = {}
-                    self.env.game_state['hands'][self.local_player_id] = local_hand
-                
-                # SOLUZIONE CRUCIALE: Aggiorna il turno corrente con quello ricevuto dal server
-                if new_current_player is not None:
-                    prev_player = self.env.current_player if hasattr(self.env, 'current_player') else None
-                    print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
-                    self.env.current_player = new_current_player
-                    self.current_player_id = new_current_player
+                # Execute the move and create animations
+                try:
+                    # Decode the move
+                    card_played, cards_captured = decode_action(move)
+                    print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
                     
-                    # Notify player if it's their turn now
-                    if prev_player != new_current_player and new_current_player == self.local_player_id:
-                        self.status_message = "It's your turn!"
-                        self.app.resources.play_sound("card_pickup")
-                        # Reset selections when it becomes the player's turn
-                        self.selected_hand_card = None
-                        self.selected_table_cards.clear()
-                
-                # Check for card movements and update visuals
-                if old_state and old_state != new_state:
-                    # Generate animations for changes
-                    self.detect_and_animate_changes(old_state, new_state, old_current_player)
-                    self.waiting_for_other_player = False
+                    # Create animations for the move
+                    self.create_move_animations(card_played, cards_captured, player_id)
                     
-                    # Check for game over
-                    if all(len(new_state["hands"].get(p, [])) == 0 for p in range(4)):
+                    # Execute the move in the environment
+                    _, _, done, info = self.env.step(move)
+                    
+                    # Update game state if game is over
+                    if done:
                         self.game_over = True
-                        from rewards import compute_final_score_breakdown
-                        self.final_breakdown = compute_final_score_breakdown(new_state)
+                        if "score_breakdown" in info:
+                            self.final_breakdown = info["score_breakdown"]
+                    
+                    # ENHANCED: Prepare a deep copy of the game state for broadcasting
+                    online_type = self.app.game_config.get("online_type")
+                    self.app.network.game_state = self.env.game_state.copy()
+                    if online_type:
+                        self.app.network.game_state['online_type'] = online_type
+                        self.app.network.game_state['ai_players'] = [1, 3]  # In team vs AI mode, players 1 and 3 are always AI
+                    
+                    # Add the current player to the state
+                    self.app.network.game_state['current_player'] = self.env.current_player
+                    
+                    # Add information about the move that was just made
+                    self.app.network.game_state['last_move'] = {
+                        'player': player_id,
+                        'card_played': card_played,
+                        'cards_captured': cards_captured
+                    }
+                    
+                    # Use the enhanced broadcast method
+                    self.app.network.broadcast_game_state()
+                    
+                    # Play a sound effect
+                    self.app.resources.play_sound("card_play")
+                    
+                    # NEW: Diagnostic message
+                    table_cards = self.env.game_state.get("table", [])
+                    print(f"Host broadcasting after player move - Current player: {self.env.current_player}, Table: {table_cards}")
+                    
+                except Exception as e:
+                    print(f"Error processing move: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        # Client logic: update local state from network
+        else:
+            if self.app.network.game_state:
+                # Keep a copy of old state for comparison
+                old_state = None
+                old_current_player = None
+                if self.env and hasattr(self.env, 'game_state'):
+                    old_state = {k: v.copy() if isinstance(v, dict) or isinstance(v, list) else v 
+                                for k, v in self.env.game_state.items()} if self.env.game_state else None
+                    old_current_player = self.env.current_player if hasattr(self.env, 'current_player') else None
                 
-                # CRITICAL: Update player hands after applying the state
-                self.update_player_hands()
+                # Get the new state from the network
+                new_state = {k: v.copy() if isinstance(v, dict) or isinstance(v, list) else v 
+                            for k, v in self.app.network.game_state.items()}
+                
+                # Extract special fields from game state
+                new_current_player = new_state.pop('current_player', None)
+                
+                # Debug output of critical components - ABILITATO PER DEBUG
+                print(f"Client received state update:")
+                print(f"  Current player: {new_current_player}")
+                print(f"  Online type: {new_state.get('online_type')}")
+                print(f"  AI players: {new_state.get('ai_players', [])}")
+                
+                # SOLUZIONE CRUCIALE: Applica configurazione AI se ne abbiamo bisogno
+                ai_players = new_state.get('ai_players', [])
+                if ai_players and new_state.get('online_type') == 'team_vs_ai':
+                    print("SYNC: Applicazione configurazione team_vs_ai dal server")
+                    self.app.game_config['online_type'] = 'team_vs_ai'
+                    
+                    # Configura i giocatori AI (1 e 3)
+                    for player_id in ai_players:
+                        if player_id < len(self.players):
+                            player = self.players[player_id]
+                            player.is_human = False
+                            player.is_ai = True
+                            player.team_id = 1  # Team 1 (AI)
+                            player.name = f"AI {player_id}"
+                    
+                    # Assicurati che i giocatori umani (0 e 2) siano configurati correttamente
+                    for player_id in [0, 2]:
+                        if player_id < len(self.players):
+                            player = self.players[player_id]
+                            player.is_human = True
+                            player.is_ai = False
+                            player.team_id = 0  # Team 0 (umano)
+                            # Nomi appropriati in base all'ID locale
+                            if player_id == self.local_player_id:
+                                player.name = "You"
+                            else:
+                                player.name = "Partner"
+                    
+                    # Stampa configurazione finale
+                    print("\nConfigurazione giocatori dopo sync:")
+                    for player in self.players:
+                        print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
+                
+                # Apply the new state to the environment
+                if self.env:
+                    # Store hands before updating state to ensure local player's hand is preserved
+                    local_hand = None
+                    if self.local_player_id is not None and 'hands' in new_state:
+                        if self.local_player_id in new_state['hands']:
+                            local_hand = new_state['hands'][self.local_player_id]
+                    
+                    # Apply the new state
+                    self.env.game_state = new_state
+                    
+                    # CRITICAL: Ensure the local player's hand is preserved and correctly updated
+                    if local_hand is not None:
+                        if 'hands' not in self.env.game_state:
+                            self.env.game_state['hands'] = {}
+                        self.env.game_state['hands'][self.local_player_id] = local_hand
+                    
+                    # SOLUZIONE CRUCIALE: Aggiorna il turno corrente con quello ricevuto dal server
+                    if new_current_player is not None:
+                        prev_player = self.env.current_player if hasattr(self.env, 'current_player') else None
+                        print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
+                        self.env.current_player = new_current_player
+                        self.current_player_id = new_current_player
+                        
+                        # Notify player if it's their turn now
+                        if prev_player != new_current_player and new_current_player == self.local_player_id:
+                            self.status_message = "It's your turn!"
+                            self.app.resources.play_sound("card_pickup")
+                            # Reset selections when it becomes the player's turn
+                            self.selected_hand_card = None
+                            self.selected_table_cards.clear()
+                    
+                    # Check for card movements and update visuals
+                    if old_state and old_state != new_state:
+                        # Generate animations for changes
+                        self.detect_and_animate_changes(old_state, new_state, old_current_player)
+                        self.waiting_for_other_player = False
+                        
+                        # Check for game over
+                        if all(len(new_state["hands"].get(p, [])) == 0 for p in range(4)):
+                            self.game_over = True
+                            from rewards import compute_final_score_breakdown
+                            self.final_breakdown = compute_final_score_breakdown(new_state)
+                    
+                    # CRITICAL: Update player hands after applying the state
+                    self.update_player_hands()
 
     def detect_and_animate_changes(self, old_state, new_state, old_current_player=None):
         """Improved change detection for more reliable animations"""
