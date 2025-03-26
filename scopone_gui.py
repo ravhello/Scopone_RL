@@ -497,26 +497,20 @@ class NetworkManager:
         self.public_ip = None
         self.connection_in_progress = False  # Add this line to track connection attempts
         self.connection_start_time = 0  # Add this line to track when connection started
-            
+        
     def start_server(self):
         """Initialize server socket for host player with improved robustness"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Allow address reuse for faster server restart
+            # Permettiamo il riuso dell'indirizzo per un riavvio più veloce del server
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # Bind to all interfaces (0.0.0.0) to accept external connections
+            # Binding su tutte le interfacce (0.0.0.0) per accettare connessioni esterne
             self.socket.bind(('0.0.0.0', self.port))
             self.socket.listen(4)  # Allow up to 4 connections
             self.connected = True
             
-            # Get public IP for internet connections
+            # Ottieni l'IP pubblico per connessioni internet
             self.public_ip = self.get_public_ip()
-            
-            # Add connection info to message queue
-            self.message_queue.append(f"Server started on port {self.port}")
-            self.message_queue.append(f"Local IP: {get_local_ip()}")
-            if self.public_ip:
-                self.message_queue.append(f"Public IP: {self.public_ip}")
             
             # Start thread to accept connections
             threading.Thread(target=self.accept_connections, daemon=True).start()
@@ -578,37 +572,30 @@ class NetworkManager:
     
     def accept_connections(self):
         """Accept connections from other players (for host)"""
-        # Get the configuration
+        # Ottieni la configurazione
         is_team_vs_ai = False
         if hasattr(self, 'game_state') and self.game_state:
-            # Check if we're in team vs AI mode
+            # Controlla se siamo in modalità team vs AI
             is_team_vs_ai = self.game_state.get('online_type') == 'team_vs_ai'
         
-        # Number of expected clients based on mode
+        # Numero di client attesi in base alla modalità
         expected_clients = 1 if is_team_vs_ai else 3
         
         while len(self.clients) < expected_clients:
             try:
                 client, addr = self.socket.accept()
                 
-                # Assign player_id based on game mode
+                # Assegna player_id in base alla modalità di gioco
                 if is_team_vs_ai:
-                    # In team vs AI mode, ALWAYS assign ID 2 to client (human partner)
+                    # In modalità team vs AI, assegna SEMPRE ID 2 al client (partner umano)
                     player_id = 2
                     print(f"Team vs AI: assegnato ID 2 al partner (client)")
                 else:
-                    # In other modes, assign progressive IDs (1, 2, 3)
+                    # Nelle altre modalità, assegna ID progressivi (1, 2, 3)
                     player_id = len(self.clients) + 1
                 
-                # Create initial message with both player_id and current game_state
-                welcome_message = {
-                    "type": "player_id", 
-                    "id": player_id,
-                    "state": self.game_state if self.game_state else {}
-                }
-                
-                # Send player ID and game state to client
-                client.sendall(pickle.dumps(welcome_message))
+                # Invia player ID al client
+                client.sendall(pickle.dumps({"type": "player_id", "id": player_id}))
                 
                 self.clients.append((client, player_id))
                 print(f"Player {player_id} connected from {addr}")
@@ -628,109 +615,6 @@ class NetworkManager:
             except Exception as e:
                 print(f"Error accepting connection: {e}")
                 break
-
-    def force_transition_to_game(self):
-        """Force client to transition to game screen when player ID is received"""
-        print("FORCE TRANSITION: NetworkManager attempting to force transition to game")
-        
-        # Find the GameModeScreen instance
-        for screen_name, screen in self.app.screens.items():
-            if screen_name == "mode" and isinstance(screen, GameModeScreen):
-                print(f"FORCE TRANSITION: Found GameModeScreen, current state: done={screen.done}")
-                # Force transition
-                screen.done = True
-                screen.next_screen = "game"
-                
-                # Set up game config with proper mode and player ID
-                self.app.game_config = {
-                    "mode": "online_multiplayer",
-                    "is_host": False,
-                    "player_id": self.player_id,
-                    "online_type": self.game_state.get('online_type', 'all_human')
-                }
-                
-                print(f"FORCE TRANSITION: Set done=True, next_screen=game, player_id={self.player_id}")
-                return True
-        
-        print("FORCE TRANSITION: Could not find GameModeScreen!")
-        return False
-
-    def receive_updates(self):
-        """Receive game state updates from server (for clients) with forced transition"""
-        transition_forced = False
-        
-        while self.connected:
-            try:
-                data = self.socket.recv(8192)  # Larger buffer for game state
-                if not data:
-                    break
-                    
-                message = pickle.loads(data)
-                print(f"CLIENT RECEIVED: Message type: {message['type']}")
-                
-                # Process different message types
-                if message["type"] == "player_id":
-                    self.player_id = message["id"]
-                    print(f"CLIENT RECEIVED: Assigned player ID: {self.player_id}")
-                    
-                    # Also log to message queue
-                    self.message_queue.append(f"You are Player {self.player_id}")
-                    
-                    # IMPORTANT: If server also sent game state, store it
-                    if "state" in message and message["state"]:
-                        self.game_state = message["state"]
-                        print(f"CLIENT RECEIVED: Initial game state keys: {self.game_state.keys()}")
-                    
-                    # CRITICAL NEW CODE: Force transition to game screen
-                    if not transition_forced and hasattr(self, 'app'):
-                        transition_forced = True
-                        print("CLIENT TRANSITION: Forcing transition to game screen...")
-                        # Use threaded approach to avoid deadlock
-                        threading.Thread(target=self.force_transition_to_game, daemon=True).start()
-                
-                elif message["type"] == "game_state":
-                    self.game_state = message["state"]
-                    print(f"CLIENT RECEIVED: Game state update, current player: {self.game_state.get('current_player')}")
-                    
-                elif message["type"] == "start_game":
-                    self.message_queue.append("Game starting!")
-                    print("CLIENT RECEIVED: Game starting signal")
-                    
-                    # BACKUP: Try to transition here as well if not done already
-                    if not transition_forced and hasattr(self, 'app') and "state" in message:
-                        self.game_state = message.get("state", {})
-                        transition_forced = True
-                        print("CLIENT TRANSITION: Backup forcing transition on game start...")
-                        threading.Thread(target=self.force_transition_to_game, daemon=True).start()
-                    
-                elif message["type"] == "chat":
-                    self.message_queue.append(f"Player {message['player_id']}: {message['text']}")
-                
-            except Exception as e:
-                print(f"Error receiving updates: {e}")
-                import traceback
-                traceback.print_exc()
-                break
-        
-        self.connected = False
-        self.message_queue.append("Disconnected from server")
-
-    def broadcast_start_game(self):
-        """Broadcast game start signal to all clients (host only)"""
-        if not self.is_host:
-            return
-            
-        message = {
-            "type": "start_game",
-            "state": self.game_state  # Include current game state
-        }
-        data = pickle.dumps(message)
-        
-        for client, _ in self.clients:
-            try:
-                client.sendall(data)
-            except:
-                pass
     
     def handle_client(self, client_socket, player_id):
         """Handle communication with a specific client"""
@@ -840,13 +724,6 @@ class NetworkManager:
                     state_copy[key] = [item.copy() if isinstance(item, list) else item for item in value]
                 else:
                     state_copy[key] = value
-        
-        # ENHANCED: Add more explicit player information for the client
-        state_copy['players_info'] = {
-            'local_player_id': self.player_id,
-            'current_player': state_copy.get('current_player', 0),
-            'ai_players': [1, 3] if state_copy.get('online_type') == 'team_vs_ai' else []
-        }
         
         # ENHANCED: Log the content of the state being sent
         hands_info = "Hands: "
@@ -1315,30 +1192,29 @@ class GameModeScreen(BaseScreen):
     
     def host_online_game(self):
         """Host an online game with internet support"""
-        # Use the app's create_network_manager method with is_host=True
-        self.app.create_network_manager(is_host=True)
+        self.app.network = NetworkManager(is_host=True)
         
-        # CORRECTION: Set the game_state BEFORE starting the server
+        # CORREZIONE: Imposta il game_state PRIMA di avviare il server
         if self.selected_online_mode == 1:  # Team vs AI
             self.app.network.game_state = {
                 'online_type': 'team_vs_ai'
             }
         
         if self.app.network.start_server():
-            # Get both local and public IP
+            # Ottieni sia l'IP locale che quello pubblico
             local_ip = get_local_ip()
             public_ip = self.app.network.public_ip
             
-            # Show both IPs in status message
-            self.status_message = f"Server active! LAN: {local_ip} | Internet: {public_ip} | Port: 5555"
+            # Mostra entrambi gli IP nello status message
+            self.status_message = f"Server attivo! LAN: {local_ip} | Internet: {public_ip} | Porta: 5555"
             
-            # Add this information to message queue in organized way
+            # Aggiungi queste informazioni alla message queue in modo organizzato
             if self.app.network:
-                self.app.network.message_queue.append("Server started successfully!")
-                self.app.network.message_queue.append(f"Local IP (LAN): {local_ip}")
-                self.app.network.message_queue.append(f"Public IP (Internet): {public_ip}")
-                self.app.network.message_queue.append("For LAN: use Local IP")
-                self.app.network.message_queue.append("For Internet: use Public IP + port forwarding (port 5555)")
+                self.app.network.message_queue.append("Server avviato con successo!")
+                self.app.network.message_queue.append(f"IP Locale (LAN): {local_ip}")
+                self.app.network.message_queue.append(f"IP Pubblico (Internet): {public_ip}")
+                self.app.network.message_queue.append("Per LAN: usa l'IP Locale")
+                self.app.network.message_queue.append("Per Internet: usa l'IP Pubblico + port forwarding (porta 5555)")
 
             if self.selected_online_mode == 0:
                 # 4 Players (All Human)
@@ -1351,11 +1227,11 @@ class GameModeScreen(BaseScreen):
                     "online_type": "all_human"
                 }
             else:
-                # 2 vs 2 (Team vs AI) - Show loading animation
+                # 2 vs 2 (Team vs AI) - Mostra animazione di caricamento
                 self.loading = True
                 self.loading_animation = LoadingAnimation(self.app.window_width, self.app.window_height)
                 self.loading_start_time = pygame.time.get_ticks()
-                self.loading_message = "Loading AI bots"
+                self.loading_message = "Caricamento bot AI in corso"
                 
                 self.app.game_config = {
                     "mode": "online_multiplayer",
@@ -1364,14 +1240,18 @@ class GameModeScreen(BaseScreen):
                     "online_type": "team_vs_ai",
                     "difficulty": self.selected_difficulty
                 }
+                
+                # Questa riga è ora ridondante ma la mantengo per sicurezza
+                if hasattr(self.app, 'network') and self.app.network:
+                    self.app.network.game_state = {
+                        'online_type': 'team_vs_ai'
+                    }
     
     def join_online_game(self):
         """Join an online game with timeout handling"""
         # Use localhost if no IP entered
         host = self.ip_input if self.ip_input else "localhost"
-        
-        # MODIFIED: Use the app's create_network_manager method
-        self.app.create_network_manager(is_host=False, host=host)
+        self.app.network = NetworkManager(is_host=False, host=host)
         
         # Start connection attempt
         self.app.network.connect_to_server()
@@ -1610,52 +1490,27 @@ class GameModeScreen(BaseScreen):
             
             # Check if connection succeeded or timed out
             if self.app.network.connected:
-                # CRITICAL FIX: Check if player_id is assigned before transitioning
-                if self.app.network.player_id is not None:
-                    print(f"Connection successful! Assigned player ID: {self.app.network.player_id}")
-                    self.done = True
-                    self.next_screen = "game"
-                    
-                    # Set up game config with proper mode and player ID
-                    self.app.game_config = {
-                        "mode": "online_multiplayer",
-                        "is_host": False,
-                        "player_id": self.app.network.player_id,
-                        # Get online_type from game_state if available
-                        "online_type": self.app.network.game_state.get('online_type', 'all_human')
-                    }
-                else:
-                    # Keep waiting for player_id assignment
-                    self.status_message = f"Connected, waiting for player assignment{dots}"
+                self.done = True
+                self.next_screen = "game"
+                self.app.game_config = {
+                    "mode": "online_multiplayer",
+                    "is_host": False,
+                    "player_id": None  # Will be set by server
+                }
             elif self.app.network.check_connection_timeout(5):  # 5-second timeout
                 self.status_message = f"Failed to connect to {self.app.network.host}"
         
-        # Also add this check to NetworkManager.receive_updates method:
-        """
-        # In NetworkManager.receive_updates:
-        if message["type"] == "player_id":
-            self.player_id = message["id"]
-            print(f"Assigned player ID: {self.player_id}")
-            
-            # Add this line to message queue for visibility
-            self.message_queue.append(f"You are Player {self.player_id}")
-            
-            # If we also received game state, store it
-            if "state" in message:
-                self.game_state = message["state"]
-        """
-        
         # Original update code continues here...
         if self.loading:
-            # If we're in loading state, update the animation
+            # Se siamo in stato di caricamento, aggiorna l'animazione
             current_time = pygame.time.get_ticks()
             elapsed = current_time - self.loading_start_time
             
-            # Update the animation
+            # Aggiorna l'animazione
             self.loading_animation.update()
             
-            # After 2 seconds, complete loading and go to game screen
-            if elapsed > 2000:  # 2 seconds of animation
+            # Dopo 2 secondi, completa il caricamento e vai alla schermata di gioco
+            if elapsed > 2000:  # 2 secondi di animazione
                 self.loading = False
                 self.done = True
                 self.next_screen = "game"
@@ -4287,15 +4142,6 @@ class ScoponeApp:
         
         # Network manager (for online play)
         self.network = None
-        
-        # IMPORTANT: When creating NetworkManager, store reference to app
-        def create_network_manager(is_host=False, host='localhost', port=5555):
-            self.network = NetworkManager(is_host, host, port)
-            self.network.app = self  # Store reference to app
-            return self.network
-
-        # Replace direct NetworkManager creation with this method
-        self.create_network_manager = create_network_manager
         
         # Store initial window size
         self.initial_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
