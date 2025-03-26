@@ -1483,22 +1483,28 @@ class GameModeScreen(BaseScreen):
     def update(self):
         """Update screen state with connection timeout handling"""
         # Check for network connection timeout
-        if hasattr(self.app, 'network') and self.app.network and self.app.network.connection_in_progress:
-            # Show connecting message with dots animation
-            dots = "." * ((pygame.time.get_ticks() // 500) % 4)
-            self.status_message = f"Connecting to {self.app.network.host}{dots}"
-            
-            # Check if connection succeeded or timed out
-            if self.app.network.connected:
+        if hasattr(self.app, 'network') and self.app.network:
+            # Verifica se la connessione ha avuto successo anche se non è più in progress
+            if self.app.network.connected and not self.done:
+                print("Connessione riuscita, passaggio alla schermata di gioco")
                 self.done = True
                 self.next_screen = "game"
                 self.app.game_config = {
                     "mode": "online_multiplayer",
                     "is_host": False,
-                    "player_id": None  # Will be set by server
+                    "player_id": self.app.network.player_id  # Usa il player_id già assegnato
                 }
-            elif self.app.network.check_connection_timeout(5):  # 5-second timeout
-                self.status_message = f"Failed to connect to {self.app.network.host}"
+                return
+                
+            # Gestione normale della connessione in corso
+            if self.app.network.connection_in_progress:
+                # Show connecting message with dots animation
+                dots = "." * ((pygame.time.get_ticks() // 500) % 4)
+                self.status_message = f"Connecting to {self.app.network.host}{dots}"
+                
+                # Check if connection timed out
+                if self.app.network.check_connection_timeout(5):  # 5-second timeout
+                    self.status_message = f"Failed to connect to {self.app.network.host}"
         
         # Original update code continues here...
         if self.loading:
