@@ -831,23 +831,7 @@ class BaseScreen:
     
     def enter(self):
         """Called when entering this screen"""
-        # Rimuovi la chiamata a super().enter() che causa l'errore
-        self.done = False  # Questo è ciò che dovrebbe fare il metodo enter della classe base
-        
-        # Initialize game based on config
-        self.initialize_game()
-        
-        # Set up player info
-        self.setup_players()
-        
-        # Set up layout
-        self.setup_layout()
-        
-        # Clear card angles and other state
-        self.game_over_button_rect = None
-        
-        # IMPORTANTE: Flag per la sincronizzazione iniziale
-        self.initial_sync_done = False
+        self.done = False
     
     def exit(self):
         """Called when exiting this screen"""
@@ -1635,6 +1619,7 @@ class GameScreen(BaseScreen):
         )
     
     def enter(self):
+        """Called when entering this screen"""
         super().enter()
         
         # Initialize game based on config
@@ -1648,6 +1633,9 @@ class GameScreen(BaseScreen):
         
         # Clear card angles and other state
         self.game_over_button_rect = None
+        
+        # IMPORTANTE: Flag per la sincronizzazione iniziale
+        self.initial_sync_done = False
     
     def initialize_game(self):
         """Initialize game environment and state with synchronized starting player"""
