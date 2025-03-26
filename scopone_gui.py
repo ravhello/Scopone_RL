@@ -1192,6 +1192,7 @@ class GameModeScreen(BaseScreen):
     
     def host_online_game(self):
         """Host an online game with internet support"""
+        print("\nDEBUG HOST GAME: Creating NetworkManager with is_host=True")
         self.app.network = NetworkManager(is_host=True)
         
         # CORREZIONE: Imposta il game_state PRIMA di avviare il server
@@ -1222,10 +1223,11 @@ class GameModeScreen(BaseScreen):
                 self.next_screen = "game"
                 self.app.game_config = {
                     "mode": "online_multiplayer",
-                    "is_host": True,
+                    "is_host": True,  # CRITICAL: Set is_host flag
                     "player_id": 0,
                     "online_type": "all_human"
                 }
+                print(f"DEBUG HOST GAME: Setting game_config with is_host=True, online_type=all_human")
             else:
                 # 2 vs 2 (Team vs AI) - Mostra animazione di caricamento
                 self.loading = True
@@ -1233,13 +1235,22 @@ class GameModeScreen(BaseScreen):
                 self.loading_start_time = pygame.time.get_ticks()
                 self.loading_message = "Caricamento bot AI in corso"
                 
+                # CRITICAL: Make sure is_host is True and explicitly set online_type
                 self.app.game_config = {
                     "mode": "online_multiplayer",
-                    "is_host": True,
+                    "is_host": True,  # CRITICAL: Set is_host flag
                     "player_id": 0,
                     "online_type": "team_vs_ai",
                     "difficulty": self.selected_difficulty
                 }
+                print(f"DEBUG HOST GAME: Setting game_config with is_host=True, online_type=team_vs_ai")
+                
+                # Force game_config to be correctly set
+                print(f"DEBUG HOST GAME: Final game_config: {self.app.game_config}")
+                
+                # CORREZIONE CRITICA: Imposta esplicitamente waiting_for_other_player a True
+                # per far sì che venga verificata la condizione in update() che attiva setup_team_vs_ai_online()
+                self.waiting_for_other_player = True
                 
                 # Questa riga è ora ridondante ma la mantengo per sicurezza
                 if hasattr(self.app, 'network') and self.app.network:
@@ -1489,11 +1500,27 @@ class GameModeScreen(BaseScreen):
                 print("Connessione riuscita, passaggio alla schermata di gioco")
                 self.done = True
                 self.next_screen = "game"
+                
+                # FIX: Preserva il valore is_host dal NetworkManager
+                # invece di sovrascriverlo con False
+                is_host = self.app.network.is_host
+                
+                # Preserva anche altre impostazioni esistenti
+                existing_config = self.app.game_config.copy() if hasattr(self.app, 'game_config') else {}
+                
+                # Aggiorna la configurazione preservando i valori originali
                 self.app.game_config = {
                     "mode": "online_multiplayer",
-                    "is_host": False,
+                    "is_host": is_host,  # Usa il valore corretto
                     "player_id": self.app.network.player_id  # Usa il player_id già assegnato
                 }
+                
+                # Ripristina altre impostazioni importanti
+                for key in ['online_type', 'difficulty']:
+                    if key in existing_config:
+                        self.app.game_config[key] = existing_config[key]
+                        
+                print(f"DEBUG: Game config dopo la connessione: {self.app.game_config}")
                 return
                 
             # Gestione normale della connessione in corso
@@ -1663,21 +1690,6 @@ class GameScreen(BaseScreen):
         # Set up AI controllers if needed
         if mode in ["single_player", "team_vs_ai"]:
             self.setup_ai_controllers()
-        # CORREZIONE: Aggiunto supporto per AI controllers nella modalità online team vs AI (solo host)
-        elif mode == "online_multiplayer" and config.get("online_type") == "team_vs_ai" and config.get("is_host", False):
-            for player_id in [1, 3]:
-                self.ai_controllers[player_id] = DQNAgent(team_id=1)
-                # Load checkpoint if available
-                checkpoint_path = "scopone_checkpoint_team1.pth"
-                if os.path.exists(checkpoint_path):
-                    self.ai_controllers[player_id].load_checkpoint(checkpoint_path)
-                # Set exploration rate based on difficulty
-                if self.ai_difficulty == 0:  # Easy
-                    self.ai_controllers[player_id].epsilon = 0.3
-                elif self.ai_difficulty == 1:  # Medium
-                    self.ai_controllers[player_id].epsilon = 0.1
-                else:  # Hard
-                    self.ai_controllers[player_id].epsilon = 0.01
         
         # Set up player ID (for online games)
         if mode == "online_multiplayer":
@@ -1732,6 +1744,18 @@ class GameScreen(BaseScreen):
         config = self.app.game_config
         mode = config.get("mode", "single_player")
         
+        # FIX: Verifica più robusta dello stato host/client
+        is_host = config.get("is_host", False)
+        # Controlla anche il network manager come backup
+        if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network:
+            is_network_host = self.app.network.is_host
+            # Stampa di debug per verificare entrambi i valori
+            print(f"DEBUG HOST CHECK: config is_host={is_host}, network is_host={is_network_host}")
+            # Se c'è una discrepanza, usa il valore dal network manager
+            if is_host != is_network_host:
+                print(f"ATTENZIONE: Discrepanza tra config.is_host e network.is_host! Uso network.is_host={is_network_host}")
+                is_host = is_network_host
+        
         # Reset player info
         self.players = []
         
@@ -1739,13 +1763,15 @@ class GameScreen(BaseScreen):
         is_online_team_vs_ai = (mode == "online_multiplayer" and 
                             config.get("online_type") == "team_vs_ai")
         
-        # Se siamo client, otteniamo le informazioni sulle AI dal game state
+        # CORREZIONE: Usa is_host invece di config.get("is_host", False)
         ai_players = []
-        if not config.get("is_host", False) and self.app.network and self.app.network.game_state:
+        if not is_host and self.app.network and self.app.network.game_state:
             ai_players = self.app.network.game_state.get('ai_players', [])
+            print(f"DEBUG: Sei considerato client e gli AI players from game state: {ai_players}")
         elif is_online_team_vs_ai:
             # Se siamo host, sappiamo già quali sono le AI
             ai_players = [1, 3]
+            print(f"DEBUG: Sei considerato host e gli AI players from config: {config.get('ai_players', [])}")
         
         # Imposta i giocatori
         for player_id in range(4):
