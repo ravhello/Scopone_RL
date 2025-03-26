@@ -1665,7 +1665,7 @@ class GameScreen(BaseScreen):
         self.initial_sync_done = False
     
     def initialize_game(self):
-        """Initialize game environment and state with synchronized starting player"""
+        """Initialize game environment and state with randomized starting player"""
         config = self.app.game_config
         mode = config.get("mode", "single_player")
         
@@ -1674,6 +1674,21 @@ class GameScreen(BaseScreen):
         
         # Create game environment
         self.env = ScoponeEnvMA()
+        
+        # Determina se siamo l'host o il client in modalità online
+        is_online = mode == "online_multiplayer"
+        is_host = config.get("is_host", False)
+        
+        if is_online and not is_host:
+            # Per i client online, inizializza con uno stato vuoto
+            # Aspetteremo che l'host invii lo stato completo del gioco
+            self.env.reset()
+            print("Client: inizializzazione base, in attesa dello stato dal server")
+        else:
+            # Per l'host (o per gioco locale/singolo), inizializza con un giocatore iniziale casuale
+            random_starter = random.randint(0, 3)
+            print(f"Host/locale: inizializzazione con giocatore random {random_starter}")
+            self.env.reset(starting_player=random_starter)
         
         # Set up AI controllers if needed
         if mode in ["single_player", "team_vs_ai"]:
@@ -2281,6 +2296,9 @@ class GameScreen(BaseScreen):
                         # Tutti i giocatori sono connessi, sblocca il gioco
                         self.waiting_for_other_player = False
                         self.status_message = "Tutti i giocatori sono connessi. Inizia il gioco!"
+                        
+                        # NUOVO: Trasmette immediatamente lo stato al client per sincronizzare le informazioni
+                        self.perform_initial_sync()
                 
                 elif online_type == "team_vs_ai":
                     # In modalità "Team vs AI" serve aspettare solo 1 giocatore umano
@@ -2298,18 +2316,6 @@ class GameScreen(BaseScreen):
                         # Sblocca il gioco
                         self.waiting_for_other_player = False
                         self.status_message = "Partner connesso. Inizia il gioco!"
-                        
-                        # NUOVO: Trasmette immediatamente lo stato al client per sincronizzare le informazioni
-                        if self.app.network:
-                            self.app.network.game_state = self.env.game_state.copy()
-                            self.app.network.game_state['online_type'] = 'team_vs_ai'
-                            self.app.network.game_state['ai_players'] = [1, 3]
-                            self.app.network.game_state['current_player'] = self.env.current_player
-                            self.app.network.broadcast_game_state()
-                            
-                            # CORREZIONE: Broadcast immediato dopo la configurazione
-                            print("Trasmissione stato dopo setup Team vs AI")
-                            self.app.network.broadcast_game_state()
             
             # CORREZIONE: Assicura che anche il client configuri correttamente i giocatori AI
             elif is_online_team_vs_ai and not self.app.game_config.get("is_host"):
@@ -2348,6 +2354,38 @@ class GameScreen(BaseScreen):
                     message = self.app.network.message_queue.popleft()
                     self.messages.append(message)
                     
+    def perform_initial_sync(self):
+        """Invia lo stato iniziale completo dal server al client, inclusi mazzo e giocatore iniziale"""
+        if not hasattr(self.app, 'network') or not self.app.network:
+            return
+        
+        if not self.app.game_config.get("is_host", False):
+            return  # Solo l'host esegue la sincronizzazione iniziale
+        
+        print("SYNC: Invio stato iniziale completo al client")
+        
+        # Assicurati che lo stato includa tutte le informazioni necessarie
+        self.app.network.game_state = self.env.game_state.copy()
+        
+        # Aggiungi informazioni aggiuntive al game_state
+        online_type = self.app.game_config.get("online_type")
+        if online_type:
+            self.app.network.game_state['online_type'] = online_type
+            if online_type == "team_vs_ai":
+                self.app.network.game_state['ai_players'] = [1, 3]
+        
+        # Includi esplicitamente informazioni sul giocatore corrente
+        self.app.network.game_state['current_player'] = self.env.current_player
+        
+        # Includi il mazzo di carte completo (con ordine casuale determinato dall'host)
+        if hasattr(self.env, 'deck'):
+            self.app.network.game_state['deck'] = self.env.deck
+        
+        # Trasmetti lo stato completo
+        self.app.network.broadcast_game_state()
+        print(f"SYNC: Stato iniziale inviato - giocatore corrente: {self.env.current_player}")
+
+
     def setup_team_vs_ai_online(self):
         """Configurazione robusta dei giocatori per la modalità Team vs AI online"""
         print("\n### CONFIGURAZIONE TEAM VS AI ONLINE ###")
@@ -2413,10 +2451,8 @@ class GameScreen(BaseScreen):
         
         # FASE 5: Imposta in modo esplicito i giocatori AI nel game_state
         if hasattr(self.app, 'network') and self.app.network:
-            self.app.network.game_state = self.env.game_state.copy()
-            self.app.network.game_state['online_type'] = 'team_vs_ai'
-            self.app.network.game_state['ai_players'] = [1, 3]
-            self.app.network.game_state['current_player'] = self.env.current_player
+            # Esegui la sincronizzazione iniziale completa invece di una parziale
+            self.perform_initial_sync()
         
         # Annuncia configurazione
         print("TEAM UMANO: giocatori 0 e 2")
