@@ -2531,7 +2531,7 @@ class GameScreen(BaseScreen):
                         print(f"WARNING: Local player {self.local_player_id} hand not found in received state!")
                     else:
                         hand = new_state['hands'][self.local_player_id]
-                        print(f"Local player hand: {hand}")
+                        #print(f"Local player hand: {hand}")
                 
                 # Update game configuration and player roles if needed
                 online_type = new_state.get('online_type')
