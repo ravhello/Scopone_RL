@@ -644,14 +644,40 @@ class NetworkManager:
         self.message_queue.append(f"Player {player_id} disconnected")
     
     def receive_updates(self):
-        """Receive game state updates from server (for clients)"""
+        """Receive game state updates from server (for clients) with improved buffer handling"""
+        buffer_size = 16384  # Aumentato da 8192 a 16KB per gestire stati di gioco più grandi
+        
         while self.connected:
             try:
-                data = self.socket.recv(8192)  # Larger buffer for game state
-                if not data:
-                    break
+                # Utilizziamo un approccio di accumulo per gestire messaggi di grandi dimensioni
+                data = bytearray()
+                
+                # Leggi i dati in più chunk se necessario
+                while True:
+                    chunk = self.socket.recv(buffer_size)
+                    if not chunk:  # Connessione chiusa
+                        if not data:  # Nessun dato ricevuto
+                            raise ConnectionError("Connection closed by server")
+                        break
                     
-                message = pickle.loads(data)
+                    data.extend(chunk)
+                    
+                    # Proviamo a vedere se abbiamo ricevuto il messaggio completo
+                    try:
+                        # Tenta di decodificare, se ha successo abbiamo il messaggio completo
+                        pickle.loads(data)
+                        break  # Messaggio completo ricevuto
+                    except (pickle.UnpicklingError, EOFError):
+                        # Dati incompleti, continua a leggere
+                        continue
+                
+                # Ora dovremmo avere un messaggio completo
+                try:
+                    message = pickle.loads(data)
+                except Exception as e:
+                    print(f"Errore nella deserializzazione del messaggio: {e}")
+                    print(f"Ricevuti {len(data)} bytes, possibilmente dati corrotti")
+                    continue  # Salta questo messaggio e continua
                 
                 # Process different message types
                 if message["type"] == "player_id":
@@ -664,6 +690,9 @@ class NetworkManager:
                 elif message["type"] == "chat":
                     self.message_queue.append(f"Player {message['player_id']}: {message['text']}")
                 
+            except socket.timeout:
+                # Timeout è normale, continua il ciclo
+                continue
             except Exception as e:
                 print(f"Error receiving updates: {e}")
                 break
@@ -744,13 +773,24 @@ class NetworkManager:
         
         try:
             # Use a larger buffer for the pickle to accommodate larger game states
-            data = pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)
+            # IMPROVED: Usa un protocollo pickle più efficiente (5 è il più recente)
+            protocol = pickle.HIGHEST_PROTOCOL
+            if hasattr(pickle, 'DEFAULT_PROTOCOL'):
+                protocol = min(pickle.DEFAULT_PROTOCOL, 4)  # Usa massimo 4 per compatibilità
+                
+            data = pickle.dumps(message, protocol=protocol)
+            data_size = len(data)
+            print(f"Broadcasting game state: {data_size} bytes")
             
             for client, player_id in self.clients:
                 try:
-                    # Send data with confirmation
-                    client.sendall(data)
-                    print(f"State sent to client (player {player_id})")
+                    # IMPROVED: Invia i dati in chunk più piccoli per evitare problemi di buffer
+                    chunk_size = 4096
+                    for i in range(0, len(data), chunk_size):
+                        chunk = data[i:i + chunk_size]
+                        client.sendall(chunk)
+                        
+                    print(f"State sent to client (player {player_id}): {data_size} bytes")
                 except Exception as e:
                     print(f"Error sending to client (player {player_id}): {e}")
         except Exception as e:
@@ -2610,44 +2650,49 @@ class GameScreen(BaseScreen):
                 # Extract special fields from game state
                 new_current_player = new_state.pop('current_player', None)
                 
-                # Debug output of critical components - ABILITATO PER DEBUG
+                # Debug output of critical components
                 print(f"Client received state update:")
                 print(f"  Current player: {new_current_player}")
                 print(f"  Online type: {new_state.get('online_type')}")
                 print(f"  AI players: {new_state.get('ai_players', [])}")
                 
-                # SOLUZIONE CRUCIALE: Applica configurazione AI se ne abbiamo bisogno
-                ai_players = new_state.get('ai_players', [])
-                if ai_players and new_state.get('online_type') == 'team_vs_ai':
-                    print("SYNC: Applicazione configurazione team_vs_ai dal server")
-                    self.app.game_config['online_type'] = 'team_vs_ai'
-                    
-                    # Configura i giocatori AI (1 e 3)
-                    for player_id in ai_players:
-                        if player_id < len(self.players):
-                            player = self.players[player_id]
-                            player.is_human = False
-                            player.is_ai = True
-                            player.team_id = 1  # Team 1 (AI)
-                            player.name = f"AI {player_id}"
-                    
-                    # Assicurati che i giocatori umani (0 e 2) siano configurati correttamente
-                    for player_id in [0, 2]:
-                        if player_id < len(self.players):
-                            player = self.players[player_id]
-                            player.is_human = True
-                            player.is_ai = False
-                            player.team_id = 0  # Team 0 (umano)
-                            # Nomi appropriati in base all'ID locale
-                            if player_id == self.local_player_id:
-                                player.name = "You"
-                            else:
-                                player.name = "Partner"
-                    
-                    # Stampa configurazione finale
-                    print("\nConfigurazione giocatori dopo sync:")
-                    for player in self.players:
-                        print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
+                # SOLUZIONE CRUCIALE: Applica configurazione AI solo se non è già stata applicata
+                if not hasattr(self, 'team_vs_ai_configured') or not self.team_vs_ai_configured:
+                    ai_players = new_state.get('ai_players', [])
+                    if ai_players and new_state.get('online_type') == 'team_vs_ai':
+                        print("SYNC: Applicazione configurazione team_vs_ai dal server")
+                        self.app.game_config['online_type'] = 'team_vs_ai'
+                        
+                        # Configura i giocatori AI (1 e 3)
+                        for player_id in ai_players:
+                            if player_id < len(self.players):
+                                player = self.players[player_id]
+                                player.is_human = False
+                                player.is_ai = True
+                                player.team_id = 1  # Team 1 (AI)
+                                player.name = f"AI {player_id}"
+                        
+                        # Assicurati che i giocatori umani (0 e 2) siano configurati correttamente
+                        for player_id in [0, 2]:
+                            if player_id < len(self.players):
+                                player = self.players[player_id]
+                                player.is_human = True
+                                player.is_ai = False
+                                player.team_id = 0  # Team 0 (umano)
+                                # Nomi appropriati in base all'ID locale
+                                if player_id == self.local_player_id:
+                                    player.name = "You"
+                                else:
+                                    player.name = "Partner"
+                        
+                        # Stampa configurazione finale
+                        print("\nConfigurazione giocatori dopo sync:")
+                        for player in self.players:
+                            print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
+                        
+                        # NUOVO: Setta il flag per evitare di riapplicare la configurazione
+                        self.team_vs_ai_configured = True
+                        print("Configurazione team_vs_ai completata e bloccata per evitare ripetizioni")
                 
                 # Apply the new state to the environment
                 if self.env:
