@@ -963,8 +963,17 @@ class GameModeScreen(BaseScreen):
     
     def enter(self):
         super().enter()
-        self.bg_image = self.app.resources.background  # Aggiorna l'immagine
-        self.setup_layout()  # Set up initial layout
+        # Resetta lo stato della schermata quando si rientra nel menu
+        self.status_message = ""
+        self.ip_input = ""
+        self.ip_input_active = False
+        self.host_screen_active = False
+        self.loading = False
+        self.waiting_for_other_player = False
+        # Aggiorna l'immagine di sfondo
+        self.bg_image = self.app.resources.background
+        # Reimposta il layout
+        self.setup_layout()
     
     def setup_layout(self):
         """Set up responsive layout for mode selection screen"""
@@ -1703,6 +1712,15 @@ class GameScreen(BaseScreen):
         
         # IMPORTANTE: Flag per la sincronizzazione iniziale
         self.initial_sync_done = False
+        
+    def exit(self):
+        """Called when exiting this screen"""
+        # Chiudi la connessione di rete quando si esce dalla schermata di gioco
+        if hasattr(self.app, 'network') and self.app.network:
+            print("Chiusura connessione di rete in corso...")
+            self.app.network.close()
+            self.app.network = None  # Rimuovi completamente l'oggetto network
+            print("Connessione di rete terminata con successo")
     
     def initialize_game(self):
         """Initialize game environment and state with randomized starting player"""
@@ -1745,42 +1763,60 @@ class GameScreen(BaseScreen):
         mode = config.get("mode", "single_player")
         
         if mode == "single_player":
-            # Player 0 is human, rest are AI
-            for player_id in [1, 2, 3]:
-                team_id = 0 if player_id in [0, 2] else 1
-                self.ai_controllers[player_id] = DQNAgent(team_id=team_id)
-                
-                # Load checkpoint if available
-                checkpoint_path = f"scopone_checkpoint_team{team_id}.pth"
-                if os.path.exists(checkpoint_path):
-                    self.ai_controllers[player_id].load_checkpoint(checkpoint_path)
-                
-                # Set exploration rate based on difficulty
-                # Easy: More random actions, Hard: More optimal actions
-                if self.ai_difficulty == 0:  # Easy
-                    self.ai_controllers[player_id].epsilon = 0.3
-                elif self.ai_difficulty == 1:  # Medium
-                    self.ai_controllers[player_id].epsilon = 0.1
-                else:  # Hard
-                    self.ai_controllers[player_id].epsilon = 0.01
+            # Crea un solo agente per squadra (come nell'addestramento)
+            # Team 0: giocatori 0, 2
+            # Team 1: giocatori 1, 3
+            
+            # Crea l'agente per la squadra 0 (giocatori 0 e 2)
+            team0_agent = DQNAgent(team_id=0)
+            checkpoint_path_0 = "scopone_checkpoint_team0.pth"
+            if os.path.exists(checkpoint_path_0):
+                team0_agent.load_checkpoint(checkpoint_path_0)
+            
+            # Crea l'agente per la squadra 1 (giocatori 1 e 3)
+            team1_agent = DQNAgent(team_id=1)
+            checkpoint_path_1 = "scopone_checkpoint_team1.pth"
+            if os.path.exists(checkpoint_path_1):
+                team1_agent.load_checkpoint(checkpoint_path_1)
+            
+            # Imposta epsilon in base alla difficoltà
+            if self.ai_difficulty == 0:  # Easy
+                team0_agent.epsilon = 0.3
+                team1_agent.epsilon = 0.3
+            elif self.ai_difficulty == 1:  # Medium
+                team0_agent.epsilon = 0.1
+                team1_agent.epsilon = 0.1
+            else:  # Hard
+                team0_agent.epsilon = 0
+                team1_agent.epsilon = 0
+            
+            # Assegna gli agenti ai rispettivi giocatori
+            # Il giocatore 0 è umano, quindi assegna agenti solo ai bot
+            self.ai_controllers[1] = team1_agent  # Giocatore 1 -> Team 1
+            self.ai_controllers[2] = team0_agent  # Giocatore 2 -> Team 0
+            self.ai_controllers[3] = team1_agent  # Giocatore 3 -> Team 1
         
         elif mode == "team_vs_ai":
             # Players 0 and 2 are human team, 1 and 3 are AI team
-            for player_id in [1, 3]:
-                self.ai_controllers[player_id] = DQNAgent(team_id=1)
-                
-                # Load checkpoint if available
-                checkpoint_path = "scopone_checkpoint_team1.pth"
-                if os.path.exists(checkpoint_path):
-                    self.ai_controllers[player_id].load_checkpoint(checkpoint_path)
-                
-                # Set exploration rate based on difficulty
-                if self.ai_difficulty == 0:  # Easy
-                    self.ai_controllers[player_id].epsilon = 0.3
-                elif self.ai_difficulty == 1:  # Medium
-                    self.ai_controllers[player_id].epsilon = 0.1
-                else:  # Hard
-                    self.ai_controllers[player_id].epsilon = 0.01
+            # Crea UN SOLO agente per la squadra AI (team 1)
+            ai_agent = DQNAgent(team_id=1)
+            
+            # Carica checkpoint se disponibile
+            checkpoint_path = "scopone_checkpoint_team1.pth"
+            if os.path.exists(checkpoint_path):
+                ai_agent.load_checkpoint(checkpoint_path)
+            
+            # Imposta epsilon in base alla difficoltà
+            if self.ai_difficulty == 0:  # Easy
+                ai_agent.epsilon = 0.3
+            elif self.ai_difficulty == 1:  # Medium
+                ai_agent.epsilon = 0.1
+            else:  # Hard
+                ai_agent.epsilon = 0
+            
+            # Assegna lo STESSO agente ad entrambi i giocatori AI
+            self.ai_controllers[1] = ai_agent
+            self.ai_controllers[3] = ai_agent
     
     def setup_players(self):
         """Set up player info objects with improved perspective handling"""
@@ -2435,13 +2471,12 @@ class GameScreen(BaseScreen):
         # Team 0 (umani): giocatori 0 e 2
         # Team 1 (AI): giocatori 1 e 3
         
-        # FASE 1: Prima configura le squadre (team_id)
+        # FASE 1-3: Configura squadre, ruoli e nomi (invariato)
         self.players[0].team_id = 0  # Team umano
         self.players[2].team_id = 0  # Team umano
         self.players[1].team_id = 1  # Team AI
         self.players[3].team_id = 1  # Team AI
         
-        # FASE 2: Poi configura chi è AI e chi è umano
         self.players[0].is_human = True
         self.players[0].is_ai = False
         
@@ -2454,7 +2489,6 @@ class GameScreen(BaseScreen):
         self.players[3].is_human = False
         self.players[3].is_ai = True
         
-        # FASE 3: Imposta i nomi corretti in base a chi è il giocatore locale
         if self.local_player_id == 0:
             self.players[0].name = "You"
             self.players[2].name = "Partner"
@@ -2465,47 +2499,50 @@ class GameScreen(BaseScreen):
         self.players[1].name = "AI 1"
         self.players[3].name = "AI 3"
         
-        # FASE 4: Configura AI controllers
-        ai_player_ids = [1, 3]
-        for player_id in ai_player_ids:
-            if player_id not in self.ai_controllers:
-                print(f"Creazione controller AI per giocatore {player_id}")
-                self.ai_controllers[player_id] = DQNAgent(team_id=1)
+        # FASE 4: Configura UN SOLO AI controller per la squadra 1
+        # Controlla se l'agente è già stato creato
+        ai_controller_exists = 1 in self.ai_controllers and 3 in self.ai_controllers
+        same_agent = ai_controller_exists and (self.ai_controllers[1] is self.ai_controllers[3])
+        
+        if not (ai_controller_exists and same_agent):
+            print(f"Creazione controller AI unificato per la squadra 1")
+            ai_agent = DQNAgent(team_id=1)
+            
+            # Carica checkpoint se disponibile
+            checkpoint_path = f"scopone_checkpoint_team1.pth"
+            if os.path.exists(checkpoint_path):
+                print(f"Caricamento checkpoint per la squadra AI")
+                ai_agent.load_checkpoint(checkpoint_path)
+            
+            # Imposta epsilon in base alla difficoltà
+            difficulty = self.ai_difficulty
+            if difficulty == 0:  # Easy
+                ai_agent.epsilon = 0.3
+            elif difficulty == 1:  # Medium
+                ai_agent.epsilon = 0.1
+            else:  # Hard
+                ai_agent.epsilon = 0
                 
-                # Carica checkpoint se disponibile
-                checkpoint_path = f"scopone_checkpoint_team1.pth"
-                if os.path.exists(checkpoint_path):
-                    print(f"Caricamento checkpoint per AI player {player_id}")
-                    self.ai_controllers[player_id].load_checkpoint(checkpoint_path)
-                
-                # Imposta epsilon in base alla difficoltà
-                difficulty = self.ai_difficulty
-                if difficulty == 0:  # Easy
-                    self.ai_controllers[player_id].epsilon = 0.3
-                elif difficulty == 1:  # Medium
-                    self.ai_controllers[player_id].epsilon = 0.1
-                else:  # Hard
-                    self.ai_controllers[player_id].epsilon = 0.01
-            else:
-                print(f"Controller AI per giocatore {player_id} già esistente")
+            # Assegna lo stesso agente a entrambi i giocatori AI
+            self.ai_controllers[1] = ai_agent
+            self.ai_controllers[3] = ai_agent
+        else:
+            print(f"Controller AI unificato per la squadra 1 già esistente")
         
         # FASE 5: Imposta in modo esplicito i giocatori AI nel game_state
         if hasattr(self.app, 'network') and self.app.network:
-            # Esegui la sincronizzazione iniziale completa invece di una parziale
             self.perform_initial_sync()
         
-        # Annuncia configurazione
+        # Resto del codice invariato...
         print("TEAM UMANO: giocatori 0 e 2")
         print("TEAM AI: giocatori 1 e 3")
         self.messages.append("TEAM UMANO: giocatori 0 e 2") 
         self.messages.append("TEAM AI: giocatori 1 e 3")
         
-        # Stampa configurazione finale
         print("\nConfigurazione finale dei giocatori:")
         for player in self.players:
             print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
             
-        # IMPORTANTE: Aggiorna lo stato di attesa
         self.waiting_for_other_player = False
     
     def update_animations(self):
