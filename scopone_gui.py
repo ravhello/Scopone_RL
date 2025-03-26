@@ -1675,18 +1675,6 @@ class GameScreen(BaseScreen):
         # Create game environment
         self.env = ScoponeEnvMA()
         
-        # CORREZIONE: Usa un seed fisso per ottenere lo stesso risultato sia sul client che sull'host
-        random.seed(42)  # Usa un seed fisso per la riprodocibilità
-        
-        # Imposta giocatore iniziale FISSO (invece di casuale) - l'AI giocatore 1
-        fixed_starter = 1  # Sempre il giocatore 1 inizia (nella modalità team_vs_ai sarà un'AI)
-        
-        # Resetta l'ambiente con il giocatore iniziale fisso
-        self.env.reset(starting_player=fixed_starter)
-        
-        # Reimposta il seed random per il resto del programma
-        random.seed()  # Ripristina casualità per il resto del gioco
-        
         # Set up AI controllers if needed
         if mode in ["single_player", "team_vs_ai"]:
             self.setup_ai_controllers()
