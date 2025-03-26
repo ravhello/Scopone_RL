@@ -594,9 +594,26 @@ class NetworkManager:
                     # Nelle altre modalità, assegna ID progressivi (1, 2, 3)
                     player_id = len(self.clients) + 1
                 
-                # Invia player ID al client
-                client.sendall(pickle.dumps({"type": "player_id", "id": player_id}))
+                # IMPORTANTE: Envía todos los datos necesarios al cliente de manera fiable
+                try:
+                    # Primero enviamos el ID del jugador
+                    id_message = {"type": "player_id", "id": player_id}
+                    client.sendall(pickle.dumps(id_message))
+                    print(f"Sent player ID {player_id} to client from {addr}")
+                    
+                    # Luego enviamos el estado del juego si existe
+                    if self.game_state:
+                        state_message = {"type": "game_state", "state": self.game_state}
+                        client.sendall(pickle.dumps(state_message))
+                        print(f"Sent initial game state to client {player_id}")
+                except Exception as e:
+                    print(f"Error sending initial data to client: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    client.close()
+                    continue  # Skip to next connection attempt
                 
+                # Si hemos llegado hasta aquí, añadimos el cliente a la lista
                 self.clients.append((client, player_id))
                 print(f"Player {player_id} connected from {addr}")
                 
@@ -606,7 +623,7 @@ class NetworkManager:
                                 daemon=True).start()
                 
                 # Add message to queue
-                self.message_queue.append(f"Player {player_id} connected")
+                self.message_queue.append(f"Player {player_id} connected from {addr}")
                 
                 # If all players connected, start the game
                 if len(self.clients) == expected_clients:
@@ -614,7 +631,10 @@ class NetworkManager:
                     self.broadcast_start_game()
             except Exception as e:
                 print(f"Error accepting connection: {e}")
-                break
+                import traceback
+                traceback.print_exc()
+                # Breve pausa para evitar bucle infinito de errores
+                time.sleep(0.5)
     
     def handle_client(self, client_socket, player_id):
         """Handle communication with a specific client"""
@@ -1490,27 +1510,33 @@ class GameModeScreen(BaseScreen):
             
             # Check if connection succeeded or timed out
             if self.app.network.connected:
-                self.done = True
-                self.next_screen = "game"
-                self.app.game_config = {
-                    "mode": "online_multiplayer",
-                    "is_host": False,
-                    "player_id": None  # Will be set by server
-                }
-            elif self.app.network.check_connection_timeout(5):  # 5-second timeout
+                # CAMBIO IMPORTANTE: Solo transicionar cuando se haya recibido un player_id válido
+                if self.app.network.player_id is not None:
+                    print(f"Conexión exitosa con ID de jugador: {self.app.network.player_id}")
+                    self.done = True
+                    self.next_screen = "game"
+                    self.app.game_config = {
+                        "mode": "online_multiplayer",
+                        "is_host": False,
+                        "player_id": self.app.network.player_id
+                    }
+                else:
+                    # Todavía esperando el ID del jugador
+                    self.status_message = f"Connected to {self.app.network.host}, waiting for player assignment..."
+            elif self.app.network.check_connection_timeout(10):  # Aumentado a 10 segundos
                 self.status_message = f"Failed to connect to {self.app.network.host}"
         
         # Original update code continues here...
         if self.loading:
-            # Se siamo in stato di caricamento, aggiorna l'animazione
+            # Si estamos en estado de carga, actualiza la animación
             current_time = pygame.time.get_ticks()
             elapsed = current_time - self.loading_start_time
             
-            # Aggiorna l'animazione
+            # Actualiza la animación
             self.loading_animation.update()
             
-            # Dopo 2 secondi, completa il caricamento e vai alla schermata di gioco
-            if elapsed > 2000:  # 2 secondi di animazione
+            # Después de 2 segundos, completa la carga y va a la pantalla de juego
+            if elapsed > 2000:  # 2 segundos de animación
                 self.loading = False
                 self.done = True
                 self.next_screen = "game"
