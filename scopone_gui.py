@@ -572,30 +572,37 @@ class NetworkManager:
     
     def accept_connections(self):
         """Accept connections from other players (for host)"""
-        # Ottieni la configurazione
+        # Get the configuration
         is_team_vs_ai = False
         if hasattr(self, 'game_state') and self.game_state:
-            # Controlla se siamo in modalità team vs AI
+            # Check if we're in team vs AI mode
             is_team_vs_ai = self.game_state.get('online_type') == 'team_vs_ai'
         
-        # Numero di client attesi in base alla modalità
+        # Number of expected clients based on mode
         expected_clients = 1 if is_team_vs_ai else 3
         
         while len(self.clients) < expected_clients:
             try:
                 client, addr = self.socket.accept()
                 
-                # Assegna player_id in base alla modalità di gioco
+                # Assign player_id based on game mode
                 if is_team_vs_ai:
-                    # In modalità team vs AI, assegna SEMPRE ID 2 al client (partner umano)
+                    # In team vs AI mode, ALWAYS assign ID 2 to client (human partner)
                     player_id = 2
                     print(f"Team vs AI: assegnato ID 2 al partner (client)")
                 else:
-                    # Nelle altre modalità, assegna ID progressivi (1, 2, 3)
+                    # In other modes, assign progressive IDs (1, 2, 3)
                     player_id = len(self.clients) + 1
                 
-                # Invia player ID al client
-                client.sendall(pickle.dumps({"type": "player_id", "id": player_id}))
+                # Create initial message with both player_id and current game_state
+                welcome_message = {
+                    "type": "player_id", 
+                    "id": player_id,
+                    "state": self.game_state if self.game_state else {}
+                }
+                
+                # Send player ID and game state to client
+                client.sendall(pickle.dumps(welcome_message))
                 
                 self.clients.append((client, player_id))
                 print(f"Player {player_id} connected from {addr}")
@@ -615,6 +622,62 @@ class NetworkManager:
             except Exception as e:
                 print(f"Error accepting connection: {e}")
                 break
+
+    def receive_updates(self):
+        """Receive game state updates from server (for clients)"""
+        while self.connected:
+            try:
+                data = self.socket.recv(8192)  # Larger buffer for game state
+                if not data:
+                    break
+                    
+                message = pickle.loads(data)
+                
+                # Process different message types
+                if message["type"] == "player_id":
+                    self.player_id = message["id"]
+                    print(f"Assigned player ID: {self.player_id}")
+                    
+                    # Also log to message queue
+                    self.message_queue.append(f"You are Player {self.player_id}")
+                    
+                    # IMPORTANT: If server also sent game state, store it
+                    if "state" in message and message["state"]:
+                        self.game_state = message["state"]
+                        print(f"Initial game state received: {self.game_state.keys()}")
+                
+                elif message["type"] == "game_state":
+                    self.game_state = message["state"]
+                    
+                elif message["type"] == "start_game":
+                    self.message_queue.append("Game starting!")
+                    
+                elif message["type"] == "chat":
+                    self.message_queue.append(f"Player {message['player_id']}: {message['text']}")
+                
+            except Exception as e:
+                print(f"Error receiving updates: {e}")
+                break
+        
+        self.connected = False
+        self.message_queue.append("Disconnected from server")
+
+    def broadcast_start_game(self):
+        """Broadcast game start signal to all clients (host only)"""
+        if not self.is_host:
+            return
+            
+        message = {
+            "type": "start_game",
+            "state": self.game_state  # Include current game state
+        }
+        data = pickle.dumps(message)
+        
+        for client, _ in self.clients:
+            try:
+                client.sendall(data)
+            except:
+                pass
     
     def handle_client(self, client_socket, player_id):
         """Handle communication with a specific client"""
@@ -1490,27 +1553,52 @@ class GameModeScreen(BaseScreen):
             
             # Check if connection succeeded or timed out
             if self.app.network.connected:
-                self.done = True
-                self.next_screen = "game"
-                self.app.game_config = {
-                    "mode": "online_multiplayer",
-                    "is_host": False,
-                    "player_id": None  # Will be set by server
-                }
+                # CRITICAL FIX: Check if player_id is assigned before transitioning
+                if self.app.network.player_id is not None:
+                    print(f"Connection successful! Assigned player ID: {self.app.network.player_id}")
+                    self.done = True
+                    self.next_screen = "game"
+                    
+                    # Set up game config with proper mode and player ID
+                    self.app.game_config = {
+                        "mode": "online_multiplayer",
+                        "is_host": False,
+                        "player_id": self.app.network.player_id,
+                        # Get online_type from game_state if available
+                        "online_type": self.app.network.game_state.get('online_type', 'all_human')
+                    }
+                else:
+                    # Keep waiting for player_id assignment
+                    self.status_message = f"Connected, waiting for player assignment{dots}"
             elif self.app.network.check_connection_timeout(5):  # 5-second timeout
                 self.status_message = f"Failed to connect to {self.app.network.host}"
         
+        # Also add this check to NetworkManager.receive_updates method:
+        """
+        # In NetworkManager.receive_updates:
+        if message["type"] == "player_id":
+            self.player_id = message["id"]
+            print(f"Assigned player ID: {self.player_id}")
+            
+            # Add this line to message queue for visibility
+            self.message_queue.append(f"You are Player {self.player_id}")
+            
+            # If we also received game state, store it
+            if "state" in message:
+                self.game_state = message["state"]
+        """
+        
         # Original update code continues here...
         if self.loading:
-            # Se siamo in stato di caricamento, aggiorna l'animazione
+            # If we're in loading state, update the animation
             current_time = pygame.time.get_ticks()
             elapsed = current_time - self.loading_start_time
             
-            # Aggiorna l'animazione
+            # Update the animation
             self.loading_animation.update()
             
-            # Dopo 2 secondi, completa il caricamento e vai alla schermata di gioco
-            if elapsed > 2000:  # 2 secondi di animazione
+            # After 2 seconds, complete loading and go to game screen
+            if elapsed > 2000:  # 2 seconds of animation
                 self.loading = False
                 self.done = True
                 self.next_screen = "game"
