@@ -30,18 +30,6 @@ if torch.cuda.is_available():
     torch.cuda.memory.set_per_process_memory_fraction(0.95)  # Usa fino al 95% della memoria disponibile
 
 from environment import ScoponeEnvMA
-"""
-# Alla fine di ogni episodio
-# Forza garbage collection
-import gc
-gc.collect()
-if torch.cuda.is_available():
-    # Più aggressivo nel liberare la memoria
-    torch.cuda.empty_cache()
-    # Stampa statistiche memoria
-    print(f"  GPU memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
-    print(f"  GPU memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB")
-"""
 
 # Parametri di rete e training
 LR = 1e-3
@@ -225,9 +213,12 @@ class QNetwork(nn.Module):
 # 3) DQNAgent con target network + replay
 ############################################################
 
-class DQNAgent:
-    def __init__(self, team_id):
-        self.team_id = team_id
+class SelfPlayDQNAgent:
+    def __init__(self):
+        """
+        Inizializza un singolo agente DQN per self-play ottimizzato.
+        Una singola rete neurale, ma gestisce due team separati come nell'originale.
+        """
         self.online_qnet = QNetwork()
         self.target_qnet = QNetwork()
         self.sync_target()
@@ -235,14 +226,29 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR)
         self.epsilon = EPSILON_START
         self.train_steps = 0
-        self.episodic_buffer = EpisodicReplayBuffer()
+        
+        # Buffer separati per ogni TEAM (non per giocatore) - come nell'originale
+        self.team0_buffer = EpisodicReplayBuffer()
+        self.team1_buffer = EpisodicReplayBuffer()
         
         # Aggiunte per ottimizzazione GPU
-        torch.backends.cudnn.benchmark = True  # Ottimizzazione per dimensioni di input fisse
-        self.scaler = torch.amp.GradScaler('cuda')  # Per mixed precision training
+        torch.backends.cudnn.benchmark = True
+        self.scaler = torch.amp.GradScaler('cuda')
+        
+        # Buffer pre-allocati per ottimizzazione
+        self.valid_actions_buffer = torch.zeros((100, 80), dtype=torch.float32, device=device)
+        self.obs_buffer = torch.zeros((1, 10823), dtype=torch.float32, device=device)
+        
+        # Buffer per training - allocati una volta sola
+        self.train_obs_buffer_team0 = torch.zeros((40, 10823), dtype=torch.float32, device=device)
+        self.train_actions_buffer_team0 = torch.zeros((40, 80), dtype=torch.float32, device=device)
+        self.train_returns_buffer_team0 = torch.zeros(40, dtype=torch.float32, device=device)
+        
+        self.train_obs_buffer_team1 = torch.zeros_like(self.train_obs_buffer_team0)
+        self.train_actions_buffer_team1 = torch.zeros_like(self.train_actions_buffer_team0)
+        self.train_returns_buffer_team1 = torch.zeros_like(self.train_returns_buffer_team0)
     
-    #@profile
-    def pick_action(self, obs, valid_actions, env):
+    def pick_action(self, obs, valid_actions, env, current_player):
         """Epsilon-greedy ottimizzato per GPU"""
         if not valid_actions:
             print("\n[DEBUG] Nessuna azione valida! Stato attuale:")
@@ -257,169 +263,234 @@ class DQNAgent:
         if random.random() < self.epsilon:
             return random.choice(valid_actions)
         else:
-            # OTTIMIZZAZIONE: Converti tutti gli input in tensori GPU in un'unica operazione
-            # e riusa il buffer pre-allocato se disponibile
-            if hasattr(self, 'valid_actions_buffer') and len(valid_actions) <= self.valid_actions_buffer.size(0):
-                valid_actions_t = self.valid_actions_buffer[:len(valid_actions)]
-                for i, va in enumerate(valid_actions):
-                    if isinstance(va, np.ndarray):
-                        valid_actions_t[i].copy_(torch.tensor(va, device=device))
-                    else:
-                        valid_actions_t[i].copy_(va)
-            else:
-                # Creazione del buffer se non esiste
-                if not hasattr(self, 'valid_actions_buffer') or len(valid_actions) > self.valid_actions_buffer.size(0):
-                    self.valid_actions_buffer = torch.zeros((max(100, len(valid_actions)), 80), 
-                                                        dtype=torch.float32, device=device)
-                valid_actions_t = torch.tensor(np.stack(valid_actions), 
-                                            dtype=torch.float32, device=device)
-                
-            with torch.no_grad():
-                # OTTIMIZZAZIONE: Riusa il buffer per observation se possibile
-                if hasattr(self, 'obs_buffer'):
-                    obs_t = self.obs_buffer
-                    if isinstance(obs, np.ndarray):
-                        obs_t.copy_(torch.tensor(obs, device=device).unsqueeze(0))
-                    else:
-                        obs_t.copy_(obs.unsqueeze(0))
+            # OTTIMIZZAZIONE: Riusa buffer pre-allocati e minimizza trasferimenti
+            if len(valid_actions) > self.valid_actions_buffer.size(0):
+                self.valid_actions_buffer = torch.zeros((len(valid_actions), 80), 
+                                                      dtype=torch.float32, device=device)
+            
+            valid_actions_t = self.valid_actions_buffer[:len(valid_actions)]
+            for i, va in enumerate(valid_actions):
+                if isinstance(va, np.ndarray):
+                    valid_actions_t[i].copy_(torch.tensor(va, device=device))
                 else:
-                    self.obs_buffer = torch.zeros((1, len(obs)), dtype=torch.float32, device=device)
-                    obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    
-                # OTTIMIZZAZIONE: Usa mixed precision per accelerare l'inferenza
+                    valid_actions_t[i].copy_(va)
+            
+            with torch.no_grad():
+                # Usa buffer pre-allocato per l'osservazione
+                if isinstance(obs, np.ndarray):
+                    self.obs_buffer.copy_(torch.tensor(obs, device=device).unsqueeze(0))
+                else:
+                    self.obs_buffer.copy_(obs.unsqueeze(0))
+                
+                # Mixed precision per inferenza
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    action_values = self.online_qnet(obs_t)
+                    action_values = self.online_qnet(self.obs_buffer)
                     q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
                 
                 best_action_idx = torch.argmax(q_values).item()
             
             return valid_actions[best_action_idx]
     
-    #@profile
-    def train_episodic_monte_carlo(self, specific_episode=None):
+    def train_on_episode(self, team_id):
         """
-        Versione ottimizzata per tenere tutto in GPU senza batching.
+        Training ottimizzato per un singolo team, più simile all'implementazione originale.
         """
-        # Determina quali episodi processare
-        if specific_episode is not None:
-            episodes_to_process = [specific_episode]
-        elif self.episodic_buffer.episodes:
-            episodes_to_process = self.episodic_buffer.get_all_episodes()
-        else:
-            return  # Nessun episodio disponibile
+        buffer = self.team0_buffer if team_id == 0 else self.team1_buffer
+        train_obs_buffer = self.train_obs_buffer_team0 if team_id == 0 else self.train_obs_buffer_team1
+        train_actions_buffer = self.train_actions_buffer_team0 if team_id == 0 else self.train_actions_buffer_team1
+        train_returns_buffer = self.train_returns_buffer_team0 if team_id == 0 else self.train_returns_buffer_team1
         
-        # OTTIMIZZAZIONE: Usa buffer pre-allocati se possibile
-        max_transitions = sum(len(episode) for episode in episodes_to_process)
+        # Salta se non ci sono episodi
+        if not buffer.episodes:
+            return False
         
-        # Crea o ridimensiona i buffer se necessario
-        if not hasattr(self, 'train_obs_buffer') or max_transitions > self.train_obs_buffer.size(0):
-            self.train_obs_buffer = torch.zeros((max_transitions, 10823), dtype=torch.float32, device=device)
-            self.train_actions_buffer = torch.zeros((max_transitions, 80), dtype=torch.float32, device=device)
-            self.train_returns_buffer = torch.zeros(max_transitions, dtype=torch.float32, device=device)
+        # Usa solo l'ultimo episodio per allenamento standard
+        last_episode = buffer.episodes[-1]
+        if not last_episode:
+            return False
         
-        # Riempi i buffer in modo efficiente
-        idx = 0
-        for episode in episodes_to_process:
-            if not episode:
-                continue
-                    
-            # Ottieni la reward finale dall'ultima transizione dell'episodio
-            final_reward = episode[-1][2] if episode else 0.0
-            
-            for obs, action, _, _, _, _ in episode:
-                # Copia direttamente nel buffer per evitare creazioni di tensori intermedie
-                if isinstance(obs, np.ndarray):
-                    self.train_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
-                else:
-                    self.train_obs_buffer[idx].copy_(obs)
-                    
-                if isinstance(action, np.ndarray):
-                    self.train_actions_buffer[idx].copy_(torch.tensor(action, device=device))
-                else:
-                    self.train_actions_buffer[idx].copy_(action)
-                    
-                self.train_returns_buffer[idx] = final_reward
-                idx += 1
+        # Ottieni reward finale
+        final_reward = last_episode[-1][2]
         
-        if idx == 0:
-            return  # Nessuna transizione da processare
+        # OTTIMIZZAZIONE: Prepara il batch in modo efficiente
+        ep_len = len(last_episode)
+        if ep_len > train_obs_buffer.size(0):
+            if team_id == 0:
+                self.train_obs_buffer_team0 = torch.zeros((ep_len, 10823), dtype=torch.float32, device=device)
+                self.train_actions_buffer_team0 = torch.zeros((ep_len, 80), dtype=torch.float32, device=device)
+                self.train_returns_buffer_team0 = torch.zeros(ep_len, dtype=torch.float32, device=device)
+                train_obs_buffer = self.train_obs_buffer_team0
+                train_actions_buffer = self.train_actions_buffer_team0
+                train_returns_buffer = self.train_returns_buffer_team0
+            else:
+                self.train_obs_buffer_team1 = torch.zeros((ep_len, 10823), dtype=torch.float32, device=device)
+                self.train_actions_buffer_team1 = torch.zeros((ep_len, 80), dtype=torch.float32, device=device)
+                self.train_returns_buffer_team1 = torch.zeros(ep_len, dtype=torch.float32, device=device)
+                train_obs_buffer = self.train_obs_buffer_team1
+                train_actions_buffer = self.train_actions_buffer_team1
+                train_returns_buffer = self.train_returns_buffer_team1
         
-        # Usa slices dei buffer per il training - processa tutto in un'unica passata
-        all_obs_t = self.train_obs_buffer[:idx]
-        all_actions_t = self.train_actions_buffer[:idx]
-        all_returns_t = self.train_returns_buffer[:idx]
+        # Riempi i buffer
+        all_obs, all_actions, _, _, _, _ = zip(*last_episode)
         
-        # OTTIMIZZAZIONE: Usa mixed precision con un singolo forward pass per tutti i dati
+        for i, (obs, action) in enumerate(zip(all_obs, all_actions)):
+            if isinstance(obs, np.ndarray):
+                train_obs_buffer[i].copy_(torch.tensor(obs, device=device))
+            else:
+                train_obs_buffer[i].copy_(obs)
+                
+            if isinstance(action, np.ndarray):
+                train_actions_buffer[i].copy_(torch.tensor(action, device=device))
+            else:
+                train_actions_buffer[i].copy_(action)
+                
+            train_returns_buffer[i] = final_reward
+        
+        # OTTIMIZZAZIONE: Training con Mixed Precision
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            # OTTIMIZZAZIONE: Zero gradients - usa set_to_none=True per maggiore efficienza di memoria
+            # Reset gradients in modo efficiente
             self.optimizer.zero_grad(set_to_none=True)
             
-            # OTTIMIZZAZIONE: Forward pass con kernel fusion dove possibile
-            q_values = self.online_qnet(all_obs_t)
-            q_values_for_actions = torch.sum(q_values * all_actions_t, dim=1)
+            # Forward pass ottimizzato
+            q_values = self.online_qnet(train_obs_buffer[:ep_len])
+            q_values_for_actions = torch.sum(q_values * train_actions_buffer[:ep_len], dim=1)
             
-            # OTTIMIZZAZIONE: Loss con mixed precision - usa reduction='mean' per stabilità numerica
-            loss = nn.MSELoss()(q_values_for_actions, all_returns_t)
+            # Loss calculation
+            loss = nn.MSELoss()(q_values_for_actions, train_returns_buffer[:ep_len])
             
-            # OTTIMIZZAZIONE: Backward e optimizer step con gradient scaling per mixed precision
+            # Backward con scaling
             self.scaler.scale(loss).backward()
             
-            # OTTIMIZZAZIONE: Clip gradient con una norma moderata per stabilità di training
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
             
-            # OTTIMIZZAZIONE: Optimizer step con scaling
+            # Step con scaling
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            # Aggiorna epsilon una sola volta
+            # Aggiorna epsilon una sola volta per episodio
             self.update_epsilon()
-            
-            # Sincronizza le reti target
-            self.sync_target()
+        
+        return True
     
-    #@profile
-    def store_episode_transition(self, transition):
+    def train_on_past_episodes(self, team_id):
         """
-        Memorizza una transizione nell'episodic buffer.
+        Training efficiente su episodi passati per un team specifico.
         """
-        # Aggiungi all'episodio corrente
-        self.episodic_buffer.add_transition(transition)
-    
-    #@profile
-    def end_episode(self):
-        """
-        Termina l'episodio corrente SENZA training.
-        Il training deve essere chiamato esplicitamente dopo questo metodo.
-        """
-        self.episodic_buffer.end_episode()
-        # Nota: rimosso il training automatico qui
+        buffer = self.team0_buffer if team_id == 0 else self.team1_buffer
+        train_obs_buffer = self.train_obs_buffer_team0 if team_id == 0 else self.train_obs_buffer_team1
+        train_actions_buffer = self.train_actions_buffer_team0 if team_id == 0 else self.train_actions_buffer_team1
+        train_returns_buffer = self.train_returns_buffer_team0 if team_id == 0 else self.train_returns_buffer_team1
+        
+        # Verifica che ci siano abbastanza episodi
+        if len(buffer.episodes) <= 3:
+            return False
             
-    #@profile
+        # Seleziona episodi passati
+        prev_episodes = buffer.get_previous_episodes()
+        past_episodes = random.sample(prev_episodes, min(3, len(prev_episodes)))
+        
+        # Calcola numero totale di transizioni
+        total_transitions = sum(len(episode) for episode in past_episodes)
+        if total_transitions == 0:
+            return False
+            
+        # Ridimensiona buffer se necessario
+        if total_transitions > train_obs_buffer.size(0):
+            if team_id == 0:
+                self.train_obs_buffer_team0 = torch.zeros((total_transitions, 10823), dtype=torch.float32, device=device)
+                self.train_actions_buffer_team0 = torch.zeros((total_transitions, 80), dtype=torch.float32, device=device)
+                self.train_returns_buffer_team0 = torch.zeros(total_transitions, dtype=torch.float32, device=device)
+                train_obs_buffer = self.train_obs_buffer_team0
+                train_actions_buffer = self.train_actions_buffer_team0
+                train_returns_buffer = self.train_returns_buffer_team0
+            else:
+                self.train_obs_buffer_team1 = torch.zeros((total_transitions, 10823), dtype=torch.float32, device=device)
+                self.train_actions_buffer_team1 = torch.zeros((total_transitions, 80), dtype=torch.float32, device=device)
+                self.train_returns_buffer_team1 = torch.zeros(total_transitions, dtype=torch.float32, device=device)
+                train_obs_buffer = self.train_obs_buffer_team1
+                train_actions_buffer = self.train_actions_buffer_team1
+                train_returns_buffer = self.train_returns_buffer_team1
+        
+        # Prepara il mega-batch
+        idx = 0
+        for episode in past_episodes:
+            if not episode or len(episode) == 0:
+                continue
+                
+            # Reward dell'episodio
+            episode_reward = episode[-1][2]
+            
+            for obs, action, _, _, _, _ in episode:
+                # Trasferimento diretto su GPU
+                if isinstance(obs, np.ndarray):
+                    train_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
+                else:
+                    train_obs_buffer[idx].copy_(obs)
+                    
+                if isinstance(action, np.ndarray):
+                    train_actions_buffer[idx].copy_(torch.tensor(action, device=device))
+                else:
+                    train_actions_buffer[idx].copy_(action)
+                    
+                train_returns_buffer[idx] = episode_reward
+                idx += 1
+        
+        if idx == 0:
+            return False
+            
+        # Training in batch
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            self.optimizer.zero_grad(set_to_none=True)
+            
+            q_values = self.online_qnet(train_obs_buffer[:idx])
+            q_values_for_actions = torch.sum(q_values * train_actions_buffer[:idx], dim=1)
+            
+            loss = nn.MSELoss()(q_values_for_actions, train_returns_buffer[:idx])
+            
+            self.scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+            self.update_epsilon()
+        
+        return True
+    
+    def store_transition(self, transition, team_id):
+        """
+        Memorizza una transizione nel buffer del team specifico.
+        """
+        if team_id == 0:
+            self.team0_buffer.add_transition(transition)
+        else:
+            self.team1_buffer.add_transition(transition)
+    
     def start_episode(self):
-        """Inizia un nuovo episodio."""
-        self.episodic_buffer.start_episode()
+        """Inizia un nuovo episodio per entrambi i team."""
+        self.team0_buffer.start_episode()
+        self.team1_buffer.start_episode()
+    
+    def end_episode(self):
+        """Termina l'episodio corrente per entrambi i team."""
+        self.team0_buffer.end_episode()
+        self.team1_buffer.end_episode()
     
     def sync_target(self):
-        """Synchronizes the target network weights with the online network weights."""
+        """Sincronizza i pesi della rete target con quella online."""
         self.target_qnet.load_state_dict(self.online_qnet.state_dict())
-
-    def maybe_sync_target(self):
-        """Syncs the target network with the online network every TARGET_UPDATE_FREQ steps."""
-        if self.train_steps % TARGET_UPDATE_FREQ == 0:
-            self.sync_target()
-
+    
     def update_epsilon(self):
-        """Updates epsilon for epsilon-greedy exploration based on training steps."""
+        """Aggiorna epsilon per esplorazione."""
         self.epsilon = max(EPSILON_END, EPSILON_START - (self.train_steps / EPSILON_DECAY) * (EPSILON_START - EPSILON_END))
         self.train_steps += 1
-
+    
     def save_checkpoint(self, filename):
-        """Salva il checkpoint tenendo conto della GPU e assicura che la directory esista"""
-        # Crea la directory se non esiste
+        """Salva il checkpoint."""
         directory = os.path.dirname(filename)
         if directory and not os.path.exists(directory):
             os.makedirs(directory)
-            print(f"[DQNAgent] Creata directory per checkpoint: {directory}")
+            print(f"[SelfPlayDQNAgent] Creata directory per checkpoint: {directory}")
         
         try:
             torch.save({
@@ -428,107 +499,84 @@ class DQNAgent:
                 "epsilon": self.epsilon,
                 "train_steps": self.train_steps
             }, filename)
-            print(f"[DQNAgent] Checkpoint salvato: {filename}")
+            print(f"[SelfPlayDQNAgent] Checkpoint salvato: {filename}")
         except Exception as e:
-            print(f"[DQNAgent] ERRORE nel salvataggio del checkpoint {filename}: {e}")
-
+            print(f"[SelfPlayDQNAgent] ERRORE nel salvataggio del checkpoint {filename}: {e}")
+    
     def load_checkpoint(self, filename):
-        """Carica il checkpoint tenendo conto della GPU"""
+        """Carica il checkpoint."""
         ckpt = torch.load(filename, map_location=device)
         self.online_qnet.load_state_dict(ckpt["online_state_dict"])
         self.target_qnet.load_state_dict(ckpt["target_state_dict"])
         self.epsilon = ckpt["epsilon"]
         self.train_steps = ckpt["train_steps"]
-        print(f"[DQNAgent] Checkpoint loaded from {filename}")
-
+        print(f"[SelfPlayDQNAgent] Checkpoint loaded from {filename}")
+        
 ############################################################
 # 4) Multi-agent training
 ############################################################
 
-#@profile
-def train_agents(num_episodes=10):
+def train_selfplay_optimized(num_episodes=10):
     """
-    Esegue un training multi-agent episodico completamente ottimizzato per GPU.
-    Il training avviene alla fine di ogni episodio, con reward flat per tutte le mosse.
-    Implementa ottimizzazioni per ridurre drasticamente i trasferimenti CPU-GPU.
+    Funzione di training self-play ottimizzata, strutturata come l'originale
+    ma usando un singolo modello per entrambi i team.
     """
-    # Configurazione ottimale GPU
+    # Configurazione GPU
     if torch.cuda.is_available():
-        # Impostazioni per massimizzare throughput
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        
-        # Gestione aggressiva della memoria
         torch.cuda.empty_cache()
         if hasattr(torch.cuda, 'memory'):
             torch.cuda.memory.set_per_process_memory_fraction(0.95)
-        
-        # Imposta allocator per ridurre frammentazione
         torch.cuda.memory_stats()
 
-    # Crea la directory dei checkpoint se non esiste
+    # Crea directory per checkpoint
     checkpoint_dir = os.path.dirname(CHECKPOINT_PATH)
     if not os.path.exists(checkpoint_dir):
         print(f"Creazione directory per checkpoint: {checkpoint_dir}")
         os.makedirs(checkpoint_dir)
     
-    # Crea gli agenti
-    agent_team0 = DQNAgent(team_id=0)
-    agent_team1 = DQNAgent(team_id=1)
+    # Crea un singolo agente self-play
+    agent = SelfPlayDQNAgent()
 
-    # Funzione di utilità per trovare il checkpoint più recente
-    def find_latest_checkpoint(base_path, team_id):
-        """Trova il checkpoint più recente per un team specifico"""
+    # Funzione per trovare checkpoint
+    def find_latest_checkpoint(base_path):
         dir_path = os.path.dirname(base_path)
         base_name = os.path.basename(base_path)
         
-        # Prima controlla se esiste il checkpoint senza numero episodio
-        standard_ckpt = f"{base_path}_team{team_id}.pth"
+        # Prima controlla checkpoint standard
+        standard_ckpt = f"{base_path}.pth"
         if os.path.isfile(standard_ckpt):
             return standard_ckpt
             
-        # Altrimenti cerca i checkpoint con numero episodio
+        # Poi checkpoint con numero episodio
         if os.path.exists(dir_path):
-            # Pattern per i checkpoint con numero episodio
             import fnmatch
-            pattern = f"{base_name}_team{team_id}_ep*.pth"
+            pattern = f"{base_name}_ep*.pth"
             matching_files = [f for f in os.listdir(dir_path) if fnmatch.fnmatch(f, pattern)]
             
             if matching_files:
-                # Estrai il numero episodio e ordina per numero più alto
                 matching_files.sort(key=lambda x: int(x.split('_ep')[1].split('.pth')[0]), reverse=True)
                 return os.path.join(dir_path, matching_files[0])
         
         return None
     
-    # Carica checkpoint con logica migliorata
-    print(f"Cercando checkpoint più recenti per i team...")
+    # Carica checkpoint se disponibile
+    print(f"Cercando checkpoint più recente...")
+    ckpt_path = find_latest_checkpoint(CHECKPOINT_PATH)
     
-    # Team 0
-    team0_ckpt = find_latest_checkpoint(CHECKPOINT_PATH, 0)
-    if team0_ckpt:
+    if ckpt_path:
         try:
-            print(f"Trovato checkpoint per team 0: {team0_ckpt}")
-            agent_team0.load_checkpoint(team0_ckpt)
+            print(f"Trovato checkpoint: {ckpt_path}")
+            agent.load_checkpoint(ckpt_path)
         except Exception as e:
-            print(f"ERRORE nel caricamento del checkpoint team 0: {e}")
+            print(f"ERRORE nel caricamento del checkpoint: {e}")
     else:
-        print(f"Nessun checkpoint trovato per team 0")
-    
-    # Team 1
-    team1_ckpt = find_latest_checkpoint(CHECKPOINT_PATH, 1)
-    if team1_ckpt:
-        try:
-            print(f"Trovato checkpoint per team 1: {team1_ckpt}")
-            agent_team1.load_checkpoint(team1_ckpt)
-        except Exception as e:
-            print(f"ERRORE nel caricamento del checkpoint team 1: {e}")
-    else:
-        print(f"Nessun checkpoint trovato per team 1")
+        print(f"Nessun checkpoint trovato, inizializzazione con pesi casuali")
 
-    # Variabili di controllo
+    # Inizializza variabili di controllo
     first_player = 0
     global_step = 0
     
@@ -537,90 +585,65 @@ def train_agents(num_episodes=10):
     train_times = []
     inference_times = []
     
-    # OTTIMIZZAZIONE: Pre-alloca buffer di tensori per evitare allocazioni ripetute
-    # Buffer per carte
+    # Preallocazione buffer per carte
     card_buffer = {}
     for suit in ['denari', 'coppe', 'spade', 'bastoni']:
         for rank in range(1, 11):
             card_buffer[(rank, suit)] = torch.zeros(80, dtype=torch.float32, device=device)
     
-    # Buffer per batch di training
-    max_transitions = 40  # Numero massimo di transizioni atteso in un episodio
-    team0_obs_buffer = torch.zeros((max_transitions, 10823), dtype=torch.float32, device=device)
-    team0_actions_buffer = torch.zeros((max_transitions, 80), dtype=torch.float32, device=device)
-    team0_rewards_buffer = torch.zeros(max_transitions, dtype=torch.float32, device=device)
-    
-    team1_obs_buffer = torch.zeros_like(team0_obs_buffer)
-    team1_actions_buffer = torch.zeros_like(team0_actions_buffer)
-    team1_rewards_buffer = torch.zeros_like(team0_rewards_buffer)
-    
-    # OTTIMIZZAZIONE: Profilo di memoria per training asincrono
-    async_train_team0 = False
-    async_train_team1 = False
-    
-    # Loop principale per episodi
+    # Loop principale episodi
     for ep in range(num_episodes):
         episode_start_time = time.time()
 
-        # If this is the first episode, create a progress bar
+        # Progress bar
         if ep == 0:
             pbar = tqdm(total=num_episodes, desc="Training episodes")
-            
-        # Update progress bar with description that includes player info
         pbar.set_description(f"Episode {ep+1}/{num_episodes} (Player {first_player})")
         pbar.update(1)
-
-        # Close progress bar on last episode
         if ep == num_episodes - 1:
             pbar.close()
         
-        # Crea ambiente e inizializza
+        # Inizializza ambiente
         env = ScoponeEnvMA()
         env.current_player = first_player
 
         # Inizializza buffer episodici
-        agent_team0.start_episode()
-        agent_team1.start_episode()
+        agent.start_episode()
 
         # Stato iniziale
         done = False
         obs_current = env._get_observation(env.current_player)
         
-        # OTTIMIZZAZIONE: Assicura che obs_current sia un array numpy
+        # Converti a numpy se necessario
         if torch.is_tensor(obs_current):
             obs_current = obs_current.cpu().numpy()
             
-        # Conteggi delle transition per ciascun team
+        # Contatori per team
         team0_transitions = 0
         team1_transitions = 0
 
-        # Loop principale della partita
+        # Loop principale partita
         inference_start = time.time()
         while not done:
-            cp = env.current_player
-            team_id = 0 if cp in [0,2] else 1
-            agent = agent_team0 if team_id==0 else agent_team1
+            current_player = env.current_player
+            team_id = 0 if current_player in [0,2] else 1
 
             # Ottieni azioni valide
             valid_acts = env.get_valid_actions()
             if not valid_acts:
                 break
             
-            # OTTIMIZZAZIONE: Conversione efficiente a tensori
-            # Se valid_acts contiene già array numpy, converti una volta sola
+            # Scelta azione ottimizzata
             if len(valid_acts) > 0:
                 if isinstance(valid_acts[0], np.ndarray):
-                    valid_acts_t = torch.tensor(np.stack(valid_acts), dtype=torch.float32, device=device)
-                    # Scelta azione ottimizzata
-                    action = agent.pick_action(obs_current, valid_acts, env)
+                    action = agent.pick_action(obs_current, valid_acts, env, current_player)
                 else:
-                    # Fallback se valid_acts non è già convertito
-                    action = agent.pick_action(obs_current, valid_acts, env)
+                    action = agent.pick_action(obs_current, valid_acts, env, current_player)
             
-            # Esegui azione sull'ambiente
+            # Esegui azione
             next_obs, reward, done, info = env.step(action)
             
-            # Assicura che next_obs sia numpy array
+            # Converti a numpy se necessario
             if torch.is_tensor(next_obs):
                 next_obs = next_obs.cpu().numpy()
                 
@@ -630,291 +653,51 @@ def train_agents(num_episodes=10):
             next_valid = env.get_valid_actions() if not done else []
             transition = (obs_current, action, reward, next_obs, done, next_valid)
             
-            # Memorizza la transizione nel buffer dell'agente del giocatore corrente
+            # Memorizza transition nel buffer del team corretto
+            agent.store_transition(transition, team_id)
+            
+            # Aggiorna contatori
             if team_id == 0:
-                agent_team0.store_episode_transition(transition)
                 team0_transitions += 1
             else:
-                agent_team1.store_episode_transition(transition)
                 team1_transitions += 1
             
-            # Prepara per la prossima iterazione
+            # Prepara per prossima iterazione
             obs_current = next_obs
             
         inference_time = time.time() - inference_start
         inference_times.append(inference_time)
-        
-        # Memoria usata dopo inferenza
-        #if torch.cuda.is_available():
-            #print(f"  Memoria GPU dopo inferenza: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocata")
 
-        # Termina episodi e prepara per training
-        agent_team0.end_episode()
-        agent_team1.end_episode()
+        # Termina episodi
+        agent.end_episode()
         
-        # Ottieni le reward finali
+        # Ottieni reward finali
         team0_reward = 0.0
         team1_reward = 0.0
         if "team_rewards" in info:
             team_rewards = info["team_rewards"]
             team0_reward = team_rewards[0]
             team1_reward = team_rewards[1]
-            #print(f"  Team Rewards finali: {team_rewards}")
         
-        # TRAINING ALLA FINE DELL'EPISODIO - Completamente ottimizzato per GPU
-        #print(f"  Training alla fine dell'episodio {ep+1}...")
+        # TRAINING ALLA FINE DELL'EPISODIO
         train_start_time = time.time()
         
-        # OTTIMIZZAZIONE: Prepara batch direttamente su GPU
-        # 1. Team 0 training batch
-        team0_batch = None
-        if agent_team0.episodic_buffer.episodes:
-            last_episode_team0 = agent_team0.episodic_buffer.episodes[-1]
-            if last_episode_team0:
-                # Estrai dati episodio
-                all_obs0, all_actions0, _, _, _, _ = zip(*last_episode_team0)
-                
-                # OTTIMIZZAZIONE: Riutilizza buffer pre-allocati
-                ep_len = len(all_obs0)
-                if ep_len > max_transitions:
-                    # Ridimensiona buffer se necessario
-                    team0_obs_buffer.resize_(ep_len, 10823)
-                    team0_actions_buffer.resize_(ep_len, 80)
-                    team0_rewards_buffer.resize_(ep_len)
-                
-                # Trasferimento dati su GPU in batch
-                for i, (obs, action) in enumerate(zip(all_obs0, all_actions0)):
-                    # Conversione diretta ottimizzata
-                    if i < ep_len:
-                        if isinstance(obs, np.ndarray):
-                            team0_obs_buffer[i].copy_(torch.tensor(obs, device=device))
-                        else:
-                            team0_obs_buffer[i].copy_(obs)
-                            
-                        if isinstance(action, np.ndarray):
-                            team0_actions_buffer[i].copy_(torch.tensor(action, device=device))
-                        else:
-                            team0_actions_buffer[i].copy_(action)
-                            
-                        team0_rewards_buffer[i] = team0_reward
-                
-                # Batch finale con slicing
-                team0_batch = (
-                    team0_obs_buffer[:ep_len], 
-                    team0_actions_buffer[:ep_len], 
-                    team0_rewards_buffer[:ep_len]
-                )
+        # Training per team 0
+        team0_trained = agent.train_on_episode(0)
         
-        # 2. Team 1 training batch - stessa logica ottimizzata
-        team1_batch = None
-        if agent_team1.episodic_buffer.episodes:
-            last_episode_team1 = agent_team1.episodic_buffer.episodes[-1]
-            if last_episode_team1:
-                all_obs1, all_actions1, _, _, _, _ = zip(*last_episode_team1)
-                
-                ep_len = len(all_obs1)
-                if ep_len > max_transitions:
-                    team1_obs_buffer.resize_(ep_len, 10823)
-                    team1_actions_buffer.resize_(ep_len, 80)
-                    team1_rewards_buffer.resize_(ep_len)
-                
-                for i, (obs, action) in enumerate(zip(all_obs1, all_actions1)):
-                    if i < ep_len:
-                        if isinstance(obs, np.ndarray):
-                            team1_obs_buffer[i].copy_(torch.tensor(obs, device=device))
-                        else:
-                            team1_obs_buffer[i].copy_(obs)
-                            
-                        if isinstance(action, np.ndarray):
-                            team1_actions_buffer[i].copy_(torch.tensor(action, device=device))
-                        else:
-                            team1_actions_buffer[i].copy_(action)
-                            
-                        team1_rewards_buffer[i] = team1_reward
-                
-                team1_batch = (
-                    team1_obs_buffer[:ep_len], 
-                    team1_actions_buffer[:ep_len], 
-                    team1_rewards_buffer[:ep_len]
-                )
+        # Training per team 1
+        team1_trained = agent.train_on_episode(1)
         
-        # OTTIMIZZAZIONE: Training con Mixed Precision
-        # Team 0 training con batch preparato
-        if team0_batch:
-            #print(f"  Training team 0 sull'ultimo episodio (reward={team0_reward}, mosse={team0_transitions})")
-            
-            # Ottiene batch con dimensione ottimale
-            team0_obs_t, team0_actions_t, team0_rewards_t = team0_batch
-            
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                # Processa tutto l'episodio in un'unica passata (no batching)
-                # Zero gradients efficienti
-                agent_team0.optimizer.zero_grad(set_to_none=True)
-                
-                # Forward pass ottimizzato su tutto il dataset
-                q_values = agent_team0.online_qnet(team0_obs_t)
-                q_values_for_actions = torch.sum(q_values * team0_actions_t, dim=1)
-                
-                # Loss con stabilità numerica
-                loss = nn.MSELoss()(q_values_for_actions, team0_rewards_t)
-                
-                # Backward con scaling
-                agent_team0.scaler.scale(loss).backward()
-                
-                # Gradient clipping per stabilità
-                torch.nn.utils.clip_grad_norm_(agent_team0.online_qnet.parameters(), max_norm=10.0)
-                
-                # Step con scaling
-                agent_team0.scaler.step(agent_team0.optimizer)
-                agent_team0.scaler.update()
-                
-                # Aggiorna epsilon
-                agent_team0.update_epsilon()
-        
-        # Team 1 training con uguale logica ottimizzata
-        if team1_batch:
-            #print(f"  Training team 1 sull'ultimo episodio (reward={team1_reward}, mosse={team1_transitions})")
-            
-            team1_obs_t, team1_actions_t, team1_rewards_t = team1_batch
-            
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                # Processa tutto l'episodio in un'unica passata (no batching)
-                agent_team1.optimizer.zero_grad(set_to_none=True)
-                
-                # Forward pass ottimizzato su tutto il dataset
-                q_values = agent_team1.online_qnet(team1_obs_t)
-                q_values_for_actions = torch.sum(q_values * team1_actions_t, dim=1)
-                
-                # Loss con stabilità numerica
-                loss = nn.MSELoss()(q_values_for_actions, team1_rewards_t)
-                
-                # Backward con scaling
-                agent_team1.scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(agent_team1.online_qnet.parameters(), max_norm=10.0)
-                agent_team1.scaler.step(agent_team1.optimizer)
-                agent_team1.scaler.update()
-                
-                # Aggiorna epsilon
-                agent_team1.update_epsilon()
-        
-        # OTTIMIZZAZIONE: Sincronizzazione target network meno frequente
+        # Sincronizzazione target network
         if global_step % TARGET_UPDATE_FREQ == 0:
-            agent_team0.sync_target()
-            agent_team1.sync_target()
+            agent.sync_target()
         
-        # OTTIMIZZAZIONE: Training su episodi passati con riutilizzo memoria
-        # Training su passi precedenti ogni 5 episodi
+        # Training su episodi passati
         if ep % 5 == 0 and ep > 0:
-            # Team 0 training su episodi passati
-            if len(agent_team0.episodic_buffer.episodes) > 3:
-                #print("  Training aggiuntivo su episodi passati per team 0")
-                
-                # Seleziona episodi precedenti
-                prev_episodes = agent_team0.episodic_buffer.get_previous_episodes()
-                past_episodes = random.sample(prev_episodes, min(3, len(prev_episodes)))
-                
-                # Count totale transizioni
-                total_transitions = sum(len(episode) for episode in past_episodes)
-                
-                # Alloca/ridimensiona buffer se necessario
-                if total_transitions > team0_obs_buffer.shape[0]:
-                    team0_obs_buffer.resize_(total_transitions, 10823)
-                    team0_actions_buffer.resize_(total_transitions, 80)
-                    team0_rewards_buffer.resize_(total_transitions)
-                
-                # Prepara mega-batch
-                idx = 0
-                for episode in past_episodes:
-                    if episode and len(episode) > 0:
-                        # Reward dell'episodio 
-                        episode_reward = episode[-1][2]
-                        
-                        for obs, action, _, _, _, _ in episode:
-                            if idx < total_transitions:
-                                # Trasferimento diretto su GPU
-                                if isinstance(obs, np.ndarray):
-                                    team0_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
-                                else:
-                                    team0_obs_buffer[idx].copy_(obs)
-                                    
-                                if isinstance(action, np.ndarray):  
-                                    team0_actions_buffer[idx].copy_(torch.tensor(action, device=device))
-                                else:
-                                    team0_actions_buffer[idx].copy_(action)
-                                    
-                                team0_rewards_buffer[idx] = episode_reward
-                                idx += 1
-                
-                # Training su tutti gli episodi passati in un'unica passata
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    # Utilizza tutti i dati in un'unica forward pass
-                    agent_team0.optimizer.zero_grad(set_to_none=True)
-                    
-                    # Usa gli intero buffer (fino all'indice idx)
-                    q_values = agent_team0.online_qnet(team0_obs_buffer[:idx])
-                    q_values_for_actions = torch.sum(q_values * team0_actions_buffer[:idx], dim=1)
-                    
-                    loss = nn.MSELoss()(q_values_for_actions, team0_rewards_buffer[:idx])
-                    
-                    agent_team0.scaler.scale(loss).backward()
-                    torch.nn.utils.clip_grad_norm_(agent_team0.online_qnet.parameters(), max_norm=10.0)
-                    agent_team0.scaler.step(agent_team0.optimizer)
-                    agent_team0.scaler.update()
-                    
-                    agent_team0.update_epsilon()
-            
-            # Team 1 training con stessa logica ottimizzata
-            if len(agent_team1.episodic_buffer.episodes) > 3:
-                #print("  Training aggiuntivo su episodi passati per team 1")
-                
-                prev_episodes = agent_team1.episodic_buffer.get_previous_episodes()
-                past_episodes = random.sample(prev_episodes, min(3, len(prev_episodes)))
-                
-                total_transitions = sum(len(episode) for episode in past_episodes)
-                
-                if total_transitions > team1_obs_buffer.shape[0]:
-                    team1_obs_buffer.resize_(total_transitions, 10823)
-                    team1_actions_buffer.resize_(total_transitions, 80)
-                    team1_rewards_buffer.resize_(total_transitions)
-                
-                idx = 0
-                for episode in past_episodes:
-                    if episode and len(episode) > 0:
-                        episode_reward = episode[-1][2]
-                        
-                        for obs, action, _, _, _, _ in episode:
-                            if idx < total_transitions:
-                                if isinstance(obs, np.ndarray):
-                                    team1_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
-                                else:
-                                    team1_obs_buffer[idx].copy_(obs)
-                                    
-                                if isinstance(action, np.ndarray):
-                                    team1_actions_buffer[idx].copy_(torch.tensor(action, device=device))
-                                else:
-                                    team1_actions_buffer[idx].copy_(action)
-                                    
-                                team1_rewards_buffer[idx] = episode_reward
-                                idx += 1
-                
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    # Utilizza tutti i dati in un'unica forward pass
-                    agent_team1.optimizer.zero_grad(set_to_none=True)
-                    
-                    # Usa l'intero buffer (fino all'indice idx)
-                    q_values = agent_team1.online_qnet(team1_obs_buffer[:idx])
-                    q_values_for_actions = torch.sum(q_values * team1_actions_buffer[:idx], dim=1)
-                    
-                    loss = nn.MSELoss()(q_values_for_actions, team1_rewards_buffer[:idx])
-                    
-                    agent_team1.scaler.scale(loss).backward()
-                    torch.nn.utils.clip_grad_norm_(agent_team1.online_qnet.parameters(), max_norm=10.0)
-                    agent_team1.scaler.step(agent_team1.optimizer)
-                    agent_team1.scaler.update()
-                    
-                    agent_team1.update_epsilon()
+            agent.train_on_past_episodes(0)  # Team 0
+            agent.train_on_past_episodes(1)  # Team 1
         
-        # Traccia tempo di training
+        # Traccia tempo training
         train_time = time.time() - train_start_time
         train_times.append(train_time)
         
@@ -922,32 +705,27 @@ def train_agents(num_episodes=10):
         episode_time = time.time() - episode_start_time
         episode_times.append(episode_time)
         
-        # Salva checkpoint periodici e checkpoint senza numero episodio
+        # Salva checkpoint
         if (ep + 1) % 1000 == 0 or ep == num_episodes - 1:
-            # Salva con numero episodio per tracciare la progressione
-            agent_team0.save_checkpoint(f"{CHECKPOINT_PATH}_team0_ep{ep+1}.pth")
-            agent_team1.save_checkpoint(f"{CHECKPOINT_PATH}_team1_ep{ep+1}.pth")
-            
-            # Salva anche senza numero episodio per facilitare la ripresa
-            agent_team0.save_checkpoint(f"{CHECKPOINT_PATH}_team0.pth")
-            agent_team1.save_checkpoint(f"{CHECKPOINT_PATH}_team1.pth")
+            agent.save_checkpoint(f"{CHECKPOINT_PATH}_ep{ep+1}.pth")
+            agent.save_checkpoint(f"{CHECKPOINT_PATH}.pth")
         
-        # Prepara per il prossimo episodio
+        # Prepara per prossimo episodio
         first_player = (first_player + 1) % 4
 
-    # Verifica che i checkpoint siano stati salvati
+    # Verifica checkpoint
     checkpoint_dir = os.path.dirname(CHECKPOINT_PATH)
     if os.path.exists(checkpoint_dir):
         print("\nCheckpoint trovati nella directory:")
         checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
         for file in checkpoint_files:
             file_path = os.path.join(checkpoint_dir, file)
-            file_size = os.path.getsize(file_path) / (1024 * 1024)  # dimensione in MB
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
             print(f" - {file} ({file_size:.2f} MB)")
     else:
         print(f"\nATTENZIONE: La directory dei checkpoint {checkpoint_dir} non esiste!")
     
-    # Report statistiche finali
+    # Report finale
     print("\n=== Fine training ===")
     print("\nRiepilogo prestazioni:")
     print(f"Tempo medio per episodio: {sum(episode_times)/len(episode_times):.2f}s")
@@ -956,17 +734,9 @@ def train_agents(num_episodes=10):
     print(f"Percentuale di tempo in training: {sum(train_times)/sum(episode_times)*100:.1f}%")
     print(f"Percentuale di tempo in inferenza: {sum(inference_times)/sum(episode_times)*100:.1f}%")
     
-    # Stampa epsilon finali
-    print(f"Epsilon finale team 0: {agent_team0.epsilon:.4f}")
-    print(f"Epsilon finale team 1: {agent_team1.epsilon:.4f}")
+    # Epsilon finale
+    print(f"Epsilon finale: {agent.epsilon:.4f}")
 
-
+# Modifica per utilizzare la nuova versione ottimizzata 
 if __name__ == "__main__":
-    # Esegui il training per pochi episodi per profilare
-    train_agents(num_episodes=200000)
-    
-    # Stampa i risultati del profiling
-    #global_profiler.print_stats()
-    
-    # Genera un report dettagliato e salvalo su file
-    #report = global_profiler.generate_report("profiling_report.txt")
+    train_selfplay_optimized(num_episodes=500000)
