@@ -706,7 +706,7 @@ def train_selfplay_optimized(num_episodes=10):
         episode_times.append(episode_time)
         
         # Salva checkpoint
-        if (ep + 1) % 1000 == 0 or ep == num_episodes - 1:
+        if (ep + 1) % 5000 == 0 or ep == num_episodes - 1:
             agent.save_checkpoint(f"{CHECKPOINT_PATH}_ep{ep+1}.pth")
             agent.save_checkpoint(f"{CHECKPOINT_PATH}.pth")
         
