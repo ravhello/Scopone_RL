@@ -109,13 +109,46 @@ class EpisodicReplayBuffer:
 # 2) Rete neurale QNetwork
 ############################################################
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim=10823, action_dim=80):  # Aggiornato da 10793 a 10823
+    def __init__(self, obs_dim=10823, action_dim=80):
         super().__init__()
-        # Feature extractor ottimizzato per la rappresentazione avanzata
+        # Backbone potenziato con neuroni quadruplicati
         self.backbone = nn.Sequential(
-            nn.Linear(obs_dim, 1024),
+            nn.Linear(obs_dim, 4096),
+            nn.ReLU(),
+            nn.Linear(4096, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, 1024),
             nn.ReLU(),
             nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+        
+        # Sezioni aggiuntive potenziate
+        self.hand_table_processor = nn.Sequential(
+            nn.Linear(83, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+        
+        self.captured_processor = nn.Sequential(
+            nn.Linear(82, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+        
+        self.stats_processor = nn.Sequential(
+            nn.Linear(334, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+        
+        self.history_processor = nn.Sequential(
+            nn.Linear(10320, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
@@ -123,35 +156,14 @@ class QNetwork(nn.Module):
             nn.ReLU()
         )
         
-        # Sezioni aggiuntive
-        self.hand_table_processor = nn.Sequential(
-            nn.Linear(83, 64),
-            nn.ReLU()
-        )
-        
-        self.captured_processor = nn.Sequential(
-            nn.Linear(82, 64),
-            nn.ReLU()
-        )
-        
-        self.stats_processor = nn.Sequential(
-            nn.Linear(334, 64),  # Aggiornato da 304 a 334 (+30 per i nuovi valori)
-            nn.ReLU()
-        )
-        
-        self.history_processor = nn.Sequential(
-            nn.Linear(10320, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU()
-        )
-        
         self.combiner = nn.Sequential(
-            nn.Linear(128 + 64*4, 256),
+            nn.Linear(256 + 128*4, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
             nn.ReLU()
         )
         
-        self.action_head = nn.Linear(256, action_dim)
+        self.action_head = nn.Linear(512, action_dim)
         
         # Sposta tutto il modello su GPU all'inizializzazione
         self.to(device)
@@ -177,7 +189,8 @@ class QNetwork(nn.Module):
         x1 = F.relu(self.backbone[0](x), inplace=True)
         x2 = F.relu(self.backbone[2](x1), inplace=True)
         x3 = F.relu(self.backbone[4](x2), inplace=True)
-        backbone_features = F.relu(self.backbone[6](x3), inplace=True)
+        x4 = F.relu(self.backbone[6](x3), inplace=True)
+        backbone_features = F.relu(self.backbone[8](x4), inplace=True)
         
         # Divide l'input in sezioni semantiche
         hand_table = x[:, :83]
@@ -186,11 +199,18 @@ class QNetwork(nn.Module):
         stats = x[:, 10489:]
         
         # Processa ogni sezione - versione in-place
-        hand_table_features = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
-        captured_features = F.relu(self.captured_processor[0](captured), inplace=True)
-        history_features = F.relu(self.history_processor[0](history), inplace=True)
-        history_features = F.relu(self.history_processor[2](history_features), inplace=True)
-        stats_features = F.relu(self.stats_processor[0](stats), inplace=True)
+        hand_table_f1 = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
+        hand_table_features = F.relu(self.hand_table_processor[2](hand_table_f1), inplace=True)
+        
+        captured_f1 = F.relu(self.captured_processor[0](captured), inplace=True)
+        captured_features = F.relu(self.captured_processor[2](captured_f1), inplace=True)
+        
+        history_f1 = F.relu(self.history_processor[0](history), inplace=True)
+        history_f2 = F.relu(self.history_processor[2](history_f1), inplace=True)
+        history_features = F.relu(self.history_processor[4](history_f2), inplace=True)
+        
+        stats_f1 = F.relu(self.stats_processor[0](stats), inplace=True)
+        stats_features = F.relu(self.stats_processor[2](stats_f1), inplace=True)
         
         # Combina tutte le features
         combined = torch.cat([
@@ -202,7 +222,8 @@ class QNetwork(nn.Module):
         ], dim=1)
         
         # Elabora le features combinate - versione in-place
-        final_features = F.relu(self.combiner[0](combined), inplace=True)
+        combined_f1 = F.relu(self.combiner[0](combined), inplace=True)
+        final_features = F.relu(self.combiner[2](combined_f1), inplace=True)
         
         # Calcola i valori delle azioni
         action_values = self.action_head(final_features)
