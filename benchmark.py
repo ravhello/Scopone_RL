@@ -156,7 +156,7 @@ def evaluate_checkpoints(checkpoint_paths, num_games=10000):
         print(f"Loading Team 0 agent from checkpoint: {path} as {name}")
         agents[name] = load_agent_from_checkpoint(path)
     
-    # Play games between all pairs of agents
+    # Play games between all pairs of agents (each pair plays only once)
     matchups = list(itertools.combinations(agents.keys(), 2))
     
     for agent1_name, agent2_name in matchups:
@@ -231,20 +231,19 @@ def evaluate_checkpoints(checkpoint_paths, num_games=10000):
         
         pbar.close()
         
-        # Calculate win rates and first-starter advantage
+        # Calculate average scores
+        results[matchup_key]["agent1_avg_score"] = results[matchup_key]["agent1_score_total"] / num_games
+        results[matchup_key]["agent2_avg_score"] = results[matchup_key]["agent2_score_total"] / num_games
+        
+        # Calculate detailed win percentages
         agent1_total_wins = results[matchup_key]["agent1_wins"]
         agent2_total_wins = results[matchup_key]["agent2_wins"]
         total_decided_games = agent1_total_wins + agent2_total_wins
         
         # Calculate first-starter advantage
         first_starter_wins = results[matchup_key]["first_starter_wins"] 
-        first_starter_advantage = first_starter_wins / total_decided_games if total_decided_games > 0 else 0
+        first_starter_advantage = first_starter_wins / total_decided_games if total_decided_games > 0 else 0.5
         
-        # Calculate average scores
-        results[matchup_key]["agent1_avg_score"] = results[matchup_key]["agent1_score_total"] / num_games
-        results[matchup_key]["agent2_avg_score"] = results[matchup_key]["agent2_score_total"] / num_games
-        
-        # Calculate detailed win percentages
         agent1_win_pct = agent1_total_wins / num_games * 100
         agent2_win_pct = agent2_total_wins / num_games * 100
         draw_pct = results[matchup_key]["draws"] / num_games * 100
@@ -264,7 +263,7 @@ def evaluate_checkpoints(checkpoint_paths, num_games=10000):
 def generate_excel_comparison(checkpoint_paths, results, output_file):
     """
     Generate an Excel file with comparative results between models.
-    Orders models by their training episode numbers.
+    Each metric has its own dedicated sheet.
     """
     # Extract checkpoint names and episode numbers
     checkpoints_info = []
@@ -276,59 +275,69 @@ def generate_excel_comparison(checkpoint_paths, results, output_file):
     # Sort checkpoints by episode number
     checkpoints_info.sort(key=lambda x: x[1])
     
-    # Create a DataFrame for win rates
+    # Get model names
     model_names = [info[0] for info in checkpoints_info]
+    
+    # Create DataFrames for different metrics
     win_rate_data = pd.DataFrame(index=model_names, columns=model_names)
     score_diff_data = pd.DataFrame(index=model_names, columns=model_names)
+    starter_advantage_data = pd.DataFrame(index=model_names, columns=model_names)
+    game_length_data = pd.DataFrame(index=model_names, columns=model_names)
+    draws_data = pd.DataFrame(index=model_names, columns=model_names)
     
-    # Fill in the win rate and score difference matrices
-    for i, (model1, _, _) in enumerate(checkpoints_info):
-        for j, (model2, _, _) in enumerate(checkpoints_info):
+    # Initialize DataFrames with dash in diagonal
+    for i, model1 in enumerate(model_names):
+        for j, model2 in enumerate(model_names):
             if i == j:
-                # Diagonal elements (model vs itself)
                 win_rate_data.loc[model1, model2] = "—"
                 score_diff_data.loc[model1, model2] = "—"
+                starter_advantage_data.loc[model1, model2] = "—"
+                game_length_data.loc[model1, model2] = "—"
+                draws_data.loc[model1, model2] = "—"
             else:
-                # Check if we have results for this matchup
-                matchup_key = f"{model1}_vs_{model2}"
-                reverse_matchup_key = f"{model2}_vs_{model1}"
-                
-                if matchup_key in results:
-                    # We have direct results
-                    data = results[matchup_key]
-                    model1_win_rate = data['agent1_wins'] / data['games'] * 100
-                    score_diff = data['agent1_avg_score'] - data['agent2_avg_score']
-                    
-                    win_rate_data.loc[model1, model2] = f"{model1_win_rate:.1f}%"
-                    score_diff_data.loc[model1, model2] = f"{score_diff:.2f}"
-                    
-                    # Also fill in the reverse matchup
-                    model2_win_rate = data['agent2_wins'] / data['games'] * 100
-                    
-                    win_rate_data.loc[model2, model1] = f"{model2_win_rate:.1f}%"
-                    score_diff_data.loc[model2, model1] = f"{-score_diff:.2f}"
-                    
-                elif reverse_matchup_key in results:
-                    # We have results for the reverse matchup
-                    data = results[reverse_matchup_key]
-                    model2_win_rate = data['agent1_wins'] / data['games'] * 100
-                    score_diff = data['agent1_avg_score'] - data['agent2_avg_score']
-                    
-                    win_rate_data.loc[model2, model1] = f"{model2_win_rate:.1f}%"
-                    score_diff_data.loc[model2, model1] = f"{score_diff:.2f}"
-                    
-                    # Also fill in the forward matchup
-                    model1_win_rate = data['agent2_wins'] / data['games'] * 100
-                    
-                    win_rate_data.loc[model1, model2] = f"{model1_win_rate:.1f}%"
-                    score_diff_data.loc[model1, model2] = f"{-score_diff:.2f}"
-                    
-                else:
-                    # No results for this matchup
-                    win_rate_data.loc[model1, model2] = "N/A"
-                    score_diff_data.loc[model1, model2] = "N/A"
+                win_rate_data.loc[model1, model2] = "N/A"
+                score_diff_data.loc[model1, model2] = "N/A"
+                starter_advantage_data.loc[model1, model2] = "N/A"
+                game_length_data.loc[model1, model2] = "N/A"
+                draws_data.loc[model1, model2] = "N/A"
     
-    # Create an Excel workbook
+    # Fill in the metric matrices
+    for matchup_key, data in results.items():
+        agents = matchup_key.split("_vs_")
+        model1, model2 = agents
+        
+        # Win rates
+        model1_win_rate = data['agent1_wins'] / data['games'] * 100
+        model2_win_rate = data['agent2_wins'] / data['games'] * 100
+        win_rate_data.loc[model1, model2] = f"{model1_win_rate:.1f}%"
+        win_rate_data.loc[model2, model1] = f"{model2_win_rate:.1f}%"
+        
+        # Score differences
+        score_diff = data['agent1_avg_score'] - data['agent2_avg_score']
+        score_diff_data.loc[model1, model2] = f"{score_diff:.2f}"
+        score_diff_data.loc[model2, model1] = f"{-score_diff:.2f}"
+        
+        # First-starter advantage
+        total_decided_games = data['agent1_wins'] + data['agent2_wins']
+        if total_decided_games > 0:
+            first_starter_advantage = data['first_starter_wins'] / total_decided_games
+            starter_advantage_data.loc[model1, model2] = f"{first_starter_advantage:.2f}"
+            starter_advantage_data.loc[model2, model1] = f"{first_starter_advantage:.2f}"  # Same value for both directions
+        else:
+            starter_advantage_data.loc[model1, model2] = "N/A"
+            starter_advantage_data.loc[model2, model1] = "N/A"
+        
+        # Game length
+        avg_game_length = sum(data['game_lengths']) / len(data['game_lengths'])
+        game_length_data.loc[model1, model2] = f"{avg_game_length:.1f}"
+        game_length_data.loc[model2, model1] = f"{avg_game_length:.1f}"  # Same value for both directions
+        
+        # Draws percentage
+        draw_pct = data['draws'] / data['games'] * 100
+        draws_data.loc[model1, model2] = f"{draw_pct:.1f}%"
+        draws_data.loc[model2, model1] = f"{draw_pct:.1f}%"  # Same value for both directions
+    
+    # Create Excel workbook
     wb = Workbook()
     
     # Create Summary sheet
@@ -338,163 +347,174 @@ def generate_excel_comparison(checkpoint_paths, results, output_file):
     # Add headers
     summary_sheet['A1'] = "Team 0 Agent Comparison Summary"
     summary_sheet['A1'].font = Font(bold=True, size=14)
-    summary_sheet.merge_cells('A1:E1')
+    summary_sheet.merge_cells('A1:F1')
     
     summary_sheet['A3'] = "Model"
     summary_sheet['B3'] = "Episodes"
     summary_sheet['C3'] = "Average Win Rate (%)"
     summary_sheet['D3'] = "Average Score Diff"
-    summary_sheet['E3'] = "Path"
+    summary_sheet['E3'] = "First-Starter Advantage"
+    summary_sheet['F3'] = "Path"
     
     # Bold the headers
-    for cell in summary_sheet['A3:E3'][0]:
+    for cell in summary_sheet['A3:F3'][0]:
         cell.font = Font(bold=True)
     
     # Fill summary data
     for row_idx, (name, episode, path) in enumerate(checkpoints_info, start=4):
-        # Calculate average win rate and score diff against all other models
+        # Calculate average metrics against all other models
         win_rates = []
         score_diffs = []
+        starter_advantages = []
         
         for other_name in model_names:
             if other_name != name:
+                # Win rates
                 win_rate_str = win_rate_data.loc[name, other_name]
-                score_diff_str = score_diff_data.loc[name, other_name]
-                
                 if win_rate_str != "N/A" and win_rate_str != "—":
                     win_rates.append(float(win_rate_str.strip('%')))
                 
+                # Score diffs
+                score_diff_str = score_diff_data.loc[name, other_name]
                 if score_diff_str != "N/A" and score_diff_str != "—":
                     score_diffs.append(float(score_diff_str))
+                
+                # Starter advantage
+                starter_adv_str = starter_advantage_data.loc[name, other_name]
+                if starter_adv_str != "N/A" and starter_adv_str != "—":
+                    starter_advantages.append(float(starter_adv_str))
         
         avg_win_rate = sum(win_rates) / len(win_rates) if win_rates else float('nan')
         avg_score_diff = sum(score_diffs) / len(score_diffs) if score_diffs else float('nan')
+        avg_starter_adv = sum(starter_advantages) / len(starter_advantages) if starter_advantages else float('nan')
         
         summary_sheet[f'A{row_idx}'] = name
         summary_sheet[f'B{row_idx}'] = episode if episode != float('inf') else "Unknown"
         summary_sheet[f'C{row_idx}'] = f"{avg_win_rate:.1f}%" if not pd.isna(avg_win_rate) else "N/A"
         summary_sheet[f'D{row_idx}'] = f"{avg_score_diff:.2f}" if not pd.isna(avg_score_diff) else "N/A"
-        summary_sheet[f'E{row_idx}'] = path
+        summary_sheet[f'E{row_idx}'] = f"{avg_starter_adv:.2f}" if not pd.isna(avg_starter_adv) else "N/A"
+        summary_sheet[f'F{row_idx}'] = path
     
-    # Auto-adjust column widths
-    for column in summary_sheet.columns:
+    # Auto-adjust column widths for Summary sheet
+    for col in range(1, 7):  # Columns A-F
+        column_letter = openpyxl.utils.get_column_letter(col)
         max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
+        for row in range(1, summary_sheet.max_row + 1):
+            cell = summary_sheet.cell(row=row, column=col)
             if cell.value:
                 max_length = max(max_length, len(str(cell.value)))
         adjusted_width = max_length + 2
         summary_sheet.column_dimensions[column_letter].width = adjusted_width
     
-    # Create Win Rate sheet
-    win_rate_sheet = wb.create_sheet(title="Win Rates")
+    # Create all metric-specific sheets
+    metrics_to_create = [
+        ("Win Rates", win_rate_data, "Win Rates (Row vs Column)", 
+         "Higher percentage means the row model wins more often against the column model"),
+        ("Score Differences", score_diff_data, "Score Differences (Row minus Column)",
+         "Positive values mean the row model scores higher than the column model"),
+        ("First-Starter Advantage", starter_advantage_data, "First-Starter Advantage",
+         "Values close to 0.5 indicate no advantage, higher values indicate advantage (1.0 = 100% advantage)"),
+        ("Game Length", game_length_data, "Average Game Length (moves)",
+         "Average number of moves per game for each matchup"),
+        ("Draws", draws_data, "Draw Percentage", 
+         "Percentage of games that ended in a draw")
+    ]
     
-    # Add title
-    win_rate_sheet['A1'] = "Win Rates (Row vs Column)"
-    win_rate_sheet['A1'].font = Font(bold=True, size=14)
-    win_rate_sheet.merge_cells(f'A1:{chr(65 + len(model_names) + 1)}1')
-    
-    # Add a header for interpretation
-    win_rate_sheet['A2'] = "Higher percentage means the row model wins more often against the column model"
-    win_rate_sheet.merge_cells(f'A2:{chr(65 + len(model_names) + 1)}2')
-    
-    # Transform DataFrame to rows and add to sheet
-    for r_idx, row in enumerate(dataframe_to_rows(win_rate_data, index=True, header=True), start=4):
-        for c_idx, value in enumerate(row, start=1):
-            win_rate_sheet.cell(row=r_idx, column=c_idx, value=value)
-            
-            # Apply color gradient to win rates (green for high, red for low)
-            cell = win_rate_sheet.cell(row=r_idx, column=c_idx)
-            if isinstance(value, str) and '%' in value and value != "—":
-                try:
-                    win_rate = float(value.strip('%'))
-                    # Apply gradient: green (good) to red (bad)
-                    if win_rate >= 50:
-                        intensity = min(255, int(155 + (win_rate - 50) * 2))
-                        green_hex = format(intensity, '02x')
-                        red_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", end_color=f"{red_hex}{green_hex}55", fill_type="solid")
-                    else:
-                        intensity = min(255, int(155 + (50 - win_rate) * 2))
-                        red_hex = format(intensity, '02x')
-                        green_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", end_color=f"{red_hex}{green_hex}55", fill_type="solid")
-                except ValueError:
-                    pass
-    
-    # Apply formatting to header row and column
-    for row in win_rate_sheet.iter_rows(min_row=4, max_row=4, min_col=2):
-        for cell in row:
-            cell.font = Font(bold=True)
-    
-    for col in win_rate_sheet.iter_cols(min_col=1, max_col=1, min_row=5):
-        for cell in col:
-            cell.font = Font(bold=True)
-    
-    # Auto-adjust column widths
-    for column in win_rate_sheet.columns:
-        max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = max_length + 2
-        win_rate_sheet.column_dimensions[column_letter].width = adjusted_width
-    
-    # Create Score Difference sheet
-    score_diff_sheet = wb.create_sheet(title="Score Differences")
-    
-    # Add title
-    score_diff_sheet['A1'] = "Score Differences (Row minus Column)"
-    score_diff_sheet['A1'].font = Font(bold=True, size=14)
-    score_diff_sheet.merge_cells(f'A1:{chr(65 + len(model_names) + 1)}1')
-    
-    # Add a header for interpretation
-    score_diff_sheet['A2'] = "Positive values mean the row model scores higher than the column model"
-    score_diff_sheet.merge_cells(f'A2:{chr(65 + len(model_names) + 1)}2')
-    
-    # Transform DataFrame to rows and add to sheet
-    for r_idx, row in enumerate(dataframe_to_rows(score_diff_data, index=True, header=True), start=4):
-        for c_idx, value in enumerate(row, start=1):
-            score_diff_sheet.cell(row=r_idx, column=c_idx, value=value)
-            
-            # Apply color gradient to score differences
-            cell = score_diff_sheet.cell(row=r_idx, column=c_idx)
-            if isinstance(value, str) and value not in ["N/A", "—"]:
-                try:
-                    score_diff = float(value)
-                    # Apply gradient: green (positive) to red (negative)
-                    if score_diff > 0:
-                        intensity = min(255, int(155 + min(score_diff * 25, 100)))
-                        green_hex = format(intensity, '02x')
-                        red_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", end_color=f"{red_hex}{green_hex}55", fill_type="solid")
-                    elif score_diff < 0:
-                        intensity = min(255, int(155 + min(abs(score_diff) * 25, 100)))
-                        red_hex = format(intensity, '02x')
-                        green_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", end_color=f"{red_hex}{green_hex}55", fill_type="solid")
-                except ValueError:
-                    pass
-    
-    # Apply formatting to header row and column
-    for row in score_diff_sheet.iter_rows(min_row=4, max_row=4, min_col=2):
-        for cell in row:
-            cell.font = Font(bold=True)
-    
-    for col in score_diff_sheet.iter_cols(min_col=1, max_col=1, min_row=5):
-        for cell in col:
-            cell.font = Font(bold=True)
-    
-    # Auto-adjust column widths
-    for column in score_diff_sheet.columns:
-        max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = max_length + 2
-        score_diff_sheet.column_dimensions[column_letter].width = adjusted_width
+    for sheet_name, data_frame, title, description in metrics_to_create:
+        sheet = wb.create_sheet(title=sheet_name)
+        
+        # Add title and description
+        sheet['A1'] = title
+        sheet['A1'].font = Font(bold=True, size=14)
+        sheet.merge_cells(f'A1:{chr(65 + len(model_names) + 1)}1')
+        
+        sheet['A2'] = description
+        sheet.merge_cells(f'A2:{chr(65 + len(model_names) + 1)}2')
+        
+        # Add data from DataFrame
+        for r_idx, row in enumerate(dataframe_to_rows(data_frame, index=True, header=True), start=4):
+            for c_idx, value in enumerate(row, start=1):
+                sheet.cell(row=r_idx, column=c_idx, value=value)
+                
+                # Apply conditional formatting based on sheet type
+                cell = sheet.cell(row=r_idx, column=c_idx)
+                
+                if sheet_name == "Win Rates" and isinstance(value, str) and '%' in value and value != "—":
+                    # Apply color gradient to win rates (green for high, red for low)
+                    try:
+                        win_rate = float(value.strip('%'))
+                        if win_rate >= 50:
+                            intensity = min(255, int(155 + (win_rate - 50) * 2))
+                            green_hex = format(intensity, '02x')
+                            red_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                  end_color=f"{red_hex}{green_hex}55", 
+                                                  fill_type="solid")
+                        else:
+                            intensity = min(255, int(155 + (50 - win_rate) * 2))
+                            red_hex = format(intensity, '02x')
+                            green_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                  end_color=f"{red_hex}{green_hex}55", 
+                                                  fill_type="solid")
+                    except ValueError:
+                        pass
+                
+                elif sheet_name == "Score Differences" and isinstance(value, str) and value not in ["N/A", "—"]:
+                    # Apply color gradient to score differences
+                    try:
+                        score_diff = float(value)
+                        if score_diff > 0:
+                            intensity = min(255, int(155 + min(score_diff * 25, 100)))
+                            green_hex = format(intensity, '02x')
+                            red_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                  end_color=f"{red_hex}{green_hex}55", 
+                                                  fill_type="solid")
+                        elif score_diff < 0:
+                            intensity = min(255, int(155 + min(abs(score_diff) * 25, 100)))
+                            red_hex = format(intensity, '02x')
+                            green_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                  end_color=f"{red_hex}{green_hex}55", 
+                                                  fill_type="solid")
+                    except ValueError:
+                        pass
+                
+                elif sheet_name == "First-Starter Advantage" and isinstance(value, str) and value not in ["N/A", "—"]:
+                    # Apply color gradient to starter advantage (neutral at 0.5)
+                    try:
+                        advantage = float(value)
+                        # Distance from 0.5 (neutral)
+                        distance = abs(advantage - 0.5)
+                        intensity = min(255, int(155 + min(distance * 200, 100)))
+                        blue_hex = format(intensity, '02x')
+                        cell.fill = PatternFill(start_color=f"55{blue_hex}{blue_hex}", 
+                                              end_color=f"55{blue_hex}{blue_hex}", 
+                                              fill_type="solid")
+                    except ValueError:
+                        pass
+        
+        # Apply formatting to header row and column
+        for row in sheet.iter_rows(min_row=4, max_row=4, min_col=2):
+            for cell in row:
+                cell.font = Font(bold=True)
+        
+        for col in sheet.iter_cols(min_col=1, max_col=1, min_row=5):
+            for cell in col:
+                cell.font = Font(bold=True)
+        
+        # Auto-adjust column widths
+        max_col = len(model_names) + 1
+        for col in range(1, max_col + 1):
+            column_letter = openpyxl.utils.get_column_letter(col)
+            max_length = 0
+            for row in range(1, sheet.max_row + 1):
+                cell = sheet.cell(row=row, column=col)
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            adjusted_width = max_length + 2
+            sheet.column_dimensions[column_letter].width = adjusted_width
     
     # Create a Detailed Results sheet
     detailed_sheet = wb.create_sheet(title="Detailed Results")
@@ -502,7 +522,7 @@ def generate_excel_comparison(checkpoint_paths, results, output_file):
     # Add headers
     detailed_sheet['A1'] = "Detailed Matchup Results"
     detailed_sheet['A1'].font = Font(bold=True, size=14)
-    detailed_sheet.merge_cells('A1:H1')
+    detailed_sheet.merge_cells('A1:J1')
     
     row_idx = 3
     detailed_sheet[f'A{row_idx}'] = "Model A"
@@ -510,12 +530,14 @@ def generate_excel_comparison(checkpoint_paths, results, output_file):
     detailed_sheet[f'C{row_idx}'] = "A Wins"
     detailed_sheet[f'D{row_idx}'] = "B Wins"
     detailed_sheet[f'E{row_idx}'] = "Draws"
-    detailed_sheet[f'F{row_idx}'] = "A Avg Score"
-    detailed_sheet[f'G{row_idx}'] = "B Avg Score"
-    detailed_sheet[f'H{row_idx}'] = "Score Diff (A-B)"
+    detailed_sheet[f'F{row_idx}'] = "A Win %"
+    detailed_sheet[f'G{row_idx}'] = "B Win %"
+    detailed_sheet[f'H{row_idx}'] = "A Avg Score"
+    detailed_sheet[f'I{row_idx}'] = "B Avg Score"
+    detailed_sheet[f'J{row_idx}'] = "First-Starter Advantage"
     
     # Bold the headers
-    for cell in detailed_sheet[f'A{row_idx}:H{row_idx}'][0]:
+    for cell in detailed_sheet[f'A{row_idx}:J{row_idx}'][0]:
         cell.font = Font(bold=True)
     
     # Add detailed results
@@ -524,22 +546,41 @@ def generate_excel_comparison(checkpoint_paths, results, output_file):
         agents = matchup.split("_vs_")
         agent1_name, agent2_name = agents
         
+        # Calculate metrics
+        total_games = data['games']
+        agent1_wins = data['agent1_wins']
+        agent2_wins = data['agent2_wins']
+        draws = data['draws']
+        
+        agent1_win_pct = (agent1_wins / total_games) * 100
+        agent2_win_pct = (agent2_wins / total_games) * 100
+        
+        total_decided_games = agent1_wins + agent2_wins
+        if total_decided_games > 0:
+            first_starter_advantage = data['first_starter_wins'] / total_decided_games
+        else:
+            first_starter_advantage = 0.5  # Default to no advantage
+        
+        # Add data to sheet
         detailed_sheet[f'A{row_idx}'] = agent1_name
         detailed_sheet[f'B{row_idx}'] = agent2_name
-        detailed_sheet[f'C{row_idx}'] = data['agent1_wins']
-        detailed_sheet[f'D{row_idx}'] = data['agent2_wins']
-        detailed_sheet[f'E{row_idx}'] = data['draws']
-        detailed_sheet[f'F{row_idx}'] = data['agent1_avg_score']
-        detailed_sheet[f'G{row_idx}'] = data['agent2_avg_score']
-        detailed_sheet[f'H{row_idx}'] = data['agent1_avg_score'] - data['agent2_avg_score']
+        detailed_sheet[f'C{row_idx}'] = agent1_wins
+        detailed_sheet[f'D{row_idx}'] = agent2_wins
+        detailed_sheet[f'E{row_idx}'] = draws
+        detailed_sheet[f'F{row_idx}'] = f"{agent1_win_pct:.1f}%"
+        detailed_sheet[f'G{row_idx}'] = f"{agent2_win_pct:.1f}%"
+        detailed_sheet[f'H{row_idx}'] = data['agent1_avg_score']
+        detailed_sheet[f'I{row_idx}'] = data['agent2_avg_score']
+        detailed_sheet[f'J{row_idx}'] = f"{first_starter_advantage:.2f}"
         
         row_idx += 1
     
-    # Auto-adjust column widths
-    for column in detailed_sheet.columns:
+    # Auto-adjust column widths for Detailed Results
+    for col in range(1, 11):  # Columns A-J
+        column_letter = openpyxl.utils.get_column_letter(col)
         max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
+        for row in range(1, detailed_sheet.max_row + 1):
+            cell = detailed_sheet.cell(row=row, column=col)
             if cell.value:
                 max_length = max(max_length, len(str(cell.value)))
         adjusted_width = max_length + 2
@@ -547,7 +588,7 @@ def generate_excel_comparison(checkpoint_paths, results, output_file):
     
     # Save the workbook
     wb.save(output_file)
-    print(f"\nExcel comparison report saved to {output_file}")
+    print(f"\nEnhanced Excel comparison report saved to {output_file}")
     
     return output_file
 
