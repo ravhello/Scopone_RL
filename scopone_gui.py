@@ -4458,6 +4458,12 @@ class GameScreen(BaseScreen):
         
         # Filter moves to only include opponent moves (not the user's moves)
         mode = self.app.game_config.get("mode")
+        # Determina l'ID locale in modo robusto (specialmente per client online)
+        effective_local_id = self.local_player_id
+        if mode == "online_multiplayer" and hasattr(self.app, "network") and self.app.network:
+            net_player_id = getattr(self.app.network, "player_id", None)
+            if net_player_id is not None:
+                effective_local_id = net_player_id
         opponent_moves = []
         
         for move in history:
@@ -4468,14 +4474,15 @@ class GameScreen(BaseScreen):
                 # In single player, opponents are players 1, 2, 3
                 is_opponent = player != 0
             elif mode == "team_vs_ai":
-                # In team vs AI, opponents are players 1, 3 (AI team)
-                is_opponent = player in [1, 3]
+                # In team vs AI locale, escludi solo le mosse del giocatore attualmente controllato
+                # (così vediamo anche quelle del partner umano quando stiamo guardando come partner)
+                is_opponent = player != self.current_player_id
             elif mode == "local_multiplayer":
                 # In local multiplayer, all other players are opponents
                 is_opponent = player != self.current_player_id
             elif mode == "online_multiplayer":
-                # In online multiplayer, all other players are opponents
-                is_opponent = player != self.local_player_id
+                # In online multiplayer, all other players are opponents rispetto al locale
+                is_opponent = player != effective_local_id
             
             if is_opponent:
                 opponent_moves.append(move)
