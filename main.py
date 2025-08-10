@@ -30,7 +30,7 @@ if torch.cuda.is_available():
     torch.cuda.memory.set_per_process_memory_fraction(0.95)  # Usa fino al 95% della memoria disponibile
 
 from environment import ScoponeEnvMA
-
+"""
 # Alla fine di ogni episodio
 # Forza garbage collection
 import gc
@@ -41,16 +41,23 @@ if torch.cuda.is_available():
     # Stampa statistiche memoria
     print(f"  GPU memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
     print(f"  GPU memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB")
+"""
 
 # Parametri di rete e training
 LR = 1e-3
 EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
-BATCH_SIZE = 128          # dimensione mini-batch
+# Nota: BATCH_SIZE non più utilizzato - processiamo tutti i dati in un'unica passata
 REPLAY_SIZE = 10000      # capacità massima del replay buffer
-TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target
+TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target (ora usato solo per sincronizzazione globale)
 CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"
+
+# Configura la frammentazione della memoria CUDA per dataset grandi
+if torch.cuda.is_available():
+    # Prova ad allocare memoria in blocchi più grandi per ridurre la frammentazione
+    torch.cuda.empty_cache()
+    torch.cuda.memory_stats()
 
 ############################################################
 # 1) Definiamo una classe EpisodicReplayBuffer
@@ -291,7 +298,7 @@ class DQNAgent:
     #@profile
     def train_episodic_monte_carlo(self, specific_episode=None):
         """
-        Versione ottimizzata con buffers pre-allocati e mixed precision.
+        Versione ottimizzata per tenere tutto in GPU senza batching.
         """
         # Determina quali episodi processare
         if specific_episode is not None:
@@ -337,70 +344,38 @@ class DQNAgent:
         if idx == 0:
             return  # Nessuna transizione da processare
         
-        # Usa slices dei buffer per il training
+        # Usa slices dei buffer per il training - processa tutto in un'unica passata
         all_obs_t = self.train_obs_buffer[:idx]
         all_actions_t = self.train_actions_buffer[:idx]
         all_returns_t = self.train_returns_buffer[:idx]
         
-        # Aumenta batch_size per sfruttare meglio la GPU
-        batch_size = min(512, idx)  # Dimensione ottimizzata per GPU moderne
-        num_batches = (idx + batch_size - 1) // batch_size
-        
-        # Riduci la frequenza di sync_target
-        sync_counter = 0
-        sync_frequency = 10  # Sincronizza ogni 10 batch invece di ogni batch
-        
-        # Traccia le metriche per diagnostica
-        total_loss = 0.0
-        batch_count = 0
-        
-        # OTTIMIZZAZIONE: Usa mixed precision in modo più efficiente con float16
+        # OTTIMIZZAZIONE: Usa mixed precision con un singolo forward pass per tutti i dati
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, idx)
-                
-                # Prendi slices dei tensori già sulla GPU (evita copie)
-                batch_obs_t = all_obs_t[start_idx:end_idx]
-                batch_actions_t = all_actions_t[start_idx:end_idx]
-                batch_returns_t = all_returns_t[start_idx:end_idx]
-                
-                # OTTIMIZZAZIONE: Zero gradients - usa set_to_none=True per maggiore efficienza di memoria
-                self.optimizer.zero_grad(set_to_none=True)
-                
-                # OTTIMIZZAZIONE: Forward pass con kernel fusion dove possibile
-                q_values = self.online_qnet(batch_obs_t)
-                q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
-                
-                # OTTIMIZZAZIONE: Loss con mixed precision - usa reduction='mean' per stabilità numerica
-                loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
-                
-                # Traccia la loss per diagnostica
-                total_loss += loss.item()
-                batch_count += 1
-                
-                # OTTIMIZZAZIONE: Backward e optimizer step con gradient scaling per mixed precision
-                self.scaler.scale(loss).backward()
-                
-                # OTTIMIZZAZIONE: Clip gradient con una norma moderata per stabilità di training
-                torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
-                
-                # OTTIMIZZAZIONE: Optimizer step con scaling
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
-                # Aggiorna epsilon dopo ogni batch per avanzare il training
-                self.update_epsilon()
-                
-                # OTTIMIZZAZIONE: Sync target network periodicamente (non ad ogni batch)
-                sync_counter += 1
-                if sync_counter >= sync_frequency:
-                    self.sync_target()
-                    sync_counter = 0
-                    
-                # OTTIMIZZAZIONE: Rilascia memoria GPU periodicamente
-                if batch_idx % 10 == 0 and batch_idx > 0:
-                    torch.cuda.empty_cache()
+            # OTTIMIZZAZIONE: Zero gradients - usa set_to_none=True per maggiore efficienza di memoria
+            self.optimizer.zero_grad(set_to_none=True)
+            
+            # OTTIMIZZAZIONE: Forward pass con kernel fusion dove possibile
+            q_values = self.online_qnet(all_obs_t)
+            q_values_for_actions = torch.sum(q_values * all_actions_t, dim=1)
+            
+            # OTTIMIZZAZIONE: Loss con mixed precision - usa reduction='mean' per stabilità numerica
+            loss = nn.MSELoss()(q_values_for_actions, all_returns_t)
+            
+            # OTTIMIZZAZIONE: Backward e optimizer step con gradient scaling per mixed precision
+            self.scaler.scale(loss).backward()
+            
+            # OTTIMIZZAZIONE: Clip gradient con una norma moderata per stabilità di training
+            torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
+            
+            # OTTIMIZZAZIONE: Optimizer step con scaling
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+            # Aggiorna epsilon una sola volta
+            self.update_epsilon()
+            
+            # Sincronizza le reti target
+            self.sync_target()
     
     #@profile
     def store_episode_transition(self, transition):
@@ -772,41 +747,29 @@ def train_agents(num_episodes=10):
             team0_obs_t, team0_actions_t, team0_rewards_t = team0_batch
             
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                # Processa in batch più grandi per sfruttare meglio la GPU
-                batch_size = min(512, len(team0_obs_t))
-                num_batches = (len(team0_obs_t) + batch_size - 1) // batch_size
+                # Processa tutto l'episodio in un'unica passata (no batching)
+                # Zero gradients efficienti
+                agent_team0.optimizer.zero_grad(set_to_none=True)
                 
-                for batch_idx in range(num_batches):
-                    start_idx = batch_idx * batch_size
-                    end_idx = min(start_idx + batch_size, len(team0_obs_t))
-                    
-                    # Slices dei tensori già sulla GPU
-                    batch_obs_t = team0_obs_t[start_idx:end_idx]
-                    batch_actions_t = team0_actions_t[start_idx:end_idx]
-                    batch_returns_t = team0_rewards_t[start_idx:end_idx]
-                    
-                    # Zero gradients efficienti
-                    agent_team0.optimizer.zero_grad(set_to_none=True)
-                    
-                    # Forward pass ottimizzato
-                    q_values = agent_team0.online_qnet(batch_obs_t)
-                    q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
-                    
-                    # Loss con stabilità numerica
-                    loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
-                    
-                    # Backward con scaling
-                    agent_team0.scaler.scale(loss).backward()
-                    
-                    # Gradient clipping per stabilità
-                    torch.nn.utils.clip_grad_norm_(agent_team0.online_qnet.parameters(), max_norm=10.0)
-                    
-                    # Step con scaling
-                    agent_team0.scaler.step(agent_team0.optimizer)
-                    agent_team0.scaler.update()
-                    
-                    # Aggiorna epsilon
-                    agent_team0.update_epsilon()
+                # Forward pass ottimizzato su tutto il dataset
+                q_values = agent_team0.online_qnet(team0_obs_t)
+                q_values_for_actions = torch.sum(q_values * team0_actions_t, dim=1)
+                
+                # Loss con stabilità numerica
+                loss = nn.MSELoss()(q_values_for_actions, team0_rewards_t)
+                
+                # Backward con scaling
+                agent_team0.scaler.scale(loss).backward()
+                
+                # Gradient clipping per stabilità
+                torch.nn.utils.clip_grad_norm_(agent_team0.online_qnet.parameters(), max_norm=10.0)
+                
+                # Step con scaling
+                agent_team0.scaler.step(agent_team0.optimizer)
+                agent_team0.scaler.update()
+                
+                # Aggiorna epsilon
+                agent_team0.update_epsilon()
         
         # Team 1 training con uguale logica ottimizzata
         if team1_batch:
@@ -815,30 +778,24 @@ def train_agents(num_episodes=10):
             team1_obs_t, team1_actions_t, team1_rewards_t = team1_batch
             
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                batch_size = min(512, len(team1_obs_t))
-                num_batches = (len(team1_obs_t) + batch_size - 1) // batch_size
+                # Processa tutto l'episodio in un'unica passata (no batching)
+                agent_team1.optimizer.zero_grad(set_to_none=True)
                 
-                for batch_idx in range(num_batches):
-                    start_idx = batch_idx * batch_size
-                    end_idx = min(start_idx + batch_size, len(team1_obs_t))
-                    
-                    batch_obs_t = team1_obs_t[start_idx:end_idx]
-                    batch_actions_t = team1_actions_t[start_idx:end_idx]
-                    batch_returns_t = team1_rewards_t[start_idx:end_idx]
-                    
-                    agent_team1.optimizer.zero_grad(set_to_none=True)
-                    
-                    q_values = agent_team1.online_qnet(batch_obs_t)
-                    q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
-                    
-                    loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
-                    
-                    agent_team1.scaler.scale(loss).backward()
-                    torch.nn.utils.clip_grad_norm_(agent_team1.online_qnet.parameters(), max_norm=10.0)
-                    agent_team1.scaler.step(agent_team1.optimizer)
-                    agent_team1.scaler.update()
-                    
-                    agent_team1.update_epsilon()
+                # Forward pass ottimizzato su tutto il dataset
+                q_values = agent_team1.online_qnet(team1_obs_t)
+                q_values_for_actions = torch.sum(q_values * team1_actions_t, dim=1)
+                
+                # Loss con stabilità numerica
+                loss = nn.MSELoss()(q_values_for_actions, team1_rewards_t)
+                
+                # Backward con scaling
+                agent_team1.scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(agent_team1.online_qnet.parameters(), max_norm=10.0)
+                agent_team1.scaler.step(agent_team1.optimizer)
+                agent_team1.scaler.update()
+                
+                # Aggiorna epsilon
+                agent_team1.update_epsilon()
         
         # OTTIMIZZAZIONE: Sincronizzazione target network meno frequente
         if global_step % TARGET_UPDATE_FREQ == 0:
@@ -888,32 +845,23 @@ def train_agents(num_episodes=10):
                                 team0_rewards_buffer[idx] = episode_reward
                                 idx += 1
                 
-                # Training su mega-batch
+                # Training su tutti gli episodi passati in un'unica passata
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    batch_size = min(512, idx)
-                    num_batches = (idx + batch_size - 1) // batch_size
+                    # Utilizza tutti i dati in un'unica forward pass
+                    agent_team0.optimizer.zero_grad(set_to_none=True)
                     
-                    for batch_idx in range(num_batches):
-                        start_idx = batch_idx * batch_size
-                        end_idx = min(start_idx + batch_size, idx)
-                        
-                        batch_obs_t = team0_obs_buffer[start_idx:end_idx]
-                        batch_actions_t = team0_actions_buffer[start_idx:end_idx]
-                        batch_returns_t = team0_rewards_buffer[start_idx:end_idx]
-                        
-                        agent_team0.optimizer.zero_grad(set_to_none=True)
-                        
-                        q_values = agent_team0.online_qnet(batch_obs_t)
-                        q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
-                        
-                        loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
-                        
-                        agent_team0.scaler.scale(loss).backward()
-                        torch.nn.utils.clip_grad_norm_(agent_team0.online_qnet.parameters(), max_norm=10.0)
-                        agent_team0.scaler.step(agent_team0.optimizer)
-                        agent_team0.scaler.update()
-                        
-                        agent_team0.update_epsilon()
+                    # Usa gli intero buffer (fino all'indice idx)
+                    q_values = agent_team0.online_qnet(team0_obs_buffer[:idx])
+                    q_values_for_actions = torch.sum(q_values * team0_actions_buffer[:idx], dim=1)
+                    
+                    loss = nn.MSELoss()(q_values_for_actions, team0_rewards_buffer[:idx])
+                    
+                    agent_team0.scaler.scale(loss).backward()
+                    torch.nn.utils.clip_grad_norm_(agent_team0.online_qnet.parameters(), max_norm=10.0)
+                    agent_team0.scaler.step(agent_team0.optimizer)
+                    agent_team0.scaler.update()
+                    
+                    agent_team0.update_epsilon()
             
             # Team 1 training con stessa logica ottimizzata
             if len(agent_team1.episodic_buffer.episodes) > 3:
@@ -950,59 +898,29 @@ def train_agents(num_episodes=10):
                                 idx += 1
                 
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    batch_size = min(512, idx)
-                    num_batches = (idx + batch_size - 1) // batch_size
+                    # Utilizza tutti i dati in un'unica forward pass
+                    agent_team1.optimizer.zero_grad(set_to_none=True)
                     
-                    for batch_idx in range(num_batches):
-                        start_idx = batch_idx * batch_size
-                        end_idx = min(start_idx + batch_size, idx)
-                        
-                        batch_obs_t = team1_obs_buffer[start_idx:end_idx]
-                        batch_actions_t = team1_actions_buffer[start_idx:end_idx]
-                        batch_returns_t = team1_rewards_buffer[start_idx:end_idx]
-                        
-                        agent_team1.optimizer.zero_grad(set_to_none=True)
-                        
-                        q_values = agent_team1.online_qnet(batch_obs_t)
-                        q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
-                        
-                        loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
-                        
-                        agent_team1.scaler.scale(loss).backward()
-                        torch.nn.utils.clip_grad_norm_(agent_team1.online_qnet.parameters(), max_norm=10.0)
-                        agent_team1.scaler.step(agent_team1.optimizer)
-                        agent_team1.scaler.update()
-                        
-                        agent_team1.update_epsilon()
-        
-        # OTTIMIZZAZIONE: Pulizia memoria aggressiva
-        # Rimuovi riferimenti espliciti
-        team0_batch = None
-        team1_batch = None
-        
-        # Forza garbage collection
-        import gc
-        gc.collect()
-        
-        # Libera memoria CUDA
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.memory_stats()  # Riorganizza allocazione
+                    # Usa l'intero buffer (fino all'indice idx)
+                    q_values = agent_team1.online_qnet(team1_obs_buffer[:idx])
+                    q_values_for_actions = torch.sum(q_values * team1_actions_buffer[:idx], dim=1)
+                    
+                    loss = nn.MSELoss()(q_values_for_actions, team1_rewards_buffer[:idx])
+                    
+                    agent_team1.scaler.scale(loss).backward()
+                    torch.nn.utils.clip_grad_norm_(agent_team1.online_qnet.parameters(), max_norm=10.0)
+                    agent_team1.scaler.step(agent_team1.optimizer)
+                    agent_team1.scaler.update()
+                    
+                    agent_team1.update_epsilon()
         
         # Traccia tempo di training
         train_time = time.time() - train_start_time
         train_times.append(train_time)
-        #print(f"  Training completato in {train_time:.2f} secondi")
-        
-        # Monitoraggio memoria GPU
-        #if torch.cuda.is_available():
-            #print(f"  GPU memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocated, "
-                  #f"{torch.cuda.memory_reserved()/1024**2:.1f}MB reserved")
         
         # Tempo totale episodio
         episode_time = time.time() - episode_start_time
         episode_times.append(episode_time)
-        #print(f"Episodio {ep+1} completato in {episode_time:.2f} secondi")
         
         # Salva checkpoint periodici e checkpoint senza numero episodio
         if (ep + 1) % 1000 == 0 or ep == num_episodes - 1:
@@ -1046,9 +964,3 @@ def train_agents(num_episodes=10):
 if __name__ == "__main__":
     # Esegui il training per pochi episodi per profilare
     train_agents(num_episodes=200000)
-    
-    # Stampa i risultati del profiling
-    #global_profiler.print_stats()
-    
-    # Genera un report dettagliato e salvalo su file
-    #report = global_profiler.generate_report("profiling_report.txt")
