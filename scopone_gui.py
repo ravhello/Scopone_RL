@@ -27,6 +27,7 @@ DARK_GREEN = (0, 100, 0)
 TABLE_GREEN = (26, 105, 66)
 HIGHLIGHT_BLUE = (0, 120, 215)
 HIGHLIGHT_RED = (220, 53, 69)
+DARK_RED = (139, 0, 0)
 GOLD = (255, 215, 0)
 DARK_BLUE = (20, 51, 104)
 LIGHT_BLUE = (100, 149, 237)
@@ -1702,6 +1703,14 @@ class GameScreen(BaseScreen):
         self.reconnection_attempts = 0
         self.max_reconnection_time = 60  # 60 seconds (1 minute) timeout
         
+        # Replay functionality
+        self.replay_button = None
+        self.replay_active = False
+        self.replay_moves = []
+        self.replay_current_index = 0
+        self.replay_animations = []
+        self.replay_table_state = []
+    
     def create_exit_button(self):
         """Create a prominent exit button when connection is lost"""
         width = self.app.window_width
@@ -2123,6 +2132,16 @@ class GameScreen(BaseScreen):
             (0, 150, 0), WHITE
         )
         
+        # Replay button - positioned above the Play Card button
+        self.replay_button = Button(
+            width - button_width - width * 0.01,
+            height - button_height - height * 0.01 - button_height - height * 0.01,
+            button_width, 
+            button_height,
+            "Replay Last 3", 
+            DARK_BLUE, WHITE
+        )
+        
         # Message log - top right corner
         self.message_log_rect = pygame.Rect(
             width - width * 0.25 - width * 0.02,
@@ -2205,6 +2224,10 @@ class GameScreen(BaseScreen):
                 if self.confirm_button.is_clicked(pos):
                     self.try_make_move()
                 
+                # Process replay button
+                if self.replay_button.is_clicked(pos):
+                    self.start_replay()
+                
                 # Check hand cards with visual perspective aware logic
                 hand_card = self.get_card_at_position(pos, area="hand")
                 if hand_card:
@@ -2258,6 +2281,10 @@ class GameScreen(BaseScreen):
         
         # Update animations
         active_animations = self.update_animations()
+        
+        # Update replay animations if replay is active
+        if self.replay_active:
+            self.update_replay_animations()
         
         # FIXED: Handling of animation phases
         if hasattr(self, 'waiting_for_animation') and self.waiting_for_animation:
@@ -2579,6 +2606,9 @@ class GameScreen(BaseScreen):
         if not hasattr(self, 'cards_in_motion'):
             self.cards_in_motion = set()
         
+        # NUOVO: Lista temporanea per le carte da rimuovere dal set di movimento
+        cards_to_remove = []
+        
         # Update existing animations
         for anim in self.animations[:]:
             # Verifica se questa è un'animazione di inizio movimento
@@ -2589,10 +2619,9 @@ class GameScreen(BaseScreen):
             
             # Verifica se questa è un'animazione di cattura che termina
             if anim.animation_type == "capture" and anim.current_frame == anim.duration - 1:
-                # Rimuovi la carta dal set delle carte in movimento
-                if anim.card in self.cards_in_motion:
-                    self.cards_in_motion.remove(anim.card)
-                    #print(f"Carta {anim.card} rimossa dal set di carte in movimento")
+                # Aggiungi la carta alla lista di rimozione invece di rimuoverla immediatamente
+                cards_to_remove.append(anim.card)
+                #print(f"Carta {anim.card} marcata per rimozione dal set di carte in movimento")
             
             # Debug dettagliato
             #if hasattr(anim, 'card') and hasattr(anim, 'animation_type') and hasattr(anim, 'current_frame'):
@@ -2610,6 +2639,14 @@ class GameScreen(BaseScreen):
                 self.animations.remove(anim)
             else:
                 active_animations = True
+        
+        # NUOVO: Rimuovi le carte dal set di movimento solo se non ci sono più animazioni attive
+        # Questo evita il flash delle carte che riappaiono sul tavolo
+        if not active_animations and cards_to_remove:
+            for card in cards_to_remove:
+                if card in self.cards_in_motion:
+                    self.cards_in_motion.remove(card)
+                    #print(f"Carta {card} rimossa dal set di carte in movimento (dopo completamento animazioni)")
         
         return active_animations
     
@@ -3553,6 +3590,10 @@ class GameScreen(BaseScreen):
         # Draw animations
         self.draw_animations(surface)
         
+        # Draw replay animations if replay is active
+        if self.replay_active:
+            self.draw_replay_animations(surface)
+        
         # Draw status info
         self.draw_status_info(surface)
         
@@ -3562,6 +3603,10 @@ class GameScreen(BaseScreen):
         # Draw confirm button if current player is controllable
         if self.env and self.is_current_player_controllable() and not self.game_over:
             self.confirm_button.draw(surface)
+        
+        # Draw replay button (always visible when not in replay mode)
+        if not self.replay_active and self.env and not self.game_over:
+            self.replay_button.draw(surface)
         
         # Draw message log
         self.draw_message_log(surface)
@@ -3902,8 +3947,14 @@ class GameScreen(BaseScreen):
         """Draw the cards on the table without any rotation but with rounded corners and border"""
         if not self.env:
             return
-                    
-        table_cards = self.env.game_state["table"]
+        
+        # Use replay table state if replay is active, otherwise use current table state
+        if self.replay_active:
+            # Durante il replay usiamo SEMPRE lo stato del replay, anche se vuoto
+            table_cards = self.replay_table_state
+        else:
+            table_cards = self.env.game_state["table"]
+            
         if not table_cards:
             # Draw "No cards on table" text
             text_surf = self.info_font.render("No cards on table", True, WHITE)
@@ -3914,6 +3965,10 @@ class GameScreen(BaseScreen):
         # NUOVO: Assicurati che esista il set di carte in movimento
         if not hasattr(self, 'cards_in_motion'):
             self.cards_in_motion = set()
+        
+        # NUOVO: Assicurati che esista il set di carte in movimento per il replay
+        if not hasattr(self, 'replay_cards_in_motion'):
+            self.replay_cards_in_motion = set()
         
         # Get the current card size based on window size
         width = self.app.window_width
@@ -3931,8 +3986,8 @@ class GameScreen(BaseScreen):
         y = self.table_rect.centery - card_height // 2
         
         for i, card in enumerate(table_cards):
-            # NUOVO: Salta la carta se è nel set delle carte in movimento
-            if card in self.cards_in_motion:
+            # NUOVO: Salta la carta se è nel set delle carte in movimento (gioco normale o replay)
+            if card in self.cards_in_motion or (self.replay_active and card in self.replay_cards_in_motion):
                 continue
                 
             x = start_x + i * card_spacing
@@ -4034,7 +4089,7 @@ class GameScreen(BaseScreen):
             mini_height = int(height * 0.08)
             mini_card = pygame.Surface((mini_width, mini_height))
             mini_card.fill(WHITE)
-            pygame.draw.rect(mini_card, DARK_RED if 'DARK_RED' in globals() else (139, 0, 0), (0, 0, mini_width, mini_height), 2)
+            pygame.draw.rect(mini_card, DARK_RED, (0, 0, mini_width, mini_height), 2)
             surface.blit(mini_card, (x, y))
     
     def draw_animations(self, surface):
@@ -4390,6 +4445,397 @@ class GameScreen(BaseScreen):
         else:
             # Altre modalità: solo giocatore locale
             return self.current_player_id == self.local_player_id
+    
+    def start_replay(self):
+        """Start replay of the last 3 moves from opponents (or fewer if game just started)"""
+        if not self.env or self.replay_active:
+            return
+        
+        # Get the last moves from game history
+        history = self.env.game_state.get("history", [])
+        if not history:
+            return  # No moves to replay
+        
+        # Filter moves to only include opponent moves (not the user's moves)
+        mode = self.app.game_config.get("mode")
+        opponent_moves = []
+        
+        for move in history:
+            player = move["player"]
+            is_opponent = False
+            
+            if mode == "single_player":
+                # In single player, opponents are players 1, 2, 3
+                is_opponent = player != 0
+            elif mode == "team_vs_ai":
+                # In team vs AI, opponents are players 1, 3 (AI team)
+                is_opponent = player in [1, 3]
+            elif mode == "local_multiplayer":
+                # In local multiplayer, all other players are opponents
+                is_opponent = player != self.current_player_id
+            elif mode == "online_multiplayer":
+                # In online multiplayer, all other players are opponents
+                is_opponent = player != self.local_player_id
+            
+            if is_opponent:
+                opponent_moves.append(move)
+        
+        # Get the last 3 opponent moves (or fewer if there are less)
+        num_moves = min(3, len(opponent_moves))
+        self.replay_moves = opponent_moves[-num_moves:]
+        
+        if not self.replay_moves:
+            return
+        
+        # Calculate the table state at the beginning of the replay
+        # We need to find the state before the first replay move
+        first_replay_move_index = history.index(self.replay_moves[0])
+        self.replay_table_state = []
+        
+        # Reconstruct the table state by going through all moves before the first replay move
+        # Start with initial table state (empty)
+        table_state = []
+        
+        for i, move in enumerate(history[:first_replay_move_index]):
+            # Add the played card to the table
+            table_state.append(move["played_card"])
+            
+            # Remove captured cards from the table
+            if move["captured_cards"]:
+                for card in move["captured_cards"]:
+                    if card in table_state:
+                        table_state.remove(card)
+        
+        self.replay_table_state = table_state
+        
+        # Start replay
+        self.replay_active = True
+        self.replay_current_index = 0
+        
+        # NUOVO: Inizializza il set di carte in movimento per il replay
+        if not hasattr(self, 'replay_cards_in_motion'):
+            self.replay_cards_in_motion = set()
+        else:
+            self.replay_cards_in_motion.clear()
+        # NUOVO: Pulisci anche eventuali carte in movimento del gioco normale
+        if hasattr(self, 'cards_in_motion'):
+            self.cards_in_motion.clear()
+        
+        # Inizializza una breve pausa per mostrare lo stato iniziale del tavolo
+        self.replay_initial_pause = 20  # ~1/3 di secondo a 60 FPS
+        # Il primo movimento del replay verrà avviato da update_replay_animations dopo la pausa
+    
+    def play_next_replay_move(self):
+        """Play the next move in the replay sequence"""
+        if not self.replay_active or self.replay_current_index >= len(self.replay_moves):
+            self.end_replay()
+            return
+        
+        move = self.replay_moves[self.replay_current_index]
+        
+        # Non modifichiamo più subito lo stato del tavolo del replay.
+        # Le modifiche al tavolo avverranno sincronizzate con la fine delle animazioni
+        # (aggiunta dopo mano->tavolo, rimozione dopo cattura).
+        
+        # Create animations for this move
+        self.create_replay_animations(move)
+        
+        self.replay_current_index += 1
+    
+    def create_replay_animations(self, move):
+        """Create animations for a replay move using the same parameters as regular game animations"""
+        player = move["player"]
+        played_card = move["played_card"]
+        captured_cards = move["captured_cards"]
+        
+        # Get player's visual position
+        visual_pos = self.get_visual_position(player)
+        
+        # Calculate start position (from player's hand) - same as regular game
+        if visual_pos == 0:  # Bottom player
+            start_x = self.app.window_width // 2
+            start_y = self.app.window_height - self.card_height - self.app.window_height * 0.05
+        elif visual_pos == 1:  # Left player
+            start_x = self.app.window_width * 0.02
+            start_y = self.app.window_height // 2
+        elif visual_pos == 2:  # Top player
+            start_x = self.app.window_width // 2
+            start_y = self.app.window_height * 0.05
+        else:  # Right player
+            start_x = self.app.window_width - self.card_width - self.app.window_width * 0.02
+            start_y = self.app.window_height // 2
+        
+        start_pos = (start_x, start_y)
+        
+        # Calculate end position (center of table)
+        table_center = (self.app.window_width // 2, self.app.window_height // 2)
+        end_pos = table_center  # Default: center of table
+        
+        # If there are captured cards, calculate position like in regular game
+        if captured_cards:
+            # Calculate table positions like in regular game
+            width = self.app.window_width
+            card_width = int(width * 0.078)
+            card_height = int(card_width * 1.5)
+            
+            # Use the replay table state to find card positions
+            original_table = self.replay_table_state.copy()
+            for card in captured_cards:
+                if card not in original_table:
+                    original_table.append(card)
+            
+            max_spacing = self.table_rect.width * 0.8 / max(len(original_table), 1)
+            card_spacing = min(card_width * 1.1, max_spacing)
+            start_x = self.table_rect.centerx - (len(original_table) * card_spacing) // 2
+            table_y = self.table_rect.centery - card_height // 2
+            
+            # Find the leftmost captured card
+            leftmost_card_index = float('inf')
+            for card in captured_cards:
+                try:
+                    idx = original_table.index(card)
+                    if idx < leftmost_card_index:
+                        leftmost_card_index = idx
+                except ValueError:
+                    pass
+            
+            if leftmost_card_index != float('inf'):
+                # Position the played card to partially overlap the leftmost captured card
+                card_x = start_x + leftmost_card_index * card_spacing
+                end_pos = (card_x - card_width * 0.25, table_y + card_height / 2)
+        
+        # Use the same animation parameters as regular game animations
+        hand_to_table_duration = 15   # Same as regular game
+        plateau_duration = 30         # Same as regular game
+        capture_duration = 25         # Same as regular game
+        inter_card_delay = 10         # Same as regular game
+        
+        # Phase 1: Card from hand to table
+        hand_to_table = CardAnimation(
+            card=played_card,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            duration=hand_to_table_duration,
+            delay=0,
+            scale_start=1.0,
+            scale_end=1.0,
+            rotation_start=0,
+            rotation_end=0,
+            animation_type="replay_play"
+        )
+        # Indica se questa giocata causerà una presa
+        try:
+            hand_to_table.causes_capture = bool(captured_cards)
+        except Exception:
+            hand_to_table.causes_capture = False
+        self.replay_animations.append(hand_to_table)
+        
+        # If there are captured cards, create capture animations
+        if captured_cards:
+            # Calculate pile position for the capturing team
+            current_player = self.players[player]
+            team_id = current_player.team_id
+            pile_pos = (self.app.window_width * 0.05, self.app.window_height // 2 + (team_id * 0.2 - 0.1) * self.app.window_height)
+            
+            # Phase 2: Plateau animation (keep card visible)
+            plateau_anim = CardAnimation(
+                card=played_card,
+                start_pos=end_pos,
+                end_pos=end_pos,
+                duration=plateau_duration,
+                delay=hand_to_table_duration,
+                scale_start=1.0,
+                scale_end=1.0,
+                rotation_start=0,
+                rotation_end=0,
+                animation_type="replay_plateau"
+            )
+            self.replay_animations.append(plateau_anim)
+            
+            # Phase 3: Capture animations
+            total_time = hand_to_table_duration + plateau_duration
+            all_capture_cards = [played_card] + list(captured_cards)
+            
+            # Calculate starting positions for all cards
+            starting_positions = {}
+            starting_positions[played_card] = end_pos
+            
+            # Calculate positions of cards on the table
+            for card in captured_cards:
+                try:
+                    card_index = original_table.index(card)
+                    card_x = start_x + card_index * card_spacing
+                    card_pos = (card_x + card_width // 2, table_y + card_height // 2)
+                    starting_positions[card] = card_pos
+                except ValueError:
+                    starting_positions[card] = table_center
+            
+            # Create capture animations for each card
+            for i, card in enumerate(all_capture_cards):
+                # Slight variation in final position to avoid overlap
+                staggered_offset = card_width * 0.3
+                end_x = pile_pos[0] + random.randint(-5, 5) + i * staggered_offset
+                end_y = pile_pos[1] + random.randint(-5, 5) + i * 3
+                varied_end_pos = (end_x, end_y)
+                
+                # Calculate delay for this card
+                card_delay = total_time + i * inter_card_delay
+                
+                # NUOVO: Crea un'animazione speciale "start_motion" per tracciare l'inizio del movimento
+                motion_start_anim = CardAnimation(
+                    card=card,
+                    start_pos=starting_positions[card],  # Stessa posizione di partenza
+                    end_pos=starting_positions[card],    # Stessa posizione (non si muove)
+                    duration=1,                          # Dura solo 1 frame
+                    delay=card_delay,                    # Stesso delay dell'animazione di cattura
+                    scale_start=1.0,
+                    scale_end=1.0,
+                    rotation_start=0,
+                    rotation_end=0,
+                    animation_type="replay_start_motion"  # Tipo speciale per tracciare l'inizio del movimento
+                )
+                self.replay_animations.append(motion_start_anim)
+                
+                capture_anim = CardAnimation(
+                    card=card,
+                    start_pos=starting_positions[card],
+                    end_pos=varied_end_pos,
+                    duration=capture_duration,
+                    delay=card_delay,
+                    scale_start=1.0,
+                    scale_end=0.8,
+                    rotation_start=0,
+                    rotation_end=random.randint(-10, 10),
+                    animation_type="replay_capture"
+                )
+                self.replay_animations.append(capture_anim)
+    
+    def update_replay_animations(self):
+        """Update replay animations and trigger next move when current animations complete"""
+        if not self.replay_active:
+            return
+        
+        # NUOVO: Pausa iniziale per mostrare lo stato del tavolo prima delle mosse
+        if hasattr(self, 'replay_initial_pause') and self.replay_initial_pause > 0:
+            self.replay_initial_pause -= 1
+            if self.replay_initial_pause == 0:
+                # Avvia il primo movimento del replay
+                self.play_next_replay_move()
+            return
+        
+        # NUOVO: Assicurati che esista il set di carte in movimento per il replay
+        if not hasattr(self, 'replay_cards_in_motion'):
+            self.replay_cards_in_motion = set()
+        
+        # NUOVO: Lista temporanea per le carte da rimuovere dal set di movimento del replay
+        replay_cards_to_remove = []
+        
+        # Update all replay animations
+        completed_animations = []
+        for anim in self.replay_animations:
+            # NUOVO: Verifica se questa è un'animazione di inizio movimento
+            if anim.animation_type == "replay_start_motion" and anim.current_frame == 0:
+                # Aggiungi la carta al set delle carte in movimento del replay
+                self.replay_cards_in_motion.add(anim.card)
+                #print(f"Replay: Carta {anim.card} aggiunta al set di carte in movimento")
+            
+            # NUOVO: Quando termina l'animazione mano->tavolo, aggiungi la carta al tavolo del replay
+            if anim.animation_type == "replay_play" and anim.current_frame == anim.duration - 1:
+                # Aggiungi la carta al tavolo solo se non causa una presa immediata
+                causes_capture = getattr(anim, 'causes_capture', False)
+                if not causes_capture:
+                    if anim.card not in self.replay_table_state:
+                        self.replay_table_state.append(anim.card)
+                        #print(f"Replay: Carta {anim.card} aggiunta al tavolo dopo animazione play (no capture)")
+
+            # NUOVO: Verifica se questa è un'animazione di cattura che termina
+            if anim.animation_type == "replay_capture" and anim.current_frame == anim.duration - 1:
+                # Aggiungi la carta alla lista di rimozione invece di rimuoverla immediatamente
+                replay_cards_to_remove.append(anim.card)
+                #print(f"Replay: Carta {anim.card} marcata per rimozione dal set di carte in movimento")
+                # NUOVO: Rimuovi la carta catturata dal tavolo del replay
+                if anim.card in self.replay_table_state:
+                    try:
+                        self.replay_table_state.remove(anim.card)
+                        #print(f"Replay: Carta {anim.card} rimossa dal tavolo dopo cattura")
+                    except ValueError:
+                        pass
+            
+            if anim.update():
+                completed_animations.append(anim)
+        
+        # Remove completed animations
+        for anim in completed_animations:
+            self.replay_animations.remove(anim)
+        
+        # NUOVO: Rimuovi le carte dal set di movimento del replay solo se non ci sono più animazioni attive
+        # Questo evita il flash delle carte che riappaiono sul tavolo durante il replay
+        if not self.replay_animations and replay_cards_to_remove:
+            for card in replay_cards_to_remove:
+                if card in self.replay_cards_in_motion:
+                    self.replay_cards_in_motion.remove(card)
+                    #print(f"Replay: Carta {card} rimossa dal set di carte in movimento (dopo completamento animazioni)")
+        
+        # If all animations are done, play next move or end replay
+        if not self.replay_animations:
+            if self.replay_current_index < len(self.replay_moves):
+                self.play_next_replay_move()
+            else:
+                self.end_replay()
+    
+    def end_replay(self):
+        """End replay"""
+        self.replay_active = False
+        self.replay_moves = []
+        self.replay_current_index = 0
+        self.replay_animations = []
+        self.replay_table_state = []
+        # NUOVO: Pulisci anche il set di carte in movimento del replay
+        if hasattr(self, 'replay_cards_in_motion'):
+            self.replay_cards_in_motion.clear()
+    
+    def draw_replay_animations(self, surface):
+        """Draw replay animations with rounded corners and borders"""
+        # Border parameters
+        border_thickness = 1  # Sottile bordo nero
+        border_radius = 8     # Angoli smussati
+        
+        for anim in self.replay_animations:
+            if anim.current_frame < 0:  # Still in delay
+                continue
+                
+            current_pos = anim.get_current_pos()
+            current_scale = anim.get_current_scale()
+            current_rotation = anim.get_current_rotation()
+            
+            # Get card image
+            card_img = self.app.resources.get_card_image(anim.card)
+            if card_img:
+                # Scale the image
+                scaled_width = int(self.card_width * current_scale)
+                scaled_height = int(self.card_height * current_scale)
+                scaled_img = pygame.transform.scale(card_img, (scaled_width, scaled_height))
+                
+                # Apply rotation
+                rotated_img = pygame.transform.rotate(scaled_img, current_rotation)
+                
+                # Create rect centered at position
+                rect = rotated_img.get_rect(center=current_pos)
+                
+                # Create a version of the card with rounded corners
+                rounded_card = pygame.Surface(rotated_img.get_size(), pygame.SRCALPHA)
+                rounded_card.fill((0, 0, 0, 0))  # Transparent background
+                
+                # Draw rounded rectangle on the surface
+                pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
+                                border_radius=border_radius)
+                
+                # Use the rounded rectangle as a mask for the card
+                rounded_card.blit(rotated_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+                
+                # Draw card with border
+                pygame.draw.rect(surface, BLACK, rect.inflate(2, 2), border_radius=border_radius)
+                surface.blit(rounded_card, rect)
 
 class ScoponeApp:
     """Main application class"""
