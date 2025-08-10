@@ -123,15 +123,18 @@ class LoadingAnimation:
             self.dots_timer = current_time
     
     def draw(self, surface, message=None):
-        # Crea un overlay semi-trasparente
-        overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
+        # Usa dimensioni correnti della superficie per essere responsive al resize
+        current_width, current_height = surface.get_size()
+
+        # Crea un overlay semi-trasparente che copra l'intera superficie corrente
+        overlay = pygame.Surface((current_width, current_height), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 180))  # Nero semi-trasparente
         surface.blit(overlay, (0, 0))
         
-        # Disegna il cerchio rotante
-        center_x = self.screen_width // 2
-        center_y = self.screen_height // 2
-        radius = min(self.screen_width, self.screen_height) * 0.1
+        # Disegna il cerchio rotante centrato e proporzionale alle dimensioni correnti
+        center_x = current_width // 2
+        center_y = current_height // 2
+        radius = min(current_width, current_height) * 0.1
         
         # Disegna archi di cerchio rotanti
         for i in range(8):
@@ -148,8 +151,8 @@ class LoadingAnimation:
                            (center_x - radius, center_y - radius, radius*2, radius*2),
                            start_angle, end_angle, width=int(radius*0.2))
         
-        # Disegna il messaggio di caricamento
-        font = pygame.font.SysFont(None, int(self.screen_height * 0.04))
+        # Disegna il messaggio di caricamento con font proporzionale all'altezza corrente
+        font = pygame.font.SysFont(None, int(current_height * 0.04))
         dots_text = "." * self.dots
         if message is None:
             message = "Caricamento bot AI in corso"
@@ -2074,37 +2077,43 @@ class GameScreen(BaseScreen):
             if player.player_id == self.local_player_id:
                 print(f"Player {player.player_id} (You) is at visual position {visual_pos}")
         
-        # Avatar positions relative to hands
+        # Avatar positions between each hand and the table center, aligned to the hand
         avatar_size = int(height * 0.08)
-        
+        gap = int(width * 0.01)
+
         for player in self.players:
             visual_pos = self.get_visual_position(player.player_id)
-            
-            if visual_pos == 0:  # Bottom player - avatar to the left
+            hand_rect = player.hand_rect
+
+            if visual_pos == 0:  # Bottom player - above the hand toward table center
                 player.avatar_rect = pygame.Rect(
-                    max(width * 0.01, player.hand_rect.left - avatar_size - width * 0.07),
-                    player.hand_rect.centery - avatar_size // 2,
-                    avatar_size, avatar_size
+                    hand_rect.centerx - avatar_size // 2,
+                    hand_rect.top - avatar_size - gap,
+                    avatar_size,
+                    avatar_size,
                 )
-            elif visual_pos == 1:  # Left player - avatar to the right
+            elif visual_pos == 1:  # Left player - to the right of the hand toward table center
                 player.avatar_rect = pygame.Rect(
-                    player.hand_rect.right + width * 0.02,
-                    player.hand_rect.centery - avatar_size // 2,
-                    avatar_size, avatar_size
+                    hand_rect.right + gap,
+                    hand_rect.centery - avatar_size // 2,
+                    avatar_size,
+                    avatar_size,
                 )
-            elif visual_pos == 2:  # Top player - avatar to the left
+            elif visual_pos == 2:  # Top player - below the hand toward table center
                 player.avatar_rect = pygame.Rect(
-                    player.hand_rect.left - avatar_size - width * 0.02,
-                    player.hand_rect.centery - avatar_size // 2,
-                    avatar_size, avatar_size
+                    hand_rect.centerx - avatar_size // 2,
+                    hand_rect.bottom + gap,
+                    avatar_size,
+                    avatar_size,
                 )
-            elif visual_pos == 3:  # Right player - avatar to the left
+            elif visual_pos == 3:  # Right player - to the left of the hand toward table center
                 player.avatar_rect = pygame.Rect(
-                    player.hand_rect.left - avatar_size - width * 0.02,
-                    player.hand_rect.centery - avatar_size // 2,
-                    avatar_size, avatar_size
+                    hand_rect.left - avatar_size - gap,
+                    hand_rect.centery - avatar_size // 2,
+                    avatar_size,
+                    avatar_size,
                 )
-                
+
             # Set info rect as the same as avatar rect for compatibility
             player.info_rect = player.avatar_rect.copy()
         
@@ -2162,6 +2171,37 @@ class GameScreen(BaseScreen):
         
         # Resize card images
         self.app.resources.rescale_card_images(card_width, card_height)
+
+    def get_team_pile_rect(self, team_id: int) -> pygame.Rect:
+        """Return the rectangle where the team's captured cards pile should be drawn.
+
+        - Local team (same team as local player): bottom-left corner
+        - Opponent team: top-right corner; when AI difficulty is shown, place pile under it
+        """
+        width = self.app.window_width
+        height = self.app.window_height
+
+        pile_width = int(width * 0.14)
+        pile_height = int(height * 0.14)
+        margin_w = int(width * 0.02)
+        margin_h = int(height * 0.02)
+
+        local_team_id = self.players[self.local_player_id].team_id if hasattr(self, 'players') else 0
+        is_local_team = (team_id == local_team_id)
+
+        if is_local_team:
+            # Bottom-left
+            left = margin_w
+            top = height - margin_h - pile_height
+            return pygame.Rect(left, top, pile_width, pile_height)
+        else:
+            # Top-right; align under difficulty label when present
+            top_base = int(height * 0.02)
+            if self.app.game_config.get("mode") in ["single_player", "team_vs_ai"]:
+                top_base = int(height * 0.026) + self.small_font.get_height() + int(height * 0.012)
+            left = width - margin_w - pile_width
+            top = top_base
+            return pygame.Rect(left, top, pile_width, pile_height)
     
     def update_player_hands(self):
         """Update player hand information from game state"""
@@ -2250,18 +2290,25 @@ class GameScreen(BaseScreen):
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
-                # Check scroll button clicks
+                # Check scroll button clicks (only exist when scrollbar is visible)
                 if hasattr(self, 'scroll_up_rect') and self.scroll_up_rect.collidepoint(pos):
                     self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
                 elif hasattr(self, 'scroll_down_rect') and self.scroll_down_rect.collidepoint(pos):
-                    self.message_scroll_offset += 1  # Limit is checked in draw_message_log
+                    self.message_scroll_offset += 1  # Limit is clamped in draw_message_log
                 
-                # Check mouse wheel scrolling over message log
-                if hasattr(self, 'scrollbar_rect') and self.message_log_rect.collidepoint(pos):
+                # Mouse wheel over the message log (work with classic wheel buttons 4/5)
+                if self.message_log_rect.collidepoint(pos):
                     if event.button == 4:  # Scroll up
                         self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
                     elif event.button == 5:  # Scroll down
                         self.message_scroll_offset += 1
+
+            # Support modern mouse wheel events (pygame 2)
+            if hasattr(pygame, 'MOUSEWHEEL') and event.type == pygame.MOUSEWHEEL:
+                mouse_pos = pygame.mouse.get_pos()
+                if self.message_log_rect.collidepoint(mouse_pos):
+                    # event.y: 1 = up, -1 = down
+                    self.message_scroll_offset = max(0, self.message_scroll_offset - event.y)
     
     def update(self):
         """Update game state with improved animation handling"""
@@ -3018,8 +3065,8 @@ class GameScreen(BaseScreen):
         player = self.players[player_id]
         team_id = player.team_id
         
-        # Calculate pile position for the capturing team
-        pile_pos = (self.app.window_width * 0.05, self.app.window_height // 2 + (team_id * 0.2 - 0.1) * self.app.window_height)
+        # Calculate pile rect for the capturing team (use new pile positions)
+        pile_rect = self.get_team_pile_rect(team_id)
         
         # Calculate positions for table cards
         width = self.app.window_width
@@ -3054,9 +3101,9 @@ class GameScreen(BaseScreen):
                 # Fallback to table center if card not found
                 start_pos = table_center
             
-            # Add slight variation to end position
-            end_x = pile_pos[0] + random.randint(-5, 5)
-            end_y = pile_pos[1] + random.randint(-5, 5)
+            # End near the center of the pile rect with slight variation
+            end_x = pile_rect.centerx + random.randint(-6, 6)
+            end_y = pile_rect.centery + random.randint(-6, 6)
             varied_end_pos = (end_x, end_y)
             
             # Create animation with staggered delay
@@ -3473,9 +3520,9 @@ class GameScreen(BaseScreen):
         
         # Se ci sono carte da catturare, crea le animazioni di cattura
         if cards_captured:
-            # Calculate pile position for the capturing team
+            # Calculate pile rect for the capturing team (use new pile positions)
             team_id = current_player.team_id
-            pile_pos = (self.app.window_width * 0.05, self.app.window_height // 2 + (team_id * 0.2 - 0.1) * self.app.window_height)
+            pile_rect = self.get_team_pile_rect(team_id)
             
             # FASE 2: NUOVO - Animazione esplicita di "plateau" per mantenere la carta visibile
             # Questa animazione mantiene la carta ferma nella stessa posizione per tutto il tempo del plateau
@@ -3522,8 +3569,8 @@ class GameScreen(BaseScreen):
             for i, card in enumerate(all_capture_cards):
                 # Leggera variazione nella posizione finale per evitare sovrapposizione
                 staggered_offset = card_width * 0.3  # Ridotto per evitare sovrapposizioni eccessive
-                end_x = pile_pos[0] + random.randint(-5, 5) + i * staggered_offset
-                end_y = pile_pos[1] + random.randint(-5, 5) + i * 3
+                end_x = pile_rect.centerx + random.randint(-5, 5) + i * staggered_offset
+                end_y = pile_rect.centery + random.randint(-5, 5) + i * 3
                 varied_end_pos = (end_x, end_y)
                 
                 # Calcola il delay per questa carta
@@ -3633,8 +3680,9 @@ class GameScreen(BaseScreen):
         if not self.replay_active and self.env and not self.game_over:
             self.replay_button.draw(surface)
         
-        # Draw message log
-        self.draw_message_log(surface)
+        # Draw message log only for online multiplayer games
+        if self.app.game_config.get("mode") == "online_multiplayer":
+            self.draw_message_log(surface)
         
         # Draw game over screen if game is over
         if self.game_over and self.final_breakdown:
@@ -4049,65 +4097,60 @@ class GameScreen(BaseScreen):
         width = self.app.window_width
         height = self.app.window_height
         
-        # Calculate pile positions based on the updated layout
-        # Top center positioning
-        pile0_x = width // 2 - int(width * 0.22)  # Left of center
-        pile0_y = height * 0.02                   # Top
-        pile_width = int(width * 0.12)
-        pile_height = int(height * 0.13)
-        
-        pile1_x = width // 2 + int(width * 0.10)  # Right of center
-        pile1_y = height * 0.02                   # Top
-        
-        # Draw team 0 pile with team-specific color
+        # Helper: compute pile rect for a team (local team -> bottom-left, opponent -> top-right under difficulty)
+        def get_team_pile_rect(team_id: int) -> pygame.Rect:
+            pile_width = int(width * 0.14)
+            pile_height = int(height * 0.14)
+            margin_w = int(width * 0.02)
+            margin_h = int(height * 0.02)
+
+            local_team_id = self.players[self.local_player_id].team_id if hasattr(self, 'players') else 0
+            is_local_team = (team_id == local_team_id)
+
+            if is_local_team:
+                # Bottom-left
+                left = margin_w
+                top = height - margin_h - pile_height
+                return pygame.Rect(left, top, pile_width, pile_height)
+            else:
+                # Top-right, under difficulty if present
+                top_base = int(height * 0.02)
+                if self.app.game_config.get("mode") in ["single_player", "team_vs_ai"]:
+                    # Align under difficulty line drawn at ~0.026 with small_font height
+                    top_base = int(height * 0.026) + self.small_font.get_height() + int(height * 0.012)
+                left = width - margin_w - pile_width
+                top = top_base
+                return pygame.Rect(left, top, pile_width, pile_height)
+
+        # Team 0 pile
         team0_count = len(captured[0])
-        
-        # Draw pile background - BLUE for team 0
-        pygame.draw.rect(surface, LIGHT_BLUE, 
-                        (pile0_x, pile0_y, pile_width, pile_height), 
-                        border_radius=5)
-        
-        # Draw text
+        rect0 = get_team_pile_rect(0)
+        pygame.draw.rect(surface, LIGHT_BLUE, rect0, border_radius=5)
         text0 = f"Team 0: {team0_count} cards"
         text0_surf = self.small_font.render(text0, True, WHITE)
-        surface.blit(text0_surf, (pile0_x + 10, pile0_y + 5))
-        
-        # Draw a few cards stacked
+        surface.blit(text0_surf, (rect0.left + 10, rect0.top + 5))
         max_display = min(5, team0_count)
         for i in range(max_display):
-            # Calculate slightly offset position
-            x = pile0_x + 10 + i * 5
-            y = pile0_y + 30 + i * 5
-            
-            # Draw a mini card
+            x = rect0.left + 10 + i * 5
+            y = rect0.top + 30 + i * 5
             mini_width = int(width * 0.04)
             mini_height = int(height * 0.08)
             mini_card = pygame.Surface((mini_width, mini_height))
             mini_card.fill(WHITE)
             pygame.draw.rect(mini_card, DARK_BLUE, (0, 0, mini_width, mini_height), 2)
             surface.blit(mini_card, (x, y))
-        
-        # Draw team 1 pile with team-specific color
+
+        # Team 1 pile
         team1_count = len(captured[1])
-        
-        # Draw pile background - RED for team 1
-        pygame.draw.rect(surface, HIGHLIGHT_RED, 
-                        (pile1_x, pile1_y, pile_width, pile_height), 
-                        border_radius=5)
-        
-        # Draw text
+        rect1 = get_team_pile_rect(1)
+        pygame.draw.rect(surface, HIGHLIGHT_RED, rect1, border_radius=5)
         text1 = f"Team 1: {team1_count} cards"
         text1_surf = self.small_font.render(text1, True, WHITE)
-        surface.blit(text1_surf, (pile1_x + 10, pile1_y + 5))
-        
-        # Draw a few cards stacked
+        surface.blit(text1_surf, (rect1.left + 10, rect1.top + 5))
         max_display = min(5, team1_count)
         for i in range(max_display):
-            # Calculate slightly offset position
-            x = pile1_x + 10 + i * 5
-            y = pile1_y + 30 + i * 5
-            
-            # Draw a mini card
+            x = rect1.left + 10 + i * 5
+            y = rect1.top + 30 + i * 5
             mini_width = int(width * 0.04)
             mini_height = int(height * 0.08)
             mini_card = pygame.Surface((mini_width, mini_height))
@@ -4164,36 +4207,57 @@ class GameScreen(BaseScreen):
         """Draw game status information with emphasis on player turn"""
         width = self.app.window_width
         height = self.app.window_height
-        
+
+        # Anchor for top-left placement under the New Game button
+        if hasattr(self, "new_game_button") and self.new_game_button:
+            anchor_left = self.new_game_button.rect.left
+            anchor_top = self.new_game_button.rect.bottom + int(height * 0.01)
+        else:
+            anchor_left = int(width * 0.01)
+            anchor_top = int(height * 0.08)
+        current_y = anchor_top
+        drew_gold_line = False
+
         # Draw status message
         if self.status_message:
-            # Use attention-grabbing color if it's player's turn notification
-            msg_color = GOLD if "your turn" in self.status_message.lower() else WHITE
-            msg_font = self.title_font if "your turn" in self.status_message.lower() else self.info_font
-            
+            is_turn_msg = "your turn" in self.status_message.lower()
+            msg_color = GOLD if is_turn_msg else WHITE
+            msg_font = self.title_font if is_turn_msg else self.info_font
+
             msg_surf = msg_font.render(self.status_message, True, msg_color)
-            msg_rect = msg_surf.get_rect(center=(width // 2, height * 0.026))
-            surface.blit(msg_surf, msg_rect)
-        
+            if is_turn_msg:
+                # Place gold turn message under New Game, top-left
+                msg_rect = msg_surf.get_rect(topleft=(anchor_left, current_y))
+                surface.blit(msg_surf, msg_rect)
+                current_y = msg_rect.bottom + int(height * 0.008)
+                drew_gold_line = True
+            else:
+                # Keep non-highlighted messages centered at the top
+                msg_rect = msg_surf.get_rect(center=(width // 2, int(height * 0.026)))
+                surface.blit(msg_surf, msg_rect)
+
         # Draw current player indicator
         if self.env:
             current_player = self.players[self.current_player_id]
             turn_text = f"Current turn: {current_player.name} (Team {current_player.team_id})"
-            
-            # Use gold color if it's local player's turn
-            turn_color = GOLD if self.current_player_id == self.local_player_id else WHITE
-            
+
+            # Always show current turn in gold at top-left under New Game
+            is_local_turn = self.current_player_id == self.local_player_id
+            turn_color = GOLD
+
             turn_surf = self.info_font.render(turn_text, True, turn_color)
-            turn_rect = turn_surf.get_rect(center=(width // 2, height * 0.065))
+            turn_rect = turn_surf.get_rect(topleft=(anchor_left, current_y))
             surface.blit(turn_surf, turn_rect)
-            
-            # Add an extra indicator if it's the local player's turn
-            if self.current_player_id == self.local_player_id:
+            current_y = turn_rect.bottom + int(height * 0.006)
+
+            # Extra gold indicator for local player's turn → move under New Game
+            if is_local_turn:
                 indicator_text = "→ YOUR TURN ←"
                 indicator_surf = self.info_font.render(indicator_text, True, GOLD)
-                indicator_rect = indicator_surf.get_rect(center=(width // 2, height * 0.095))
+                indicator_rect = indicator_surf.get_rect(topleft=(anchor_left, current_y))
                 surface.blit(indicator_surf, indicator_rect)
-            
+                current_y = indicator_rect.bottom + int(height * 0.006)
+
             # Draw difficulty info if playing against AI
             if self.app.game_config.get("mode") in ["single_player", "team_vs_ai"]:
                 diff_text = "AI Difficulty: "
@@ -4206,9 +4270,9 @@ class GameScreen(BaseScreen):
                 else:
                     diff_text += "Hard"
                     diff_color = HIGHLIGHT_RED
-                
+
                 diff_surf = self.small_font.render(diff_text, True, diff_color)
-                diff_rect = diff_surf.get_rect(topright=(width - width * 0.02, height * 0.026))
+                diff_rect = diff_surf.get_rect(topright=(width - int(width * 0.02), int(height * 0.026)))
                 surface.blit(diff_surf, diff_rect)
     
     def draw_message_log(self, surface):
@@ -4662,10 +4726,10 @@ class GameScreen(BaseScreen):
         
         # If there are captured cards, create capture animations
         if captured_cards:
-            # Calculate pile position for the capturing team
+            # Calculate pile rect for the capturing team (use new pile positions)
             current_player = self.players[player]
             team_id = current_player.team_id
-            pile_pos = (self.app.window_width * 0.05, self.app.window_height // 2 + (team_id * 0.2 - 0.1) * self.app.window_height)
+            pile_rect = self.get_team_pile_rect(team_id)
             
             # Phase 2: Plateau animation (keep card visible)
             plateau_anim = CardAnimation(
@@ -4704,8 +4768,8 @@ class GameScreen(BaseScreen):
             for i, card in enumerate(all_capture_cards):
                 # Slight variation in final position to avoid overlap
                 staggered_offset = card_width * 0.3
-                end_x = pile_pos[0] + random.randint(-5, 5) + i * staggered_offset
-                end_y = pile_pos[1] + random.randint(-5, 5) + i * 3
+                end_x = pile_rect.centerx + random.randint(-5, 5) + i * staggered_offset
+                end_y = pile_rect.centery + random.randint(-5, 5) + i * 3
                 varied_end_pos = (end_x, end_y)
                 
                 # Calculate delay for this card
