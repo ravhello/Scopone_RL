@@ -3153,10 +3153,18 @@ class GameScreen(BaseScreen):
             visual_pos = self.get_visual_position(current_player.player_id)
             is_horizontal = visual_pos in [0, 2]  # Bottom or top
             
+            # Mirror drawing logic: exclude visually hidden cards
+            visible_hand = hand
+            if hasattr(self, 'visually_hidden_cards') and current_player.player_id in getattr(self, 'visually_hidden_cards', {}):
+                hidden = self.visually_hidden_cards[current_player.player_id]
+                visible_hand = [c for c in hand if c not in hidden]
+            if not visible_hand:
+                return None
+
             if is_horizontal:
                 # Horizontal hand (bottom or top player)
                 card_spread = card_width * 0.7
-                total_width = (len(hand) - 1) * card_spread + card_width
+                total_width = (len(visible_hand) - 1) * card_spread + card_width
                 start_x = hand_rect.centerx - total_width / 2
                 
                 # Y position depends on visual position
@@ -3165,18 +3173,26 @@ class GameScreen(BaseScreen):
                 else:  # Top
                     base_y = hand_rect.top
                 
-                for i, card in enumerate(hand):
+                # Iterate from top-most to bottom-most (reverse draw order)
+                for i in range(len(visible_hand) - 1, -1, -1):
+                    card = visible_hand[i]
                     # Calculate x position for this card
                     x = start_x + i * card_spread
-                    
-                    # Check if position is within this card
+                    # Base rect
                     card_rect = pygame.Rect(x, base_y, card_width, card_height)
+                    # Apply same selection offset used in draw for accurate hit-test
+                    if card == self.selected_hand_card:
+                        if visual_pos == 0:
+                            card_rect.move_ip(0, -15)
+                        else:
+                            card_rect.move_ip(0, 15)
+                    # Check hit
                     if card_rect.collidepoint(pos):
                         return card
             else:
                 # Vertical hand (left or right player)
                 card_spread = card_height * 0.4
-                total_height = (len(hand) - 1) * card_spread + card_height
+                total_height = (len(visible_hand) - 1) * card_spread + card_height
                 start_y = hand_rect.centery - total_height / 2
                 
                 # X position depends on visual position
@@ -3185,12 +3201,20 @@ class GameScreen(BaseScreen):
                 else:  # Right
                     base_x = hand_rect.right - card_width
                 
-                for i, card in enumerate(hand):
+                # Iterate from top-most to bottom-most (reverse draw order)
+                for i in range(len(visible_hand) - 1, -1, -1):
+                    card = visible_hand[i]
                     # Calculate y position for this card
                     y = start_y + i * card_spread
-                    
-                    # Check if position is within this card
+                    # Base rect
                     card_rect = pygame.Rect(base_x, y, card_width, card_height)
+                    # Apply same selection offset used in draw for accurate hit-test
+                    if card == self.selected_hand_card:
+                        if visual_pos == 1:
+                            card_rect.move_ip(15, 0)
+                        else:
+                            card_rect.move_ip(-15, 0)
+                    # Check hit
                     if card_rect.collidepoint(pos):
                         return card
             
@@ -3209,9 +3233,10 @@ class GameScreen(BaseScreen):
             start_x = self.table_rect.centerx - (len(table_cards) * card_spacing) // 2
             y = self.table_rect.centery - card_height // 2
             
-            for i, card in enumerate(table_cards):
+            # Iterate in reverse to respect draw order in case of overlap
+            for i in range(len(table_cards) - 1, -1, -1):
+                card = table_cards[i]
                 x = start_x + i * card_spacing
-                
                 # Check if position is within this card
                 card_rect = pygame.Rect(x, y, card_width, card_height)
                 if card_rect.collidepoint(pos):
@@ -3757,17 +3782,16 @@ class GameScreen(BaseScreen):
                 # Get rect for the card
                 card_rect = card_img.get_rect(center=(x + card_width/2, base_y + card_height/2))
                 
-                # Highlight selected card
+                # Apply selection offset first so highlight follows moved card
                 if card == self.selected_hand_card:
-                    # Draw selection border
-                    highlight_rect = card_rect.copy()
-                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=border_radius + 3)
-                    
                     # Raise selected card for bottom player, lower for top player
                     if visual_pos == 0:
                         card_rect.move_ip(0, -15)
                     else:
                         card_rect.move_ip(0, 15)
+                    # Draw selection border using moved rect
+                    highlight_rect = card_rect.copy()
+                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=border_radius + 3)
                 
                 # Create a version of the card with rounded corners
                 rounded_card = pygame.Surface(card_img.get_size(), pygame.SRCALPHA)
@@ -3811,17 +3835,16 @@ class GameScreen(BaseScreen):
                 # Get rect for the rotated card
                 card_rect = card_img.get_rect(center=(base_x + card_width/2, y + card_height/2))
                 
-                # Highlight selected card
+                # Apply selection offset first so highlight follows moved card
                 if card == self.selected_hand_card:
-                    # Draw selection border
-                    highlight_rect = card_rect.copy()
-                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=border_radius + 3)
-                    
                     # Move selected card outward
                     if visual_pos == 1:
                         card_rect.move_ip(15, 0)
                     else:
                         card_rect.move_ip(-15, 0)
+                    # Draw selection border using moved rect
+                    highlight_rect = card_rect.copy()
+                    pygame.draw.rect(surface, HIGHLIGHT_BLUE, highlight_rect.inflate(10, 10), 3, border_radius=border_radius + 3)
                 
                 # Create a version of the card with rounded corners
                 rounded_card = pygame.Surface(card_img.get_size(), pygame.SRCALPHA)
