@@ -33,7 +33,12 @@ DARK_BLUE = (20, 51, 104)
 LIGHT_BLUE = (100, 149, 237)
 GRAY = (128, 128, 128)
 LIGHT_GRAY = (200, 200, 200)
-
+# Additional UI colors for status dots
+GREEN = (0, 170, 0)
+LIGHT_GREEN = (144, 238, 144)
+ORANGE = (255, 165, 0)
+YELLOW = (255, 215, 0)  # same as GOLD, explicit alias for clarity
+RED = (255, 0, 0)
 # Card dimensions
 CARD_WIDTH = 80
 CARD_HEIGHT = 120
@@ -3932,6 +3937,9 @@ class GameScreen(BaseScreen):
         # Draw status info
         self.draw_status_info(surface)
 
+        # Draw live points panel next to Player 0 avatar
+        self.draw_live_points_panel(surface)
+
         # Draw message log LAST in online multiplayer so it stays in front of team boxes and cards
         if self.app.game_config.get("mode") == "online_multiplayer":
             self.draw_message_log(surface)
@@ -4666,6 +4674,228 @@ class GameScreen(BaseScreen):
                 diff_rect = diff_surf.get_rect(topright=(width - int(width * 0.02), int(height * 0.026)))
                 surface.blit(diff_surf, diff_rect)
     
+    def draw_live_points_panel(self, surface):
+        """Small live score panel near Player 0's avatar showing current statuses.
+
+        Displays per team:
+        - Carte (majority so far)
+        - Ori (denari majority)
+        - Primiera leader
+        - Settebello possession
+        - Scope count
+        """
+        if not getattr(self, 'env', None) or not getattr(self, 'players', None):
+            return
+
+        # Anchor to player 0 avatar
+        try:
+            player0 = next(p for p in self.players if p.player_id == 0)
+        except StopIteration:
+            return
+
+        width = self.app.window_width
+        height = self.app.window_height
+        anchor = player0.avatar_rect
+
+        panel_w = int(width * 0.16)
+        panel_h = int(height * 0.08)
+        margin = max(6, int(min(width, height) * 0.01))
+
+        # Prefer to the right of avatar; fallback left if needed
+        x = anchor.right + margin
+        y = anchor.top
+        if x + panel_w > width - margin:
+            x = anchor.left - margin - panel_w
+        x = max(margin, min(x, width - margin - panel_w))
+        y = max(margin, min(y, height - margin - panel_h))
+
+        panel_rect = pygame.Rect(x, y, panel_w, panel_h)
+
+        # Semi-transparent rounded background + border
+        panel_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        pygame.draw.rect(panel_surf, (0, 0, 0, 170), panel_surf.get_rect(), border_radius=8)
+        pygame.draw.rect(panel_surf, WHITE, panel_surf.get_rect(), 2, border_radius=8)
+
+        small_font = pygame.font.SysFont(None, int(height * 0.022))
+
+        # Gather game data
+        gs = self.env.game_state
+        captured = gs.get("captured_squads", {0: [], 1: []})
+        team_cards_0 = captured[0] if isinstance(captured, (list, tuple)) else captured.get(0, [])
+        team_cards_1 = captured[1] if isinstance(captured, (list, tuple)) else captured.get(1, [])
+
+        # Remaining cards pool (all hands + table)
+        remaining_cards = []
+        hands = gs.get("hands", {})
+        for pid in range(4):
+            remaining_cards.extend(hands.get(pid, []))
+        remaining_cards.extend(gs.get("table", []))
+        rem_total = len(remaining_cards)
+        rem_den = sum(1 for r, s in remaining_cards if s == 'denari')
+
+        # Scope counts
+        scope0 = 0
+        scope1 = 0
+        for move in gs.get("history", []):
+            if move.get("capture_type") == "scopa":
+                if move.get("player") in [0, 2]:
+                    scope0 += 1
+                else:
+                    scope1 += 1
+
+        # Carte majority indicator
+        c0 = len(team_cards_0)
+        c1 = len(team_cards_1)
+        lead_c0 = 1 if c0 > c1 else 0 if c0 == c1 else -1
+
+        # Denari majority
+        den0 = sum(1 for r, s in team_cards_0 if s == 'denari')
+        den1 = sum(1 for r, s in team_cards_1 if s == 'denari')
+        lead_d0 = 1 if den0 > den1 else 0 if den0 == den1 else -1
+
+        # Primiera leader
+        val_map = {1: 16, 2: 12, 3: 13, 4: 14, 5: 15, 6: 18, 7: 21, 8: 10, 9: 10, 10: 10}
+        def prim_sum(cards):
+            best = {"denari": 0, "coppe": 0, "spade": 0, "bastoni": 0}
+            for (rank, suit) in cards:
+                v = val_map.get(rank, 0)
+                if v > best.get(suit, 0):
+                    best[suit] = v
+            return sum(best.values())
+
+        prim0 = prim_sum(team_cards_0)
+        prim1 = prim_sum(team_cards_1)
+        lead_p0 = 1 if prim0 > prim1 else 0 if prim0 == prim1 else -1
+
+        # Settebello possession
+        sb0 = (7, 'denari') in team_cards_0
+        sb1 = (7, 'denari') in team_cards_1
+
+        # Render two compact rows: team 0 and 1
+        row_y = 6
+        row_h = (panel_h - 12) // 2
+
+        def draw_team_row(team_id):
+            nonlocal row_y
+            color = LIGHT_BLUE if team_id == 0 else HIGHLIGHT_RED
+            if team_id == 0:
+                carte_mark = "✓" if lead_c0 == 1 else "=" if lead_c0 == 0 else ""
+                denari_mark = "✓" if lead_d0 == 1 else "=" if lead_d0 == 0 else ""
+                prim_mark = "✓" if lead_p0 == 1 else "=" if lead_p0 == 0 else ""
+                sette_mark = "✓" if sb0 else ""
+                scope_text = str(scope0)
+            else:
+                carte_mark = "✓" if lead_c0 == -1 else "=" if lead_c0 == 0 else ""
+                denari_mark = "✓" if lead_d0 == -1 else "=" if lead_d0 == 0 else ""
+                prim_mark = "✓" if lead_p0 == -1 else "=" if lead_p0 == 0 else ""
+                sette_mark = "✓" if sb1 else ""
+                scope_text = str(scope1)
+
+            # Team label compact
+            team_label = f"T{team_id}"
+            team_surf = small_font.render(team_label, True, color)
+            panel_surf.blit(team_surf, (8, row_y))
+
+            # Helper to map a metric state to a colored dot per requirement
+            def dot_color(win, lose, tie, advantage):
+                # win: already won definitively; lose: already lost definitively
+                # tie: exactly equal; advantage: currently in advantage (not final)
+                if lose:
+                    return RED
+                if win:
+                    return GREEN
+                if tie:
+                    return YELLOW
+                if advantage > 0:
+                    return LIGHT_GREEN
+                if advantage < 0:
+                    return ORANGE
+                return GRAY
+
+            # Determine statuses for each metric
+            # Live definitiveness per requirement: assume opponent takes all remaining cards
+            # Carte/Denari/Primiera: if opponent can't overturn even with all remaining → win; viceversa → lose
+            # Settebello: definitive when captured
+            # Compute advantages from team 0 perspective; invert for team 1 when drawing
+            adv_c = (c0 - c1)
+            adv_d = (den0 - den1)
+            adv_p = (prim0 - prim1)
+
+            if team_id == 1:
+                adv_c *= -1
+                adv_d *= -1
+                adv_p *= -1
+
+            # Carte (cards majority) live definitiveness
+            if team_id == 0:
+                carte_win = c0 > c1 + rem_total
+                carte_lose = c0 + rem_total < c1
+            else:
+                carte_win = c1 > c0 + rem_total
+                carte_lose = c1 + rem_total < c0
+            carte_tie = (c0 == c1)
+            # Denari (ori) live definitiveness
+            if team_id == 0:
+                den_win = den0 > den1 + rem_den
+                den_lose = den0 + rem_den < den1
+            else:
+                den_win = den1 > den0 + rem_den
+                den_lose = den1 + rem_den < den0
+            den_tie = (den0 == den1)
+            # Primiera live definitiveness via maximum potential with remaining cards
+            if team_id == 0:
+                opp_max = prim_sum(team_cards_1 + remaining_cards)
+                team_max = prim_sum(team_cards_0 + remaining_cards)
+                prim_win = prim0 > opp_max
+                prim_lose = team_max < prim1
+            else:
+                opp_max = prim_sum(team_cards_0 + remaining_cards)
+                team_max = prim_sum(team_cards_1 + remaining_cards)
+                prim_win = prim1 > opp_max
+                prim_lose = team_max < prim0
+            prim_tie = (prim0 == prim1)
+            # Settebello
+            sette_win = sb0 if team_id == 0 else sb1
+            sette_lose = (sb1 if team_id == 0 else sb0)
+            sette_tie = (not sb0) and (not sb1)
+
+            # Render dots line: C O P 7 S
+            cx = 8 + team_surf.get_width() + 8
+            cy = row_y + small_font.get_height() // 2
+            radius = max(4, small_font.get_height() // 4)
+
+            def draw_dot(label, color_val):
+                nonlocal cx
+                lbl = small_font.render(label, True, WHITE)
+                panel_surf.blit(lbl, (cx, row_y))
+                cx += lbl.get_width() + 4
+                pygame.draw.circle(panel_surf, color_val, (cx + radius, cy), radius)
+                pygame.draw.circle(panel_surf, WHITE, (cx + radius, cy), radius, 1)
+                cx += radius * 2 + 8
+
+            draw_dot("C", dot_color(carte_win, carte_lose, carte_tie, adv_c))
+            draw_dot("O", dot_color(den_win, den_lose, den_tie, adv_d))
+            draw_dot("P", dot_color(prim_win, prim_lose, prim_tie, adv_p))
+            draw_dot("7", dot_color(sette_win, sette_lose, sette_tie, 0))
+
+            # Scope as count with color reflecting advantage
+            scope_team = scope0 if team_id == 0 else scope1
+            scope_other = scope1 if team_id == 0 else scope0
+            scope_adv = scope_team - scope_other
+            scope_color = LIGHT_GREEN if scope_adv > 0 else YELLOW if scope_adv == 0 else ORANGE
+            scope_lbl = small_font.render("S", True, WHITE)
+            panel_surf.blit(scope_lbl, (cx, row_y))
+            cx += scope_lbl.get_width() + 4
+            scope_text_surf = small_font.render(str(scope_team), True, scope_color)
+            panel_surf.blit(scope_text_surf, (cx, row_y))
+
+            row_y += row_h
+
+        draw_team_row(0)
+        draw_team_row(1)
+
+        surface.blit(panel_surf, panel_rect)
+
     def draw_message_log(self, surface):
         """Draw message log with scrolling support"""
         # Draw background
