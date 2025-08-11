@@ -1713,6 +1713,18 @@ class GameScreen(BaseScreen):
         self.replay_current_index = 0
         self.replay_animations = []
         self.replay_table_state = []
+        # Ensure motion-tracking sets are fresh per match
+        if hasattr(self, 'cards_in_motion'):
+            self.cards_in_motion.clear()
+        else:
+            self.cards_in_motion = set()
+        if hasattr(self, 'replay_cards_in_motion'):
+            self.replay_cards_in_motion.clear()
+        else:
+            self.replay_cards_in_motion = set()
+        # Cancel any leftover staged animation state from previous match
+        self.waiting_for_animation = False
+        self.pending_action = None
         
         # Message log interaction state
         self.message_minimized = False
@@ -2933,11 +2945,15 @@ class GameScreen(BaseScreen):
             else:
                 active_animations = True
         
-        # NUOVO: Rimuovi le carte dal set di movimento solo se non ci sono più animazioni attive
-        # Questo evita il flash delle carte che riappaiono sul tavolo
-        if not active_animations and cards_to_remove:
+        # NUOVO: Rimuovi le carte dal set di movimento quando non esiste più
+        # alcuna animazione per quella carta, indipendentemente dal fatto che
+        # ci siano altre animazioni attive per altre carte
+        if cards_to_remove:
             for card in cards_to_remove:
-                if card in self.cards_in_motion:
+                # Verifica che non esistano altre animazioni attive per questa carta
+                still_animating = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False)
+                                      for anim in self.animations)
+                if not still_animating and card in self.cards_in_motion:
                     self.cards_in_motion.remove(card)
                     #print(f"Carta {card} rimossa dal set di carte in movimento (dopo completamento animazioni)")
         
@@ -4273,7 +4289,14 @@ class GameScreen(BaseScreen):
         else:
             table_cards = self.env.game_state["table"]
             
+        # Se lo stato segnala tavolo vuoto ma ci sono animazioni di "play" in corso che dovrebbero
+        # aver già portato carte sul tavolo, evita di mostrare "No cards on table" e lascia lo spazio
+        # libero per l'animazione, così l'utente non crede che manchino le carte.
         if not table_cards:
+            # Se c'è un'animazione in corso che non sia di cattura (plateau/play), non mostrare il testo.
+            if any(getattr(anim, 'animation_type', '') in ('play', 'plateau', 'replay_play') and not getattr(anim, 'done', False)
+                   for anim in getattr(self, 'animations', [])):
+                return
             # Draw "No cards on table" text
             text_surf = self.info_font.render("No cards on table", True, WHITE)
             text_rect = text_surf.get_rect(center=self.table_rect.center)
@@ -4304,9 +4327,24 @@ class GameScreen(BaseScreen):
         y = self.table_rect.centery - card_height // 2
         
         for i, card in enumerate(table_cards):
-            # NUOVO: Salta la carta se è nel set delle carte in movimento (gioco normale o replay)
-            if card in self.cards_in_motion or (self.replay_active and card in self.replay_cards_in_motion):
-                continue
+            # NUOVO: Salta la carta solo se è effettivamente in animazione attiva.
+            # Se la carta è nel set ma non ha un'animazione in corso (set stantio), disegna comunque e ripulisci.
+            in_motion_flag = card in self.cards_in_motion or (self.replay_active and card in self.replay_cards_in_motion)
+            if in_motion_flag:
+                has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.animations)
+                if has_active_anim:
+                    continue
+                # Ripulisci flag stantio se nessuna animazione è attiva per questa carta
+                if card in self.cards_in_motion:
+                    try:
+                        self.cards_in_motion.remove(card)
+                    except KeyError:
+                        pass
+                if self.replay_active and card in self.replay_cards_in_motion:
+                    try:
+                        self.replay_cards_in_motion.remove(card)
+                    except KeyError:
+                        pass
                 
             x = start_x + i * card_spacing
             
