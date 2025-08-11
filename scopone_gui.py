@@ -1713,6 +1713,30 @@ class GameScreen(BaseScreen):
         self.replay_current_index = 0
         self.replay_animations = []
         self.replay_table_state = []
+        
+        # Message log interaction state
+        self.message_minimized = False
+        self.message_dragging = False
+        self.message_resizing = False
+        self.message_drag_offset = (0, 0)
+        self.message_resize_start_mouse = (0, 0)
+        self.message_resize_start_rect = None
+        self.message_resize_zone_size = 14
+        self.message_header_height = 28
+        self.message_minimize_rect = None
+        self.message_resize_rect = None
+        self.message_prev_size = None
+        self.message_prev_height = None
+        self.message_focused = False
+        # Scrollbar state
+        self.scrollbar_dragging = False
+        self.scrollbar_drag_offset = 0
+        self.scrollbar_up_rect = None
+        self.scrollbar_down_rect = None
+        self.scrollbar_track_rect = None
+        self.scrollbar_thumb_rect = None
+        self.scrollbar_thumb_height = 0
+        self.scrollbar_max_offset = 0
     
     def create_exit_button(self):
         """Create a prominent exit button when connection is lost"""
@@ -1736,6 +1760,35 @@ class GameScreen(BaseScreen):
     def enter(self):
         """Called when entering this screen"""
         super().enter()
+        # Reset transient state so a new match doesn't inherit previous game_over and UI flags
+        self.game_over = False
+        self.final_breakdown = None
+        self.status_message = ""
+        self.selected_hand_card = None
+        self.selected_table_cards = set()
+        self.animations = []
+        self.waiting_for_other_player = False
+        self.ai_thinking = False
+        self.ai_move_timer = 0
+        self.replay_active = False
+        self.replay_moves = []
+        self.replay_current_index = 0
+        self.replay_animations = []
+        self.replay_table_state = []
+        self.connection_lost = False
+        self.exit_button = None
+        self.reconnect_start_time = 0
+        self.reconnection_attempts = 0
+        self.messages = []
+        self.message_scroll_offset = 0
+        self.message_minimized = False
+        self.message_dragging = False
+        self.message_resizing = False
+        self.message_focused = False
+        self.message_prev_size = None
+        self.message_prev_height = None
+        self.visually_hidden_cards = {}
+        self.ai_controllers = {}
         
         # Initialize game based on config
         self.initialize_game()
@@ -2151,13 +2204,44 @@ class GameScreen(BaseScreen):
             DARK_BLUE, WHITE
         )
         
-        # Message log - top right corner
-        self.message_log_rect = pygame.Rect(
-            width - width * 0.25 - width * 0.02,
-            height * 0.05,
-            width * 0.25, 
-            height * 0.18
-        )
+        # Message log placement
+        msg_w = width * 0.25
+        msg_h = height * 0.18
+        margin = max(8, int(min(width, height) * 0.01))
+
+        if self.app.game_config.get("mode") == "online_multiplayer":
+            # Place at the corner between bottom of Player 2's hand and left of Player 3's hand
+            try:
+                player2 = next(p for p in self.players if p.player_id == 2)
+                player3 = next(p for p in self.players if p.player_id == 3)
+                corner_x = player3.hand_rect.left
+                corner_y = player2.hand_rect.bottom
+
+                # Position the box just inside the corner (left of player 3's hand, below player 2's hand)
+                x = corner_x - msg_w - margin
+                y = corner_y + margin
+
+                # Clamp inside the window
+                x = max(margin, min(x, width - msg_w - margin))
+                y = max(margin, min(y, height - msg_h - margin))
+
+                self.message_log_rect = pygame.Rect(x, y, msg_w, msg_h)
+            except StopIteration:
+                # Fallback to top-right if players not initialized
+                self.message_log_rect = pygame.Rect(
+                    width - msg_w - width * 0.02,
+                    height * 0.05,
+                    msg_w,
+                    msg_h,
+                )
+        else:
+            # Default: top right corner
+            self.message_log_rect = pygame.Rect(
+                width - msg_w - width * 0.02,
+                height * 0.05,
+                msg_w, 
+                msg_h
+            )
         
         # Update fonts based on screen dimensions
         self.title_font = pygame.font.SysFont(None, int(height * 0.042))
@@ -2234,7 +2318,7 @@ class GameScreen(BaseScreen):
                         self.next_screen = "mode"
                         return
             
-            # Always check for the "New Game" button
+            # Always check for the "New Game" button and message log interactions
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
@@ -2242,6 +2326,71 @@ class GameScreen(BaseScreen):
                     self.done = True
                     self.next_screen = "mode"
                     return
+
+                # Message log interactions (active regardless of game state)
+                if self.message_log_rect.collidepoint(pos):
+                    self.message_focused = True
+                    # Minimize toggle
+                    if self.message_minimize_rect and self.message_minimize_rect.collidepoint(pos):
+                        # Toggle minimize and adjust size
+                        if not self.message_minimized:
+                            # Save previous height and minimize to header height
+                            self.message_prev_height = self.message_log_rect.height
+                            self.message_log_rect.height = self.message_header_height + 2  # show border
+                            self.message_minimized = True
+                        else:
+                            # Restore height
+                            if self.message_prev_height:
+                                self.message_log_rect.height = self.message_prev_height
+                            self.message_minimized = False
+                        return
+                    # Start dragging if click in header
+                    header_rect = pygame.Rect(
+                        self.message_log_rect.left,
+                        self.message_log_rect.top,
+                        self.message_log_rect.width,
+                        self.message_header_height,
+                    )
+                    if header_rect.collidepoint(pos):
+                        self.message_dragging = True
+                        mx, my = pos
+                        self.message_drag_offset = (mx - self.message_log_rect.left, my - self.message_log_rect.top)
+                        return
+                    # Scrollbar clicks
+                    if self.scroll_up_rect and self.scroll_up_rect.collidepoint(pos):
+                        self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
+                        return
+                    if self.scroll_down_rect and self.scroll_down_rect.collidepoint(pos):
+                        self.message_scroll_offset = min(self.message_scroll_offset + 1, getattr(self, 'scrollbar_max_offset', self.message_scroll_offset + 1))
+                        return
+                    if self.scrollbar_thumb_rect and self.scrollbar_thumb_rect.collidepoint(pos):
+                        self.scrollbar_dragging = True
+                        self.scrollbar_drag_offset = pos[1] - self.scrollbar_thumb_rect.top
+                        return
+                    if self.scrollbar_rect and self.scrollbar_rect.collidepoint(pos):
+                        # Jump to position and start dragging
+                        my = pos[1]
+                        track_top = self.scrollbar_rect.top
+                        track_height = self.scrollbar_rect.height
+                        rel_y = my - track_top - self.scrollbar_thumb_height / 2
+                        rel_y = max(0, min(rel_y, track_height - self.scrollbar_thumb_height))
+                        if self.scrollbar_max_offset > 0:
+                            ratio = rel_y / (track_height - self.scrollbar_thumb_height)
+                            self.message_scroll_offset = int(round(ratio * self.scrollbar_max_offset))
+                        self.scrollbar_dragging = True
+                        self.scrollbar_drag_offset = self.scrollbar_thumb_height / 2
+                        return
+                # Start resizing if click in resize handle (only when not minimized)
+                if (not self.message_minimized) and self.message_resize_rect and self.message_resize_rect.collidepoint(pos):
+                    self.message_resizing = True
+                    self.message_resize_start_mouse = pos
+                    self.message_resize_start_rect = self.message_log_rect.copy()
+                    return
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                # Click outside message box removes focus
+                pos = pygame.mouse.get_pos()
+                if not self.message_log_rect.collidepoint(pos):
+                    self.message_focused = False
             
             # Ignore input during specific game states
             if self.game_over or self.waiting_for_other_player or self.ai_thinking:
@@ -2251,6 +2400,34 @@ class GameScreen(BaseScreen):
                     if hasattr(self, 'game_over_button_rect') and self.game_over_button_rect and self.game_over_button_rect.collidepoint(mouse_pos):
                         self.done = True
                         self.next_screen = "mode"
+                # Allow message log drag/resize while other inputs are ignored
+                if event.type == pygame.MOUSEMOTION:
+                    mx, my = event.pos
+                    if self.message_dragging:
+                        new_x = mx - self.message_drag_offset[0]
+                        new_y = my - self.message_drag_offset[1]
+                        new_x = max(0, min(new_x, self.app.window_width - self.message_log_rect.width))
+                        new_y = max(0, min(new_y, self.app.window_height - self.message_log_rect.height))
+                        self.message_log_rect.topleft = (new_x, new_y)
+                        return
+                    if self.message_resizing:
+                        start_x, start_y = self.message_resize_start_mouse
+                        dx = mx - start_x
+                        dy = my - start_y
+                        min_w = int(self.app.window_width * 0.15)
+                        min_h = int(self.app.window_height * 0.12)
+                        new_w = max(min_w, self.message_resize_start_rect.width + dx)
+                        new_h = max(min_h, self.message_resize_start_rect.height + dy)
+                        max_w = int(self.app.window_width * 0.6)
+                        max_h = int(self.app.window_height * 0.6)
+                        new_w = min(new_w, max_w)
+                        new_h = min(new_h, max_h)
+                        self.message_log_rect.size = (new_w, new_h)
+                        return
+                if event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        self.message_dragging = False
+                        self.message_resizing = False
                 continue
             
             # Check if current player is controllable
@@ -2286,29 +2463,98 @@ class GameScreen(BaseScreen):
                         self.selected_table_cards.add(table_card)
                     self.app.resources.play_sound("card_pickup")
             
-            # Handle message log scrolling
+            # Handle message log scrolling (legacy wheel buttons 4/5)
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
-                # Check scroll button clicks (only exist when scrollbar is visible)
-                if hasattr(self, 'scroll_up_rect') and self.scroll_up_rect.collidepoint(pos):
-                    self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
-                elif hasattr(self, 'scroll_down_rect') and self.scroll_down_rect.collidepoint(pos):
-                    self.message_scroll_offset += 1  # Limit is clamped in draw_message_log
+                # Check scroll button clicks (only exist when scrollbar is visible) handled earlier in message box section.
                 
-                # Mouse wheel over the message log (work with classic wheel buttons 4/5)
-                if self.message_log_rect.collidepoint(pos):
+                # Mouse wheel over the message log (classic wheel buttons 4/5)
+                if self.message_log_rect.collidepoint(pos) or self.message_focused:
                     if event.button == 4:  # Scroll up
                         self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
                     elif event.button == 5:  # Scroll down
                         self.message_scroll_offset += 1
 
+            # Keyboard scrolling when message box focused
+            if event.type == pygame.KEYDOWN and self.message_focused:
+                if event.key in (pygame.K_UP, pygame.K_PAGEUP):
+                    self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
+                elif event.key in (pygame.K_DOWN, pygame.K_PAGEDOWN):
+                    self.message_scroll_offset += 1
+
             # Support modern mouse wheel events (pygame 2)
             if hasattr(pygame, 'MOUSEWHEEL') and event.type == pygame.MOUSEWHEEL:
                 mouse_pos = pygame.mouse.get_pos()
-                if self.message_log_rect.collidepoint(mouse_pos):
+                # Allow wheel when hovering or when focused
+                if self.message_log_rect.collidepoint(mouse_pos) or self.message_focused:
                     # event.y: 1 = up, -1 = down
                     self.message_scroll_offset = max(0, self.message_scroll_offset - event.y)
+
+            # Dragging / Resizing while normal play
+            if event.type == pygame.MOUSEMOTION:
+                mx, my = event.pos
+                if self.message_dragging:
+                    new_x = mx - self.message_drag_offset[0]
+                    new_y = my - self.message_drag_offset[1]
+                    new_x = max(0, min(new_x, self.app.window_width - self.message_log_rect.width))
+                    new_y = max(0, min(new_y, self.app.window_height - self.message_log_rect.height))
+                    self.message_log_rect.topleft = (new_x, new_y)
+                if self.message_resizing:
+                    start_x, start_y = self.message_resize_start_mouse
+                    dx = mx - start_x
+                    dy = my - start_y
+                    min_w = int(self.app.window_width * 0.15)
+                    min_h = int(self.app.window_height * 0.12)
+                    new_w = max(min_w, self.message_resize_start_rect.width + dx)
+                    new_h = max(min_h, self.message_resize_start_rect.height + dy)
+                    max_w = int(self.app.window_width * 0.6)
+                    max_h = int(self.app.window_height * 0.6)
+                    new_w = min(new_w, max_w)
+                    new_h = min(new_h, max_h)
+                    self.message_log_rect.size = (new_w, new_h)
+                # Scrollbar dragging
+                if self.scrollbar_dragging and self.scrollbar_rect:
+                    # map mouse y to scroll offset
+                    track_top = self.scrollbar_rect.top
+                    track_height = self.scrollbar_rect.height
+                    rel_y = my - track_top - self.scrollbar_drag_offset
+                    rel_y = max(0, min(rel_y, track_height - self.scrollbar_thumb_height))
+                    if self.scrollbar_max_offset > 0:
+                        ratio = rel_y / (track_height - self.scrollbar_thumb_height)
+                        self.message_scroll_offset = int(round(ratio * self.scrollbar_max_offset))
+            if event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    self.message_dragging = False
+                    self.message_resizing = False
+                    self.scrollbar_dragging = False
+
+            # Dragging / Resizing while normal play
+            if event.type == pygame.MOUSEMOTION:
+                mx, my = event.pos
+                if self.message_dragging:
+                    new_x = mx - self.message_drag_offset[0]
+                    new_y = my - self.message_drag_offset[1]
+                    new_x = max(0, min(new_x, self.app.window_width - self.message_log_rect.width))
+                    new_y = max(0, min(new_y, self.app.window_height - self.message_log_rect.height))
+                    self.message_log_rect.topleft = (new_x, new_y)
+                if self.message_resizing:
+                    start_x, start_y = self.message_resize_start_mouse
+                    dx = mx - start_x
+                    dy = my - start_y
+                    min_w = int(self.app.window_width * 0.15)
+                    min_h = int(self.app.window_height * 0.12)
+                    new_w = max(min_w, self.message_resize_start_rect.width + dx)
+                    new_h = max(min_h, self.message_resize_start_rect.height + dy)
+                    max_w = int(self.app.window_width * 0.6)
+                    max_h = int(self.app.window_height * 0.6)
+                    new_w = min(new_w, max_w)
+                    new_h = min(new_h, max_h)
+                    self.message_log_rect.size = (new_w, new_h)
+            if event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    self.message_dragging = False
+                    self.message_resizing = False
     
     def update(self):
         """Update game state with improved animation handling"""
@@ -3649,41 +3895,42 @@ class GameScreen(BaseScreen):
                         self.table_rect.inflate(50, 30))
         pygame.draw.ellipse(surface, DARK_GREEN, 
                         self.table_rect.inflate(50, 30), 5)
-        
-        # Draw players
+
+        # Ensure elements meant to be under cards are drawn first
+        # Draw capture piles (team cards) beneath any cards
+        self.draw_capture_piles(surface)
+
+        # Draw players (hands and info)
         self.draw_players(surface)
-        
+
         # Draw table cards
         self.draw_table_cards(surface)
-        
-        # Draw capture piles
-        self.draw_capture_piles(surface)
-        
-        # Draw animations
+
+        # Draw animations (cards in motion should appear on top)
         self.draw_animations(surface)
-        
+
         # Draw replay animations if replay is active
         if self.replay_active:
             self.draw_replay_animations(surface)
-        
+
         # Draw status info
         self.draw_status_info(surface)
-        
+
+        # Draw message log LAST in online multiplayer so it stays in front of team boxes and cards
+        if self.app.game_config.get("mode") == "online_multiplayer":
+            self.draw_message_log(surface)
+
         # Draw buttons
         self.new_game_button.draw(surface)
-        
+
         # Draw confirm button if current player is controllable
         if self.env and self.is_current_player_controllable() and not self.game_over:
             self.confirm_button.draw(surface)
-        
+
         # Draw replay button (always visible when not in replay mode)
         if not self.replay_active and self.env and not self.game_over:
             self.replay_button.draw(surface)
-        
-        # Draw message log only for online multiplayer games
-        if self.app.game_config.get("mode") == "online_multiplayer":
-            self.draw_message_log(surface)
-        
+
         # Draw game over screen if game is over
         if self.game_over and self.final_breakdown:
             self.draw_game_over(surface)
@@ -4089,74 +4336,186 @@ class GameScreen(BaseScreen):
             surface.blit(rounded_card, card_rect)
     
     def draw_capture_piles(self, surface):
-        """Draw the capture piles for each team with updated positioning"""
+        """Draw realistic capture piles for both teams with scopa highlights.
+
+        - Cards in piles are rendered as real face-down cards, slightly misaligned
+          to convey stack height.
+        - For each scopa, the played card is left inside the pile, rotated about 90° and
+          face-up, anchored to the center of the left long side of the covered card
+          directly below the face-up card (or the first covered card if none below).
+        - Cards captured in a scopa remain covered
+        - If there's more than one scopa (so more than one card face up) they are distanced by 40° each.
+        - Captured cards are drawn at ~1/3 the size of hand cards.
+        """
         if not self.env:
             return
                 
-        captured = self.env.game_state["captured_squads"]
+        gs = self.env.game_state
+        captured = gs["captured_squads"]
         width = self.app.window_width
         height = self.app.window_height
         
-        # Helper: compute pile rect for a team (local team -> bottom-left, opponent -> top-right under difficulty)
-        def get_team_pile_rect(team_id: int) -> pygame.Rect:
-            pile_width = int(width * 0.14)
-            pile_height = int(height * 0.14)
-            margin_w = int(width * 0.02)
-            margin_h = int(height * 0.02)
+        # Mini card size ~ 1/3 of hand card size
+        mini_w = max(1, int(CARD_WIDTH * 0.33))
+        mini_h = max(1, int(CARD_HEIGHT * 0.33))
 
-            local_team_id = self.players[self.local_player_id].team_id if hasattr(self, 'players') else 0
-            is_local_team = (team_id == local_team_id)
+        # Slight misalignment per card (very small, to avoid clutter)
+        tiny_dx = max(1, int(mini_w * 0.06))
+        tiny_dy = max(1, int(mini_h * 0.06))
 
-            if is_local_team:
-                # Bottom-left
-                left = margin_w
-                top = height - margin_h - pile_height
-                return pygame.Rect(left, top, pile_width, pile_height)
-            else:
-                # Top-right, under difficulty if present
-                top_base = int(height * 0.02)
-                if self.app.game_config.get("mode") in ["single_player", "team_vs_ai"]:
-                    # Align under difficulty line drawn at ~0.026 with small_font height
-                    top_base = int(height * 0.026) + self.small_font.get_height() + int(height * 0.012)
-                left = width - margin_w - pile_width
-                top = top_base
-                return pygame.Rect(left, top, pile_width, pile_height)
+        padding = int(min(width, height) * 0.008)
 
-        # Team 0 pile
-        team0_count = len(captured[0])
-        rect0 = get_team_pile_rect(0)
-        pygame.draw.rect(surface, LIGHT_BLUE, rect0, border_radius=5)
-        text0 = f"Team 0: {team0_count} cards"
-        text0_surf = self.small_font.render(text0, True, WHITE)
-        surface.blit(text0_surf, (rect0.left + 10, rect0.top + 5))
-        max_display = min(5, team0_count)
-        for i in range(max_display):
-            x = rect0.left + 10 + i * 5
-            y = rect0.top + 30 + i * 5
-            mini_width = int(width * 0.04)
-            mini_height = int(height * 0.08)
-            mini_card = pygame.Surface((mini_width, mini_height))
-            mini_card.fill(WHITE)
-            pygame.draw.rect(mini_card, DARK_BLUE, (0, 0, mini_width, mini_height), 2)
-            surface.blit(mini_card, (x, y))
+        def team_of_player(player_id: int) -> int:
+            return 0 if player_id in [0, 2] else 1
 
-        # Team 1 pile
-        team1_count = len(captured[1])
-        rect1 = get_team_pile_rect(1)
-        pygame.draw.rect(surface, HIGHLIGHT_RED, rect1, border_radius=5)
-        text1 = f"Team 1: {team1_count} cards"
-        text1_surf = self.small_font.render(text1, True, WHITE)
-        surface.blit(text1_surf, (rect1.left + 10, rect1.top + 5))
-        max_display = min(5, team1_count)
-        for i in range(max_display):
-            x = rect1.left + 10 + i * 5
-            y = rect1.top + 30 + i * 5
-            mini_width = int(width * 0.04)
-            mini_height = int(height * 0.08)
-            mini_card = pygame.Surface((mini_width, mini_height))
-            mini_card.fill(WHITE)
-            pygame.draw.rect(mini_card, DARK_RED, (0, 0, mini_width, mini_height), 2)
-            surface.blit(mini_card, (x, y))
+        # Collect capture moves per team to reconstruct pile order
+        team_moves = {0: [], 1: []}
+        for move in gs.get("history", []):
+            ctype = move.get("capture_type")
+            if ctype in ("capture", "scopa"):
+                t = team_of_player(move.get("player"))
+                team_moves[t].append(move)
+
+        def blit_rounded(surface_ref, img, dest_rect, border_radius=6, rotation_degrees=0):
+            # Render a rounded, optionally rotated card with border drawn on the card surface
+            if rotation_degrees:
+                img = pygame.transform.rotate(img, rotation_degrees)
+            rounded_card = pygame.Surface(img.get_size(), pygame.SRCALPHA)
+            rounded_card.fill((0, 0, 0, 0))
+            inner_rect = rounded_card.get_rect()
+            pygame.draw.rect(rounded_card, (255, 255, 255), inner_rect, border_radius=border_radius)
+            rounded_card.blit(img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            pygame.draw.rect(rounded_card, BLACK, inner_rect, width=2, border_radius=border_radius)
+            # Recompute destination if image has been rotated (size may differ)
+            if rotation_degrees:
+                dest_rect = rounded_card.get_rect(center=dest_rect.center)
+            surface_ref.blit(rounded_card, dest_rect)
+
+        def draw_team_pile(team_id: int):
+            rect = self.get_team_pile_rect(team_id)
+
+            # Background panel for the pile area and label
+            panel_color = LIGHT_BLUE if team_id == 0 else HIGHLIGHT_RED
+            pygame.draw.rect(surface, panel_color, rect, border_radius=5)
+
+            count = len(captured[team_id])
+            text = f"Team {team_id}: {count} cards"
+            text_surf = self.small_font.render(text, True, WHITE)
+            surface.blit(text_surf, (rect.left + 10, rect.top + 5))
+
+            # Pre-scale card back for this team
+            back_img = self.app.resources.get_card_back(team_id)
+            scaled_back = pygame.transform.scale(back_img, (mini_w, mini_h))
+
+            # Starting position for top of the pile
+            cur_x = rect.left + padding
+            cur_y = rect.top + padding + self.small_font.get_height() + 6  # leave space for label
+
+            drawn_cards = set()
+
+            # Number and index of scopa moves to distribute face-up angles (40° increments)
+            num_scopa = sum(1 for m in team_moves[team_id] if m.get("capture_type") == "scopa")
+            scopa_idx_seen = 0
+
+            # Draw captures in chronological order to preserve stack order
+            for move in team_moves[team_id]:
+                ctype = move.get("capture_type")
+                captured_cards = move.get("captured_cards") or []
+                played_card = move.get("played_card")
+
+                if ctype == "scopa":
+                    # Base position at current top of pile; face-up will anchor to the covered card just below it
+                    base_x = cur_x
+                    base_y = cur_y
+
+                    # Angle distribution among all scopa face-up cards for this team (±40° steps around 90°)
+                    angle_offset = 0.0
+                    if num_scopa > 1:
+                        start = -40.0 * (num_scopa - 1) / 2.0
+                        angle_offset = start + scopa_idx_seen * 40.0
+
+                    # Played card shown face-up (drawn first so it stays UNDER captured cards), rotated 90° + offset,
+                    # anchored to the covered card just below it, then detached to their vertical axis by half length
+                    if played_card:
+                        face_img = self.app.resources.get_card_image(played_card)
+                        if face_img:
+                            scaled_face = pygame.transform.scale(face_img, (mini_w, mini_h))
+                            # Compose rounded card with border BEFORE rotation so the border rotates with the card
+                            base_card = pygame.Surface((mini_w, mini_h), pygame.SRCALPHA)
+                            base_card.fill((0, 0, 0, 0))
+                            base_rect = base_card.get_rect()
+                            pygame.draw.rect(base_card, (255, 255, 255), base_rect, border_radius=6)
+                            base_card.blit(scaled_face, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+                            pygame.draw.rect(base_card, BLACK, base_rect, width=2, border_radius=6)
+                            # Desired rotation and precise anchoring with pivot at TOP short side center
+                            angle_deg = -90 + angle_offset
+                            rotated_card = pygame.transform.rotate(base_card, -angle_deg)
+
+                            # Determine the anchor on the covered card just below the face-up card
+                            covered_below_index = max(0, len(captured_cards) - 1)
+                            anchor_x = base_x - covered_below_index * tiny_dx
+                            anchor_y = base_y + covered_below_index * tiny_dy
+                            anchor = pygame.math.Vector2(anchor_x, anchor_y + mini_h / 2.0)
+
+                            # Pivot math: rotate around the center of the TOP short side of the unrotated card
+                            center_local = pygame.math.Vector2(mini_w / 2.0, mini_h / 2.0)
+                            pivot_local = pygame.math.Vector2(mini_w / 2.0, 0.0)  # top middle
+                            v = pivot_local - center_local
+                            v_rot = v.rotate(angle_deg)
+
+                            # Place rotated surface so that rotated pivot lands on the anchor
+                            dest = rotated_card.get_rect()
+                            dest.center = (anchor.x - v_rot.x, anchor.y - v_rot.y)
+                            
+                            # Detach along the card's long axis by half the card length
+                            shift_dir = pygame.math.Vector2(0.0, 1.0).rotate(angle_deg)
+                            dest.x += int(shift_dir.x * (mini_h * 0.5))
+                            dest.y += int(shift_dir.y * (mini_h * 0.5))
+                            
+                            
+                            surface.blit(rotated_card, dest)
+                            drawn_cards.add(played_card)
+                            scopa_idx_seen += 1
+
+                    # Now lay out captured cards strongly offset to the left, kept covered (drawn after => on top)
+                    for i, card in enumerate(captured_cards):
+                        x = base_x - i * tiny_dx
+                        y = base_y + i * tiny_dy
+                        dest = pygame.Rect(x, y, mini_w, mini_h)
+                        blit_rounded(surface, scaled_back, dest)
+                        drawn_cards.add(card)
+
+                    # Advance the pile slightly for next additions (keep the pile compact)
+                    cur_x += tiny_dx
+                    cur_y += tiny_dy
+                else:
+                    # Normal capture: all cards remain covered, slightly misaligned
+                    for card in captured_cards:
+                        dest = pygame.Rect(cur_x, cur_y, mini_w, mini_h)
+                        blit_rounded(surface, scaled_back, dest)
+                        drawn_cards.add(card)
+                        cur_x += tiny_dx
+                        cur_y += tiny_dy
+
+                    # Add the played card on top, still covered
+                    if played_card:
+                        dest = pygame.Rect(cur_x, cur_y, mini_w, mini_h)
+                        blit_rounded(surface, scaled_back, dest)
+                        drawn_cards.add(played_card)
+                        cur_x += tiny_dx
+                        cur_y += tiny_dy
+
+            # Draw any leftover captured cards not represented in history (e.g., end-of-round sweep)
+            for card in captured[team_id]:
+                if card not in drawn_cards:
+                    dest = pygame.Rect(cur_x, cur_y, mini_w, mini_h)
+                    blit_rounded(surface, scaled_back, dest)
+                    cur_x += tiny_dx
+                    cur_y += tiny_dy
+
+        # Draw both teams' piles
+        draw_team_pile(0)
+        draw_team_pile(1)
     
     def draw_animations(self, surface):
         """Draw all active card animations with rounded corners and borders"""
@@ -4173,14 +4532,20 @@ class GameScreen(BaseScreen):
             
             # Apply scaling
             scale = anim.get_current_scale()
-            scaled_img = pygame.transform.scale(
-                card_img,
-                (int(CARD_WIDTH * scale), int(CARD_HEIGHT * scale))
-            )
+            scaled_width = int(CARD_WIDTH * scale)
+            scaled_height = int(CARD_HEIGHT * scale)
+            scaled_img = pygame.transform.scale(card_img, (scaled_width, scaled_height))
             
             # Apply rotation
             rotation = anim.get_current_rotation()
-            rotated_img = pygame.transform.rotate(scaled_img, rotation)
+            # Compose rounded card with border BEFORE rotation so border/rounding rotate with the card
+            base_card = pygame.Surface((scaled_width, scaled_height), pygame.SRCALPHA)
+            base_card.fill((0, 0, 0, 0))
+            base_rect = base_card.get_rect()
+            pygame.draw.rect(base_card, (255, 255, 255), base_rect, border_radius=border_radius)
+            base_card.blit(scaled_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            pygame.draw.rect(base_card, BLACK, base_rect, width=2, border_radius=border_radius)
+            rotated_img = pygame.transform.rotate(base_card, rotation)
             
             # Get current position
             pos = anim.get_current_pos()
@@ -4188,20 +4553,8 @@ class GameScreen(BaseScreen):
             # Create rect centered at position
             rect = rotated_img.get_rect(center=pos)
             
-            # Create a version of the card with rounded corners
-            rounded_card = pygame.Surface(rotated_img.get_size(), pygame.SRCALPHA)
-            rounded_card.fill((0, 0, 0, 0))  # Transparent background
-            
-            # Draw rounded rectangle on the surface
-            pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
-                            border_radius=border_radius)
-            
-            # Use the rounded rectangle as a mask for the card
-            rounded_card.blit(rotated_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
-            
-            # Draw card with border
-            pygame.draw.rect(surface, BLACK, rect.inflate(2, 2), border_radius=border_radius)
-            surface.blit(rounded_card, rect)
+            # Draw rotated card surface directly (already has rounded corners and border)
+            surface.blit(rotated_img, rect)
     
     def draw_status_info(self, surface):
         """Draw game status information with emphasis on player turn"""
@@ -4279,19 +4632,53 @@ class GameScreen(BaseScreen):
         """Draw message log with scrolling support"""
         # Draw background
         pygame.draw.rect(surface, DARK_BLUE, self.message_log_rect, border_radius=5)
+
+        # Header area for dragging and controls
+        header_rect = pygame.Rect(
+            self.message_log_rect.left,
+            self.message_log_rect.top,
+            self.message_log_rect.width,
+            self.message_header_height,
+        )
+        pygame.draw.rect(surface, DARK_BLUE, header_rect, border_radius=5)
+        # Minimize button at right of header
+        btn_size = self.message_header_height - 8
+        self.message_minimize_rect = pygame.Rect(
+            header_rect.right - btn_size - 6,
+            header_rect.top + 4,
+            btn_size,
+            btn_size,
+        )
+        pygame.draw.rect(surface, GOLD, self.message_minimize_rect, border_radius=4)
+        minus_y = self.message_minimize_rect.centery
+        pygame.draw.line(surface, DARK_BLUE, (self.message_minimize_rect.left + 4, minus_y), (self.message_minimize_rect.right - 4, minus_y), 3)
+
+        # Draw border LAST, so it stays on top (fix top light blue outline)
         pygame.draw.rect(surface, LIGHT_BLUE, self.message_log_rect, 2, border_radius=5)
+
+        # Resize handle at bottom-right
+        self.message_resize_rect = pygame.Rect(
+            self.message_log_rect.right - self.message_resize_zone_size,
+            self.message_log_rect.bottom - self.message_resize_zone_size,
+            self.message_resize_zone_size,
+            self.message_resize_zone_size,
+        )
+        pygame.draw.rect(surface, LIGHT_GRAY, self.message_resize_rect, border_radius=3)
         
         # Draw title
         title_surf = self.small_font.render("Messages", True, WHITE)
-        title_rect = title_surf.get_rect(midtop=(self.message_log_rect.centerx, self.message_log_rect.top + 5))
+        title_rect = title_surf.get_rect(midleft=(self.message_log_rect.left + 8, self.message_log_rect.top + 6))
         surface.blit(title_surf, title_rect)
+
+        if self.message_minimized:
+            return
         
         # Calcola area utile per i messaggi
         content_rect = pygame.Rect(
             self.message_log_rect.left + 5,
-            self.message_log_rect.top + 25,
+            self.message_log_rect.top + self.message_header_height + 5,
             self.message_log_rect.width - 30,  # Spazio per la scrollbar
-            self.message_log_rect.height - 30
+            self.message_log_rect.height - self.message_header_height - 10
         )
         
         # Recupera tutti i messaggi (non limitandoli più a 5)
@@ -4346,50 +4733,62 @@ class GameScreen(BaseScreen):
         
         # Disegna la scrollbar se necessaria
         if total_messages > max_visible:
-            scrollbar_rect = pygame.Rect(
+            scrollbar_outer = pygame.Rect(
                 self.message_log_rect.right - 20,
                 content_rect.top,
                 15,
                 content_rect.height
             )
-            pygame.draw.rect(surface, LIGHT_GRAY, scrollbar_rect, border_radius=7)
-            
-            # Calcola la posizione e dimensione del cursore di scorrimento
-            thumb_height = max(30, scrollbar_rect.height * max_visible / total_messages)
-            thumb_pos = scrollbar_rect.top + (scrollbar_rect.height - thumb_height) * self.message_scroll_offset / max_offset
-            
-            thumb_rect = pygame.Rect(
-                scrollbar_rect.left,
-                thumb_pos,
-                scrollbar_rect.width,
-                thumb_height
-            )
-            pygame.draw.rect(surface, WHITE, thumb_rect, border_radius=7)
-            
-            # Disegna pulsanti di scorrimento
-            up_arrow = pygame.Rect(scrollbar_rect.left, scrollbar_rect.top - 20, 15, 15)
-            down_arrow = pygame.Rect(scrollbar_rect.left, scrollbar_rect.bottom + 5, 15, 15)
-            
+            pygame.draw.rect(surface, LIGHT_GRAY, scrollbar_outer, border_radius=7)
+
+            # Frecce di scorrimento dentro il box messaggi
+            arrow_h = 16
+            up_arrow = pygame.Rect(scrollbar_outer.left, content_rect.top, scrollbar_outer.width, arrow_h)
+            down_arrow = pygame.Rect(scrollbar_outer.left, content_rect.bottom - arrow_h, scrollbar_outer.width, arrow_h)
             pygame.draw.rect(surface, LIGHT_GRAY, up_arrow, border_radius=3)
             pygame.draw.rect(surface, LIGHT_GRAY, down_arrow, border_radius=3)
             
-            # Disegna triangoli per le frecce
+            # Triangoli per le frecce
             pygame.draw.polygon(surface, WHITE, [
                 (up_arrow.centerx, up_arrow.top + 3),
                 (up_arrow.left + 3, up_arrow.bottom - 3),
                 (up_arrow.right - 3, up_arrow.bottom - 3)
             ])
-            
             pygame.draw.polygon(surface, WHITE, [
                 (down_arrow.centerx, down_arrow.bottom - 3),
                 (down_arrow.left + 3, down_arrow.top + 3),
                 (down_arrow.right - 3, down_arrow.top + 3)
             ])
-            
-            # Salva i rettangoli per il rilevamento dei clic
+
+            # Traccia della scrollbar tra le frecce
+            track_top = up_arrow.bottom + 2
+            track_height = max(10, content_rect.height - 2 * arrow_h - 4)
+            scrollbar_track = pygame.Rect(scrollbar_outer.left, track_top, scrollbar_outer.width, track_height)
+            pygame.draw.rect(surface, (200, 200, 200), scrollbar_track, border_radius=7)
+
+            # Cursore proporzionale alla quantità visibile
+            if max_offset > 0:
+                thumb_height = max(30, track_height * max_visible / total_messages)
+                thumb_offset = (track_height - thumb_height) * (self.message_scroll_offset / max_offset)
+            else:
+                thumb_height = track_height
+                thumb_offset = 0
+            thumb_rect = pygame.Rect(scrollbar_track.left, scrollbar_track.top + thumb_offset, scrollbar_track.width, thumb_height)
+            pygame.draw.rect(surface, WHITE, thumb_rect, border_radius=7)
+
+            # Salva i rettangoli per click/drag
+            # Persist scrollbar geometry for interactions
             self.scroll_up_rect = up_arrow
             self.scroll_down_rect = down_arrow
-            self.scrollbar_rect = scrollbar_rect
+            self.scrollbar_rect = scrollbar_track
+            self.scrollbar_thumb_rect = thumb_rect
+            self.scrollbar_thumb_height = thumb_height
+            self.scrollbar_max_offset = max_offset
+        else:
+            self.scroll_up_rect = None
+            self.scroll_down_rect = None
+            self.scrollbar_rect = None
+            self.scrollbar_thumb_rect = None
     
     def draw_game_over(self, surface):
         """Draw responsive game over screen with results"""
@@ -4910,26 +5309,20 @@ class GameScreen(BaseScreen):
                 scaled_height = int(self.card_height * current_scale)
                 scaled_img = pygame.transform.scale(card_img, (scaled_width, scaled_height))
                 
+                # Compose rounded card with border BEFORE rotation
+                base_card = pygame.Surface((scaled_width, scaled_height), pygame.SRCALPHA)
+                base_card.fill((0, 0, 0, 0))
+                base_rect = base_card.get_rect()
+                pygame.draw.rect(base_card, (255, 255, 255), base_rect, border_radius=border_radius)
+                base_card.blit(scaled_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+                pygame.draw.rect(base_card, BLACK, base_rect, width=2, border_radius=border_radius)
+                
                 # Apply rotation
-                rotated_img = pygame.transform.rotate(scaled_img, current_rotation)
+                rotated_img = pygame.transform.rotate(base_card, current_rotation)
                 
-                # Create rect centered at position
+                # Create rect centered at position and blit rotated card directly
                 rect = rotated_img.get_rect(center=current_pos)
-                
-                # Create a version of the card with rounded corners
-                rounded_card = pygame.Surface(rotated_img.get_size(), pygame.SRCALPHA)
-                rounded_card.fill((0, 0, 0, 0))  # Transparent background
-                
-                # Draw rounded rectangle on the surface
-                pygame.draw.rect(rounded_card, (255, 255, 255), rounded_card.get_rect(), 
-                                border_radius=border_radius)
-                
-                # Use the rounded rectangle as a mask for the card
-                rounded_card.blit(rotated_img, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
-                
-                # Draw card with border
-                pygame.draw.rect(surface, BLACK, rect.inflate(2, 2), border_radius=border_radius)
-                surface.blit(rounded_card, rect)
+                surface.blit(rotated_img, rect)
 
 class ScoponeApp:
     """Main application class"""
