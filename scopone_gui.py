@@ -2220,7 +2220,19 @@ class GameModeScreen(BaseScreen):
                 except Exception:
                     pass
                 self.done = True
-                self.next_screen = "lobby" if go_lobby else "game"
+                # Heuristic: if client and no full game state yet, go to lobby
+                try:
+                    gs = self.app.network.game_state if isinstance(self.app.network.game_state, dict) else {}
+                except Exception:
+                    gs = {}
+                is_client = not self.app.network.is_host
+                no_hands_yet = not gs or ('hands' not in gs)
+                all_human_flag = (gs.get('online_type') == 'all_human') if isinstance(gs, dict) else False
+                team_vs_ai_flag = (gs.get('online_type') == 'team_vs_ai') if isinstance(gs, dict) else False
+                if is_client and (go_lobby or all_human_flag or (no_hands_yet and not team_vs_ai_flag)):
+                    self.next_screen = "lobby"
+                else:
+                    self.next_screen = "game"
                 
                 # FIX: Preserva il valore is_host dal NetworkManager
                 # invece di sovrascriverlo con False
@@ -2477,6 +2489,19 @@ class LobbyScreen(BaseScreen):
         # Title
         title = self.title_font.render("Lobby (4 giocatori)", True, WHITE)
         surface.blit(title, title.get_rect(center=(center_x, int(height*0.12))))
+        # Client waiting badge
+        if self.app.network and not self.app.network.is_host:
+            badge_text = "In attesa dell'host…"
+            badge_surf = self.small_font.render(badge_text, True, WHITE)
+            padding_x = 12
+            padding_y = 6
+            badge_rect = badge_surf.get_rect()
+            badge_bg = pygame.Rect(0, 0, badge_rect.width + 2*padding_x, badge_rect.height + 2*padding_y)
+            # Place under the title
+            badge_bg.center = (center_x, int(height*0.18))
+            pygame.draw.rect(surface, (30, 30, 70), badge_bg, border_radius=12)
+            pygame.draw.rect(surface, GOLD, badge_bg, 2, border_radius=12)
+            surface.blit(badge_surf, badge_surf.get_rect(center=badge_bg.center))
         # Input label and box
         label = self.info_font.render("Nickname:", True, WHITE)
         surface.blit(label, label.get_rect(midleft=(self.name_input_rect.left, self.name_input_rect.top - 10)))
@@ -4310,8 +4335,8 @@ class GameScreen(BaseScreen):
                         self.team_vs_ai_configured = True
                         print("Configurazione team_vs_ai completata e bloccata per evitare ripetizioni")
                 
-                # Apply the new state to the environment
-                if self.env:
+                # Apply the new state to the environment (only when it contains basic fields)
+                if self.env and isinstance(new_state, dict):
                     # Store hands before updating state to ensure local player's hand is preserved
                     local_hand = None
                     if self.local_player_id is not None and 'hands' in new_state:
@@ -4358,17 +4383,21 @@ class GameScreen(BaseScreen):
                     
                     # Check for card movements and update visuals
                     if old_state and old_state != new_state:
-                        # Generate animations for changes
+                        # Generate animations for changes (only if both states have 'table' or 'hands')
                         self.detect_and_animate_changes(old_state, new_state, old_current_player)
                         self.waiting_for_other_player = False
                         
-                        # Check for game over
-                        if all(len(new_state["hands"].get(p, [])) == 0 for p in range(4)):
-                            self.game_over = True
-                            from rewards import compute_final_score_breakdown
-                            # Usa le regole correnti per il breakdown
-                            from rewards import compute_final_score_breakdown
-                            self.final_breakdown = compute_final_score_breakdown(new_state, rules=self.app.game_config.get("rules", {}))
+                        # Check for game over only if 'hands' exists in new_state
+                        if 'hands' in new_state:
+                            try:
+                                if all(len(new_state["hands"].get(p, [])) == 0 for p in range(4)):
+                                    self.game_over = True
+                                    from rewards import compute_final_score_breakdown
+                                    # Usa le regole correnti per il breakdown
+                                    from rewards import compute_final_score_breakdown
+                                    self.final_breakdown = compute_final_score_breakdown(new_state, rules=self.app.game_config.get("rules", {}))
+                            except Exception:
+                                pass
                     
                     # Apply series fields if provided by host
                     if series_state and isinstance(series_state, dict):
@@ -4388,9 +4417,9 @@ class GameScreen(BaseScreen):
         if not old_state or not new_state:
             return
         
-        # Get table states
-        old_table = old_state.get('table', [])
-        new_table = new_state.get('table', [])
+        # Get table states safely
+        old_table = old_state.get('table', []) if isinstance(old_state, dict) else []
+        new_table = new_state.get('table', []) if isinstance(new_state, dict) else []
         
         print(f"Client detecting changes: Old table: {old_table}")
         print(f"New table: {new_table}")
@@ -4422,8 +4451,10 @@ class GameScreen(BaseScreen):
         
         # Check each player's hand for a card that disappeared
         for p_id in range(4):
-            old_hand = old_state.get('hands', {}).get(p_id, [])
-            new_hand = new_state.get('hands', {}).get(p_id, [])
+            old_hands = old_state.get('hands', {}) if isinstance(old_state, dict) else {}
+            new_hands = new_state.get('hands', {}) if isinstance(new_state, dict) else {}
+            old_hand = old_hands.get(p_id, [])
+            new_hand = new_hands.get(p_id, [])
             
             # Skip if hands are the same or missing
             if not old_hand or not new_hand or old_hand == new_hand:
