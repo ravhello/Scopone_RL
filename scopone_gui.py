@@ -1176,24 +1176,43 @@ class GameOptionsScreen(BaseScreen):
         mode = self.rules.get("mode_type", "points")
 
         # Duration section
-        duration_items = 4  # radio buttons, target points, tiebreak, + optional num_hands
+        # radio buttons, one stepper (target/mani) and tiebreak
+        duration_items = 3
         if mode == "hands":
-            duration_items += 1  # add num_hands stepper
-        duration_height = 60 + duration_items * 45  # title space + items
+            duration_items += 0  # still one stepper, just label changes
+        duration_height = 56 + duration_items * 36  # tighter spacing
 
         # Variants section
-        variant_toggles = 6  # all the toggle options
-        variant_steppers = 1  # max consecutive scope
-        variants_height = 60 + variant_toggles * 40 + variant_steppers * 50
+        # Base toggles: AP, last_scopa, re_bello, napola
+        variant_toggles = 4
+        # AP-dependent
+        if self.rules.get("asso_piglia_tutto", False):
+            variant_toggles += 2  # scopa_on_asso_piglia_tutto + posabile
+            if self.rules.get("asso_piglia_tutto_posabile", False):
+                variant_toggles += 1  # only_empty
+        # Napola scoring line if enabled
+        if self.rules.get("napola", False):
+            variant_toggles += 1
+        # One stepper for max consecutive scope
+        variant_steppers = 1
+        variants_height = 56 + variant_toggles * 36 + variant_steppers * 40
 
         # Setup section (AI subsection rimosso)
         setup_items = 2  # starting team + last cards to dealer
-        combined_height = 60 + setup_items * 42
+        # Altezza più aderente al contenuto: padding top/bottom 8px, item ~28-30px con gap
+        combined_height = 8 + setup_items * 34 + 8
+
+        # Visibility section (only for local multiplayer and team_vs_ai)
+        is_local_mode = self.app.game_config.get("mode") in ("local_multiplayer", "team_vs_ai")
+        visibility_items = 1 if is_local_mode else 0
+        # Altezza compatta anche qui
+        visibility_height = 0 if visibility_items == 0 else (8 + visibility_items * 34 + 8)
 
         return {
             "duration": duration_height,
             "variants": variants_height,
             "setup_ai": combined_height,
+            "visibility": visibility_height,
         }
 
     def setup_layout(self):
@@ -1211,8 +1230,9 @@ class GameOptionsScreen(BaseScreen):
         right_x = int(width * 0.52)
         top_y = int(height * 0.19)
         
-        # Left column - only variants now
+        # Left column - variants + visibility (if any)
         var_h = section_heights["variants"]
+        vis_h = section_heights.get("visibility", 0)
         
         # Right column - duration at top, setup below
         dur_h = section_heights["duration"]
@@ -1223,9 +1243,12 @@ class GameOptionsScreen(BaseScreen):
             "duration": pygame.Rect(right_x, top_y, col_w, dur_h),
             "setup_ai": pygame.Rect(right_x, top_y + dur_h + pad, col_w, setup_ai_h),
         }
+        # Add visibility section only if it has height
+        if vis_h > 0:
+            self.sections["visibility"] = pygame.Rect(left_x, top_y + var_h + pad, col_w, vis_h)
 
         # Buttons at bottom - position based on tallest column
-        left_col_bottom = top_y + var_h
+        left_col_bottom = top_y + var_h + (pad + vis_h if vis_h > 0 else 0)
         right_col_bottom = top_y + dur_h + pad + setup_ai_h
         content_bottom = max(left_col_bottom, right_col_bottom)
         
@@ -1339,6 +1362,10 @@ class GameOptionsScreen(BaseScreen):
         if getattr(self, 'last_cards_rect', None) and self.last_cards_rect.collidepoint(pos):
             self._toggle("last_cards_to_dealer")
 
+        # Visibility (only if rect exists)
+        if getattr(self, 'only_turn_cards_rect', None) and self.only_turn_cards_rect.collidepoint(pos):
+            self._toggle("show_only_current_turn_cards")
+
         # (Rimosso) Tempo per mossa AI
 
     def _on_start(self):
@@ -1427,33 +1454,29 @@ class GameOptionsScreen(BaseScreen):
         pygame.draw.rect(surface, GOLD, dur_rect, 2, border_radius=10)
         self.draw_section_title(surface, dur_rect, "Durata / Condizioni di Vittoria")
 
-        # Radios mode
+        # Radios mode (compact)
         mode = self.rules.get("mode_type", "points")
         radios = self.draw_radio3(surface, ["A punti", "A mani", "One-shot"],
                                   ["points","hands","oneshot"].index(mode),
-                                  pygame.Rect(dur_rect.left+10, dur_rect.top+10, dur_rect.width-20, 40))
+                                  pygame.Rect(dur_rect.left+10, dur_rect.top+8, dur_rect.width-20, 34))
         self.mode_points_rect, self.mode_hands_rect, self.mode_oneshot_rect = radios
 
-        # Show only controls relevant to selected mode
+        # Compact stepper just below radios
         self.nh_minus_rect = self.nh_plus_rect = None
         self.tp_minus_rect = self.tp_plus_rect = None
-        # Draw mode-specific controls
+        center_y = dur_rect.top + 8 + 34 + 26
         if mode == "points":
-            tp_center = (dur_rect.centerx, dur_rect.centery - 10)
+            tp_center = (dur_rect.centerx, center_y)
             self.tp_minus_rect, self.tp_plus_rect = self.draw_stepper(
                 surface, "Target punti", self.rules.get("target_points", 21), tp_center,
-                int(dur_rect.width*0.3), 36)
+                int(dur_rect.width*0.3), 32)
         elif mode == "hands":
-            nh_center = (dur_rect.centerx, dur_rect.centery)
+            nh_center = (dur_rect.centerx, center_y)
             self.nh_minus_rect, self.nh_plus_rect = self.draw_stepper(
                 surface, "Numero mani", self.rules.get("num_hands", 1), nh_center,
-                int(dur_rect.width*0.3), 36)
-        else:
-            # oneshot: no extra controls
-            pass
-
-        # Tiebreak option (visible for all modes)
-        tb_rect = pygame.Rect(dur_rect.left + 10, dur_rect.bottom - 40, dur_rect.width - 20, 28)
+                int(dur_rect.width*0.3), 32)
+        # Tiebreak option (compact, directly below)
+        tb_rect = pygame.Rect(dur_rect.left + 10, center_y + 32 + 10, dur_rect.width - 20, 26)
         self.tb_rect = tb_rect
         tb_text = f"Spareggio: {self.rules.get('tiebreak','single')}"
         pygame.draw.rect(surface, DARK_BLUE, tb_rect, border_radius=6)
@@ -1463,9 +1486,9 @@ class GameOptionsScreen(BaseScreen):
 
         # Variants content (moved above) continues
 
-        # toggles
-        h = 32
-        y = var_rect.top + 10
+        # toggles (more compact gaps)
+        h = 30
+        y = var_rect.top + 8
         self.ap_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
         self.draw_toggle(surface, self.ap_rect, "Asso piglia tutto", self.rules.get("asso_piglia_tutto", False))
 
@@ -1494,21 +1517,34 @@ class GameOptionsScreen(BaseScreen):
         self.draw_toggle(surface, self.rb_rect, "Re Bello (Re di denari)", self.rules.get("re_bello", False))
         self.nap_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h)
         self.draw_toggle(surface, self.nap_rect, "Napola (A-2-3... di denari)", self.rules.get("napola", False))
-        y += h+8
+        y += h+6
         # Mostra la riga di scoring solo se Napola è attiva
         if self.rules.get("napola", False):
             self.nap_scoring_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h)
             ns_text = f"Punteggio Napola: {self.rules.get('napola_scoring','fixed3')}"
             self.draw_toggle(surface, self.nap_scoring_rect, ns_text, True)
-            y += h+8
+            y += h+6
         else:
             self.nap_scoring_rect = None
-        # max consecutive scope stepper
+        # max consecutive scope stepper subito dopo Napola
         cur = self.rules.get("max_consecutive_scope")
         cur_disp = 0 if cur is None else int(cur)
         self.max_scope_minus_rect, self.max_scope_plus_rect = self.draw_stepper(
             surface, "Limite scope consecutive (0=nessuno)", cur_disp,
-            (var_rect.centerx, var_rect.bottom - 45), int(var_rect.width*0.3), 32)
+            (var_rect.centerx, y + 20), int(var_rect.width*0.3), 30)
+        y += 46
+
+        # Sezione visibilità carte (solo locale)
+        is_local_mode = self.app.game_config.get("mode") in ("local_multiplayer", "team_vs_ai")
+        if is_local_mode and "visibility" in self.sections:
+            vis_rect = self.sections["visibility"]
+            pygame.draw.rect(surface, (10, 10, 40), vis_rect, border_radius=10)
+            pygame.draw.rect(surface, GOLD, vis_rect, 2, border_radius=10)
+            self.draw_section_title(surface, vis_rect, "Visibilità carte")
+            vh = 30
+            vy = vis_rect.top + 8
+            self.only_turn_cards_rect = pygame.Rect(vis_rect.left+10, vy, vis_rect.width-20, vh)
+            self.draw_toggle(surface, self.only_turn_cards_rect, "Carte scoperte solo quelle di quello di turno", self.rules.get("show_only_current_turn_cards", False))
 
         # Setup section (right bottom)
         setup_ai_rect = self.sections["setup_ai"]
@@ -1516,15 +1552,15 @@ class GameOptionsScreen(BaseScreen):
         pygame.draw.rect(surface, GOLD, setup_ai_rect, 2, border_radius=10)
         self.draw_section_title(surface, setup_ai_rect, "Setup tavolo")
         
-        # Setup content
-        y_offset = setup_ai_rect.top + 10
+        # Setup content (compact)
+        y_offset = setup_ai_rect.top + 8
         st_text = f"Chi inizia: {self.rules.get('starting_team','random')}"
-        self.start_team_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 32)
+        self.start_team_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 28)
         self.draw_toggle(surface, self.start_team_rect, st_text, True)
-        y_offset += 42
-        self.last_cards_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 32)
+        y_offset += 36
+        self.last_cards_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 28)
         self.draw_toggle(surface, self.last_cards_rect, "Ultime carte al team dell'ultima presa", self.rules.get("last_cards_to_dealer", True))
-        y_offset += 42
+        y_offset += 36
 
         # (Sezione AI rimossa)
 
@@ -1630,6 +1666,8 @@ class GameModeScreen(BaseScreen):
             "napola": False,
             "napola_scoring": "fixed3",
             "max_consecutive_scope": None,
+            # Visibilità carte (solo locale)
+            "show_only_current_turn_cards": False,
             # Nuove opzioni AP posabilità
             "asso_piglia_tutto_posabile": False,
             "asso_piglia_tutto_posabile_only_empty": False,
@@ -3713,17 +3751,24 @@ class GameScreen(BaseScreen):
             return pygame.Rect(left, top, pile_width, pile_height)
     
     def update_player_hands(self):
-        """Update player hand information from game state"""
+        """Update player hand information from game state in a safe way"""
         if not self.env:
             return
-            
-        gs = self.env.game_state
+        
+        gs = getattr(self.env, 'game_state', None)
+        if not isinstance(gs, dict):
+            # Clear all hands if no valid game state is present yet
+            for player in self.players:
+                player.set_hand([])
+            return
+        
+        hands = gs.get('hands', {})
+        if not isinstance(hands, dict):
+            hands = {}
         
         for player in self.players:
-            if player.player_id in gs["hands"]:
-                player.set_hand(gs["hands"][player.player_id])
-            else:
-                player.set_hand([])
+            hand = hands.get(player.player_id, [])
+            player.set_hand(hand if isinstance(hand, list) else [])
     def handle_events(self, events):
         """Handle pygame events with connection loss recovery"""
         for event in events:
@@ -5610,31 +5655,30 @@ class GameScreen(BaseScreen):
         """Draw all players' hands and info with proper perspective handling"""
         for player in self.players:
             self.draw_player_info(surface, player)
-                
+
             # Determine if player's hand should be visible
             mode = self.app.game_config.get("mode")
             is_online = mode == "online_multiplayer"
-            
-            # Regole per determinare se mostrare la mano di un giocatore
+            rules = self.app.game_config.get("rules", {}) if hasattr(self.app, 'game_config') else {}
+            only_turn_local = bool(rules.get("show_only_current_turn_cards", False))
+
             show_hand = False
-            
-            # Regola 1: Online - mostra SOLO la mano del giocatore locale, mai quelle degli altri
+
             if is_online:
+                # Online: only local player's hand visible
                 show_hand = (player.player_id == self.local_player_id)
-            
-            # Regola 2: In modalità locale (sia 4 giocatori che team vs AI), mostra tutte le mani
             elif mode == "local_multiplayer":
-                show_hand = True
-            
-            # Regola 3: In team vs AI locale, mostra le mani di entrambi i membri del team (0 e 2)
-            elif mode == "team_vs_ai" and player.player_id in [0, 2]:
-                show_hand = True
-            
-            # Regola 4: In single player, mostra solo la mano del giocatore 0
-            elif mode == "single_player" and player.player_id == 0:
-                show_hand = True
-            
-            # Disegna la mano appropriata (visibile o nascosta)
+                # Local 4 human: either all hands or only current player's hand if option enabled
+                show_hand = (player.player_id == self.current_player_id) if only_turn_local else True
+            elif mode == "team_vs_ai":
+                # Local team vs AI: never reveal AI hands; with the option, only reveal the current human player's hand
+                if only_turn_local:
+                    show_hand = (player.player_id == self.current_player_id) and (not self.players[player.player_id].is_ai)
+                else:
+                    show_hand = (player.player_id in [0, 2])  # Only humans in local team vs AI
+            elif mode == "single_player":
+                show_hand = (player.player_id == 0)
+
             if show_hand:
                 self.draw_player_hand(surface, player)
             else:
