@@ -103,6 +103,46 @@ class ScoponeEnvMA(gym.Env):
                                         pass
                                 if not exists:
                                     valid_actions.append(extra)
+
+                    # Nuova regola: posabilità dell'asso piglia tutto
+                    # Se posabile è consentito, aggiungi anche l'azione di "posa" (nessuna presa)
+                    ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
+                    ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
+                    if ap_posabile:
+                        for card in hand_cards:
+                            if card[0] == 1:
+                                can_place_now = True if not ap_only_empty else (len(table_cards) == 0)
+                                if can_place_now:
+                                    # Verifica se esiste già l'azione di posa (cattura vuota)
+                                    place_vec = encode_action(card, [])
+                                    exists = False
+                                    for v in valid_actions:
+                                        try:
+                                            if (place_vec == v).all():
+                                                exists = True
+                                                break
+                                        except Exception:
+                                            pass
+                                    if not exists:
+                                        valid_actions.append(place_vec)
+
+                    # Se AP è attivo ma la posa non è consentita nelle condizioni attuali,
+                    # rimuovi eventuali azioni di "posa" dell'asso (no-capture)
+                    allow_place_now = ap_posabile and (not ap_only_empty or (len(table_cards) == 0))
+                    if not allow_place_now:
+                        filtered = []
+                        for v in valid_actions:
+                            keep = True
+                            try:
+                                pc, cc = decode_action(v)
+                                if pc[0] == 1 and len(cc) == 0:
+                                    # è una posa di asso → vietata ora
+                                    keep = False
+                            except Exception:
+                                pass
+                            if keep:
+                                filtered.append(v)
+                        valid_actions = filtered
             except Exception:
                 # In caso di qualunque errore, non interrompere il flusso
                 pass
@@ -142,9 +182,24 @@ class ScoponeEnvMA(gym.Env):
         for c in cards_to_capture:
             if c not in table:
                 raise ValueError(f"La carta {c} non si trova sul tavolo; cattura non valida.")
+
+        # Applicazione nuova regola AP posabilità: forza presa totale se non è consentito posare
+        rank, suit = played_card
+        ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
+        ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
+        ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
+        forced_ace_capture_on_empty = False
+        if ap_enabled and rank == 1:
+            can_place_now = ap_posabile and (not ap_only_empty or (ap_only_empty and len(table) == 0))
+            if not can_place_now and len(cards_to_capture) == 0:
+                if len(table) > 0:
+                    # Forza presa di tutto il tavolo
+                    cards_to_capture = list(table)
+                else:
+                    # Tavolo vuoto: la posa è vietata, tratta come cattura forzata per scopa
+                    forced_ace_capture_on_empty = True
         
         # Verifica regole di cattura
-        rank, suit = played_card
         same_rank_cards = [tc for tc in table if tc[0] == rank]
         
         if same_rank_cards:
@@ -169,7 +224,17 @@ class ScoponeEnvMA(gym.Env):
         # Rimuovi la carta giocata dalla mano
         hand.remove(played_card)
         
-        if cards_to_capture:
+        if forced_ace_capture_on_empty:
+            # Cattura forzata su tavolo vuoto: conta come scopa (o cattura se disabilitata via opzione)
+            squad_id = 0 if current_player in [0, 2] else 1
+            self.game_state["captured_squads"][squad_id].append(played_card)
+            # Scopa se non è l'ultima carta giocata
+            cards_left = sum(len(self.game_state["hands"][p]) for p in range(4))
+            if cards_left > 0:
+                capture_type = "scopa"
+            else:
+                capture_type = "scopa" if self.rules.get("scopa_on_last_capture", False) else "capture"
+        elif cards_to_capture:
             # Cattura carte
             for c in cards_to_capture:
                 table.remove(c)
