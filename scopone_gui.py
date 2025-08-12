@@ -524,7 +524,7 @@ class NetworkManager:
         self.clients = []
         self.connected = False
         self.player_id = 0 if is_host else None
-        self.game_state = None
+        self.game_state = {}
         self.message_queue = deque()
         self.move_queue = deque()
         self.reconnect_attempts = 0
@@ -643,10 +643,35 @@ class NetworkManager:
                 # Add message to queue
                 self.message_queue.append(f"Player {player_id} connected")
                 
-                # If all players connected, start the game
+                # Initialize/refresh lobby state for all-human mode
+                if not is_team_vs_ai:
+                    try:
+                        lobby = self.game_state.setdefault('lobby_state', {'players': {}})
+                        players = lobby.setdefault('players', {})
+                        # Ensure host entry exists
+                        if 0 not in players:
+                            players[0] = {'name': 'Host', 'team': 0, 'ready': False}
+                        # Ensure this client entry exists with default team by seat
+                        if player_id not in players:
+                            default_team = 0 if player_id in [0, 2] else 1
+                            players[player_id] = {
+                                'name': f'Player {player_id}',
+                                'team': default_team,
+                                'ready': False
+                            }
+                        # Broadcast lobby to all connected clients
+                        self.broadcast_lobby_state()
+                    except Exception as e:
+                        print(f"Error updating/broadcasting lobby state: {e}")
+                
+                # If all players connected
                 if len(self.clients) == expected_clients:
-                    self.message_queue.append("All players connected, starting game...")
-                    self.broadcast_start_game()
+                    if is_team_vs_ai:
+                        self.message_queue.append("All players connected, starting game...")
+                        self.broadcast_start_game()
+                    else:
+                        # All-human: wait in lobby, do not auto-start
+                        self.message_queue.append("All players connected. Waiting in lobby...")
             except Exception as e:
                 print(f"Error accepting connection: {e}")
                 break
@@ -669,6 +694,19 @@ class NetworkManager:
                 elif message["type"] == "chat":
                     # Add chat message to queue
                     self.message_queue.append(f"Player {player_id}: {message['text']}")
+                elif message["type"] == "lobby_update" and self.is_host:
+                    # Update lobby state with client's nickname/ready/team changes
+                    lobby = self.game_state.setdefault('lobby_state', {'players': {}})
+                    pdata = lobby.setdefault('players', {}).setdefault(player_id, {})
+                    # Allowed fields: name, ready; team is fixed by seat (0&2 vs 1&3)
+                    if 'name' in message:
+                        pdata['name'] = str(message['name'])[:20]
+                    if 'ready' in message:
+                        pdata['ready'] = bool(message['ready'])
+                    # Ensure team based on seat
+                    pdata['team'] = 0 if player_id in [0, 2] else 1
+                    # Broadcast updated lobby to all
+                    self.broadcast_lobby_state()
                 
             except Exception as e:
                 print(f"Error handling client {player_id}: {e}")
@@ -731,8 +769,22 @@ class NetworkManager:
                             self.app.game_config["rules"].update(message["rules"])
                         # Messaggio a schermo
                         self.message_queue.append("Regole partita sincronizzate dall'host")
+                elif message["type"] == "lobby_state":
+                    # Sync lobby state from host
+                    if not isinstance(self.game_state, dict):
+                        self.game_state = {}
+                    self.game_state['lobby_state'] = message.get('state', {})
+                    self.message_queue.append("Lobby aggiornata dall'host")
                 elif message["type"] == "start_game":
                     self.message_queue.append("Game starting!")
+                elif message["type"] == "player_names":
+                    # Store player names into app config for GameScreen to use
+                    try:
+                        if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                            self.app.game_config['player_names'] = message.get('names', {})
+                            self.message_queue.append("Nicknames sincronizzati")
+                    except Exception:
+                        pass
                 elif message["type"] == "series_state":
                     # Update series and overlay state from host (store in network.game_state)
                     state = message.get('state', {})
@@ -883,6 +935,26 @@ class NetworkManager:
             except:
                 pass
 
+        # Send player names if present
+        try:
+            names = None
+            if isinstance(self.game_state, dict):
+                names = self.game_state.get('player_names')
+            if not names:
+                import builtins
+                if hasattr(builtins, 'app') and hasattr(builtins.app, 'game_config'):
+                    names = builtins.app.game_config.get('player_names')
+            if names:
+                names_msg = {"type": "player_names", "names": names}
+                data_names = pickle.dumps(names_msg)
+                for client, _ in self.clients:
+                    try:
+                        client.sendall(data_names)
+                    except:
+                        pass
+        except Exception:
+            pass
+
         message = {"type": "start_game"}
         data = pickle.dumps(message)
         
@@ -903,6 +975,36 @@ class NetworkManager:
                 client.sendall(data)
             except Exception:
                 pass
+    
+    def broadcast_lobby_state(self):
+        """Broadcast lobby state to clients (host only)"""
+        if not self.is_host:
+            return
+        state = self.game_state.get('lobby_state', {})
+        try:
+            msg = {"type": "lobby_state", "state": state}
+            data = pickle.dumps(msg)
+            for client, _ in self.clients:
+                try:
+                    client.sendall(data)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Error broadcasting lobby: {e}")
+
+    def send_lobby_update(self, name: str = None, ready: bool = None):
+        """Send a lobby update to host (for clients)."""
+        if self.is_host or not self.connected or not self.socket:
+            return
+        payload = {"type": "lobby_update"}
+        if name is not None:
+            payload['name'] = name
+        if ready is not None:
+            payload['ready'] = bool(ready)
+        try:
+            self.socket.sendall(pickle.dumps(payload))
+        except Exception as e:
+            print(f"Error sending lobby update: {e}")
     
     def broadcast_chat(self, player_id, text):
         """Broadcast chat message to all clients (host only)"""
@@ -1805,16 +1907,24 @@ class GameModeScreen(BaseScreen):
                 self.app.network.message_queue.append("Per Internet: usa l'IP Pubblico + port forwarding (porta 5555)")
 
             if self.selected_online_mode == 0:
-                # 4 Players (All Human)
+                # 4 Players (All Human) -> go to lobby
                 self.done = True
-                self.next_screen = "game"
+                self.next_screen = "lobby"
                 self.app.game_config = {
                     "mode": "online_multiplayer",
-                    "is_host": True,  # CRITICAL: Set is_host flag
+                    "is_host": True,
                     "player_id": 0,
                     "online_type": "all_human"
                 }
-                print(f"DEBUG HOST GAME: Setting game_config with is_host=True, online_type=all_human")
+                # Initialize basic lobby state for host
+                try:
+                    lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
+                    players = lobby.setdefault('players', {})
+                    players[0] = {'name': 'Host', 'team': 0, 'ready': False}
+                    self.app.network.broadcast_lobby_state()
+                except Exception:
+                    pass
+                print("DEBUG HOST GAME: Lobby avviata (all_human)")
             else:
                 # 2 vs 2 (Team vs AI) - Mostra animazione di caricamento
                 self.loading = True
@@ -2085,8 +2195,17 @@ class GameModeScreen(BaseScreen):
             # Verifica se la connessione ha avuto successo anche se non è più in progress
             if self.app.network.connected and not self.done:
                 print("Connessione riuscita, passaggio alla schermata di gioco")
+                # If we're joining a 4-human room, go to lobby first; otherwise go to game
+                go_lobby = False
+                try:
+                    if isinstance(self.app.network.game_state, dict):
+                        go_lobby = self.app.network.game_state.get('online_type') == 'all_human' or (
+                            'lobby_state' in self.app.network.game_state
+                        )
+                except Exception:
+                    pass
                 self.done = True
-                self.next_screen = "game"
+                self.next_screen = "lobby" if go_lobby else "game"
                 
                 # FIX: Preserva il valore is_host dal NetworkManager
                 # invece di sovrascriverlo con False
@@ -2150,6 +2269,259 @@ class PlayerInfo:
         
     def set_hand(self, cards):
         self.hand_cards = cards.copy() if cards else []
+
+class LobbyScreen(BaseScreen):
+    """Lobby for 4-human online games: players set nickname and ready before start."""
+    def __init__(self, app):
+        super().__init__(app)
+        self.title_font = pygame.font.SysFont(None, 52)
+        self.info_font = pygame.font.SysFont(None, 28)
+        self.small_font = pygame.font.SysFont(None, 22)
+        self.input_active = False
+        self.nickname = ""
+        self.ready = False
+        self.start_button = None
+        self.ready_button = None
+        self.name_input_rect = None
+        self.status_message = ""
+        # Caret blink state
+        self.caret_visible = True
+        self.caret_last_toggle = 0
+        self.caret_blink_interval_ms = 500
+        # Connection info rect
+        self.conn_info_rect = None
+
+    def enter(self):
+        super().enter()
+        # Prefill nickname from config if present
+        self.nickname = self.app.game_config.get('nickname', '')
+        self.ready = False
+        self.status_message = ""
+        self.setup_layout()
+        # Focus nickname input for host to show blinking caret immediately
+        self.input_active = bool(self.app.network and self.app.network.is_host)
+        # Ensure host initializes lobby players
+        if self.app.network and self.app.network.is_host:
+            lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
+            players = lobby.setdefault('players', {})
+            for pid in [0, 1, 2, 3]:
+                if pid not in players:
+                    players[pid] = {'name': f'Player {pid}', 'team': (0 if pid in [0, 2] else 1), 'ready': False}
+            self.app.network.broadcast_lobby_state()
+
+    def setup_layout(self):
+        width = self.app.window_width
+        height = self.app.window_height
+        btn_w = int(width * 0.22)
+        btn_h = int(height * 0.07)
+        center_x = width // 2
+        # Input rect
+        self.name_input_rect = pygame.Rect(center_x - int(width * 0.25)//2, int(height * 0.30), int(width * 0.25), int(height * 0.07))
+        # Ready/Start buttons
+        self.ready_button = Button(center_x - btn_w - int(width*0.02), int(height * 0.45), btn_w, btn_h, "Pronto", DARK_GREEN, WHITE)
+        self.start_button = Button(center_x + int(width*0.02), int(height * 0.45), btn_w, btn_h, "Avvia partita", HIGHLIGHT_BLUE, WHITE)
+        # Connection info panel (top-right)
+        panel_w = int(width * 0.34)
+        panel_h = int(height * 0.22)
+        desired_x = width - panel_w - int(width*0.02)
+        # Ensure we don't overlap the nickname input: keep a small gap to its right
+        min_left = self.name_input_rect.right + int(width * 0.02)
+        panel_x = max(desired_x, min_left)
+        self.conn_info_rect = pygame.Rect(panel_x, int(height*0.16), panel_w, panel_h)
+
+    def handle_events(self, events):
+        for event in events:
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                pos = pygame.mouse.get_pos()
+                if self.name_input_rect.collidepoint(pos):
+                    self.input_active = True
+                else:
+                    self.input_active = False
+                # Ready toggle
+                if self.ready_button.is_clicked(pos):
+                    self.ready = not self.ready
+                    # Persist nickname locally
+                    if self.nickname:
+                        self.app.game_config['nickname'] = self.nickname
+                    # Send lobby update to host (or update local lobby if host)
+                    if self.app.network:
+                        if self.app.network.is_host:
+                            lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
+                            pid = 0
+                            pdata = lobby['players'].setdefault(pid, {})
+                            if self.nickname:
+                                pdata['name'] = self.nickname[:20]
+                            pdata['ready'] = bool(self.ready)
+                            pdata['team'] = 0
+                            self.app.network.broadcast_lobby_state()
+                        else:
+                            self.app.network.send_lobby_update(name=self.nickname or None, ready=self.ready)
+                # Start game (host only, when all ready)
+                if self.start_button.is_clicked(pos):
+                    if self.app.network and self.app.network.is_host:
+                        lobby = self.app.network.game_state.get('lobby_state', {})
+                        players = lobby.get('players', {})
+                        # Check all 4 present and ready
+                        all_ready = all(players.get(pid, {}).get('ready') for pid in [0,1,2,3]) and len(players) >= 4
+                        if all_ready:
+                            # Build player_names mapping and store
+                            names = {pid: players.get(pid, {}).get('name', f'Player {pid}') for pid in [0,1,2,3]}
+                            self.app.game_config['player_names'] = names
+                            self.app.network.game_state['player_names'] = names
+                            # Switch to game and broadcast start
+                            self.done = True
+                            self.next_screen = "game"
+                            # Ensure game mode flags
+                            self.app.game_config.update({
+                                "mode": "online_multiplayer",
+                                "is_host": True,
+                                "player_id": 0,
+                                "online_type": "all_human"
+                            })
+                            self.app.network.broadcast_start_game()
+                        else:
+                            self.status_message = "Tutti e 4 devono essere pronti."
+                    else:
+                        self.status_message = "Solo l'host può avviare."
+            elif event.type == pygame.KEYDOWN and self.input_active:
+                if event.key == pygame.K_RETURN:
+                    # Toggle ready when pressing Enter
+                    self.ready = not self.ready
+                    if self.app.network:
+                        if self.app.network.is_host:
+                            lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
+                            pdata = lobby['players'].setdefault(0, {})
+                            if self.nickname:
+                                pdata['name'] = self.nickname[:20]
+                            pdata['ready'] = bool(self.ready)
+                            pdata['team'] = 0
+                            self.app.network.broadcast_lobby_state()
+                        else:
+                            self.app.network.send_lobby_update(name=self.nickname or None, ready=self.ready)
+                elif event.key == pygame.K_BACKSPACE:
+                    self.nickname = self.nickname[:-1]
+                    # Live-update nickname to others
+                    if self.app.network:
+                        if self.app.network.is_host:
+                            lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
+                            pdata = lobby['players'].setdefault(0, {})
+                            pdata['name'] = self.nickname[:20] if self.nickname else f'Player 0'
+                            pdata['team'] = 0
+                            self.app.network.broadcast_lobby_state()
+                        else:
+                            self.app.network.send_lobby_update(name=self.nickname or "")
+                else:
+                    if len(self.nickname) < 20:
+                        self.nickname += event.unicode
+                        # Live-update nickname to others
+                        if self.app.network:
+                            if self.app.network.is_host:
+                                lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
+                                pdata = lobby['players'].setdefault(0, {})
+                                pdata['name'] = self.nickname[:20]
+                                pdata['team'] = 0
+                                self.app.network.broadcast_lobby_state()
+                            else:
+                                self.app.network.send_lobby_update(name=self.nickname)
+
+    def update(self):
+        # Toggle caret visibility
+        now = pygame.time.get_ticks()
+        if now - self.caret_last_toggle > self.caret_blink_interval_ms:
+            self.caret_visible = not self.caret_visible
+            self.caret_last_toggle = now
+
+    def draw(self, surface):
+        surface.blit(self.app.resources.background, (0, 0))
+        width = self.app.window_width
+        height = self.app.window_height
+        center_x = width // 2
+        # Title
+        title = self.title_font.render("Lobby (4 giocatori)", True, WHITE)
+        surface.blit(title, title.get_rect(center=(center_x, int(height*0.12))))
+        # Input label and box
+        label = self.info_font.render("Nickname:", True, WHITE)
+        surface.blit(label, label.get_rect(midleft=(self.name_input_rect.left, self.name_input_rect.top - 10)))
+        pygame.draw.rect(surface, (20,20,50), self.name_input_rect, border_radius=8)
+        pygame.draw.rect(surface, GOLD, self.name_input_rect, 2, border_radius=8)
+        shown = self.nickname if self.nickname else "Inserisci nickname..."
+        color = WHITE if self.nickname else LIGHT_GRAY
+        txt = self.info_font.render(shown, True, color)
+        surface.blit(txt, txt.get_rect(left=self.name_input_rect.left+8, centery=self.name_input_rect.centery))
+        # Blinking caret when focused
+        if self.input_active and self.caret_visible:
+            caret_x = self.name_input_rect.left + 8 + txt.get_width() + 2
+            caret_x = min(caret_x, self.name_input_rect.right - 6)
+            pygame.draw.line(surface, WHITE, (caret_x, self.name_input_rect.top + 8), (caret_x, self.name_input_rect.bottom - 8), 2)
+        # Players grid (2x2 by seat)
+        grid_top = int(height*0.58)
+        cell_w = int(width*0.22)
+        cell_h = int(height*0.12)
+        gap = int(width*0.02)
+        lobby = {}
+        if self.app.network and isinstance(self.app.network.game_state, dict):
+            lobby = self.app.network.game_state.get('lobby_state', {})
+        players = lobby.get('players', {})
+        seat_order = [0,1,2,3]
+        start_x = center_x - (cell_w*2 + gap)//2
+        start_y = grid_top
+        for idx, pid in enumerate(seat_order):
+            col = idx % 2
+            row = idx // 2
+            rect = pygame.Rect(start_x + col*(cell_w+gap), start_y + row*(cell_h+gap), cell_w, cell_h)
+            team = 0 if pid in [0,2] else 1
+            bg = (10,40,10) if team == 0 else (40,10,10)
+            pygame.draw.rect(surface, bg, rect, border_radius=10)
+            pygame.draw.rect(surface, GOLD, rect, 2, border_radius=10)
+            pname = players.get(pid, {}).get('name', f'Player {pid}')
+            pready = players.get(pid, {}).get('ready', False)
+            name_s = self.small_font.render(f"{pname} (Team {team})", True, WHITE)
+            ready_s = self.small_font.render("Pronto" if pready else "In attesa", True, LIGHT_GREEN if pready else ORANGE)
+            surface.blit(name_s, name_s.get_rect(left=rect.left+8, top=rect.top+8))
+            surface.blit(ready_s, ready_s.get_rect(left=rect.left+8, top=rect.top+36))
+        # Buttons
+        self.ready_button.draw(surface)
+        # Dim the start button if not host
+        if self.app.network and not self.app.network.is_host:
+            # Draw disabled style
+            disabled = Button(self.start_button.rect.left, self.start_button.rect.top, self.start_button.rect.width, self.start_button.rect.height, self.start_button.text, (80,80,100), LIGHT_GRAY)
+            disabled.draw(surface)
+        else:
+            self.start_button.draw(surface)
+        
+        # Connection info panel (host-focused)
+        pygame.draw.rect(surface, (15,15,35), self.conn_info_rect, border_radius=10)
+        pygame.draw.rect(surface, GOLD, self.conn_info_rect, 2, border_radius=10)
+        header = self.info_font.render("Info Connessione (da condividere)", True, WHITE)
+        surface.blit(header, header.get_rect(midtop=(self.conn_info_rect.centerx, self.conn_info_rect.top + 8)))
+        y = self.conn_info_rect.top + 38
+        line_h = 24
+        try:
+            local_ip = get_local_ip()
+        except Exception:
+            local_ip = "-"
+        public_ip = "-"
+        if hasattr(self.app, 'network') and self.app.network and getattr(self.app.network, 'public_ip', None):
+            public_ip = self.app.network.public_ip
+        port_text = str(getattr(self.app.network, 'port', 5555)) if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network else "5555"
+        
+        lines = [
+            f"IP Locale (LAN): {local_ip}",
+            f"IP Pubblico (Internet): {public_ip}",
+            f"Porta: {port_text}",
+        ]
+        # Show connections count if host
+        if self.app.network and self.app.network.is_host:
+            num_clients = len(self.app.network.clients)
+            lines.append(f"Giocatori connessi: {num_clients}/3")
+        for s in lines:
+            surf = self.small_font.render(s, True, LIGHT_GRAY)
+            surface.blit(surf, surf.get_rect(left=self.conn_info_rect.left + 12, top=y))
+            y += line_h
+        # Status
+        if self.status_message:
+            s = self.small_font.render(self.status_message, True, HIGHLIGHT_RED)
+            surface.blit(s, s.get_rect(center=(center_x, int(height*0.9))))
 class GameScreen(BaseScreen):
     """Main game screen for playing Scopone"""
     def __init__(self, app):
@@ -2621,15 +2993,19 @@ class GameScreen(BaseScreen):
                     is_ai = False
             
             # Determina il nome del giocatore
+            player_names = config.get('player_names', {}) if mode == "online_multiplayer" else {}
+            name = None
             if is_human:
-                if player_id == self.local_player_id:
-                    name = "You"
-                elif is_online_team_vs_ai and player_id in [0, 2] and player_id != self.local_player_id:
-                    name = "Partner"
-                elif mode == "team_vs_ai" and player_id == 2:
-                    name = "Partner"
-                else:
-                    name = f"Player {player_id}"
+                name = player_names.get(player_id)
+                if not name:
+                    if player_id == self.local_player_id:
+                        name = "You"
+                    elif is_online_team_vs_ai and player_id in [0, 2] and player_id != self.local_player_id:
+                        name = "Partner"
+                    elif mode == "team_vs_ai" and player_id == 2:
+                        name = "Partner"
+                    else:
+                        name = f"Player {player_id}"
             else:  # AI
                 name = f"AI {player_id}"
             
@@ -6674,6 +7050,7 @@ class ScoponeApp:
         self.screens = {
             "mode": GameModeScreen(self),
             "options": GameOptionsScreen(self),
+            "lobby": None,  # Placeholder, initialized lazily to avoid font init clashes
             "game": GameScreen(self)
         }
         self.current_screen = "mode"
@@ -6696,6 +7073,10 @@ class ScoponeApp:
         while running:
             # Get current screen
             screen = self.screens[self.current_screen]
+            # Lazy-init LobbyScreen when needed
+            if screen is None and self.current_screen == "lobby":
+                screen = LobbyScreen(self)
+                self.screens["lobby"] = screen
             
             # Call enter method ONLY when first accessing the screen
             if not already_entered:
