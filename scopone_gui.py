@@ -4511,25 +4511,30 @@ class GameScreen(BaseScreen):
                         else:
                             self._handle_hand_end(info.get("score_breakdown"))
         
-        # Check for connection loss in online mode
-        if (self.app.game_config.get("mode") == "online_multiplayer" and 
-                self.app.network and not self.app.network.connected):
-            
-            # If connection was just lost
-            if not self.connection_lost:
-                self.connection_lost = True
-                self.reconnect_start_time = time.time()
-                self.create_exit_button()
-                self.status_message = "Connection to host lost. Attempting to reconnect..."
-                self.reconnection_attempts = 0
-                self.app.resources.play_sound("card_pickup")  # Alert sound
+        # Check for connection loss in online mode (show countdown for both client and host)
+        if (self.app.game_config.get("mode") == "online_multiplayer" and self.app.network):
+            lost = False
+            if not self.app.network.is_host:
+                lost = not self.app.network.connected
+            else:
+                # Host: if any disconnect detected recently, trigger overlay; we piggyback on player_left flow which closes sockets
+                lost = not self.app.network.connected
+            if lost:
+                # If connection was just lost
+                if not self.connection_lost:
+                    self.connection_lost = True
+                    self.reconnect_start_time = time.time()
+                    self.create_exit_button()
+                    self.status_message = "Connection to host lost. Attempting to reconnect..."
+                    self.reconnection_attempts = 0
+                    self.app.resources.play_sound("card_pickup")  # Alert sound
             
             # Check if we should attempt reconnection
             current_time = time.time()
             elapsed = current_time - self.reconnect_start_time
             
-            # Try to reconnect every 5 seconds
-            if elapsed > self.reconnection_attempts * 5 and not self.app.network.connection_in_progress:
+            # Try to reconnect every 5 seconds (clients only)
+            if (not self.app.network.is_host) and elapsed > self.reconnection_attempts * 5 and not self.app.network.connection_in_progress:
                 self.reconnection_attempts += 1
                 # Start async reconnection attempt
                 self.app.network.connection_in_progress = True
@@ -4537,7 +4542,7 @@ class GameScreen(BaseScreen):
                 threading.Thread(target=self.app.network._connect_async, daemon=True).start()
             
             # If reconnection successful
-            if self.app.network.connected:
+            if (not self.app.network.is_host) and self.app.network.connected:
                 self.connection_lost = False
                 self.status_message = "Reconnected to host!"
                 self.exit_button = None
@@ -5200,7 +5205,7 @@ class GameScreen(BaseScreen):
                         
                         # Aggiorna e stampa solo se è passato abbastanza tempo o se il giocatore è cambiato
                         if player_changed or (current_time - self.last_turn_update_time) > 0.5:  # 2 volte al secondo (0.5s)
-                            print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
+                            #print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
                             self.last_turn_update_time = current_time
                         
                         # Aggiorna sempre lo stato interno
