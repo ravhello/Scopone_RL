@@ -3713,17 +3713,24 @@ class GameScreen(BaseScreen):
             return pygame.Rect(left, top, pile_width, pile_height)
     
     def update_player_hands(self):
-        """Update player hand information from game state"""
+        """Update player hand information from game state in a safe way"""
         if not self.env:
             return
-            
-        gs = self.env.game_state
+        
+        gs = getattr(self.env, 'game_state', None)
+        if not isinstance(gs, dict):
+            # Clear all hands if no valid game state is present yet
+            for player in self.players:
+                player.set_hand([])
+            return
+        
+        hands = gs.get('hands', {})
+        if not isinstance(hands, dict):
+            hands = {}
         
         for player in self.players:
-            if player.player_id in gs["hands"]:
-                player.set_hand(gs["hands"][player.player_id])
-            else:
-                player.set_hand([])
+            hand = hands.get(player.player_id, [])
+            player.set_hand(hand if isinstance(hand, list) else [])
     def handle_events(self, events):
         """Handle pygame events with connection loss recovery"""
         for event in events:
