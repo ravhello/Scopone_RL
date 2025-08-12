@@ -617,28 +617,24 @@ class NetworkManager:
         return False
     
     def accept_connections(self):
-        """Accept connections from other players (for host)"""
-        # Ottieni la configurazione
-        is_team_vs_ai = False
-        online_type = None
-        if hasattr(self, 'game_state') and self.game_state:
-            # Controlla la modalità
-            online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
-            is_team_vs_ai = online_type == 'team_vs_ai'
-        
-        # Numero di client attesi in base alla modalità
-        try:
-            online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else online_type
-        except Exception:
-            pass
-        if online_type == 'team_vs_ai' or online_type == 'humans_plus_ai':
-            expected_clients = 1
-        elif online_type == 'three_humans_one_ai':
-            expected_clients = 2
-        else:  # all_human o sconosciuto
-            expected_clients = 3
-        
-        while len(self.clients) < expected_clients:
+        """Accept connections from other players (for host) with dynamic mode detection"""
+        while True:
+            # Rileggi online_type dinamicamente per supportare transizioni tra modalità
+            try:
+                online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
+            except Exception:
+                online_type = None
+            is_team_vs_ai = (online_type == 'team_vs_ai')
+            if online_type in ('team_vs_ai', 'humans_plus_ai'):
+                expected_clients = 1
+            elif online_type == 'three_humans_one_ai':
+                expected_clients = 2
+            else:
+                expected_clients = 3
+
+            # Se già raggiunto il numero atteso, esci
+            if len(self.clients) >= expected_clients:
+                break
             try:
                 client, addr = self.socket.accept()
                 
@@ -2265,11 +2261,20 @@ class GameModeScreen(BaseScreen):
         print("\nDEBUG HOST GAME: Creating NetworkManager with is_host=True")
         self.app.network = NetworkManager(is_host=True)
         
-        # CORREZIONE: Imposta il game_state PRIMA di avviare il server
-        if self.selected_online_mode == 1:  # Team vs AI
-            self.app.network.game_state = {
-                'online_type': 'team_vs_ai'
-            }
+        # CORREZIONE: Imposta SEMPRE l'online_type PRIMA di avviare il server (evita race in accept_connections)
+        try:
+            preset_type = None
+            if self.selected_online_mode == 0:
+                preset_type = 'all_human'
+            elif self.selected_online_mode == 1:
+                preset_type = 'team_vs_ai'
+            elif self.selected_online_mode == 2:
+                preset_type = 'humans_plus_ai'
+            else:
+                preset_type = 'three_humans_one_ai'
+            self.app.network.game_state = {'online_type': preset_type}
+        except Exception:
+            pass
         
         if self.app.network.start_server():
             # Salva le regole correnti (se già impostate) nello stato da sincronizzare
