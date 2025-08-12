@@ -2574,20 +2574,28 @@ class GameModeScreen(BaseScreen):
                 start_flag = bool(gs.get('start_game')) if isinstance(gs, dict) else False
 
                 if is_client:
-                    # Client: go to lobby for lobby-type rooms or if lobby present; go to game only after start signal
-                    # If host closed room, kick to mode
+                    # Client: lobby for lobby-type rooms; in AI modes auto-enter game when state is available; otherwise wait for start signal
                     if gs.get('room_closed_by_host'):
                         self.app.game_config = {}
                         self.done = True
                         self.next_screen = "mode"
-                    elif start_flag:
-                        self.done = True
-                        self.next_screen = "game"
                     elif (ot in ['all_human', 'three_humans_one_ai']) or has_lobby:
                         self.done = True
                         self.next_screen = "lobby"
+                    elif ot in ['team_vs_ai', 'humans_plus_ai']:
+                        # Auto-enter game when we have received any meaningful state from host
+                        if isinstance(gs, dict) and any(k in gs for k in ['hands', 'table', 'current_player', 'deck']):
+                            self.done = True
+                            self.next_screen = "game"
+                        elif start_flag:
+                            self.done = True
+                            self.next_screen = "game"
+                        else:
+                            return
+                    elif start_flag:
+                        self.done = True
+                        self.next_screen = "game"
                     else:
-                        # Keep waiting for lobby_state or start_game; don't force game
                         return
                 else:
                     # Host: proceed to lobby or game based on setup
