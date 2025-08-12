@@ -7957,8 +7957,9 @@ class ScoponeApp:
                             except Exception:
                                 pass
                             self.network = None
-                        # Clear game config minimal state
-                        self.game_config = {}
+                        # Clear config only when cleaning up network (kick/room_closed). Otherwise preserve for normal transitions
+                        if self._force_cleanup_network:
+                            self.game_config = {}
                         # Switch screen
                         self.current_screen = self._force_screen
                         already_entered = False
