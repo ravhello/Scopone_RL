@@ -5870,6 +5870,23 @@ class GameScreen(BaseScreen):
                 card_delay = total_time + i * inter_card_delay
                 
                 #print(f"Carta {card} - delay cattura: {card_delay} frame")
+
+                # VISIBILITÀ: Mantieni visibili le carte da catturare sul tavolo finché
+                # non parte la loro animazione di cattura, disegnandole via animazione statica.
+                if card != card_played:
+                    plateau_captured = CardAnimation(
+                        card=card,
+                        start_pos=starting_positions[card],
+                        end_pos=starting_positions[card],
+                        duration=card_delay + 1,  # Fino all'avvio della sua animazione di cattura
+                        delay=0,
+                        scale_start=1.0,
+                        scale_end=1.0,
+                        rotation_start=0,
+                        rotation_end=0,
+                        animation_type="plateau_captured"
+                    )
+                    self.animations.append(plateau_captured)
                 
                 # NUOVO: Aggiungi la carta al set di carte in movimento quando inizia l'animazione
                 # Creiamo un'animazione speciale "start_motion" che aggiungerà la carta a cards_in_motion
