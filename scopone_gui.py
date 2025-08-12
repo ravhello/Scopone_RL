@@ -4393,7 +4393,7 @@ class GameScreen(BaseScreen):
                 # Check for pending action and execute it
                 if hasattr(self, 'pending_action') and self.pending_action is not None:
                     # CRITICAL FIX: Verify the action is valid for the current player before executing
-                    card_played, _ = decode_action(self.pending_action)
+                    card_played, cards_captured = decode_action(self.pending_action)
                     hands = {}
                     if hasattr(self.env, 'game_state') and isinstance(self.env.game_state, dict):
                         hands = self.env.game_state.get('hands', {}) if isinstance(self.env.game_state.get('hands', {}), dict) else {}
@@ -4401,6 +4401,7 @@ class GameScreen(BaseScreen):
                     
                     if card_played in current_player_hand:
                         # Execute the move on the environment
+                        prev_cp = getattr(self.env, 'current_player', None)
                         _, _, done, info = self.env.step(self.pending_action)
                         
                         # If game is finished, set final state
@@ -4408,6 +4409,33 @@ class GameScreen(BaseScreen):
                             self.game_over = True
                             if "score_breakdown" in info:
                                 self.final_breakdown = info["score_breakdown"]
+                        
+                        # If host in online mode, broadcast updated state to clients (AI or local moves)
+                        try:
+                            if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
+                                # Prepare game_state copy
+                                online_type = self.app.game_config.get("online_type")
+                                self.app.network.game_state = self.env.game_state.copy()
+                                if online_type:
+                                    self.app.network.game_state['online_type'] = online_type
+                                    # In team vs AI, players 1 and 3 are AI
+                                    if online_type == 'team_vs_ai':
+                                        self.app.network.game_state['ai_players'] = [1, 3]
+                                # Current player after the move
+                                self.app.network.game_state['current_player'] = getattr(self.env, 'current_player', None)
+                                # Last move info for clients to animate
+                                self.app.network.game_state['last_move'] = {
+                                    'player': prev_cp,
+                                    'card_played': card_played,
+                                    'cards_captured': cards_captured
+                                }
+                                # Broadcast
+                                self.app.network.broadcast_game_state()
+                                # Debug
+                                table_cards = self.env.game_state.get("table", [])
+                                print(f"Host broadcast after local/AI move - Prev: {prev_cp}, Now: {self.env.current_player}, Table: {table_cards}")
+                        except Exception:
+                            pass
                     else:
                         # The card is no longer valid - this can happen if turn changed while animation was playing
                         print(f"WARNING: Card {card_played} not in player {self.env.current_player}'s hand - skipping action")
