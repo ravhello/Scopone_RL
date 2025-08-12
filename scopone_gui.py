@@ -4580,7 +4580,14 @@ class GameScreen(BaseScreen):
                                 if no_cap is None:
                                     no_cap = filtered[0]
                                 chosen = no_cap
-                    action, card_played, cards_captured = chosen
+                            action, card_played, cards_captured = chosen
+                        else:
+                            # Nessuna azione valida (es. stato non ancora sincronizzato): non procedere
+                            action = card_played = cards_captured = None
+                    else:
+                        action = card_played = cards_captured = None
+                    if action is None:
+                        return
                     if is_online and not is_host:
                         # Client: never auto-play; also suppress click selection when not your turn
                         self.status_message = "Waiting for host..."
