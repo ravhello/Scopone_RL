@@ -839,6 +839,9 @@ class NetworkManager:
                     if not isinstance(self.game_state, dict):
                         self.game_state = {}
                     self.game_state['lobby_state'] = message.get('state', {})
+                    # Also store/refresh online_type when provided by host
+                    if 'online_type' in message:
+                        self.game_state['online_type'] = message.get('online_type')
                     self.message_queue.append("Lobby aggiornata dall'host")
                 elif message["type"] == "start_game":
                     self.message_queue.append("Game starting!")
@@ -1047,7 +1050,8 @@ class NetworkManager:
             return
         state = self.game_state.get('lobby_state', {})
         try:
-            msg = {"type": "lobby_state", "state": state}
+            # Include online_type so clients can route to lobby immediately
+            msg = {"type": "lobby_state", "state": state, "online_type": self.game_state.get('online_type')}
             data = pickle.dumps(msg)
             for client, _ in self.clients:
                 try:
@@ -2375,11 +2379,12 @@ class GameModeScreen(BaseScreen):
             # Verifica se la connessione ha avuto successo anche se non è più in progress
             if self.app.network.connected and not self.done:
                 print("Connessione riuscita, passaggio alla schermata di gioco")
-                # If we're joining a 4-human room, go to lobby first; otherwise go to game
+                # Route: go to lobby when online_type indicates a lobby flow or when lobby_state already exists
                 go_lobby = False
                 try:
                     if isinstance(self.app.network.game_state, dict):
-                        go_lobby = self.app.network.game_state.get('online_type') == 'all_human' or (
+                        ot = self.app.network.game_state.get('online_type')
+                        go_lobby = (ot in ['all_human', 'three_humans_one_ai']) or (
                             'lobby_state' in self.app.network.game_state
                         )
                 except Exception:
@@ -2391,9 +2396,11 @@ class GameModeScreen(BaseScreen):
                 except Exception:
                     gs = {}
                 is_client = not self.app.network.is_host
-                all_human_flag = (gs.get('online_type') == 'all_human') if isinstance(gs, dict) else False
+                ot = gs.get('online_type') if isinstance(gs, dict) else None
+                all_human_flag = (ot == 'all_human') if isinstance(gs, dict) else False
                 has_lobby = ('lobby_state' in gs) if isinstance(gs, dict) else False
-                if is_client and (all_human_flag or has_lobby):
+                # Send clients to lobby if host flagged a lobby-type room or if we already have lobby state
+                if is_client and ((ot in ['all_human', 'three_humans_one_ai']) or has_lobby):
                     self.next_screen = "lobby"
                 else:
                     self.next_screen = "game"
@@ -4767,6 +4774,9 @@ class GameScreen(BaseScreen):
                 # Extract special fields from game state
                 new_current_player = new_state.pop('current_player', None)
                 
+                # If state is clearly partial (no current_player AND no hands/table), ignore it
+                if (new_current_player is None) and ('hands' not in new_state) and ('table' not in new_state):
+                    return
                 # Debug output of critical components
                 print(f"Client received state update:")
                 print(f"  Current player: {new_current_player}")
