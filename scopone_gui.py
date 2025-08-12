@@ -4212,7 +4212,7 @@ class GameScreen(BaseScreen):
                                 self.message_log_rect.height = self.message_prev_height
                             self.message_minimized = False
                         return
-                    # Start dragging if click in header (always allow, even when other inputs are ignored)
+                    # Start dragging if click in header
                     header_rect = pygame.Rect(
                         self.message_log_rect.left,
                         self.message_log_rect.top,
@@ -4248,7 +4248,7 @@ class GameScreen(BaseScreen):
                         self.scrollbar_dragging = True
                         self.scrollbar_drag_offset = self.scrollbar_thumb_height / 2
                         return
-                # Start resizing if click in resize handle (only when not minimized) – always allow
+                # Start resizing if click in resize handle (only when not minimized)
                 if (not self.message_minimized) and self.message_resize_rect and self.message_resize_rect.collidepoint(pos):
                     self.message_resizing = True
                     self.message_resize_start_mouse = pos
@@ -4259,6 +4259,66 @@ class GameScreen(BaseScreen):
                 pos = pygame.mouse.get_pos()
                 if not self.message_log_rect.collidepoint(pos):
                     self.message_focused = False
+
+            # Always-available interactions for the message box (client or host, any turn)
+            # Handle drag/resize/scroll regardless of current player controllability
+            if event.type == pygame.MOUSEMOTION:
+                mx, my = event.pos
+                handled_motion = False
+                if self.message_dragging:
+                    new_x = mx - self.message_drag_offset[0]
+                    new_y = my - self.message_drag_offset[1]
+                    new_x = max(0, min(new_x, self.app.window_width - self.message_log_rect.width))
+                    new_y = max(0, min(new_y, self.app.window_height - self.message_log_rect.height))
+                    self.message_log_rect.topleft = (new_x, new_y)
+                    handled_motion = True
+                if self.message_resizing:
+                    start_x, start_y = self.message_resize_start_mouse
+                    dx = mx - start_x
+                    dy = my - start_y
+                    min_w = int(self.app.window_width * 0.15)
+                    min_h = int(self.app.window_height * 0.12)
+                    new_w = max(min_w, self.message_resize_start_rect.width + dx)
+                    new_h = max(min_h, self.message_resize_start_rect.height + dy)
+                    max_w = int(self.app.window_width * 0.6)
+                    max_h = int(self.app.window_height * 0.6)
+                    new_w = min(new_w, max_w)
+                    new_h = min(new_h, max_h)
+                    self.message_log_rect.size = (new_w, new_h)
+                    handled_motion = True
+                if self.scrollbar_dragging and getattr(self, 'scrollbar_rect', None):
+                    track_top = self.scrollbar_rect.top
+                    track_height = self.scrollbar_rect.height
+                    rel_y = my - track_top - self.scrollbar_drag_offset
+                    rel_y = max(0, min(rel_y, track_height - self.scrollbar_thumb_height))
+                    if self.scrollbar_max_offset > 0:
+                        ratio = rel_y / (track_height - self.scrollbar_thumb_height)
+                        self.message_scroll_offset = int(round(ratio * self.scrollbar_max_offset))
+                    handled_motion = True
+                if handled_motion:
+                    return
+
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if self.message_dragging or self.message_resizing or self.scrollbar_dragging:
+                    self.message_dragging = False
+                    self.message_resizing = False
+                    self.scrollbar_dragging = False
+                    return
+
+            if hasattr(pygame, 'MOUSEWHEEL') and event.type == pygame.MOUSEWHEEL:
+                mouse_pos = pygame.mouse.get_pos()
+                if self.message_log_rect.collidepoint(mouse_pos) or self.message_focused:
+                    # event.y: 1 = up, -1 = down
+                    self.message_scroll_offset = max(0, self.message_scroll_offset - event.y)
+                    return
+
+            if event.type == pygame.KEYDOWN and self.message_focused:
+                if event.key in (pygame.K_UP, pygame.K_PAGEUP):
+                    self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
+                    return
+                elif event.key in (pygame.K_DOWN, pygame.K_PAGEDOWN):
+                    self.message_scroll_offset += 1
+                    return
             
             # Ignore input during specific game states
             if self.game_over or self.waiting_for_other_player or self.ai_thinking:
@@ -7160,8 +7220,6 @@ class GameScreen(BaseScreen):
             self.message_log_rect.width,
             self.message_header_height,
         )
-        # Make header easier to grab on client by rendering a solid header band
-        pygame.draw.rect(surface, (20, 20, 60), header_rect, border_radius=5)
         pygame.draw.rect(surface, DARK_BLUE, header_rect, border_radius=5)
         # Minimize button at right of header
         btn_size = self.message_header_height - 8
@@ -7187,9 +7245,9 @@ class GameScreen(BaseScreen):
         )
         pygame.draw.rect(surface, LIGHT_GRAY, self.message_resize_rect, border_radius=3)
         
-        # Draw title (fixed label, not first message)
+        # Draw title
         title_surf = self.small_font.render("Messages", True, WHITE)
-        title_rect = title_surf.get_rect(midleft=(self.message_log_rect.left + 10, self.message_log_rect.top + self.message_header_height // 2))
+        title_rect = title_surf.get_rect(midleft=(self.message_log_rect.left + 8, self.message_log_rect.top + 6))
         surface.blit(title_surf, title_rect)
 
         if self.message_minimized:
