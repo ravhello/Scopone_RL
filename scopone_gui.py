@@ -805,6 +805,33 @@ class NetworkManager:
         # Client disconnected
         print(f"Player {player_id} disconnected")
         self.message_queue.append(f"Player {player_id} disconnected")
+        # If in lobby or game online: notify all clients and close room
+        try:
+            # Build and send player_left message to all connected clients
+            msg = {"type": "player_left", "player_id": player_id}
+            data = pickle.dumps(msg)
+            for c, pid in list(self.clients):
+                try:
+                    c.sendall(data)
+                except Exception:
+                    pass
+            # Close all client sockets gracefully
+            for c, pid in list(self.clients):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            # Close server socket
+            try:
+                if self.socket:
+                    self.socket.close()
+            except Exception:
+                pass
+            self.socket = None
+            self.clients = []
+            self.connected = False
+        except Exception:
+            pass
         # Remove player from lobby seats/players and broadcast the update so seats become free
         try:
             if hasattr(self, 'game_state') and isinstance(self.game_state, dict):
@@ -970,6 +997,24 @@ class NetworkManager:
                         pass
                 elif message["type"] == "chat":
                     self.message_queue.append(f"Player {message['player_id']}: {message['text']}")
+                elif message.get("type") == "player_left":
+                    # Host notifies that a player left: close and return home
+                    try:
+                        self.connected = False
+                        if self.socket:
+                            try:
+                                self.socket.close()
+                            except Exception:
+                                pass
+                        self.socket = None
+                        if hasattr(self, 'app'):
+                            # Force transition to home
+                            import builtins
+                            builtins.app._force_screen = 'mode'
+                            builtins.app._force_cleanup_network = True
+                            builtins.app._flash_message = "Un giocatore ha lasciato: partita annullata"
+                    except Exception:
+                        pass
                 
             except socket.timeout:
                 # Timeout è normale, continua il ciclo
@@ -5084,11 +5129,6 @@ class GameScreen(BaseScreen):
                 # If state is clearly partial (no current_player AND no hands/table), ignore it
                 if (new_current_player is None) and ('hands' not in new_state) and ('table' not in new_state):
                     return
-                # Debug output of critical components
-                print(f"Client received state update:")
-                print(f"  Current player: {new_current_player}")
-                print(f"  Online type: {new_state.get('online_type')}")
-                print(f"  AI players: {new_state.get('ai_players', [])}")
                 
                 # SOLUZIONE CRUCIALE: Applica configurazione AI solo se non è già stata applicata
                 if not hasattr(self, 'team_vs_ai_configured') or not self.team_vs_ai_configured:
