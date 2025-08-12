@@ -5140,6 +5140,17 @@ class GameScreen(BaseScreen):
                         self.team_vs_ai_configured = True
                         print("Configurazione team_vs_ai completata e bloccata per evitare ripetizioni")
                 
+                # Prima applicazione: sincronizzazione iniziale senza animazioni/diff
+                if not hasattr(self, 'has_received_initial_state') or not self.has_received_initial_state:
+                    if self.env and isinstance(new_state, dict):
+                        self.env.game_state = new_state
+                        if new_current_player is not None:
+                            self.env.current_player = new_current_player
+                            self.current_player_id = new_current_player
+                        self.update_player_hands()
+                        self.has_received_initial_state = True
+                        return
+                
                 # Apply the new state to the environment (only when it contains basic fields)
                 if self.env and isinstance(new_state, dict):
                     # Store hands before updating state to ensure local player's hand is preserved
