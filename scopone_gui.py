@@ -4580,21 +4580,18 @@ class GameScreen(BaseScreen):
                                 if no_cap is None:
                                     no_cap = filtered[0]
                                 chosen = no_cap
-                            action, card_played, cards_captured = chosen
-                            if is_online and not is_host:
-                                # Client: auto-send move only if human and not multiple capture choices
-                                if current_is_human and not multiple_captures and cp == self.local_player_id:
-                                    if hasattr(self.app, 'network') and self.app.network:
-                                        self.app.network.send_move(action)
-                                        self.autoplay_sent_for_turn = True
-                            else:
-                                # Local or Host: perform animations and schedule env step
-                                if (not multiple_captures) or (not current_is_human):
-                                    self.create_move_animations(card_played, cards_captured)
-                                    self.app.resources.play_sound("card_play")
-                                    self.waiting_for_animation = True
-                                    self.pending_action = action
-                                    self.autoplay_sent_for_turn = True
+                    action, card_played, cards_captured = chosen
+                    if is_online and not is_host:
+                        # Client: never auto-play; also suppress click selection when not your turn
+                        self.status_message = "Waiting for host..."
+                    else:
+                        # Local or Host: perform animations and schedule env step
+                        if (not multiple_captures) or (not current_is_human):
+                            self.create_move_animations(card_played, cards_captured)
+                            self.app.resources.play_sound("card_play")
+                            self.waiting_for_animation = True
+                            self.pending_action = action
+                            self.autoplay_sent_for_turn = True
             except Exception as e:
                 # Non bloccare il gioco in caso di errore nell'auto-play
                 print(f"Auto-play error: {e}")
@@ -5481,9 +5478,13 @@ class GameScreen(BaseScreen):
         
         if area == "hand":
             # Determine active player based on game mode and turn
-            current_player = None
+            # Online client: do not allow picking cards when not your turn
             mode = self.app.game_config.get("mode")
-            
+            is_online = (mode == "online_multiplayer")
+            is_host = self.app.game_config.get("is_host", False)
+            if is_online and not is_host and self.env and self.env.current_player != self.local_player_id:
+                return None
+            current_player = None
             # For all modes, start with the current player whose turn it is
             if self.is_current_player_controllable():
                 current_player = self.players[self.current_player_id]
