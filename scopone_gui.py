@@ -2088,18 +2088,20 @@ class GameModeScreen(BaseScreen):
                     pygame.draw.rect(surface, GOLD, button.rect.inflate(6, 6), 3, border_radius=8)
                 button.draw(surface)
             
-            # Draw instructions
+            # Draw instructions based on selected mode
             if self.selected_online_mode == 0:
                 info_text = "You'll need 3 more human players to join"
-            elif self.selected_online_mode in (1, 2, 3):
+            elif self.selected_online_mode in (1, 2):
                 info_text = "You'll need 1 more human player to join (for your team)"
+            elif self.selected_online_mode == 3:
+                info_text = "You'll need 2 more human players to join"
             
             info_surf = self.info_font.render(info_text, True, WHITE)
             info_rect = info_surf.get_rect(center=(center_x, height - height * 0.15))
             surface.blit(info_surf, info_rect)
             
-            # Draw difficulty selection if we're doing Team vs AI
-            if self.selected_online_mode == 1:
+            # Draw difficulty selection if the selected mode uses AI
+            if self.selected_online_mode in (1, 2, 3):
                 difficulty_y = height - height * 0.25
                 difficulty_label = self.info_font.render("AI Difficulty:", True, WHITE)
                 label_rect = difficulty_label.get_rect(
@@ -2262,10 +2264,12 @@ class GameModeScreen(BaseScreen):
         
         button_width = int(width * 0.4)
         button_height = int(height * 0.08)
-        button_spacing = int(height * 0.05)
+        # Further reduce vertical spacing between mode buttons for a tighter layout
+        button_spacing = int(height * 0.015)
         
         title_y = int(height * 0.18)
-        button_start_y = title_y + int(height * 0.08)
+        # Start buttons closer to the title
+        button_start_y = title_y + int(height * 0.06)
         
         self.online_mode_buttons = [
             Button(center_x - button_width // 2,
@@ -2440,11 +2444,19 @@ class LobbyScreen(BaseScreen):
         self.input_active = bool(self.app.network and self.app.network.is_host)
         # Ensure host initializes lobby players
         if self.app.network and self.app.network.is_host:
-            lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
+            # Non pre-popolare tutti i giocatori: aggiungi solo l'host (e AI seat per 3v1)
+            lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
             players = lobby.setdefault('players', {})
-            for pid in [0, 1, 2, 3]:
-                if pid not in players:
-                    players[pid] = {'name': f'Player {pid}', 'team': (0 if pid in [0, 2] else 1), 'ready': False}
+            seats = lobby.setdefault('seats', {})
+            # Assicurati che l'host sia presente
+            if 0 not in players:
+                players[0] = {'name': 'Host', 'team': 0, 'ready': False}
+            seats.setdefault(0, 0)
+            # Per 3v1 assegna un posto AI di default (es. seat 3)
+            online_type = self.app.network.game_state.get('online_type')
+            if online_type == 'three_humans_one_ai':
+                lobby.setdefault('ai_seat', 3)
+                lobby['ai_ready'] = True
             self.app.network.broadcast_lobby_state()
 
     def setup_layout(self):
@@ -2692,6 +2704,15 @@ class LobbyScreen(BaseScreen):
         players = lobby.get('players', {})
         seats = lobby.get('seats', {})
         online_type = (self.app.network.game_state.get('online_type') if self.app.network and isinstance(self.app.network.game_state, dict) else None)
+        ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
+        # Compute connected humans (host + connected clients)
+        connected_humans = {0}
+        try:
+            if self.app.network and getattr(self.app.network, 'clients', None):
+                for _, pid in self.app.network.clients:
+                    connected_humans.add(pid)
+        except Exception:
+            pass
         # Seat layout: 0,1 top row; 2,3 bottom row (or keep 0..3 order)
         seat_order = [0,1,2,3]
         start_x = center_x - (cell_w*2 + gap)//2
@@ -2700,8 +2721,8 @@ class LobbyScreen(BaseScreen):
             col = idx % 2
             row = idx // 2
             rect = pygame.Rect(start_x + col*(cell_w+gap), start_y + row*(cell_h+gap), cell_w, cell_h)
-            # Determine seated player id for this seat
-            pid = seats.get(seat, seat)
+            # Determine seated player id for this seat (None means libero)
+            pid = seats.get(seat) if seat in seats else None
             team = 0 if seat in [0,2] else 1
             bg = (10,40,10) if team == 0 else (40,10,10)
             pygame.draw.rect(surface, bg, rect, border_radius=10)
@@ -2713,19 +2734,26 @@ class LobbyScreen(BaseScreen):
                 border_color = LIGHT_BLUE
                 border_width = 4
             pygame.draw.rect(surface, border_color, rect, border_width, border_radius=10)
-            # AI handling for three_humans_one_ai: if a seat is unassigned to humans, show AI ready
-            pname = players.get(pid, {}).get('name', f'Player {pid}')
-            pready = players.get(pid, {}).get('ready', False)
+            # Seat content: AI, Human, or Libero
+            pname = None
+            pready = False
             is_ai_seat = False
-            if online_type == 'three_humans_one_ai':
-                # Consider seat is AI if no human explicitly occupies it in players mapping
-                # Heuristic: if pid not present in players or marked as AI later
-                if pid not in players or players.get(pid, {}).get('is_ai'):
-                    pname = f"AI {pid}"
-                    pready = True
-                    is_ai_seat = True
-            name_s = self.small_font.render(f"{pname} (Team {team})", True, WHITE)
-            ready_s = self.small_font.render("Pronto" if pready else "In attesa", True, LIGHT_GREEN if pready else ORANGE)
+            if online_type == 'three_humans_one_ai' and seat == ai_seat:
+                # Explicit AI seat
+                pname = f"AI {seat}"
+                pready = True
+                is_ai_seat = True
+            elif pid is None:
+                # Libero
+                pname = "Libero"
+                pready = False
+            else:
+                # Human or preset player info
+                pname = players.get(pid, {}).get('name', f'Player {pid}')
+                pready = players.get(pid, {}).get('ready', False)
+
+            name_s = self.small_font.render(f"{pname} (Team {team})", True, WHITE if pname != "Libero" else LIGHT_GRAY)
+            ready_s = self.small_font.render("Pronto" if pready else ("Libero" if pname == "Libero" else "In attesa"), True, (LIGHT_GREEN if pready else (LIGHT_GRAY if pname == "Libero" else ORANGE)))
             surface.blit(name_s, name_s.get_rect(left=rect.left+8, top=rect.top+8))
             # Place readiness text slightly lower and indented to avoid arrow overlap
             ready_rect = ready_s.get_rect()
@@ -2748,17 +2776,19 @@ class LobbyScreen(BaseScreen):
                 pygame.draw.rect(surface, (20, 70, 20), badge_bg, border_radius=10)
                 pygame.draw.rect(surface, LIGHT_GREEN, badge_bg, 2, border_radius=10)
                 surface.blit(badge_surf, badge_surf.get_rect(center=badge_bg.center))
-            # Draw switch seat arrows (left/right) for each seat
+            # Draw switch seat arrows (left/right) for each seat (disable on AI seat or libero)
             arrow_w = 24
             arrow_h = 24
             left_rect = pygame.Rect(rect.left + 6, rect.bottom - arrow_h - 6, arrow_w, arrow_h)
             right_rect = pygame.Rect(rect.right - arrow_w - 6, rect.bottom - arrow_h - 6, arrow_w, arrow_h)
-            pygame.draw.polygon(surface, WHITE, [(left_rect.right, left_rect.top), (left_rect.left, left_rect.centery), (left_rect.right, left_rect.bottom)])
-            pygame.draw.polygon(surface, WHITE, [(right_rect.left, right_rect.top), (right_rect.right, right_rect.centery), (right_rect.left, right_rect.bottom)])
+            arrows_enabled = not (online_type == 'three_humans_one_ai' and seat == ai_seat)
+            if arrows_enabled:
+                pygame.draw.polygon(surface, WHITE, [(left_rect.right, left_rect.top), (left_rect.left, left_rect.centery), (left_rect.right, left_rect.bottom)])
+                pygame.draw.polygon(surface, WHITE, [(right_rect.left, right_rect.top), (right_rect.right, right_rect.centery), (right_rect.left, right_rect.bottom)])
             # Save for click handling
             if not hasattr(self, 'seat_controls'):
                 self.seat_controls = {}
-            self.seat_controls[seat] = {'rect': rect, 'left': left_rect, 'right': right_rect}
+            self.seat_controls[seat] = {'rect': rect, 'left': left_rect, 'right': right_rect, 'enabled': arrows_enabled}
         # Buttons
         self.ready_button.draw(surface)
         # Dim the start button if not host
