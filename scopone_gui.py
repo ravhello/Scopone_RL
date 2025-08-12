@@ -1073,15 +1073,25 @@ class GameOptionsScreen(BaseScreen):
             self._cycle("tiebreak", ["single", "+2", "allow_draw"])
 
         # Variants
-        for key, rect in [
+        # Base variants always available
+        base_variants = [
             ("asso_piglia_tutto", getattr(self, 'ap_rect', None)),
-            ("scopa_on_asso_piglia_tutto", getattr(self, 'ap_scopa_rect', None)),
             ("scopa_on_last_capture", getattr(self, 'last_scopa_rect', None)),
             ("re_bello", getattr(self, 'rb_rect', None)),
             ("napola", getattr(self, 'nap_rect', None)),
-        ]:
+        ]
+        for key, rect in base_variants:
             if rect is not None and rect.collidepoint(pos):
                 self._toggle(key)
+
+        # AP-dependent variants
+        if self.rules.get("asso_piglia_tutto", False):
+            if getattr(self, 'ap_scopa_rect', None) and self.ap_scopa_rect.collidepoint(pos):
+                self._toggle("scopa_on_asso_piglia_tutto")
+            if getattr(self, 'ap_place_rect', None) and self.ap_place_rect.collidepoint(pos):
+                self._toggle("asso_piglia_tutto_posabile")
+            if getattr(self, 'ap_place_only_empty_rect', None) and self.ap_place_only_empty_rect.collidepoint(pos):
+                self._toggle("asso_piglia_tutto_posabile_only_empty")
 
         if self.rules.get("napola", False) and getattr(self, 'nap_scoring_rect', None) and self.nap_scoring_rect.collidepoint(pos):
             self._cycle("napola_scoring", ["fixed3", "length"])
@@ -1224,8 +1234,26 @@ class GameOptionsScreen(BaseScreen):
         y = var_rect.top + 10
         self.ap_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
         self.draw_toggle(surface, self.ap_rect, "Asso piglia tutto", self.rules.get("asso_piglia_tutto", False))
-        self.ap_scopa_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
-        self.draw_toggle(surface, self.ap_scopa_rect, "Conta scopa con Asso piglia tutto", self.rules.get("scopa_on_asso_piglia_tutto", False))
+
+        # Show AP-dependent options only when AP is enabled
+        if self.rules.get("asso_piglia_tutto", False):
+            self.ap_scopa_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
+            self.draw_toggle(surface, self.ap_scopa_rect, "Conta scopa con Asso piglia tutto", self.rules.get("scopa_on_asso_piglia_tutto", False))
+
+            # Ace placeability
+            self.ap_place_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
+            self.draw_toggle(surface, self.ap_place_rect, "Asso piglia tutto posabile", self.rules.get("asso_piglia_tutto_posabile", False))
+
+            if self.rules.get("asso_piglia_tutto_posabile", False):
+                self.ap_place_only_empty_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
+                self.draw_toggle(surface, self.ap_place_only_empty_rect, "Posabile solo a tavolo vuoto", self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
+            else:
+                self.ap_place_only_empty_rect = None
+        else:
+            self.ap_scopa_rect = None
+            self.ap_place_rect = None
+            self.ap_place_only_empty_rect = None
+
         self.last_scopa_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
         self.draw_toggle(surface, self.last_scopa_rect, "Scopa sull'ultima presa", self.rules.get("scopa_on_last_capture", False))
         self.rb_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
@@ -1368,6 +1396,9 @@ class GameModeScreen(BaseScreen):
             "napola": False,
             "napola_scoring": "fixed3",
             "max_consecutive_scope": None,
+            # Nuove opzioni AP posabilità
+            "asso_piglia_tutto_posabile": False,
+            "asso_piglia_tutto_posabile_only_empty": False,
             # Setup
             "starting_team": "random",     # random | team0 | team1
             "last_cards_to_dealer": True,
@@ -5307,6 +5338,11 @@ class GameScreen(BaseScreen):
                 ap_line = "Asso piglia tutto"
                 if rules.get("scopa_on_asso_piglia_tutto", False):
                     ap_line += " + Scopa"
+                if rules.get("asso_piglia_tutto_posabile", False):
+                    if rules.get("asso_piglia_tutto_posabile_only_empty", False):
+                        ap_line += " (posabile: solo tavolo vuoto)"
+                    else:
+                        ap_line += " (posabile: sempre)"
                 lines.append(ap_line)
             if rules.get("scopa_on_last_capture", False):
                 lines.append("Scopa su ultima")
