@@ -4012,21 +4012,16 @@ class GameScreen(BaseScreen):
         margin = max(8, int(min(width, height) * 0.01))
 
         if self.app.game_config.get("mode") == "online_multiplayer":
-            # Place near the intersection between the top side of the front partner's hand (player opposite)
-            # and the left side of the right opponent's hand, as viewed from the local perspective.
+            # Place relative to visual positions: right (1) and top (2) from the local perspective
             try:
-                # Determine logical IDs for front partner and right opponent relative to local player
-                local_id = self.local_player_id if self.local_player_id is not None else 0
-                # In visual mapping: local at 0, right at 1, top at 2, left at 3
-                # Find players at visual positions 2 (front/top) and 1 (right)
-                front = next(p for p in self.players if self.get_visual_position(p.player_id) == 2)
-                rightp = next(p for p in self.players if self.get_visual_position(p.player_id) == 1)
-                corner_x = rightp.hand_rect.left
-                corner_y = front.hand_rect.top
+                right_player = next(p for p in self.players if self.get_visual_position(p.player_id) == 1)
+                top_player = next(p for p in self.players if self.get_visual_position(p.player_id) == 2)
+                corner_x = right_player.hand_rect.left
+                corner_y = top_player.hand_rect.bottom
 
-                # Position slightly left of right hand and slightly above front hand
+                # Position the box just inside the corner (left of right player hand, below top player hand)
                 x = corner_x - msg_w - margin
-                y = corner_y - msg_h - margin
+                y = corner_y + margin
 
                 # Clamp inside the window
                 x = max(margin, min(x, width - msg_w - margin))
@@ -4036,8 +4031,8 @@ class GameScreen(BaseScreen):
             except StopIteration:
                 # Fallback to top-right if players not initialized
                 self.message_log_rect = pygame.Rect(
-                    width - msg_w - width * 0.02,
-                    height * 0.05,
+                    width - msg_w - int(width * 0.02),
+                    int(height * 0.05),
                     msg_w,
                     msg_h,
                 )
@@ -4252,34 +4247,33 @@ class GameScreen(BaseScreen):
                         self.done = True
                         self.next_screen = "mode"
                 # Allow message log drag/resize while other inputs are ignored
-                if self.message_log_rect:
-                    if event.type == pygame.MOUSEMOTION:
-                        mx, my = event.pos
-                        if self.message_dragging:
-                            new_x = mx - self.message_drag_offset[0]
-                            new_y = my - self.message_drag_offset[1]
-                            new_x = max(0, min(new_x, self.app.window_width - self.message_log_rect.width))
-                            new_y = max(0, min(new_y, self.app.window_height - self.message_log_rect.height))
-                            self.message_log_rect.topleft = (new_x, new_y)
-                            return
-                        if self.message_resizing:
-                            start_x, start_y = self.message_resize_start_mouse
-                            dx = mx - start_x
-                            dy = my - start_y
-                            min_w = int(self.app.window_width * 0.15)
-                            min_h = int(self.app.window_height * 0.12)
-                            new_w = max(min_w, self.message_resize_start_rect.width + dx)
-                            new_h = max(min_h, self.message_resize_start_rect.height + dy)
-                            max_w = int(self.app.window_width * 0.6)
-                            max_h = int(self.app.window_height * 0.6)
-                            new_w = min(new_w, max_w)
-                            new_h = min(new_h, max_h)
-                            self.message_log_rect.size = (new_w, new_h)
-                            return
-                    if event.type == pygame.MOUSEBUTTONUP:
-                        if event.button == 1:
-                            self.message_dragging = False
-                            self.message_resizing = False
+                if event.type == pygame.MOUSEMOTION:
+                    mx, my = event.pos
+                    if self.message_dragging:
+                        new_x = mx - self.message_drag_offset[0]
+                        new_y = my - self.message_drag_offset[1]
+                        new_x = max(0, min(new_x, self.app.window_width - self.message_log_rect.width))
+                        new_y = max(0, min(new_y, self.app.window_height - self.message_log_rect.height))
+                        self.message_log_rect.topleft = (new_x, new_y)
+                        return
+                    if self.message_resizing:
+                        start_x, start_y = self.message_resize_start_mouse
+                        dx = mx - start_x
+                        dy = my - start_y
+                        min_w = int(self.app.window_width * 0.15)
+                        min_h = int(self.app.window_height * 0.12)
+                        new_w = max(min_w, self.message_resize_start_rect.width + dx)
+                        new_h = max(min_h, self.message_resize_start_rect.height + dy)
+                        max_w = int(self.app.window_width * 0.6)
+                        max_h = int(self.app.window_height * 0.6)
+                        new_w = min(new_w, max_w)
+                        new_h = min(new_h, max_h)
+                        self.message_log_rect.size = (new_w, new_h)
+                        return
+                if event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        self.message_dragging = False
+                        self.message_resizing = False
                 continue
             
             # Check if current player is controllable
