@@ -880,10 +880,12 @@ class NetworkManager:
                             self.app.game_config['kicked_by_host'] = True
                             if kick_reason:
                                 self.app.game_config['kicked_reason'] = str(kick_reason)
-                            # Immediate route back to home if on connect screen
+                            # Also stash a minimal game_state to trigger transition logic
                             try:
-                                # Note: actual screen switch is handled by OnlineConnectScreen.update
-                                pass
+                                if not isinstance(self.game_state, dict):
+                                    self.game_state = {}
+                                # Clear any lobby state to avoid lingering lobby UI
+                                self.game_state.pop('lobby_state', None)
                             except Exception:
                                 pass
                     except Exception:
@@ -2941,6 +2943,25 @@ class LobbyScreen(BaseScreen):
                                 self.app.network.send_lobby_update(name=self.nickname)
 
     def update(self):
+        # Auto-exit to home if host closed room or this client was kicked
+        try:
+            if hasattr(self.app, 'game_config') and (
+                self.app.game_config.get('room_closed_by_host') or self.app.game_config.get('kicked_by_host')
+            ):
+                # Ensure network is closed and clear state
+                try:
+                    if hasattr(self.app, 'network') and self.app.network:
+                        self.app.network.close()
+                        self.app.network = None
+                except Exception:
+                    pass
+                self.app.game_config = {}
+                self.done = True
+                self.next_screen = "mode"
+                return
+        except Exception:
+            pass
+
         # Toggle caret visibility
         now = pygame.time.get_ticks()
         if now - self.caret_last_toggle > self.caret_blink_interval_ms:
