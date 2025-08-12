@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# profile_train.py - Standalone profiling script
+# profile_timing_fixed.py - Profiler per tempi di calcolo e trasferimenti (versione corretta)
 
 import numpy as np
 import torch
@@ -13,8 +13,9 @@ from tqdm import tqdm
 import gc
 import fnmatch
 from pathlib import Path
+import traceback
 
-# PyTorch profiler imports
+# Import PyTorch profiler
 import torch.profiler as prof
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -27,23 +28,17 @@ from rewards import compute_final_score_breakdown, compute_final_reward_from_bre
 
 # Set up GPU device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+print(f"Utilizzo device: {device}")
 
-# GPU configuration
+# Configurazione GPU
 if torch.cuda.is_available():
-    # Optimize for CUDA performance
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
-    
-    # For newer GPUs (Ampere+)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
-    # Increase cache allocation size
     torch.cuda.empty_cache()
-    torch.cuda.memory.set_per_process_memory_fraction(0.95)
 
-# Training parameters
+# Parametri di training
 LR = 1e-3
 EPSILON_START = 1.0
 EPSILON_END = 0.01
@@ -53,7 +48,7 @@ REPLAY_SIZE = 10000
 TARGET_UPDATE_FREQ = 1000
 CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"
 
-# Create profile directory
+# Crea directory per il profiling
 PROFILE_DIR = "./profile_results"
 Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -106,7 +101,7 @@ class EpisodicReplayBuffer:
 class QNetwork(nn.Module):
     def __init__(self, obs_dim=10823, action_dim=80):
         super().__init__()
-        # Feature extractor optimized for advanced representation
+        # Feature extractor 
         self.backbone = nn.Sequential(
             nn.Linear(obs_dim, 1024),
             nn.ReLU(),
@@ -118,7 +113,7 @@ class QNetwork(nn.Module):
             nn.ReLU()
         )
         
-        # Additional sections
+        # Sezioni aggiuntive
         self.hand_table_processor = nn.Sequential(
             nn.Linear(83, 64),
             nn.ReLU()
@@ -148,43 +143,43 @@ class QNetwork(nn.Module):
         
         self.action_head = nn.Linear(256, action_dim)
         
-        # Move model to GPU
+        # Sposta il modello su GPU
         self.to(device)
         
-        # Set CUDA options for performance
+        # Opzioni CUDA per performance
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
     
     def forward(self, x):
-        # Ensure input is on GPU
+        # Assicura che l'input sia su GPU
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float32, device=device)
         elif x.device != device:
             x = x.to(device)
                 
         import torch.nn.functional as F
-        # Use inplace ReLU to save memory
+        # Usa ReLU inplace per risparmiare memoria
         x1 = F.relu(self.backbone[0](x), inplace=True)
         x2 = F.relu(self.backbone[2](x1), inplace=True)
         x3 = F.relu(self.backbone[4](x2), inplace=True)
         backbone_features = F.relu(self.backbone[6](x3), inplace=True)
         
-        # Split input into semantic sections
+        # Dividi l'input in sezioni semantiche
         hand_table = x[:, :83]
         captured = x[:, 83:165]
         history = x[:, 169:10489]
         stats = x[:, 10489:]
         
-        # Process each section - inplace version
+        # Processa ogni sezione
         hand_table_features = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
         captured_features = F.relu(self.captured_processor[0](captured), inplace=True)
         history_features = F.relu(self.history_processor[0](history), inplace=True)
         history_features = F.relu(self.history_processor[2](history_features), inplace=True)
         stats_features = F.relu(self.stats_processor[0](stats), inplace=True)
         
-        # Combine all features
+        # Combina tutte le features
         combined = torch.cat([
             backbone_features,
             hand_table_features,
@@ -193,10 +188,10 @@ class QNetwork(nn.Module):
             stats_features
         ], dim=1)
         
-        # Process combined features - inplace version
+        # Elabora le features combinate
         final_features = F.relu(self.combiner[0](combined), inplace=True)
         
-        # Calculate action values
+        # Calcola i valori delle azioni
         action_values = self.action_head(final_features)
         
         return action_values
@@ -214,26 +209,25 @@ class DQNAgent:
         self.train_steps = 0
         self.episodic_buffer = EpisodicReplayBuffer()
         
-        # GPU optimization
+        # Ottimizzazione GPU
         torch.backends.cudnn.benchmark = True
         self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
     
     def pick_action(self, obs, valid_actions, env):
         if not valid_actions:
-            print("\n[DEBUG] No valid actions! Current state:")
+            print("\n[DEBUG] Nessuna azione valida! Stato attuale:")
             print("  Current player:", env.current_player)
-            print("  Table:", env.game_state["table"])
+            print("  Tavolo:", env.game_state["table"])
             for p in range(4):
-                print(f"  Hand p{p}:", env.game_state["hands"][p])
+                print(f"  Mano p{p}:", env.game_state["hands"][p])
             print("  History:", env.game_state["history"])
-            raise ValueError("No valid actions (valid_actions=[]).")
+            raise ValueError("Nessuna azione valida (valid_actions=[]).")
         
-        # Epsilon-greedy: choose random action with epsilon probability
+        # Epsilon-greedy: scegli un'azione casuale con probabilità epsilon
         if random.random() < self.epsilon:
             return random.choice(valid_actions)
         else:
-            # OPTIMIZATION: Convert all inputs to GPU tensors in a single operation
-            # and reuse pre-allocated buffer if available
+            # Converti gli input in tensori GPU in un'unica operazione
             if hasattr(self, 'valid_actions_buffer') and len(valid_actions) <= self.valid_actions_buffer.size(0):
                 valid_actions_t = self.valid_actions_buffer[:len(valid_actions)]
                 for i, va in enumerate(valid_actions):
@@ -242,7 +236,6 @@ class DQNAgent:
                     else:
                         valid_actions_t[i].copy_(va)
             else:
-                # Create buffer if it doesn't exist
                 if not hasattr(self, 'valid_actions_buffer') or len(valid_actions) > self.valid_actions_buffer.size(0):
                     self.valid_actions_buffer = torch.zeros((max(100, len(valid_actions)), 80), 
                                                         dtype=torch.float32, device=device)
@@ -250,7 +243,6 @@ class DQNAgent:
                                             dtype=torch.float32, device=device)
                 
             with torch.no_grad():
-                # OPTIMIZATION: Reuse observation buffer if possible
                 if hasattr(self, 'obs_buffer'):
                     obs_t = self.obs_buffer
                     if isinstance(obs, np.ndarray):
@@ -261,7 +253,7 @@ class DQNAgent:
                     self.obs_buffer = torch.zeros((1, len(obs)), dtype=torch.float32, device=device)
                     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     
-                # OPTIMIZATION: Use mixed precision for faster inference
+                # Usa mixed precision per accelerare l'inferenza
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                     action_values = self.online_qnet(obs_t)
                     q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
@@ -271,34 +263,34 @@ class DQNAgent:
             return valid_actions[best_action_idx]
     
     def train_episodic_monte_carlo(self, specific_episode=None):
-        # Determine which episodes to process
+        # Determina quali episodi processare
         if specific_episode is not None:
             episodes_to_process = [specific_episode]
         elif self.episodic_buffer.episodes:
             episodes_to_process = self.episodic_buffer.get_all_episodes()
         else:
-            return  # No episodes available
+            return  # Nessun episodio disponibile
         
-        # OPTIMIZATION: Use pre-allocated buffers if possible
+        # Usa buffer pre-allocati se possibile
         max_transitions = sum(len(episode) for episode in episodes_to_process)
         
-        # Create or resize buffers if needed
+        # Crea o ridimensiona i buffer se necessario
         if not hasattr(self, 'train_obs_buffer') or max_transitions > self.train_obs_buffer.size(0):
             self.train_obs_buffer = torch.zeros((max_transitions, 10823), dtype=torch.float32, device=device)
             self.train_actions_buffer = torch.zeros((max_transitions, 80), dtype=torch.float32, device=device)
             self.train_returns_buffer = torch.zeros(max_transitions, dtype=torch.float32, device=device)
         
-        # Fill buffers efficiently
+        # Riempi i buffer in modo efficiente
         idx = 0
         for episode in episodes_to_process:
             if not episode:
                 continue
                     
-            # Get final reward from last transition
+            # Ottieni la reward finale dall'ultima transizione dell'episodio
             final_reward = episode[-1][2] if episode else 0.0
             
             for obs, action, _, _, _, _ in episode:
-                # Copy directly to buffer to avoid intermediate tensor creation
+                # Copia direttamente nel buffer per evitare creazioni di tensori intermedie
                 if isinstance(obs, np.ndarray):
                     self.train_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
                 else:
@@ -313,58 +305,58 @@ class DQNAgent:
                 idx += 1
         
         if idx == 0:
-            return  # No transitions to process
+            return  # Nessuna transizione da processare
         
-        # Use buffer slices for training
+        # Usa slices dei buffer per il training
         all_obs_t = self.train_obs_buffer[:idx]
         all_actions_t = self.train_actions_buffer[:idx]
         all_returns_t = self.train_returns_buffer[:idx]
         
-        # Increase batch_size to better utilize GPU
+        # Aumenta batch_size per sfruttare meglio la GPU
         batch_size = min(512, idx)
         num_batches = (idx + batch_size - 1) // batch_size
         
-        # Reduce target sync frequency
+        # Riduci la frequenza di sync_target
         sync_counter = 0
         sync_frequency = 10
         
-        # Track metrics for diagnostics
+        # Traccia le metriche per diagnostica
         total_loss = 0.0
         batch_count = 0
         
-        # OPTIMIZATION: Use mixed precision more efficiently with float16
+        # Usa mixed precision in modo più efficiente con float16
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, idx)
                 
-                # Take slices of tensors already on GPU (avoid copies)
+                # Prendi slices dei tensori già sulla GPU (evita copie)
                 batch_obs_t = all_obs_t[start_idx:end_idx]
                 batch_actions_t = all_actions_t[start_idx:end_idx]
                 batch_returns_t = all_returns_t[start_idx:end_idx]
                 
-                # OPTIMIZATION: Zero gradients - use set_to_none=True for better memory efficiency
+                # Zero gradients - usa set_to_none=True per maggiore efficienza di memoria
                 self.optimizer.zero_grad(set_to_none=True)
                 
-                # OPTIMIZATION: Forward pass with kernel fusion where possible
+                # Forward pass con kernel fusion dove possibile
                 q_values = self.online_qnet(batch_obs_t)
                 q_values_for_actions = torch.sum(q_values * batch_actions_t, dim=1)
                 
-                # OPTIMIZATION: Loss with mixed precision - use reduction='mean' for numerical stability
+                # Loss con mixed precision
                 loss = nn.MSELoss()(q_values_for_actions, batch_returns_t)
                 
-                # Track loss for diagnostics
+                # Traccia la loss per diagnostica
                 total_loss += loss.item()
                 batch_count += 1
                 
-                # OPTIMIZATION: Backward and optimizer step with gradient scaling for mixed precision
+                # Backward e optimizer step con gradient scaling per mixed precision
                 if self.scaler:
                     self.scaler.scale(loss).backward()
                     
-                    # OPTIMIZATION: Clip gradient with moderate norm for training stability
+                    # Clip gradient con una norma moderata per stabilità di training
                     torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
                     
-                    # OPTIMIZATION: Optimizer step with scaling
+                    # Optimizer step con scaling
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
@@ -372,26 +364,22 @@ class DQNAgent:
                     torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
                     self.optimizer.step()
                 
-                # Update epsilon after each batch to advance training
+                # Aggiorna epsilon dopo ogni batch per avanzare il training
                 self.update_epsilon()
                 
-                # OPTIMIZATION: Sync target network periodically (not every batch)
+                # Sync target network periodicamente (non ad ogni batch)
                 sync_counter += 1
                 if sync_counter >= sync_frequency:
                     self.sync_target()
                     sync_counter = 0
-                    
-                # OPTIMIZATION: Release GPU memory periodically
-                if batch_idx % 10 == 0 and batch_idx > 0:
-                    torch.cuda.empty_cache()
     
     def store_episode_transition(self, transition):
-        # Add to current episode
+        # Aggiungi all'episodio corrente
         self.episodic_buffer.add_transition(transition)
     
     def end_episode(self):
-        # End current episode WITHOUT training
-        # Training must be called explicitly after this method
+        # Termina l'episodio corrente SENZA training
+        # Il training deve essere chiamato esplicitamente dopo questo metodo
         self.episodic_buffer.end_episode()
             
     def start_episode(self):
@@ -409,11 +397,11 @@ class DQNAgent:
         self.train_steps += 1
 
     def save_checkpoint(self, filename):
-        # Create directory if it doesn't exist
+        # Crea la directory se non esiste
         directory = os.path.dirname(filename)
         if directory and not os.path.exists(directory):
             os.makedirs(directory)
-            print(f"[DQNAgent] Created checkpoint directory: {directory}")
+            print(f"[DQNAgent] Creata directory per checkpoint: {directory}")
         
         try:
             torch.save({
@@ -422,9 +410,9 @@ class DQNAgent:
                 "epsilon": self.epsilon,
                 "train_steps": self.train_steps
             }, filename)
-            print(f"[DQNAgent] Checkpoint saved: {filename}")
+            print(f"[DQNAgent] Checkpoint salvato: {filename}")
         except Exception as e:
-            print(f"[DQNAgent] ERROR saving checkpoint {filename}: {e}")
+            print(f"[DQNAgent] ERRORE nel salvataggio del checkpoint {filename}: {e}")
 
     def load_checkpoint(self, filename):
         ckpt = torch.load(filename, map_location=device)
@@ -432,20 +420,20 @@ class DQNAgent:
         self.target_qnet.load_state_dict(ckpt["target_state_dict"])
         self.epsilon = ckpt["epsilon"]
         self.train_steps = ckpt["train_steps"]
-        print(f"[DQNAgent] Checkpoint loaded from {filename}")
+        print(f"[DQNAgent] Checkpoint caricato da {filename}")
 
 
 def find_latest_checkpoint(base_path, team_id):
-    """Find the latest checkpoint for a specific team"""
+    """Trova il checkpoint più recente per un team specifico"""
     dir_path = os.path.dirname(base_path)
     base_name = os.path.basename(base_path)
     
-    # First check if standard checkpoint exists
+    # Prima controlla se esiste il checkpoint standard
     standard_ckpt = f"{base_path}_team{team_id}.pth"
     if os.path.isfile(standard_ckpt):
         return standard_ckpt
         
-    # Otherwise search for checkpoints with episode number
+    # Altrimenti cerca i checkpoint con numero episodio
     if os.path.exists(dir_path):
         pattern = f"{base_name}_team{team_id}_ep*.pth"
         matching_files = [f for f in os.listdir(dir_path) if fnmatch.fnmatch(f, pattern)]
@@ -457,157 +445,201 @@ def find_latest_checkpoint(base_path, team_id):
     return None
 
 
-def save_profile_summary(profiler, name="profile_summary"):
-    """Save detailed summary of profiling results"""
-    import pandas as pd
-    
-    # Export key averages to CSV
-    events = profiler.key_averages()
-    data = []
-    
-    for evt in events:
-        # Skip tiny operations that pollute the data
-        if evt.cpu_time_total < 10 and evt.cuda_time_total < 10:
-            continue
+def analyze_timing_results(profiler_data_file=f"{PROFILE_DIR}/raw_profiler_data.pt", name="timing_results"):
+    """Analizza e salva i risultati del profiler focalizzandosi sui tempi"""
+    try:
+        # Carica i dati del profiler salvati
+        profiler_data = torch.load(profiler_data_file)
+        events = profiler_data.get('key_averages', [])
+        
+        if not events:
+            print(f"Nessun dato di profiling valido trovato in {profiler_data_file}")
+            return
             
-        data.append({
-            'Name': evt.key,
-            'CPU Time (μs)': evt.cpu_time_total,
-            'CUDA Time (μs)': evt.cuda_time_total,
-            'Self CPU Time (μs)': evt.self_cpu_time_total,
-            'Self CUDA Time (μs)': evt.self_cuda_time_total,
-            'CPU Memory Used (B)': evt.cpu_memory_usage,
-            'CUDA Memory Used (B)': evt.cuda_memory_usage,
-            'Calls': evt.count
-        })
-    
-    df = pd.DataFrame(data)
-    df.to_csv(f"{PROFILE_DIR}/{name}.csv", index=False)
-    
-    # Calculate CPU/GPU time breakdown
-    total_cpu_time = sum(evt.cpu_time_total for evt in events)
-    total_cuda_time = sum(evt.cuda_time_total for evt in events)
-    
-    # Find memcpy operations (data transfers)
-    memcpy_ops = [evt for evt in events if 'memcpy' in evt.key.lower()]
-    memcpy_time = sum(evt.cuda_time_total for evt in memcpy_ops)
-    
-    # Save summary text file
-    with open(f"{PROFILE_DIR}/{name}_overview.txt", 'w') as f:
-        f.write("PROFILING SUMMARY\n")
-        f.write("================\n\n")
-        f.write(f"Total CPU Time: {total_cpu_time/1000:.2f} ms\n")
-        f.write(f"Total CUDA Time: {total_cuda_time/1000:.2f} ms\n")
-        f.write(f"Data Transfer Time: {memcpy_time/1000:.2f} ms ({memcpy_time/total_cuda_time*100 if total_cuda_time else 0:.1f}% of CUDA time)\n\n")
+        # Trova le operazioni di memcpy (trasferimenti CPU-GPU)
+        memcpy_ops = [evt for evt in events if 'memcpy' in evt.key.lower()]
         
-        f.write("TOP CPU OPERATIONS\n")
-        f.write("=================\n")
-        cpu_events = sorted(events, key=lambda x: x.self_cpu_time_total, reverse=True)[:20]
-        for i, evt in enumerate(cpu_events):
-            f.write(f"{i+1}. {evt.key.split('/')[-1]} - {evt.self_cpu_time_total/1000:.2f} ms ({evt.count} calls)\n")
+        # Calcola statistiche totali
+        total_cpu_time = sum(evt.cpu_time_total for evt in events)
+        total_cuda_time = sum(evt.cuda_time_total for evt in events)
+        total_memcpy_time = sum(evt.cuda_time_total for evt in memcpy_ops)
         
-        f.write("\nTOP CUDA OPERATIONS\n")
-        f.write("==================\n")
-        cuda_events = sorted(events, key=lambda x: x.self_cuda_time_total, reverse=True)[:20]
-        for i, evt in enumerate(cuda_events):
-            f.write(f"{i+1}. {evt.key.split('/')[-1]} - {evt.self_cuda_time_total/1000:.2f} ms ({evt.count} calls)\n")
-    
-    print(f"Saved profile summary to {PROFILE_DIR}/{name}.csv")
-    print(f"Saved profile overview to {PROFILE_DIR}/{name}_overview.txt")
-    
-    return df
+        # Salva un report di testo
+        with open(f"{PROFILE_DIR}/{name}.txt", 'w') as f:
+            f.write("RIEPILOGO TEMPI DI ESECUZIONE\n")
+            f.write("===========================\n\n")
+            f.write(f"Tempo CPU totale: {total_cpu_time/1000:.2f} ms\n")
+            f.write(f"Tempo CUDA totale: {total_cuda_time/1000:.2f} ms\n")
+            f.write(f"Tempo trasferimenti CPU-GPU: {total_memcpy_time/1000:.2f} ms " +
+                    f"({total_memcpy_time/total_cuda_time*100 if total_cuda_time else 0:.1f}% del tempo CUDA)\n\n")
+            
+            # Top operazioni CPU per tempo
+            f.write("TOP 20 OPERAZIONI CPU (per tempo totale)\n")
+            f.write("======================================\n")
+            cpu_events = sorted(events, key=lambda x: x.cpu_time_total, reverse=True)[:20]
+            for i, evt in enumerate(cpu_events):
+                f.write(f"{i+1}. {evt.key.split('/')[-1]} - {evt.cpu_time_total/1000:.2f} ms " +
+                        f"({evt.count} chiamate, {evt.cpu_time_total/evt.count/1000:.3f} ms/chiamata)\n")
+            
+            # Top operazioni CUDA per tempo
+            f.write("\nTOP 20 OPERAZIONI CUDA (per tempo totale)\n")
+            f.write("=======================================\n")
+            cuda_events = sorted(events, key=lambda x: x.cuda_time_total, reverse=True)[:20]
+            for i, evt in enumerate(cuda_events):
+                f.write(f"{i+1}. {evt.key.split('/')[-1]} - {evt.cuda_time_total/1000:.2f} ms " +
+                        f"({evt.count} chiamate, {evt.cuda_time_total/evt.count/1000:.3f} ms/chiamata)\n")
+            
+            # Operazioni di trasferimento dati
+            f.write("\nOPERAZIONI DI TRASFERIMENTO CPU-GPU\n")
+            f.write("==================================\n")
+            if memcpy_ops:
+                for i, evt in enumerate(memcpy_ops):
+                    f.write(f"{i+1}. {evt.key.split('/')[-1]} - {evt.cuda_time_total/1000:.2f} ms " +
+                            f"({evt.count} chiamate, {evt.cuda_time_total/evt.count/1000:.3f} ms/chiamata)\n")
+            else:
+                f.write("Nessuna operazione di trasferimento esplicita rilevata.\n")
+        
+        print(f"Analisi dei tempi salvata in {PROFILE_DIR}/{name}.txt")
+        
+        # Crea anche una versione tabellare dei dati completi
+        import pandas as pd
+        data = []
+        for evt in events:
+            # Salta operazioni con tempi minimi che inquinano i dati
+            if evt.cpu_time_total < 10 and evt.cuda_time_total < 10:
+                continue
+                
+            data.append({
+                'Name': evt.key,
+                'CPU Time (ms)': evt.cpu_time_total/1000,
+                'CUDA Time (ms)': evt.cuda_time_total/1000,
+                'Self CPU Time (ms)': evt.self_cpu_time_total/1000,
+                'Self CUDA Time (ms)': evt.self_cuda_time_total/1000,
+                'Calls': evt.count,
+                'Avg CPU Time (ms)': evt.cpu_time_total/evt.count/1000 if evt.count else 0,
+                'Avg CUDA Time (ms)': evt.cuda_time_total/evt.count/1000 if evt.count else 0,
+                'Is Transfer': 'memcpy' in evt.key.lower()
+            })
+        
+        df = pd.DataFrame(data)
+        df.to_csv(f"{PROFILE_DIR}/{name}.csv", index=False)
+        
+        print(f"Dati completi salvati in {PROFILE_DIR}/{name}.csv")
+        return df
+        
+    except Exception as e:
+        print(f"Errore durante l'analisi dei risultati: {e}")
+        traceback.print_exc()
+        return None
 
 
 def profiled_train_agents(num_episodes=200):
     """
-    Profiled version of the training function, limited to the specified number of episodes
+    Versione profilata della funzione di training, limitata al numero di episodi specificato
     """
-    # Create checkpoint directory if it doesn't exist
+    # Crea la directory dei checkpoint se non esiste
     checkpoint_dir = os.path.dirname(CHECKPOINT_PATH)
     if not os.path.exists(checkpoint_dir):
-        print(f"Creating checkpoint directory: {checkpoint_dir}")
+        print(f"Creazione directory per checkpoint: {checkpoint_dir}")
         os.makedirs(checkpoint_dir)
     
-    # Create the agents
+    # Crea gli agenti
     agent_team0 = DQNAgent(team_id=0)
     agent_team1 = DQNAgent(team_id=1)
 
-    # Look for existing checkpoints
-    print(f"Looking for latest checkpoints...")
+    # Cerca i checkpoint esistenti
+    print(f"Ricerca dei checkpoint più recenti...")
     
     # Team 0
     team0_ckpt = find_latest_checkpoint(CHECKPOINT_PATH, 0)
     if team0_ckpt:
         try:
-            print(f"Found checkpoint for team 0: {team0_ckpt}")
+            print(f"Trovato checkpoint per team 0: {team0_ckpt}")
             agent_team0.load_checkpoint(team0_ckpt)
         except Exception as e:
-            print(f"ERROR loading team 0 checkpoint: {e}")
+            print(f"ERRORE nel caricamento del checkpoint team 0: {e}")
     else:
-        print(f"No checkpoint found for team 0")
+        print(f"Nessun checkpoint trovato per team 0")
     
     # Team 1
     team1_ckpt = find_latest_checkpoint(CHECKPOINT_PATH, 1)
     if team1_ckpt:
         try:
-            print(f"Found checkpoint for team 1: {team1_ckpt}")
+            print(f"Trovato checkpoint per team 1: {team1_ckpt}")
             agent_team1.load_checkpoint(team1_ckpt)
         except Exception as e:
-            print(f"ERROR loading team 1 checkpoint: {e}")
+            print(f"ERRORE nel caricamento del checkpoint team 1: {e}")
     else:
-        print(f"No checkpoint found for team 1")
+        print(f"Nessun checkpoint trovato per team 1")
 
-    # Control variables
+    # Variabili di controllo
     first_player = 0
     global_step = 0
     
-    # Performance monitoring
+    # Monitoraggio prestazioni
     episode_times = []
     train_times = []
     inference_times = []
     
-    # Create profiler
+    # Crea profiler
     profiler_activities = [ProfilerActivity.CPU]
     if torch.cuda.is_available():
         profiler_activities.append(ProfilerActivity.CUDA)
     
-    # Set up the profiler
+    # Configura il profiler con schedule più gestibile
+    # Usa "active" più breve per evitare il problema dello stack overflow
     profiler = profile(
         activities=profiler_activities,
-        schedule=prof.schedule(wait=1, warmup=1, active=num_episodes-2, repeat=1),
+        # MODIFICATO: Divide il profiling in blocchi più piccoli per evitare lo stack overflow
+        schedule=prof.schedule(wait=1, warmup=1, active=40, repeat=4),
         record_shapes=True,
-        profile_memory=True,
         with_stack=True
     )
-    profiler.__enter__()
     
-    # Progress bar
-    pbar = tqdm(total=num_episodes, desc="Profiling episodes")
+    # Record di dati per l'analisi finale
+    all_profiling_data = []
+    current_profiler = None
     
-    # Main loop for episodes
+    # Barra di progresso
+    pbar = tqdm(total=num_episodes, desc="Profilazione episodi")
+    
+    # Loop principale per episodi
     for ep in range(num_episodes):
         episode_start_time = time.time()
         
-        # Update progress
-        pbar.set_description(f"Episode {ep+1}/{num_episodes} (Player {first_player})")
+        # Gestisci avvio/terminazione del profiler
+        if ep % 40 == 0:
+            # Chiudi profiler precedente se esiste
+            if current_profiler is not None:
+                try:
+                    current_profiler.__exit__(None, None, None)
+                    all_profiling_data.append(current_profiler)
+                except Exception as e:
+                    print(f"Errore nel chiudere il profiler all'episodio {ep}: {e}")
+            
+            # Avvia un nuovo profiler
+            current_profiler = profiler.__enter__()
+        
+        # Aggiorna progresso
+        pbar.set_description(f"Episodio {ep+1}/{num_episodes} (Giocatore {first_player})")
         pbar.update(1)
         
-        # Create environment and initialize
+        # Crea environment e inizializza
         with record_function("Environment_Setup"):
             env = ScoponeEnvMA()
             env.current_player = first_player
 
-        # Initialize episode buffers
+        # Inizializza i buffer degli episodi
         with record_function("Initialize_Episode"):
             agent_team0.start_episode()
             agent_team1.start_episode()
 
-        # Initial state
+        # Stato iniziale
         with record_function("Initial_Observation"):
             obs_current = env._get_observation(env.current_player)
             done = False
         
-        # Count transitions per team
+        # Conteggio transizioni per team
         team0_transitions = 0
         team1_transitions = 0
 
@@ -623,22 +655,22 @@ def profiled_train_agents(num_episodes=200):
                     team_id = 0 if cp in [0,2] else 1
                     agent = agent_team0 if team_id==0 else agent_team1
                     
-                    # Get valid actions
+                    # Ottieni azioni valide
                     with record_function("Get_Valid_Actions"):
                         valid_acts = env.get_valid_actions()
                     
                     if not valid_acts:
                         break
                     
-                    # Choose action
+                    # Scegli azione
                     with record_function("Pick_Action"):
                         action = agent.pick_action(obs_current, valid_acts, env)
                     
-                    # Execute action
+                    # Esegui azione
                     with record_function("Environment_Step"):
                         next_obs, reward, done, info = env.step(action)
                     
-                    # Store transition
+                    # Memorizza transizione
                     with record_function("Store_Transition"):
                         next_valid = env.get_valid_actions() if not done else []
                         transition = (obs_current, action, reward, next_obs, done, next_valid)
@@ -652,18 +684,18 @@ def profiled_train_agents(num_episodes=200):
                     
                     global_step += 1
                     
-                    # Prepare for next iteration
+                    # Prepara per la prossima iterazione
                     obs_current = next_obs
         
         inference_time = time.time() - inference_start
         inference_times.append(inference_time)
 
-        # End episodes
+        # Termina episodi
         with record_function("End_Episodes"):
             agent_team0.end_episode()
             agent_team1.end_episode()
         
-        # Get final rewards
+        # Ottieni reward finali
         team0_reward = 0.0
         team1_reward = 0.0
         if "team_rewards" in info:
@@ -689,7 +721,7 @@ def profiled_train_agents(num_episodes=200):
                     if last_episode_team1:
                         agent_team1.train_episodic_monte_carlo()
             
-            # Target network sync
+            # Sincronizzazione network target
             if global_step % TARGET_UPDATE_FREQ == 0:
                 with record_function("Sync_Target_Networks"):
                     agent_team0.sync_target()
@@ -698,208 +730,121 @@ def profiled_train_agents(num_episodes=200):
             train_time = time.time() - train_start_time
             train_times.append(train_time)
         
-        # Memory cleanup
+        # Pulizia memoria
         with record_function("Memory_Cleanup"):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
-        # Episode time
+        # Tempo episodio
         episode_time = time.time() - episode_start_time
         episode_times.append(episode_time)
         
-        # Save checkpoint periodically
+        # Salva checkpoint periodicamente
         if (ep + 1) % 50 == 0 or ep == num_episodes - 1:
             with record_function("Save_Checkpoints"):
                 agent_team0.save_checkpoint(f"{CHECKPOINT_PATH}_profile_team0_ep{ep+1}.pth")
                 agent_team1.save_checkpoint(f"{CHECKPOINT_PATH}_profile_team1_ep{ep+1}.pth")
         
-        # Step the profiler
-        profiler.step()
+        # Step profiler
+        if current_profiler is not None:
+            try:
+                # Fai lo step del profiler
+                profiler.step()
+            except Exception as e:
+                print(f"Errore durante lo step del profiler all'episodio {ep+1}: {e}")
+                # Tenta di chiudere e ricrearlo
+                try:
+                    current_profiler.__exit__(None, None, None)
+                except:
+                    pass
+                current_profiler = profiler.__enter__()
         
-        # Next player
+        # Cambia primo giocatore
         first_player = (first_player + 1) % 4
     
-    # End profiler
-    profiler.__exit__(None, None, None)
+    # Chiudi l'ultimo profiler se ancora aperto
+    if current_profiler is not None:
+        try:
+            current_profiler.__exit__(None, None, None)
+            all_profiling_data.append(current_profiler)
+        except Exception as e:
+            print(f"Errore nel chiudere l'ultimo profiler: {e}")
     
-    # Close progress bar
+    # Chiudi barra di progresso
     pbar.close()
     
-    # Save profiler results
+    # Esporta tutti i dati di profiling in un file
     try:
-        profiler.export_chrome_trace(f"{PROFILE_DIR}/trace.json")
-        print(f"Exported Chrome trace to {PROFILE_DIR}/trace.json")
-        print("You can view this trace in Chrome by navigating to chrome://tracing")
+        # Prendi l'ultimo profiler (che dovrebbe avere i dati più freschi)
+        if all_profiling_data:
+            last_profiler = all_profiling_data[-1]
+            # Salva i dati grezzi del profiler
+            torch.save({
+                'key_averages': last_profiler.key_averages(),
+                'events': last_profiler._events
+            }, f"{PROFILE_DIR}/raw_profiler_data.pt")
+            
+            # Prova a esportare anche la traccia Chrome
+            try:
+                last_profiler.export_chrome_trace(f"{PROFILE_DIR}/trace.json")
+                print(f"Esportato Chrome trace in {PROFILE_DIR}/trace.json")
+                print("Puoi visualizzare questo trace in Chrome navigando a chrome://tracing")
+            except Exception as e:
+                print(f"Errore nell'esportazione del trace: {e}")
     except Exception as e:
-        print(f"Error exporting trace: {e}")
+        print(f"Errore nel salvare i dati del profiler: {e}")
     
-    # Save tabular summary
-    save_profile_summary(profiler)
+    # Analizza e salva i risultati del timing
+    analyze_timing_results()
     
-    # Generate performance report
+    # Genera report prestazioni
     avg_episode_time = sum(episode_times) / len(episode_times)
     avg_inference_time = sum(inference_times) / len(inference_times)
     avg_train_time = sum(train_times) / len(train_times)
     
-    print("\n=== Performance Report ===")
-    print(f"Average episode time: {avg_episode_time:.3f}s")
-    print(f"Average inference time: {avg_inference_time:.3f}s ({avg_inference_time/avg_episode_time*100:.1f}% of episode)")
-    print(f"Average training time: {avg_train_time:.3f}s ({avg_train_time/avg_episode_time*100:.1f}% of episode)")
+    print("\n=== Report Prestazioni ===")
+    print(f"Tempo medio per episodio: {avg_episode_time:.3f}s")
+    print(f"Tempo medio per inferenza: {avg_inference_time:.3f}s ({avg_inference_time/avg_episode_time*100:.1f}% dell'episodio)")
+    print(f"Tempo medio per training: {avg_train_time:.3f}s ({avg_train_time/avg_episode_time*100:.1f}% dell'episodio)")
     
-    # Save performance metrics
+    # Salva metriche di performance
     with open(f"{PROFILE_DIR}/performance_metrics.txt", "w") as f:
-        f.write("PERFORMANCE METRICS\n")
-        f.write("===================\n\n")
-        f.write(f"Episodes: {num_episodes}\n")
-        f.write(f"Total steps: {global_step}\n\n")
+        f.write("METRICHE DI PERFORMANCE\n")
+        f.write("=====================\n\n")
+        f.write(f"Episodi: {num_episodes}\n")
+        f.write(f"Step totali: {global_step}\n\n")
         
-        f.write(f"Average episode time: {avg_episode_time:.3f}s\n")
-        f.write(f"Average inference time: {avg_inference_time:.3f}s ({avg_inference_time/avg_episode_time*100:.1f}% of episode)\n")
-        f.write(f"Average training time: {avg_train_time:.3f}s ({avg_train_time/avg_episode_time*100:.1f}% of episode)\n\n")
-        
-        f.write("GPU MEMORY USAGE\n")
-        f.write("===============\n")
-        if torch.cuda.is_available():
-            f.write(f"Peak memory allocated: {torch.cuda.max_memory_allocated()/1024**2:.1f}MB\n")
-            f.write(f"Peak memory reserved: {torch.cuda.max_memory_reserved()/1024**2:.1f}MB\n")
-            f.write(f"Current memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB\n")
-            f.write(f"Current memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB\n")
-        else:
-            f.write("No GPU available\n")
+        f.write(f"Tempo medio per episodio: {avg_episode_time:.3f}s\n")
+        f.write(f"Tempo medio per inferenza: {avg_inference_time:.3f}s ({avg_inference_time/avg_episode_time*100:.1f}% dell'episodio)\n")
+        f.write(f"Tempo medio per training: {avg_train_time:.3f}s ({avg_train_time/avg_episode_time*100:.1f}% dell'episodio)\n")
     
-    print(f"Saved performance metrics to {PROFILE_DIR}/performance_metrics.txt")
+    print(f"Metriche di performance salvate in {PROFILE_DIR}/performance_metrics.txt")
     
-    return profiler
-
-
-def create_visualization(profile_dir=PROFILE_DIR):
-    """Create visualizations from profiling data"""
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    
-    # Check if visualization dependencies are available
-    try:
-        import pandas as pd
-        import matplotlib
-        import seaborn
-    except ImportError:
-        print("Visualization libraries not available. Install pandas, matplotlib, and seaborn.")
-        return
-    
-    # Check if profile data exists
-    csv_path = f"{profile_dir}/profile_summary.csv"
-    if not os.path.exists(csv_path):
-        print(f"Profile data not found at {csv_path}")
-        return
-    
-    # Load data
-    df = pd.read_csv(csv_path)
-    
-    # Create visualizations directory
-    viz_dir = f"{profile_dir}/visualizations"
-    Path(viz_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Set style
-    sns.set(style="whitegrid", font_scale=1.1)
-    
-    # 1. Top CPU Operations
-    plt.figure(figsize=(14, 8))
-    top_cpu = df.sort_values('Self CPU Time (μs)', ascending=False).head(15)
-    top_cpu['Name'] = top_cpu['Name'].str.split('/').str[-1]  # Simplify names
-    sns.barplot(x='Self CPU Time (μs)', y='Name', data=top_cpu, palette='Blues_d')
-    plt.title('Top 15 Operations by CPU Time', fontsize=16)
-    plt.xlabel('Self CPU Time (μs)', fontsize=14)
-    plt.ylabel('Operation', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(f"{viz_dir}/top_cpu_operations.png", dpi=300)
-    plt.close()
-    
-    # 2. Top CUDA Operations
-    plt.figure(figsize=(14, 8))
-    top_cuda = df.sort_values('Self CUDA Time (μs)', ascending=False).head(15)
-    top_cuda['Name'] = top_cuda['Name'].str.split('/').str[-1]  # Simplify names
-    sns.barplot(x='Self CUDA Time (μs)', y='Name', data=top_cuda, palette='Reds_d')
-    plt.title('Top 15 Operations by CUDA Time', fontsize=16)
-    plt.xlabel('Self CUDA Time (μs)', fontsize=14)
-    plt.ylabel('Operation', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(f"{viz_dir}/top_cuda_operations.png", dpi=300)
-    plt.close()
-    
-    # 3. Memory Usage by Operation
-    plt.figure(figsize=(14, 8))
-    top_mem = df.sort_values('CUDA Memory Used (B)', ascending=False).head(15)
-    top_mem['Name'] = top_mem['Name'].str.split('/').str[-1]  # Simplify names
-    top_mem['CUDA Memory (MB)'] = top_mem['CUDA Memory Used (B)'] / (1024 * 1024)
-    sns.barplot(x='CUDA Memory (MB)', y='Name', data=top_mem, palette='Greens_d')
-    plt.title('Top 15 Operations by CUDA Memory Usage', fontsize=16)
-    plt.xlabel('CUDA Memory (MB)', fontsize=14)
-    plt.ylabel('Operation', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(f"{viz_dir}/top_memory_operations.png", dpi=300)
-    plt.close()
-    
-    # 4. CPU vs CUDA Time Comparison
-    plt.figure(figsize=(14, 8))
-    comp_df = df.sort_values('Self CUDA Time (μs)', ascending=False).head(10).copy()
-    comp_df['Name'] = comp_df['Name'].str.split('/').str[-1]  # Simplify names
-    comp_df['Self CPU Time (ms)'] = comp_df['Self CPU Time (μs)'] / 1000
-    comp_df['Self CUDA Time (ms)'] = comp_df['Self CUDA Time (μs)'] / 1000
-    
-    # Reshape for grouped bar chart
-    comp_melted = pd.melt(comp_df, 
-                          id_vars=['Name'], 
-                          value_vars=['Self CPU Time (ms)', 'Self CUDA Time (ms)'],
-                          var_name='Timing Type', 
-                          value_name='Time (ms)')
-    
-    plt.figure(figsize=(14, 8))
-    sns.barplot(x='Name', y='Time (ms)', hue='Timing Type', data=comp_melted, palette='Set1')
-    plt.title('CPU vs CUDA Time for Top Operations', fontsize=16)
-    plt.xticks(rotation=45, ha='right')
-    plt.xlabel('Operation', fontsize=14)
-    plt.ylabel('Time (ms)', fontsize=14)
-    plt.legend(title='', fontsize=12)
-    plt.tight_layout()
-    plt.savefig(f"{viz_dir}/cpu_vs_cuda_comparison.png", dpi=300)
-    plt.close()
-    
-    # 5. Most Called Operations
-    plt.figure(figsize=(14, 8))
-    top_calls = df.sort_values('Calls', ascending=False).head(15)
-    top_calls['Name'] = top_calls['Name'].str.split('/').str[-1]  # Simplify names
-    sns.barplot(x='Calls', y='Name', data=top_calls, palette='Purples_d')
-    plt.title('Top 15 Most Frequently Called Operations', fontsize=16)
-    plt.xlabel('Number of Calls', fontsize=14)
-    plt.ylabel('Operation', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(f"{viz_dir}/most_called_operations.png", dpi=300)
-    plt.close()
-    
-    print(f"Created visualizations in {viz_dir}")
+    return all_profiling_data
 
 
 if __name__ == "__main__":
-    # Number of episodes to profile
-    NUM_EPISODES = 200
+    # Numero di episodi da profilare
+    NUM_EPISODES = 10
     
-    print(f"Starting profiled training for {NUM_EPISODES} episodes...")
+    print(f"Avvio profilazione per {NUM_EPISODES} episodi...")
     
-    # Run profiled training
+    # Esegui training profilato
     start_time = time.time()
-    profile_result = profiled_train_agents(NUM_EPISODES)
+    try:
+        profile_result = profiled_train_agents(NUM_EPISODES)
+    except Exception as e:
+        print(f"Errore durante la profilazione: {e}")
+        traceback.print_exc()
+        
+        # Prova comunque ad analizzare i dati salvati (se esistono)
+        print("Tentativo di analisi dei dati di profiling disponibili...")
+        if os.path.exists(f"{PROFILE_DIR}/raw_profiler_data.pt"):
+            analyze_timing_results()
+    
     total_time = time.time() - start_time
     
-    print(f"Profiling completed in {total_time:.2f} seconds")
-    print(f"Results saved to {PROFILE_DIR}")
-    
-    # Create visualizations
-    try:
-        print("Creating visualizations...")
-        create_visualization()
-    except Exception as e:
-        print(f"Error creating visualizations: {e}")
-    
-    print("Done!")
+    print(f"Profilazione completata in {total_time:.2f} secondi")
+    print(f"Risultati salvati in {PROFILE_DIR}")
+    print("\nAnalisi completata!")

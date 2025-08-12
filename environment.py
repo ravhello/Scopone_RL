@@ -15,7 +15,7 @@ from line_profiler import LineProfiler, profile, global_profiler
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ScoponeEnvMA(gym.Env):
-    def __init__(self):
+    def __init__(self, rules=None):
         super().__init__()
         
         # Observation space con la rappresentazione avanzata
@@ -38,6 +38,17 @@ class ScoponeEnvMA(gym.Env):
         self.done = False
         self.current_player = 0
         self.rewards = [0,0]
+        
+        # Regole/varianti opzionali della partita
+        # Esempi di chiavi supportate:
+        #  - asso_piglia_tutto: bool
+        #  - scopa_on_asso_piglia_tutto: bool
+        #  - scopa_on_last_capture: bool
+        #  - re_bello: bool
+        #  - napola: bool
+        #  - napola_scoring: "fixed3" | "length"
+        #  - max_consecutive_scope: int | None (limite per team)
+        self.rules = rules or {}
         
         # Contatori per diagnostica prestazioni
         self._get_obs_time = 0
@@ -70,6 +81,31 @@ class ScoponeEnvMA(gym.Env):
                 game_state=self.game_state,
                 current_player=self.current_player
             )
+
+            # Variante: Asso piglia tutto → aggiungi azioni extra (asso cattura tutto il tavolo)
+            try:
+                if self.rules.get("asso_piglia_tutto", False):
+                    hand_cards = self.game_state["hands"].get(self.current_player, [])
+                    table_cards = self.game_state.get("table", [])
+                    if table_cards:
+                        for card in hand_cards:
+                            if card[0] == 1:  # Asso
+                                extra = encode_action(card, list(table_cards))
+                                # Evita duplicati
+                                exists = False
+                                for v in valid_actions:
+                                    try:
+                                        # v è un np.array
+                                        if (extra == v).all():
+                                            exists = True
+                                            break
+                                    except Exception:
+                                        pass
+                                if not exists:
+                                    valid_actions.append(extra)
+            except Exception:
+                # In caso di qualunque errore, non interrompere il flusso
+                pass
             
             # Aggiorna la cache
             self._valid_actions_cache = {current_hash: valid_actions}  # Mantieni la cache piccola
@@ -112,14 +148,20 @@ class ScoponeEnvMA(gym.Env):
         same_rank_cards = [tc for tc in table if tc[0] == rank]
         
         if same_rank_cards:
-            # Cattura diretta obbligatoria
-            if set(cards_to_capture) != set(same_rank_cards):
-                raise ValueError(f"Quando esistono carte di rank uguale, devi catturarle tutte.")
+            # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta
+            ace_take_all = (rank == 1 and self.rules.get("asso_piglia_tutto", False) 
+                            and set(cards_to_capture) == set(table))
+            if not ace_take_all:
+                # Cattura diretta obbligatoria
+                if set(cards_to_capture) != set(same_rank_cards):
+                    raise ValueError(f"Quando esistono carte di rank uguale, devi catturarle tutte.")
         elif cards_to_capture:
             # Verifica somma
-            sum_chosen = sum(c[0] for c in cards_to_capture)
-            if sum_chosen != rank:
-                raise ValueError(f"La somma delle carte catturate ({sum_chosen}) deve essere uguale al rank ({rank}).")
+            # Eccezione: Asso piglia tutto
+            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False) and set(cards_to_capture) == set(table)):
+                sum_chosen = sum(c[0] for c in cards_to_capture)
+                if sum_chosen != rank:
+                    raise ValueError(f"La somma delle carte catturate ({sum_chosen}) deve essere uguale al rank ({rank}).")
         
         # OTTIMIZZAZIONE: Esegui l'azione in modo più efficiente
         capture_type = "no_capture"
@@ -144,7 +186,8 @@ class ScoponeEnvMA(gym.Env):
                 if cards_left > 0:
                     capture_type = "scopa"
                 else:
-                    capture_type = "capture"
+                    # Scopa all'ultima presa: opzionale
+                    capture_type = "scopa" if self.rules.get("scopa_on_last_capture", False) else "capture"
             else:
                 capture_type = "capture"
         else:
@@ -158,6 +201,29 @@ class ScoponeEnvMA(gym.Env):
             "capture_type": capture_type,
             "captured_cards": cards_to_capture
         }
+        # Eccezione: Asso piglia tutto non conta scopa (a meno di opzione esplicita)
+        if (move_info["capture_type"] == "scopa" and rank == 1 and 
+            self.rules.get("asso_piglia_tutto", False) and not self.rules.get("scopa_on_asso_piglia_tutto", False)):
+            move_info["capture_type"] = "capture"
+
+        # Limite scope consecutive per team
+        if move_info["capture_type"] == "scopa":
+            limit = self.rules.get("max_consecutive_scope")
+            if isinstance(limit, int) and limit > 0:
+                team_id = 0 if current_player in [0, 2] else 1
+                consecutive = 0
+                for m in reversed(self.game_state["history"]):
+                    if m.get("capture_type") == "scopa":
+                        prev_team = 0 if m.get("player") in [0, 2] else 1
+                        if prev_team == team_id:
+                            consecutive += 1
+                        else:
+                            break
+                    else:
+                        break
+                if consecutive >= limit:
+                    move_info["capture_type"] = "capture"
+
         self.game_state["history"].append(move_info)
         
         # OTTIMIZZAZIONE: Invalida la cache delle osservazioni
@@ -168,21 +234,23 @@ class ScoponeEnvMA(gym.Env):
         self.done = done
         
         if done:
-            # Assegna le carte rimaste sul tavolo
+            # Assegna le carte rimaste sul tavolo (opzionale)
             if self.game_state["table"]:
-                last_capturing_team = None
-                for m in reversed(self.game_state["history"]):
-                    if m["capture_type"] in ["capture", "scopa"]:
-                        last_capturing_team = 0 if m["player"] in [0, 2] else 1
-                        break
-                
-                if last_capturing_team is not None:
-                    self.game_state["captured_squads"][last_capturing_team].extend(self.game_state["table"])
-                    self.game_state["table"].clear()
+                if self.rules.get("last_cards_to_dealer", True):
+                    last_capturing_team = None
+                    for m in reversed(self.game_state["history"]):
+                        if m["capture_type"] in ["capture", "scopa"]:
+                            last_capturing_team = 0 if m["player"] in [0, 2] else 1
+                            break
+                    
+                    if last_capturing_team is not None:
+                        self.game_state["captured_squads"][last_capturing_team].extend(self.game_state["table"])
+                # In ogni caso svuota il tavolo a fine mano
+                self.game_state["table"].clear()
             
             # Calcolo punteggio finale
             from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
-            final_breakdown = compute_final_score_breakdown(self.game_state)
+            final_breakdown = compute_final_score_breakdown(self.game_state, rules=self.rules)
             final_reward = compute_final_reward_from_breakdown(final_breakdown)
             
             info = {

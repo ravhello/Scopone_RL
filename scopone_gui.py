@@ -514,7 +514,6 @@ class ResourceManager:
                 sound.play()
             except:
                 pass  # Silently fail if sound playback fails
-
 class NetworkManager:
     """Manages network communication for multiplayer games over the internet"""
     def __init__(self, is_host=False, host='localhost', port=5555):
@@ -913,6 +912,364 @@ class BaseScreen:
         """Called when exiting this screen"""
         pass
 
+class GameOptionsScreen(BaseScreen):
+    """Intermediate screen to configure game options before starting"""
+    def __init__(self, app):
+        super().__init__(app)
+        self.title_font = pygame.font.SysFont(None, 48)
+        self.info_font = pygame.font.SysFont(None, 24)
+        self.small_font = pygame.font.SysFont(None, 22)
+
+        # Internal copy of rules to edit safely
+        self.rules = {}
+
+        # UI controls (simple buttons/toggles and +/-)
+        self.controls = {}
+
+        # Buttons
+        self.start_button = None
+        self.back_button = None
+        self.reset_button = None
+
+        # Cached layout rects
+        self.sections = {}
+
+    def enter(self):
+        super().enter()
+        # Clone defaults each time
+        defaults = getattr(self.app.screens["mode"], "default_rules", {})
+        # Preserve previously set rules if present in app.game_config
+        existing = self.app.game_config.get("rules", {})
+        merged = defaults.copy()
+        merged.update(existing)
+        self.rules = merged
+        self.setup_layout()
+
+    def calculate_section_heights(self):
+        """Calculate dynamic heights for each section based on content"""
+        mode = self.rules.get("mode_type", "points")
+
+        # Duration section
+        duration_items = 4  # radio buttons, target points, tiebreak, + optional num_hands
+        if mode == "hands":
+            duration_items += 1  # add num_hands stepper
+        duration_height = 60 + duration_items * 45  # title space + items
+
+        # Variants section
+        variant_toggles = 6  # all the toggle options
+        variant_steppers = 1  # max consecutive scope
+        variants_height = 60 + variant_toggles * 40 + variant_steppers * 50
+
+        # Setup section (AI subsection rimosso)
+        setup_items = 2  # starting team + last cards to dealer
+        combined_height = 60 + setup_items * 42
+
+        return {
+            "duration": duration_height,
+            "variants": variants_height,
+            "setup_ai": combined_height,
+        }
+
+    def setup_layout(self):
+        width = self.app.window_width
+        height = self.app.window_height
+        # Maggior spazio tra i 4 box delle opzioni
+        pad = int(height * 0.07)
+        col_w = int(width * 0.42)
+
+        # Calculate dynamic heights
+        section_heights = self.calculate_section_heights()
+
+        # Define sections with dynamic heights
+        left_x = int(width * 0.06)
+        right_x = int(width * 0.52)
+        top_y = int(height * 0.19)
+        
+        # Left column - only variants now
+        var_h = section_heights["variants"]
+        
+        # Right column - duration at top, setup below
+        dur_h = section_heights["duration"]
+        setup_ai_h = section_heights["setup_ai"]
+
+        self.sections = {
+            "variants": pygame.Rect(left_x, top_y, col_w, var_h),
+            "duration": pygame.Rect(right_x, top_y, col_w, dur_h),
+            "setup_ai": pygame.Rect(right_x, top_y + dur_h + pad, col_w, setup_ai_h),
+        }
+
+        # Buttons at bottom - position based on tallest column
+        left_col_bottom = top_y + var_h
+        right_col_bottom = top_y + dur_h + pad + setup_ai_h
+        content_bottom = max(left_col_bottom, right_col_bottom)
+        
+        bw = int(width * 0.22)
+        bh = int(height * 0.08)
+        by = min(height - bh - pad, content_bottom + pad)
+        self.start_button = Button(width//2 - bw//2, by, bw, bh, "Start", DARK_GREEN, WHITE)
+        self.back_button = Button(left_x, by, int(bw*0.7), bh, "Back", HIGHLIGHT_RED, WHITE)
+        self.reset_button = Button(right_x + col_w - int(bw*0.7), by, int(bw*0.7), bh, "Reset", DARK_BLUE, WHITE)
+
+    def handle_events(self, events):
+        for event in events:
+            if event.type == pygame.QUIT:
+                self.done = True
+                self.next_screen = None
+                pygame.quit(); sys.exit()
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                pos = pygame.mouse.get_pos()
+                # Handle clicks on toggles and steppers
+                self._handle_click_controls(pos)
+
+                if self.start_button and self.start_button.is_clicked(pos):
+                    self._on_start()
+                elif self.back_button and self.back_button.is_clicked(pos):
+                    self.done = True
+                    self.next_screen = "mode"
+                elif self.reset_button and self.reset_button.is_clicked(pos):
+                    # Reset to defaults (single preset)
+                    defaults = getattr(self.app.screens["mode"], "default_rules", {})
+                    self.rules = defaults.copy()
+
+    def _toggle(self, key):
+        self.rules[key] = not bool(self.rules.get(key, False))
+
+    def _step_int(self, key, delta, lo=None, hi=None):
+        val = int(self.rules.get(key, 0)) + delta
+        if lo is not None:
+            val = max(lo, val)
+        if hi is not None:
+            val = min(hi, val)
+        self.rules[key] = val
+
+    def _cycle(self, key, values):
+        cur = self.rules.get(key, values[0])
+        try:
+            idx = values.index(cur)
+        except ValueError:
+            idx = 0
+        self.rules[key] = values[(idx + 1) % len(values)]
+
+    def _handle_click_controls(self, pos):
+        # Duration controls
+        if getattr(self, 'mode_points_rect', None) and self.mode_points_rect.collidepoint(pos):
+            self.rules["mode_type"] = "points"
+        if getattr(self, 'mode_hands_rect', None) and self.mode_hands_rect.collidepoint(pos):
+            self.rules["mode_type"] = "hands"
+        if getattr(self, 'mode_oneshot_rect', None) and self.mode_oneshot_rect.collidepoint(pos):
+            self.rules["mode_type"] = "oneshot"
+
+        if getattr(self, 'tp_minus_rect', None) and self.tp_minus_rect.collidepoint(pos):
+            self._step_int("target_points", -1, lo=1, hi=200)
+        if getattr(self, 'tp_plus_rect', None) and self.tp_plus_rect.collidepoint(pos):
+            self._step_int("target_points", +1, lo=1, hi=200)
+
+        if getattr(self, 'nh_minus_rect', None) and self.nh_minus_rect.collidepoint(pos):
+            self._step_int("num_hands", -1, lo=1, hi=99)
+        if getattr(self, 'nh_plus_rect', None) and self.nh_plus_rect.collidepoint(pos):
+            self._step_int("num_hands", +1, lo=1, hi=99)
+
+        if getattr(self, 'tb_rect', None) and self.tb_rect.collidepoint(pos):
+            self._cycle("tiebreak", ["single", "+2", "allow_draw"])
+
+        # Variants
+        for key, rect in [
+            ("asso_piglia_tutto", getattr(self, 'ap_rect', None)),
+            ("scopa_on_asso_piglia_tutto", getattr(self, 'ap_scopa_rect', None)),
+            ("scopa_on_last_capture", getattr(self, 'last_scopa_rect', None)),
+            ("re_bello", getattr(self, 'rb_rect', None)),
+            ("napola", getattr(self, 'nap_rect', None)),
+        ]:
+            if rect is not None and rect.collidepoint(pos):
+                self._toggle(key)
+
+        if self.rules.get("napola", False) and getattr(self, 'nap_scoring_rect', None) and self.nap_scoring_rect.collidepoint(pos):
+            self._cycle("napola_scoring", ["fixed3", "length"])
+
+        if getattr(self, 'max_scope_minus_rect', None) and self.max_scope_minus_rect.collidepoint(pos):
+            cur = self.rules.get("max_consecutive_scope")
+            cur = 0 if cur is None else int(cur)
+            cur = max(0, cur - 1)
+            self.rules["max_consecutive_scope"] = None if cur == 0 else cur
+        if getattr(self, 'max_scope_plus_rect', None) and self.max_scope_plus_rect.collidepoint(pos):
+            cur = self.rules.get("max_consecutive_scope")
+            cur = 0 if cur is None else int(cur)
+            cur = min(9, cur + 1)
+            self.rules["max_consecutive_scope"] = None if cur == 0 else cur
+
+        # Setup
+        if getattr(self, 'start_team_rect', None) and self.start_team_rect.collidepoint(pos):
+            self._cycle("starting_team", ["random", "team0", "team1"])
+        if getattr(self, 'last_cards_rect', None) and self.last_cards_rect.collidepoint(pos):
+            self._toggle("last_cards_to_dealer")
+
+        # (Rimosso) Tempo per mossa AI
+
+    def _on_start(self):
+        # Salva regole in config e avvia gioco
+        self.app.game_config["rules"] = self.rules.copy()
+        # Reset eventuali meta di partita (punteggi di serie) non implementati ora
+        self.done = True
+        self.next_screen = "game"
+
+    def update(self):
+        pass
+
+    def draw_toggle(self, surface, rect, label, active):
+        pygame.draw.rect(surface, DARK_BLUE, rect, border_radius=8)
+        pygame.draw.rect(surface, GOLD, rect, 2, border_radius=8)
+        text = f"{label}: {'ON' if active else 'OFF'}"
+        surf = self.small_font.render(text, True, WHITE)
+        surface.blit(surf, surf.get_rect(center=rect.center))
+
+    def draw_stepper(self, surface, label, value, center, w, h):
+        # label (più vicino ai pulsanti)
+        label_surf = self.small_font.render(f"{label}: {value}", True, WHITE)
+        gap = max(6, int(h * 0.45))
+        label_rect = label_surf.get_rect(midtop=(center[0], center[1] - gap))
+        surface.blit(label_surf, label_rect)
+        # buttons
+        minus = pygame.Rect(center[0] - w, center[1], h, h)
+        plus = pygame.Rect(center[0] + w - h, center[1], h, h)
+        pygame.draw.rect(surface, DARK_BLUE, minus, border_radius=6)
+        pygame.draw.rect(surface, DARK_BLUE, plus, border_radius=6)
+        pygame.draw.rect(surface, GOLD, minus, 2, border_radius=6)
+        pygame.draw.rect(surface, GOLD, plus, 2, border_radius=6)
+        m_s = self.small_font.render("-", True, WHITE)
+        p_s = self.small_font.render("+", True, WHITE)
+        surface.blit(m_s, m_s.get_rect(center=minus.center))
+        surface.blit(p_s, p_s.get_rect(center=plus.center))
+        return minus, plus
+
+    def draw_radio3(self, surface, labels, active_idx, rect):
+        # Simple 3 radio buttons horizontal with highlighted active selection
+        w = rect.width // 3
+        rects = []
+        for i, lab in enumerate(labels):
+            r = pygame.Rect(rect.left + i*w, rect.top, w - 4, rect.height)
+            pygame.draw.rect(surface, DARK_BLUE, r, border_radius=8)
+            border_color = GOLD if i == active_idx else (120, 120, 120)
+            pygame.draw.rect(surface, border_color, r, 2, border_radius=8)
+            surf = self.small_font.render(lab, True, WHITE)
+            surface.blit(surf, surf.get_rect(center=r.center))
+            rects.append(r)
+        return rects
+
+    def draw_section_title(self, surface, rect, text):
+        title = self.title_font.render(text, True, GOLD)
+        surface.blit(title, title.get_rect(midtop=(rect.centerx, rect.top - 40)))
+
+    def draw(self, surface):
+        width = self.app.window_width
+        height = self.app.window_height
+        surface.blit(self.app.resources.background, (0, 0))
+
+        # Recalculate layout in case mode changed (affects duration section height)
+        self.setup_layout()
+
+        # Title
+        title = self.title_font.render("Opzioni di Partita", True, GOLD)
+        surface.blit(title, title.get_rect(center=(width//2, int(height*0.08))))
+
+        # Variants (left)
+        var_rect = self.sections["variants"]
+        pygame.draw.rect(surface, (10, 10, 40), var_rect, border_radius=10)
+        pygame.draw.rect(surface, GOLD, var_rect, 2, border_radius=10)
+        self.draw_section_title(surface, var_rect, "Varianti / House Rules")
+
+        # Duration (right top)
+        dur_rect = self.sections["duration"]
+        pygame.draw.rect(surface, (10, 10, 40), dur_rect, border_radius=10)
+        pygame.draw.rect(surface, GOLD, dur_rect, 2, border_radius=10)
+        self.draw_section_title(surface, dur_rect, "Durata / Condizioni di Vittoria")
+
+        # Radios mode
+        mode = self.rules.get("mode_type", "points")
+        radios = self.draw_radio3(surface, ["A punti", "A mani", "One-shot"],
+                                  ["points","hands","oneshot"].index(mode),
+                                  pygame.Rect(dur_rect.left+10, dur_rect.top+10, dur_rect.width-20, 40))
+        self.mode_points_rect, self.mode_hands_rect, self.mode_oneshot_rect = radios
+
+        # Show only controls relevant to selected mode
+        self.nh_minus_rect = self.nh_plus_rect = None
+        self.tp_minus_rect = self.tp_plus_rect = None
+        # Draw mode-specific controls
+        if mode == "points":
+            tp_center = (dur_rect.centerx, dur_rect.centery - 10)
+            self.tp_minus_rect, self.tp_plus_rect = self.draw_stepper(
+                surface, "Target punti", self.rules.get("target_points", 21), tp_center,
+                int(dur_rect.width*0.3), 36)
+        elif mode == "hands":
+            nh_center = (dur_rect.centerx, dur_rect.centery)
+            self.nh_minus_rect, self.nh_plus_rect = self.draw_stepper(
+                surface, "Numero mani", self.rules.get("num_hands", 1), nh_center,
+                int(dur_rect.width*0.3), 36)
+        else:
+            # oneshot: no extra controls
+            pass
+
+        # Tiebreak option (visible for all modes)
+        tb_rect = pygame.Rect(dur_rect.left + 10, dur_rect.bottom - 40, dur_rect.width - 20, 28)
+        self.tb_rect = tb_rect
+        tb_text = f"Spareggio: {self.rules.get('tiebreak','single')}"
+        pygame.draw.rect(surface, DARK_BLUE, tb_rect, border_radius=6)
+        pygame.draw.rect(surface, GOLD, tb_rect, 2, border_radius=6)
+        surface.blit(self.small_font.render(tb_text, True, WHITE),
+                    self.small_font.render(tb_text, True, WHITE).get_rect(center=tb_rect.center))
+
+        # Variants content (moved above) continues
+
+        # toggles
+        h = 32
+        y = var_rect.top + 10
+        self.ap_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
+        self.draw_toggle(surface, self.ap_rect, "Asso piglia tutto", self.rules.get("asso_piglia_tutto", False))
+        self.ap_scopa_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
+        self.draw_toggle(surface, self.ap_scopa_rect, "Conta scopa con Asso piglia tutto", self.rules.get("scopa_on_asso_piglia_tutto", False))
+        self.last_scopa_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
+        self.draw_toggle(surface, self.last_scopa_rect, "Scopa sull'ultima presa", self.rules.get("scopa_on_last_capture", False))
+        self.rb_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h); y += h+8
+        self.draw_toggle(surface, self.rb_rect, "Re Bello (Re di denari)", self.rules.get("re_bello", False))
+        self.nap_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h)
+        self.draw_toggle(surface, self.nap_rect, "Napola (A-2-3... di denari)", self.rules.get("napola", False))
+        y += h+8
+        # Mostra la riga di scoring solo se Napola è attiva
+        if self.rules.get("napola", False):
+            self.nap_scoring_rect = pygame.Rect(var_rect.left+10, y, var_rect.width-20, h)
+            ns_text = f"Punteggio Napola: {self.rules.get('napola_scoring','fixed3')}"
+            self.draw_toggle(surface, self.nap_scoring_rect, ns_text, True)
+            y += h+8
+        else:
+            self.nap_scoring_rect = None
+        # max consecutive scope stepper
+        cur = self.rules.get("max_consecutive_scope")
+        cur_disp = 0 if cur is None else int(cur)
+        self.max_scope_minus_rect, self.max_scope_plus_rect = self.draw_stepper(
+            surface, "Limite scope consecutive (0=nessuno)", cur_disp,
+            (var_rect.centerx, var_rect.bottom - 45), int(var_rect.width*0.3), 32)
+
+        # Setup section (right bottom)
+        setup_ai_rect = self.sections["setup_ai"]
+        pygame.draw.rect(surface, (10, 10, 40), setup_ai_rect, border_radius=10)
+        pygame.draw.rect(surface, GOLD, setup_ai_rect, 2, border_radius=10)
+        self.draw_section_title(surface, setup_ai_rect, "Setup tavolo")
+        
+        # Setup content
+        y_offset = setup_ai_rect.top + 10
+        st_text = f"Chi inizia: {self.rules.get('starting_team','random')}"
+        self.start_team_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 32)
+        self.draw_toggle(surface, self.start_team_rect, st_text, True)
+        y_offset += 42
+        self.last_cards_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 32)
+        self.draw_toggle(surface, self.last_cards_rect, "Ultime carte al team dell'ultima presa", self.rules.get("last_cards_to_dealer", True))
+        y_offset += 42
+
+        # (Sezione AI rimossa)
+
+        # Bottom buttons
+        self.back_button.draw(surface)
+        self.start_button.draw(surface)
+        self.reset_button.draw(surface)
 class GameModeScreen(BaseScreen):
     """Screen for selecting game mode"""
     def __init__(self, app):
@@ -996,6 +1353,27 @@ class GameModeScreen(BaseScreen):
         self.host_screen_active = False
         self.online_mode_buttons = []
         self.selected_online_mode = 0  # 0: 4 Players, 1: 2v2 with AI
+
+        # Default rules/options (used by the upcoming options screen)
+        self.default_rules = {
+            "mode_type": "points",          # points | hands | oneshot
+            "target_points": 21,
+            "num_hands": 1,
+            "tiebreak": "single",          # single | +2 | allow_draw
+            # Varianti
+            "asso_piglia_tutto": False,
+            "scopa_on_asso_piglia_tutto": False,
+            "scopa_on_last_capture": False,
+            "re_bello": False,
+            "napola": False,
+            "napola_scoring": "fixed3",
+            "max_consecutive_scope": None,
+            # Setup
+            "starting_team": "random",     # random | team0 | team1
+            "last_cards_to_dealer": True,
+            # AI/tempo mossa
+            "move_time_ms": 0,
+        }
     
     def enter(self):
         super().enter()
@@ -1227,13 +1605,15 @@ class GameModeScreen(BaseScreen):
             self.loading_start_time = pygame.time.get_ticks()
             self.loading_message = "Caricamento bot AI in corso"
             
-            # Configura il gioco ma non passare direttamente alla prossima schermata
+            # Configura la base e vai alla schermata opzioni
             self.app.game_config = {
                 "mode": "single_player",
                 "human_players": 1,
                 "ai_players": 3,
                 "difficulty": self.selected_difficulty
             }
+            self.done = True
+            self.next_screen = "options"
             return
             
         elif button_index == 1:
@@ -1243,20 +1623,22 @@ class GameModeScreen(BaseScreen):
             self.loading_start_time = pygame.time.get_ticks()
             self.loading_message = "Caricamento bot AI in corso"
             
-            # Configura il gioco ma non passare direttamente alla prossima schermata
+            # Configura la base e vai alla schermata opzioni
             self.app.game_config = {
                 "mode": "team_vs_ai",
                 "human_players": 2,
                 "ai_players": 2,
                 "difficulty": self.selected_difficulty
             }
+            self.done = True
+            self.next_screen = "options"
             return
             
         # Solo per le modalità senza bot, passa direttamente alla prossima schermata
         elif button_index == 2:
-            # 4 Players (Local)
+            # 4 Players (Local) -> passa alla schermata opzioni
             self.done = True
-            self.next_screen = "game"
+            self.next_screen = "options"
             self.app.game_config = {
                 "mode": "local_multiplayer",
                 "human_players": 4,
@@ -1648,7 +2030,6 @@ class PlayerInfo:
         
     def set_hand(self, cards):
         self.hand_cards = cards.copy() if cards else []
-
 class GameScreen(BaseScreen):
     """Main game screen for playing Scopone"""
     def __init__(self, app):
@@ -1685,7 +2066,7 @@ class GameScreen(BaseScreen):
                                     140, 50, "Play Card", 
                                     (0, 150, 0), WHITE)
         
-        self.new_game_button = Button(20, 20, 140, 50, "New Game", 
+        self.new_game_button = Button(20, 20, 140, 50, "Exit", 
                                      DARK_BLUE, WHITE)
         
         # Message log
@@ -1754,6 +2135,24 @@ class GameScreen(BaseScreen):
         self.scrollbar_thumb_rect = None
         self.scrollbar_thumb_height = 0
         self.scrollbar_max_offset = 0
+
+        # Match/series configuration and tracking
+        self.series_mode = "oneshot"          # "points" | "hands" | "oneshot"
+        self.series_target_points = 21
+        self.series_num_hands = 1
+        self.series_tiebreak = "single"       # "single" | "+2" | "allow_draw"
+        self.series_scores = [0, 0]
+        self.series_hands_played = 0
+        self.series_prev_starter = None
+        # Storico punteggi per mano (solo per modalità a punti)
+        self.points_history = []  # list[(team0_points:int, team1_points:int)]
+        # Conteggio mani vinte (modalità a mani)
+        self.hands_won = [0, 0]
+        # Recap intermedio tra le mani (modalità a punti)
+        self.show_intermediate_recap = False
+        self.last_hand_breakdown = None
+        self._pending_next_starter = None
+        self.next_hand_button = None
     
     def create_exit_button(self):
         """Create a prominent exit button when connection is lost"""
@@ -1810,6 +2209,22 @@ class GameScreen(BaseScreen):
         # Initialize game based on config
         self.initialize_game()
         
+        # Initialize series settings from options
+        rules = self.app.game_config.get("rules", {})
+        self.series_mode = rules.get("mode_type", "oneshot")
+        self.series_target_points = int(rules.get("target_points", 21))
+        self.series_num_hands = int(rules.get("num_hands", 1))
+        self.series_tiebreak = rules.get("tiebreak", "single")
+        self.series_scores = [0, 0]
+        self.series_hands_played = 0
+        self.series_prev_starter = None
+        self.points_history = []
+        self.hands_won = [0, 0]
+        self.show_intermediate_recap = False
+        self.last_hand_breakdown = None
+        self._pending_next_starter = None
+        self.next_hand_button = None
+        
         # Set up player info
         self.setup_players()
         
@@ -1839,8 +2254,9 @@ class GameScreen(BaseScreen):
         # Set difficulty
         self.ai_difficulty = config.get("difficulty", 2)  # Default: Hard
         
-        # Create game environment
-        self.env = ScoponeEnvMA()
+        # Create game environment con regole/varianti
+        rules = config.get("rules", {})
+        self.env = ScoponeEnvMA(rules=rules)
         
         # Determina se siamo l'host o il client in modalità online
         is_online = mode == "online_multiplayer"
@@ -1854,6 +2270,12 @@ class GameScreen(BaseScreen):
         else:
             # Per l'host (o per gioco locale/singolo), inizializza con un giocatore iniziale casuale
             random_starter = random.randint(0, 3)
+            # Rispetta scelta di chi inizia
+            st = rules.get("starting_team", "random")
+            if st == "team0":
+                random_starter = 0
+            elif st == "team1":
+                random_starter = 1
             print(f"Host/locale: inizializzazione con giocatore random {random_starter}")
             self.env.reset(starting_player=random_starter)
         
@@ -1864,6 +2286,87 @@ class GameScreen(BaseScreen):
         # Set up player ID (for online games)
         if mode == "online_multiplayer":
             self.local_player_id = config.get("player_id", 0)
+
+    def _handle_hand_end(self, final_breakdown):
+        """Handle end of a single hand and possibly continue series/match."""
+        # Update series counters
+        self.series_hands_played += 1
+        if isinstance(final_breakdown, dict):
+            hand_p0 = int(final_breakdown.get(0, {}).get("total", 0))
+            hand_p1 = int(final_breakdown.get(1, {}).get("total", 0))
+            # Punti cumulativi (utili per riepilogo anche in modalità a mani)
+            self.series_scores[0] += hand_p0
+            self.series_scores[1] += hand_p1
+            # Storico punteggi per mano (sempre, per recap)
+            self.points_history.append((hand_p0, hand_p1))
+            # Conteggio mani vinte per modalità a mani
+            if self.series_mode == "hands":
+                if hand_p0 > hand_p1:
+                    self.hands_won[0] += 1
+                elif hand_p1 > hand_p0:
+                    self.hands_won[1] += 1
+                else:
+                    # pareggio mano: nessuno incrementa (gestito da tiebreak in serie)
+                    pass
+
+        proceed_new_hand = False
+        # Decide if series continues
+        if self.series_mode == "oneshot":
+            proceed_new_hand = False
+        elif self.series_mode == "hands":
+            if self.series_hands_played < self.series_num_hands:
+                proceed_new_hand = True
+            # Early termination: chiudi appena una squadra non può più superare l'altra
+            remaining = max(0, self.series_num_hands - self.series_hands_played)
+            # Se il leader ha un vantaggio maggiore del numero di mani restanti, termina
+            lead = max(self.hands_won)
+            trail = min(self.hands_won)
+            if lead - trail > remaining:
+                proceed_new_hand = False
+        elif self.series_mode == "points":
+            if max(self.series_scores) < self.series_target_points:
+                proceed_new_hand = True
+            else:
+                # Tiebreak logic (simplified for now)
+                if self.series_scores[0] == self.series_scores[1]:
+                    if self.series_tiebreak == "+2":
+                        # Need a 2-point lead
+                        if abs(self.series_scores[0] - self.series_scores[1]) < 2:
+                            proceed_new_hand = True
+                    elif self.series_tiebreak == "allow_draw":
+                        proceed_new_hand = False
+                    else:  # "single"
+                        proceed_new_hand = True
+
+        if proceed_new_hand:
+            # In modalità a punti o a mani mostra prima un recap dell'ultima mano
+            if self.series_mode in ("points", "hands"):
+                self.show_intermediate_recap = True
+                self.last_hand_breakdown = final_breakdown
+                # Calcola in anticipo il prossimo starter ma non resettare ancora
+                next_starter = (self.series_prev_starter + 1) % 4 if self.series_prev_starter is not None else random.randint(0, 3)
+                self._pending_next_starter = next_starter
+                return
+            else:
+                # Start a new hand immediately (modalità a mani)
+                next_starter = (self.series_prev_starter + 1) % 4 if self.series_prev_starter is not None else random.randint(0, 3)
+                self.series_prev_starter = next_starter
+                self.game_over = False
+                self.final_breakdown = None
+                self.status_message = ""
+                self.selected_hand_card = None
+                self.selected_table_cards = set()
+                self.animations = []
+                # Recreate environment with same rules
+                rules = self.app.game_config.get("rules", {})
+                self.env = ScoponeEnvMA(rules=rules)
+                self.env.reset(starting_player=next_starter)
+                # Keep AI controllers
+                self.setup_players()
+                self.setup_layout()
+        else:
+            # Series ended; show final scoreboard by setting final_breakdown to last hand (already set)
+            pass
 
     
     def setup_ai_controllers(self):
@@ -2191,13 +2694,13 @@ class GameScreen(BaseScreen):
         button_width = int(width * 0.14)
         button_height = int(height * 0.06)
         
-        # New Game button - top-left corner
+        # Exit button - top-left corner
         self.new_game_button = Button(
             width * 0.01,  # Far left
             height * 0.01,  # Far top
             button_width, 
             button_height,
-            "New Game", 
+            "Exit", 
             DARK_BLUE, WHITE
         )
         
@@ -2316,7 +2819,6 @@ class GameScreen(BaseScreen):
                 player.set_hand(gs["hands"][player.player_id])
             else:
                 player.set_hand([])
-    
     def handle_events(self, events):
         """Handle pygame events with connection loss recovery"""
         for event in events:
@@ -2335,7 +2837,39 @@ class GameScreen(BaseScreen):
                         self.next_screen = "mode"
                         return
             
-            # Always check for the "New Game" button and message log interactions
+            # Schermata di recap intermedio (modalità a punti)
+            if self.show_intermediate_recap and self.next_hand_button:
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    pos = pygame.mouse.get_pos()
+                    if self.next_hand_button.is_clicked(pos):
+                        # Avanza alla mano successiva
+                        next_starter = self._pending_next_starter if self._pending_next_starter is not None else random.randint(0, 3)
+                        self.series_prev_starter = next_starter
+                        self.game_over = False
+                        self.final_breakdown = None
+                        self.status_message = ""
+                        self.selected_hand_card = None
+                        self.selected_table_cards = set()
+                        self.animations = []
+                        rules = self.app.game_config.get("rules", {})
+                        self.env = ScoponeEnvMA(rules=rules)
+                        self.env.reset(starting_player=next_starter)
+                        self.setup_players()
+                        self.setup_layout()
+                        # Chiudi overlay
+                        self.show_intermediate_recap = False
+                        self.last_hand_breakdown = None
+                        self._pending_next_starter = None
+                        self.next_hand_button = None
+                        self.exit_overlay_button = None
+                        return
+                    if getattr(self, 'exit_overlay_button', None) and self.exit_overlay_button.is_clicked(pos):
+                        # Esci al menu
+                        self.done = True
+                        self.next_screen = "mode"
+                        return
+
+            # Always check for the Exit button and message log interactions
             if event.type == pygame.MOUSEBUTTONDOWN:
                 pos = pygame.mouse.get_pos()
                 
@@ -2581,6 +3115,10 @@ class GameScreen(BaseScreen):
         # Update current player
         if self.env:
             self.current_player_id = self.env.current_player
+            # Reset one-shot auto-play guard when turn changes
+            if getattr(self, '_last_player_for_autoplay', None) != self.current_player_id:
+                self.autoplay_sent_for_turn = False
+                self._last_player_for_autoplay = self.current_player_id
         
         # Debug: stampa numero di animazioni attive
         if hasattr(self, 'animations') and self.animations:
@@ -2641,6 +3179,10 @@ class GameScreen(BaseScreen):
                             
                             self.app.network.game_state['current_player'] = self.env.current_player
                             self.app.network.broadcast_game_state()
+                    
+                    # Detect end of hand after environment update (local modes only)
+                    if hasattr(self.env, 'done') and self.env.done and self.app.game_config.get("mode") != "online_multiplayer":
+                        self._handle_hand_end(info.get("score_breakdown"))
         
         # Check for connection loss in online mode
         if (self.app.game_config.get("mode") == "online_multiplayer" and 
@@ -2702,6 +3244,60 @@ class GameScreen(BaseScreen):
                             self.setup_player_perspective()
                             self.setup_layout()
             
+            # Auto-play when a player has exactly one card left, unless multiple capture choices exist (humans only)
+            try:
+                if (self.env and not self.game_over and not self.animations
+                        and not getattr(self, 'waiting_for_animation', False)
+                        and not getattr(self, 'show_intermediate_recap', False)
+                        and not getattr(self, 'autoplay_sent_for_turn', False)):
+                    mode = self.app.game_config.get("mode")
+                    is_online = (mode == "online_multiplayer")
+                    is_host = self.app.game_config.get("is_host", False)
+                    cp = self.env.current_player
+                    hand = self.env.game_state["hands"].get(cp, [])
+                    if len(hand) == 1:
+                        the_card = hand[0]
+                        valid_actions = self.env.get_valid_actions() or []
+                        # Filter actions for the only card in hand
+                        filtered = []
+                        for act in valid_actions:
+                            try:
+                                pc, cc = decode_action(act)
+                                if pc == the_card:
+                                    filtered.append((act, pc, cc))
+                            except Exception:
+                                continue
+                        if filtered:
+                            capture_options = [t for t in filtered if t[2]]
+                            multiple_captures = len(capture_options) > 1
+                            current_is_human = not self.players[self.current_player_id].is_ai
+                            # Choose action we would auto-play with
+                            if capture_options:
+                                chosen = capture_options[0]
+                            else:
+                                no_cap = next((t for t in filtered if not t[2]), None)
+                                if no_cap is None:
+                                    no_cap = filtered[0]
+                                chosen = no_cap
+                            action, card_played, cards_captured = chosen
+                            if is_online and not is_host:
+                                # Client: auto-send move only if human and not multiple capture choices
+                                if current_is_human and not multiple_captures and cp == self.local_player_id:
+                                    if hasattr(self.app, 'network') and self.app.network:
+                                        self.app.network.send_move(action)
+                                        self.autoplay_sent_for_turn = True
+                            else:
+                                # Local or Host: perform animations and schedule env step
+                                if (not multiple_captures) or (not current_is_human):
+                                    self.create_move_animations(card_played, cards_captured)
+                                    self.app.resources.play_sound("card_play")
+                                    self.waiting_for_animation = True
+                                    self.pending_action = action
+                                    self.autoplay_sent_for_turn = True
+            except Exception as e:
+                # Non bloccare il gioco in caso di errore nell'auto-play
+                print(f"Auto-play error: {e}")
+
             # Handle AI turns (solo il server lo fa in modalità online)
             self.handle_ai_turns()
             
@@ -2989,11 +3585,11 @@ class GameScreen(BaseScreen):
         if self.ai_thinking:
             current_time = pygame.time.get_ticks()
             # Adjust delay based on difficulty (faster for hard, slower for easy)
-            delay = 2000 if self.ai_difficulty == 0 else 1000 if self.ai_difficulty == 1 else 500
+            base_delay = 2000 if self.ai_difficulty == 0 else 1000 if self.ai_difficulty == 1 else 500
+            delay = base_delay
             if current_time - self.ai_move_timer > delay:
                 self.make_ai_move()
                 self.ai_thinking = False
-    
     def handle_network_updates(self):
         """Network update handling with improved state synchronization"""
         if not self.app.network:
@@ -3193,7 +3789,9 @@ class GameScreen(BaseScreen):
                         if all(len(new_state["hands"].get(p, [])) == 0 for p in range(4)):
                             self.game_over = True
                             from rewards import compute_final_score_breakdown
-                            self.final_breakdown = compute_final_score_breakdown(new_state)
+                            # Usa le regole correnti per il breakdown
+                            from rewards import compute_final_score_breakdown
+                            self.final_breakdown = compute_final_score_breakdown(new_state, rules=self.app.game_config.get("rules", {}))
                     
                     # CRITICAL: Update player hands after applying the state
                     self.update_player_hands()
@@ -3423,7 +4021,8 @@ class GameScreen(BaseScreen):
             
             # Calculate final score
             from rewards import compute_final_score_breakdown
-            self.final_breakdown = compute_final_score_breakdown(gs)
+            from rewards import compute_final_score_breakdown
+            self.final_breakdown = compute_final_score_breakdown(gs, rules=self.app.game_config.get("rules", {}))
             
             # Determine winner
             team0_score = self.final_breakdown[0]["total"]
@@ -3669,7 +4268,6 @@ class GameScreen(BaseScreen):
             print(f"Error making AI move: {e}")
             import traceback
             traceback.print_exc()
-    
     def create_move_animations(self, card_played, cards_captured, source_player_id=None):
         """Create animations for a move with improved positioning"""
         # Get player ID - use current player if no source player specified
@@ -3937,6 +4535,7 @@ class GameScreen(BaseScreen):
         # Draw status info
         self.draw_status_info(surface)
 
+
         # Draw live points panel next to Player 0 avatar
         self.draw_live_points_panel(surface)
 
@@ -3944,7 +4543,8 @@ class GameScreen(BaseScreen):
         if self.app.game_config.get("mode") == "online_multiplayer":
             self.draw_message_log(surface)
 
-        # Draw buttons
+        # Draw Exit button (always 'Exit')
+        self.new_game_button.text = "Exit"
         self.new_game_button.draw(surface)
 
         # Draw confirm button if current player is controllable
@@ -3955,8 +4555,12 @@ class GameScreen(BaseScreen):
         if not self.replay_active and self.env and not self.game_over:
             self.replay_button.draw(surface)
 
-        # Draw game over screen if game is over
-        if self.game_over and self.final_breakdown:
+        # Intermediate recap overlay between hands (points mode) - draw on TOP of everything
+        if self.show_intermediate_recap and self.last_hand_breakdown:
+            self.draw_intermediate_recap(surface)
+
+        # Draw game over screen if game is over (but not during intermediate recap)
+        if self.game_over and self.final_breakdown and not self.show_intermediate_recap:
             self.draw_game_over(surface)
     
     def draw_players(self, surface):
@@ -4380,7 +4984,6 @@ class GameScreen(BaseScreen):
             # Draw card with border
             pygame.draw.rect(surface, BLACK, card_rect.inflate(2, 2), border_radius=border_radius)
             surface.blit(rounded_card, card_rect)
-    
     def draw_capture_piles(self, surface):
         """Draw realistic capture piles for both teams with scopa highlights.
 
@@ -4607,7 +5210,7 @@ class GameScreen(BaseScreen):
         width = self.app.window_width
         height = self.app.window_height
 
-        # Anchor for top-left placement under the New Game button
+        # Anchor for top-left placement under the Exit button
         if hasattr(self, "new_game_button") and self.new_game_button:
             anchor_left = self.new_game_button.rect.left
             anchor_top = self.new_game_button.rect.bottom + int(height * 0.01)
@@ -4625,7 +5228,7 @@ class GameScreen(BaseScreen):
 
             msg_surf = msg_font.render(self.status_message, True, msg_color)
             if is_turn_msg:
-                # Place gold turn message under New Game, top-left
+                # Place gold turn message under Exit, top-left
                 msg_rect = msg_surf.get_rect(topleft=(anchor_left, current_y))
                 surface.blit(msg_surf, msg_rect)
                 current_y = msg_rect.bottom + int(height * 0.008)
@@ -4640,7 +5243,7 @@ class GameScreen(BaseScreen):
             current_player = self.players[self.current_player_id]
             turn_text = f"Current turn: {current_player.name} (Team {current_player.team_id})"
 
-            # Always show current turn in gold at top-left under New Game
+            # Always show current turn in gold at top-left under Exit
             is_local_turn = self.current_player_id == self.local_player_id
             turn_color = GOLD
 
@@ -4649,9 +5252,9 @@ class GameScreen(BaseScreen):
             surface.blit(turn_surf, turn_rect)
             current_y = turn_rect.bottom + int(height * 0.006)
 
-            # Extra gold indicator for local player's turn → move under New Game
+            # Extra gold indicator for local player's turn → move under Exit
             if is_local_turn:
-                indicator_text = "→ YOUR TURN ←"
+                indicator_text = "YOUR TURN"
                 indicator_surf = self.info_font.render(indicator_text, True, GOLD)
                 indicator_rect = indicator_surf.get_rect(topleft=(anchor_left, current_y))
                 surface.blit(indicator_surf, indicator_rect)
@@ -4673,6 +5276,99 @@ class GameScreen(BaseScreen):
                 diff_surf = self.small_font.render(diff_text, True, diff_color)
                 diff_rect = diff_surf.get_rect(topright=(width - int(width * 0.02), int(height * 0.026)))
                 surface.blit(diff_surf, diff_rect)
+
+        # Small rules summary box under the turn info (top-left)
+        rules = self.app.game_config.get("rules", {})
+        if rules:
+            # Compose compact lines
+            mode_type = rules.get("mode_type", "oneshot")
+            lines = []
+            if mode_type == "points":
+                lines.append(f"Modalità: Punti ({int(rules.get('target_points', 21))})")
+            elif mode_type == "hands":
+                lines.append(f"Modalità: Mani ({int(rules.get('num_hands', 1))})")
+            else:
+                lines.append("Modalità: One-shot")
+
+            st = rules.get("starting_team", "random")
+            lines.append(f"Chi inizia: {st}")
+
+            # Per modalità a mani, mostra anche mani vinte
+            if mode_type == "hands":
+                try:
+                    wins0, wins1 = self.hands_won
+                    total_hands = int(self.series_num_hands)
+                    lines.append(f"Mani vinte: {wins0}-{wins1} / {total_hands}")
+                except Exception:
+                    pass
+
+            # Active toggles
+            if rules.get("asso_piglia_tutto", False):
+                ap_line = "Asso piglia tutto"
+                if rules.get("scopa_on_asso_piglia_tutto", False):
+                    ap_line += " + Scopa"
+                lines.append(ap_line)
+            if rules.get("scopa_on_last_capture", False):
+                lines.append("Scopa su ultima")
+            if rules.get("re_bello", False):
+                lines.append("Re Bello")
+            if rules.get("napola", False):
+                ns = rules.get("napola_scoring", "fixed3")
+                lines.append("Napola (" + ("len" if ns == "length" else "3") + ")")
+            lim = rules.get("max_consecutive_scope")
+            if lim is not None:
+                lines.append(f"Limite scope: {int(lim)}")
+            if not rules.get("last_cards_to_dealer", True):
+                lines.append("Ultime al team dell'ultima presa: OFF")
+            # Tempo per mossa AI rimosso
+
+            # Box geometry
+            pad_x = int(width * 0.008)
+            pad_y = int(height * 0.006)
+            box_w = int(width * 0.24)
+            # Measure height from lines
+            line_h = self.small_font.get_height()
+            box_h = pad_y * 2 + line_h * len(lines)
+            box_rect = pygame.Rect(anchor_left, current_y + int(height * 0.006), box_w, box_h)
+            # Background
+            box_surf = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+            pygame.draw.rect(box_surf, (0, 0, 0, 150), box_surf.get_rect(), border_radius=8)
+            pygame.draw.rect(box_surf, LIGHT_BLUE, box_surf.get_rect(), 2, border_radius=8)
+            # Render lines
+            y = pad_y
+            for text in lines[:8]:  # cap length
+                ts = self.small_font.render(text, True, WHITE)
+                box_surf.blit(ts, (pad_x, y))
+                y += line_h
+            surface.blit(box_surf, box_rect)
+            current_y = box_rect.bottom + int(height * 0.008)
+
+            # In modalità a punti, mostra lo storico e la somma cumulativa
+            if mode_type == "points" and len(self.points_history) > 0:
+                hist_pad_x = pad_x
+                hist_pad_y = pad_y
+                # Somme cumulative
+                tot0 = sum(p0 for p0, _ in self.points_history)
+                tot1 = sum(p1 for _, p1 in self.points_history)
+                title = self.small_font.render(f"Storico mani (T0-T1)  Tot: {tot0}-{tot1}", True, GOLD)
+                # Calcola larghezza dinamica in base al numero di voci
+                entries = [f"{p0}-{p1}" for (p0, p1) in self.points_history[-8:]]
+                hist_lines = [", ".join(entries[i:i+4]) for i in range(0, len(entries), 4)]
+                hist_line_h = self.small_font.get_height()
+                hist_box_w = box_w
+                hist_box_h = hist_pad_y * 2 + hist_line_h * (1 + len(hist_lines))
+                hist_rect = pygame.Rect(anchor_left, current_y, hist_box_w, hist_box_h)
+                hist_surf = pygame.Surface((hist_box_w, hist_box_h), pygame.SRCALPHA)
+                pygame.draw.rect(hist_surf, (0, 0, 0, 150), hist_surf.get_rect(), border_radius=8)
+                pygame.draw.rect(hist_surf, LIGHT_BLUE, hist_surf.get_rect(), 2, border_radius=8)
+                # Title
+                hist_surf.blit(title, (hist_pad_x, hist_pad_y))
+                y = hist_pad_y + hist_line_h
+                for row in hist_lines:
+                    ts = self.small_font.render(row, True, WHITE)
+                    hist_surf.blit(ts, (hist_pad_x, y))
+                    y += hist_line_h
+                surface.blit(hist_surf, hist_rect)
     
     def draw_live_points_panel(self, surface):
         """Small live score panel near Player 0's avatar showing current statuses.
@@ -5057,7 +5753,6 @@ class GameScreen(BaseScreen):
             self.scroll_down_rect = None
             self.scrollbar_rect = None
             self.scrollbar_thumb_rect = None
-    
     def draw_game_over(self, surface):
         """Draw responsive game over screen with results"""
         # Get current dimensions
@@ -5092,8 +5787,13 @@ class GameScreen(BaseScreen):
         surface.blit(title_surf, title_rect)
         
         # Draw team scores
-        team0_score = self.final_breakdown[0]["total"]
-        team1_score = self.final_breakdown[1]["total"]
+        # In modalità a punti mostra anche i totali cumulativi di serie
+        if self.series_mode == "points" and self.points_history:
+            team0_score = sum(p0 for p0, _ in self.points_history)
+            team1_score = sum(p1 for _, p1 in self.points_history)
+        else:
+            team0_score = self.final_breakdown[0]["total"]
+            team1_score = self.final_breakdown[1]["total"]
         
         if team0_score > team1_score:
             winner_text = "Team 0 wins!"
@@ -5108,6 +5808,26 @@ class GameScreen(BaseScreen):
         winner_surf = title_font.render(winner_text, True, winner_color)
         winner_rect = winner_surf.get_rect(midtop=(panel_rect.centerx, panel_rect.top + height * 0.1))
         surface.blit(winner_surf, winner_rect)
+
+        # Final series recap (points or hands)
+        recap_y = winner_rect.bottom + int(height * 0.015)
+        if self.series_mode == "points":
+            final_text = f"Punteggio finale: {team0_score} - {team1_score}"
+            if getattr(self, "series_target_points", None):
+                final_text += f" (target {self.series_target_points})"
+            final_surf = category_font.render(final_text, True, WHITE)
+            final_rect = final_surf.get_rect(midtop=(panel_rect.centerx, recap_y))
+            surface.blit(final_surf, final_rect)
+            recap_y = final_rect.bottom + int(height * 0.01)
+        elif self.series_mode == "hands":
+            won0 = self.hands_won[0] if hasattr(self, "hands_won") else 0
+            won1 = self.hands_won[1] if hasattr(self, "hands_won") else 0
+            total_hands = self.series_num_hands if hasattr(self, "series_num_hands") else 0
+            final_text = f"Mani vinte: {won0} - {won1} / {total_hands}"
+            final_surf = category_font.render(final_text, True, WHITE)
+            final_rect = final_surf.get_rect(midtop=(panel_rect.centerx, recap_y))
+            surface.blit(final_surf, final_rect)
+            recap_y = final_rect.bottom + int(height * 0.01)
         
         # Draw score breakdown with responsive positioning
         # Team 0 column (left side)
@@ -5120,8 +5840,13 @@ class GameScreen(BaseScreen):
         score_x = panel_rect.left + width * 0.07
         score_y = team0_title_rect.bottom + height * 0.02
         
+        rules = self.app.game_config.get("rules", {})
         for category, score in self.final_breakdown[0].items():
             if category == "total":
+                continue
+            if category == "napola" and not rules.get("napola", False):
+                continue
+            if category == "re_bello" and not rules.get("re_bello", False):
                 continue
             text = f"{category.capitalize()}: {score}"
             text_surf = detail_font.render(text, True, WHITE)
@@ -5146,6 +5871,10 @@ class GameScreen(BaseScreen):
         for category, score in self.final_breakdown[1].items():
             if category == "total":
                 continue
+            if category == "napola" and not rules.get("napola", False):
+                continue
+            if category == "re_bello" and not rules.get("re_bello", False):
+                continue
             text = f"{category.capitalize()}: {score}"
             text_surf = detail_font.render(text, True, WHITE)
             surface.blit(text_surf, (score_x, score_y))
@@ -5156,14 +5885,14 @@ class GameScreen(BaseScreen):
         total1_surf = category_font.render(total1_text, True, HIGHLIGHT_RED)
         surface.blit(total1_surf, (score_x, score_y + height * 0.02))
         
-        # Draw new game button
+        # Draw exit button (always Exit)
         button_width = width * 0.2
         button_height = height * 0.07
         new_game_button = Button(
             panel_rect.centerx - button_width // 2,
             panel_rect.bottom - button_height - height * 0.03,
             button_width, button_height,
-            "New Game",
+            "Exit",
             DARK_GREEN, WHITE,
             font_size=int(height * 0.03)
         )
@@ -5199,6 +5928,58 @@ class GameScreen(BaseScreen):
         else:
             # Altre modalità: solo giocatore locale
             return self.current_player_id == self.local_player_id
+
+    def draw_intermediate_recap(self, surface):
+        """Overlay di recap dell'ultima mano in modalità a punti con pulsante Avanti."""
+        width = self.app.window_width
+        height = self.app.window_height
+        overlay = pygame.Surface((width, height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        surface.blit(overlay, (0, 0))
+
+        panel_w = int(width * 0.6)
+        panel_h = int(height * 0.5)
+        panel_rect = pygame.Rect(width//2 - panel_w//2, height//2 - panel_h//2, panel_w, panel_h)
+        pygame.draw.rect(surface, DARK_BLUE, panel_rect, border_radius=10)
+        pygame.draw.rect(surface, GOLD, panel_rect, 4, border_radius=10)
+
+        title_font = pygame.font.SysFont(None, int(height * 0.05))
+        detail_font = pygame.font.SysFont(None, int(height * 0.03))
+
+        title = title_font.render("Fine mano - riepilogo", True, GOLD)
+        surface.blit(title, title.get_rect(midtop=(panel_rect.centerx, panel_rect.top + int(height * 0.03))))
+
+        bd = self.last_hand_breakdown or {}
+        p0 = int(bd.get(0, {}).get("total", 0))
+        p1 = int(bd.get(1, {}).get("total", 0))
+        tot0 = sum(x for x, _ in self.points_history)
+        tot1 = sum(x for _, x in self.points_history)
+
+        # Riga punteggi mano
+        hand_text = detail_font.render(f"Mano: {p0} - {p1}", True, WHITE)
+        surface.blit(hand_text, hand_text.get_rect(midtop=(panel_rect.centerx, panel_rect.top + int(height * 0.14))))
+
+        # Riga cumulativi
+        if self.series_mode == "points":
+            extra = f" (target {self.series_target_points})"
+        elif self.series_mode == "hands":
+            extra = f" | Mani vinte: {self.hands_won[0]}-{self.hands_won[1]} / {self.series_num_hands}"
+        else:
+            extra = ""
+        tot_text = detail_font.render(f"Totale serie: {tot0} - {tot1}{extra}", True, WHITE)
+        surface.blit(tot_text, tot_text.get_rect(midtop=(panel_rect.centerx, panel_rect.top + int(height * 0.2))))
+
+        # Pulsanti Avanti ed Exit sull'overlay
+        btn_w = int(panel_w * 0.28)
+        btn_h = int(height * 0.06)
+        gap = int(width * 0.02)
+        left_x = panel_rect.centerx - btn_w - gap//2
+        right_x = panel_rect.centerx + gap//2
+        y_btn = panel_rect.bottom - btn_h - int(height * 0.04)
+        self.next_hand_button = Button(left_x, y_btn, btn_w, btn_h, "Avanti", DARK_GREEN, WHITE, font_size=int(height * 0.03))
+        self.exit_overlay_button = Button(right_x, y_btn, btn_w, btn_h, "Exit", HIGHLIGHT_RED, WHITE, font_size=int(height * 0.03))
+        self.next_hand_button.draw(surface)
+        self.exit_overlay_button.draw(surface)
     
     def start_replay(self):
         """Start replay of the last 3 moves from opponents (or fewer if game just started)"""
@@ -5627,6 +6408,7 @@ class ScoponeApp:
         # Set up screens
         self.screens = {
             "mode": GameModeScreen(self),
+            "options": GameOptionsScreen(self),
             "game": GameScreen(self)
         }
         self.current_screen = "mode"

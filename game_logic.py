@@ -3,7 +3,7 @@
 from actions import decode_action
 from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
 
-def update_game_state(game_state, action_id, current_player):
+def update_game_state(game_state, action_id, current_player, rules=None):
     """
     Ora accetta un'azione in formato matrice (vettore a 80 dimensioni)
     e aggiorna lo stato del gioco di conseguenza.
@@ -12,7 +12,7 @@ def update_game_state(game_state, action_id, current_player):
 
     hand = game_state["hands"][current_player]
     if not hand:
-        final_breakdown = compute_final_score_breakdown(game_state)
+        final_breakdown = compute_final_score_breakdown(game_state, rules=rules)
         final_reward = compute_final_reward_from_breakdown(final_breakdown)
         return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
 
@@ -82,7 +82,7 @@ def update_game_state(game_state, action_id, current_player):
                 game_state["captured_squads"][last_capturing_team].extend(game_state["table"])
                 game_state["table"].clear()
 
-        final_breakdown = compute_final_score_breakdown(game_state)
+        final_breakdown = compute_final_score_breakdown(game_state, rules=rules)
         final_reward = compute_final_reward_from_breakdown(final_breakdown)
         return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
     else:
