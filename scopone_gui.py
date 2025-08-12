@@ -4568,30 +4568,25 @@ class GameScreen(BaseScreen):
                                     filtered.append((act, pc, cc))
                             except Exception:
                                 continue
-                        if filtered:
-                            capture_options = [t for t in filtered if t[2]]
-                            multiple_captures = len(capture_options) > 1
-                            current_is_human = not self.players[self.current_player_id].is_ai
-                            # Choose action we would auto-play with
-                            if capture_options:
-                                chosen = capture_options[0]
-                            else:
-                                no_cap = next((t for t in filtered if not t[2]), None)
-                                if no_cap is None:
-                                    no_cap = filtered[0]
-                                chosen = no_cap
-                            action, card_played, cards_captured = chosen
+                        # No valid action yet (e.g., state not fully synced): do nothing
+                        if not filtered:
+                            return
+                        capture_options = [t for t in filtered if t[2]]
+                        multiple_captures = len(capture_options) > 1
+                        current_is_human = not self.players[self.current_player_id].is_ai
+                        # Choose action we would auto-play with
+                        if capture_options:
+                            chosen = capture_options[0]
                         else:
-                            # Nessuna azione valida (es. stato non ancora sincronizzato): non procedere
-                            action = card_played = cards_captured = None
-                    else:
-                        action = card_played = cards_captured = None
-                    if action is None:
-                        return
-                    if is_online and not is_host:
-                        # Client: never auto-play; also suppress click selection when not your turn
-                        self.status_message = "Waiting for host..."
-                    else:
+                            no_cap = next((t for t in filtered if not t[2]), None)
+                            if no_cap is None:
+                                no_cap = filtered[0]
+                            chosen = no_cap
+                        action, card_played, cards_captured = chosen
+                        if is_online and not is_host:
+                            # Client: never auto-play; also suppress click selection when not your turn
+                            self.status_message = "Waiting for host..."
+                            return
                         # Local or Host: perform animations and schedule env step
                         if (not multiple_captures) or (not current_is_human):
                             self.create_move_animations(card_played, cards_captured)
