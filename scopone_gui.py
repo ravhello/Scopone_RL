@@ -664,8 +664,9 @@ class NetworkManager:
                 # Add message to queue
                 self.message_queue.append(f"Player {player_id} connected")
                 
-                # Initialize/refresh lobby state for all-human mode
-                if not is_team_vs_ai:
+                # Initialize/refresh lobby state ONLY for lobby-based modes
+                # (all_human or three_humans_one_ai). Do NOT create lobby for humans_plus_ai or team_vs_ai
+                if online_type in ('all_human', 'three_humans_one_ai'):
                     try:
                         lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
                         players = lobby.setdefault('players', {})
@@ -3396,15 +3397,15 @@ class GameScreen(BaseScreen):
         width = self.app.window_width
         height = self.app.window_height
         
-        button_width = int(width * 0.2)
+        button_width = int(width * 0.22)
         button_height = int(height * 0.06)
         
         self.exit_button = Button(
-            width // 2 - button_width // 2,
-            height * 0.1,
+            width // 2 - button_width - int(width * 0.01),
+            int(height * 0.1),
             button_width,
             button_height,
-            "Exit Game",
+            "Return to Home",
             HIGHLIGHT_RED,
             WHITE,
             font_size=int(height * 0.03)
@@ -5972,10 +5973,6 @@ class GameScreen(BaseScreen):
             overlay.fill((0, 0, 0, 100))  # Semi-transparent black
             surface.blit(overlay, (0, 0))
             
-            # Draw exit button
-            if self.exit_button:
-                self.exit_button.draw(surface)
-            
             # Draw reconnection status
             elapsed = time.time() - self.reconnect_start_time
             remaining = max(0, self.max_reconnection_time - elapsed)
@@ -5983,14 +5980,35 @@ class GameScreen(BaseScreen):
             # Create animated dots
             dots = "." * ((pygame.time.get_ticks() // 500) % 4)
             
-            # Draw reconnection message
-            reconnect_text = f"Attempting to reconnect{dots} ({int(remaining)}s remaining)"
-            text_surf = self.info_font.render(reconnect_text, True, HIGHLIGHT_RED)
+            # Draw header and messages
+            header = self.title_font.render("Connection lost", True, GOLD)
+            header_rect = header.get_rect(
+                midtop=(self.app.window_width // 2, int(self.app.window_height * 0.06))
+            )
+            surface.blit(header, header_rect)
+            
+            reconnect_text = f"Attempting to reconnect{dots}"
+            text_surf = self.info_font.render(reconnect_text, True, WHITE)
             text_rect = text_surf.get_rect(
-                midbottom=(self.app.window_width // 2, 
-                        self.exit_button.rect.top - 10 if self.exit_button else self.app.window_height * 0.15)
+                midtop=(self.app.window_width // 2, header_rect.bottom + int(self.app.window_height * 0.01))
             )
             surface.blit(text_surf, text_rect)
+            
+            # Countdown badge
+            badge_text = f"Time left: {int(remaining)}s"
+            badge_surf = self.info_font.render(badge_text, True, WHITE)
+            pad_x = 10
+            pad_y = 6
+            badge_rect = badge_surf.get_rect()
+            badge_bg = pygame.Rect(0, 0, badge_rect.width + 2*pad_x, badge_rect.height + 2*pad_y)
+            badge_bg.midtop = (self.app.window_width // 2, text_rect.bottom + int(self.app.window_height * 0.008))
+            pygame.draw.rect(surface, (40,40,90), badge_bg, border_radius=10)
+            pygame.draw.rect(surface, LIGHT_BLUE, badge_bg, 2, border_radius=10)
+            surface.blit(badge_surf, badge_surf.get_rect(center=badge_bg.center))
+            
+            # Draw return-to-home button on the right
+            if self.exit_button:
+                self.exit_button.draw(surface)
         
         # Continue with regular drawing
         # Draw table
