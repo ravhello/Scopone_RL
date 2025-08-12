@@ -7245,10 +7245,7 @@ class GameScreen(BaseScreen):
         )
         pygame.draw.rect(surface, LIGHT_GRAY, self.message_resize_rect, border_radius=3)
         
-        # Draw title
-        title_surf = self.small_font.render("Messages", True, WHITE)
-        title_rect = title_surf.get_rect(midleft=(self.message_log_rect.left + 8, self.message_log_rect.top + 6))
-        surface.blit(title_surf, title_rect)
+        # (Title will be drawn after all other elements, to ensure it's on top)
 
         if self.message_minimized:
             return
@@ -7369,6 +7366,17 @@ class GameScreen(BaseScreen):
             self.scroll_down_rect = None
             self.scrollbar_rect = None
             self.scrollbar_thumb_rect = None
+
+        # Draw title last so it can't be hidden by border/scrollbar
+        # Add a slight shadow to improve contrast
+        title_text = "Messages"
+        title_surface = self.small_font.render(title_text, True, WHITE)
+        title_shadow = self.small_font.render(title_text, True, (0, 0, 0))
+        title_rect = title_surface.get_rect(midleft=(header_rect.left + 10, header_rect.centery))
+        shadow_rect = title_rect.copy()
+        shadow_rect.move_ip(1, 1)
+        surface.blit(title_shadow, shadow_rect)
+        surface.blit(title_surface, title_rect)
     def draw_game_over(self, surface):
         """Draw responsive game over screen with results"""
         # Get current dimensions
