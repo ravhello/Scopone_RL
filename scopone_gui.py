@@ -546,6 +546,17 @@ class NetworkManager:
             
             # Ottieni l'IP pubblico per connessioni internet
             self.public_ip = self.get_public_ip()
+            # Prepara info connessione da condividere in lobby
+            try:
+                if not isinstance(self.game_state, dict):
+                    self.game_state = {}
+                lobby = self.game_state.setdefault('lobby_state', {})
+                conn = lobby.setdefault('connection_info', {})
+                conn['local_ip'] = get_local_ip()
+                conn['public_ip'] = self.public_ip
+                conn['port'] = self.port
+            except Exception:
+                pass
             
             # Start thread to accept connections
             threading.Thread(target=self.accept_connections, daemon=True).start()
@@ -646,11 +657,18 @@ class NetworkManager:
                 # Initialize/refresh lobby state for all-human mode
                 if not is_team_vs_ai:
                     try:
-                        lobby = self.game_state.setdefault('lobby_state', {'players': {}})
+                        lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
                         players = lobby.setdefault('players', {})
+                        seats = lobby.setdefault('seats', {})
+                        # Ensure connection info exists and broadcast it to clients
+                        conn = lobby.setdefault('connection_info', {})
+                        conn.setdefault('local_ip', get_local_ip())
+                        conn.setdefault('public_ip', getattr(self, 'public_ip', None))
+                        conn.setdefault('port', self.port)
                         # Ensure host entry exists
                         if 0 not in players:
                             players[0] = {'name': 'Host', 'team': 0, 'ready': False}
+                        seats.setdefault(0, 0)
                         # Ensure this client entry exists with default team by seat
                         if player_id not in players:
                             default_team = 0 if player_id in [0, 2] else 1
@@ -659,6 +677,9 @@ class NetworkManager:
                                 'team': default_team,
                                 'ready': False
                             }
+                        # Default seat assignment for this player if free
+                        if player_id not in seats.values():
+                            seats.setdefault(player_id, player_id)
                         # Broadcast lobby to all connected clients
                         self.broadcast_lobby_state()
                     except Exception as e:
@@ -707,6 +728,27 @@ class NetworkManager:
                     pdata['team'] = 0 if player_id in [0, 2] else 1
                     # Broadcast updated lobby to all
                     self.broadcast_lobby_state()
+                elif message.get("type") == "lobby_swap_request" and self.is_host:
+                    # Client requests to move to a target seat index (0..3)
+                    try:
+                        target_seat = int(message.get('target_seat'))
+                    except Exception:
+                        target_seat = None
+                    lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
+                    seats = lobby.setdefault('seats', {})
+                    # Build reverse map: seat_of_player
+                    seat_of_player = None
+                    for s, pid in seats.items():
+                        if pid == player_id:
+                            seat_of_player = s
+                            break
+                    if target_seat is not None and target_seat in [0,1,2,3] and seat_of_player is not None and target_seat != seat_of_player:
+                        # Swap occupants between current seat and target seat
+                        other_pid = seats.get(target_seat, target_seat)
+                        seats[target_seat] = player_id
+                        seats[seat_of_player] = other_pid
+                        # Broadcast lobby update
+                        self.broadcast_lobby_state()
                 
             except Exception as e:
                 print(f"Error handling client {player_id}: {e}")
@@ -953,7 +995,7 @@ class NetworkManager:
                     except:
                         pass
         except Exception:
-            pass
+                pass
 
         message = {"type": "start_game"}
         data = pickle.dumps(message)
@@ -2373,6 +2415,54 @@ class LobbyScreen(BaseScreen):
                     self.input_active = True
                 else:
                     self.input_active = False
+                # Copy buttons (connection info)
+                if hasattr(self, 'copy_buttons'):
+                    for btn_rect, value in self.copy_buttons:
+                        if btn_rect.collidepoint(pos):
+                            try:
+                                text_to_copy = str(value)
+                                if hasattr(pygame, 'scrap'):
+                                    pygame.scrap.put(pygame.SCRAP_TEXT, text_to_copy.encode('utf-8'))
+                                # Fallback: try Windows clipboard via os if needed
+                            except Exception:
+                                pass
+                            # Brief UI feedback
+                            self.status_message = f"Copiato: {text_to_copy}"
+                            return
+                # Handle seat swap clicks (left/right arrows)
+                if hasattr(self, 'seat_controls') and self.app.network:
+                    # Identify clicked seat control
+                    for seat, ctrls in self.seat_controls.items():
+                        if ctrls['left'].collidepoint(pos) or ctrls['right'].collidepoint(pos):
+                            # compute target seat: prev or next in ring (0..3)
+                            delta = -1 if ctrls['left'].collidepoint(pos) else 1
+                            target_seat = (seat + delta) % 4
+                            if self.app.network.is_host:
+                                # Host swaps on behalf of local player
+                                lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
+                                seats = lobby.setdefault('seats', {})
+                                local_pid = getattr(self.app.network, 'player_id', 0)
+                                # Find current seat of local player
+                                current_seat = None
+                                for s, pid in seats.items():
+                                    if pid == local_pid:
+                                        current_seat = s
+                                        break
+                                if current_seat is None:
+                                    current_seat = local_pid
+                                # Swap
+                                other_pid = seats.get(target_seat, target_seat)
+                                seats[target_seat] = local_pid
+                                seats[current_seat] = other_pid
+                                self.app.network.broadcast_lobby_state()
+                            else:
+                                # Client: send swap request to host
+                                try:
+                                    payload = {"type": "lobby_swap_request", "target_seat": target_seat}
+                                    self.app.network.socket.sendall(pickle.dumps(payload))
+                                except Exception:
+                                    pass
+                            return
                 # Cancel/Exit room
                 if self.cancel_button and self.cancel_button.is_clicked(pos):
                     # Close network and return to home
@@ -2411,9 +2501,9 @@ class LobbyScreen(BaseScreen):
                     if self.app.network and self.app.network.is_host:
                         lobby = self.app.network.game_state.get('lobby_state', {})
                         players = lobby.get('players', {})
-                        # Check all 4 present and ready
-                        all_ready = all(players.get(pid, {}).get('ready') for pid in [0,1,2,3]) and len(players) >= 4
-                        if all_ready:
+                        # Host can start if the other 3 players (1,2,3) are ready
+                        others_ready = all(players.get(pid, {}).get('ready') for pid in [1,2,3]) and all(pid in players for pid in [1,2,3])
+                        if others_ready:
                             # Build player_names mapping and store
                             names = {pid: players.get(pid, {}).get('name', f'Player {pid}') for pid in [0,1,2,3]}
                             self.app.game_config['player_names'] = names
@@ -2430,7 +2520,7 @@ class LobbyScreen(BaseScreen):
                             })
                             self.app.network.broadcast_start_game()
                         else:
-                            self.status_message = "Tutti e 4 devono essere pronti."
+                            self.status_message = "Devono essere pronti gli altri 3 giocatori."
                     else:
                         self.status_message = "Solo l'host può avviare."
             elif event.type == pygame.KEYDOWN and self.input_active:
@@ -2525,23 +2615,45 @@ class LobbyScreen(BaseScreen):
         if self.app.network and isinstance(self.app.network.game_state, dict):
             lobby = self.app.network.game_state.get('lobby_state', {})
         players = lobby.get('players', {})
+        seats = lobby.get('seats', {})
+        # Seat layout: 0,1 top row; 2,3 bottom row (or keep 0..3 order)
         seat_order = [0,1,2,3]
         start_x = center_x - (cell_w*2 + gap)//2
         start_y = grid_top
-        for idx, pid in enumerate(seat_order):
+        for idx, seat in enumerate(seat_order):
             col = idx % 2
             row = idx // 2
             rect = pygame.Rect(start_x + col*(cell_w+gap), start_y + row*(cell_h+gap), cell_w, cell_h)
-            team = 0 if pid in [0,2] else 1
+            # Determine seated player id for this seat
+            pid = seats.get(seat, seat)
+            team = 0 if seat in [0,2] else 1
             bg = (10,40,10) if team == 0 else (40,10,10)
             pygame.draw.rect(surface, bg, rect, border_radius=10)
-            pygame.draw.rect(surface, GOLD, rect, 2, border_radius=10)
+            # Highlight border: thicker and cyan if this seat belongs to local player
+            local_pid = getattr(self.app.network, 'player_id', None)
+            border_color = GOLD
+            border_width = 2
+            if pid == local_pid:
+                border_color = LIGHT_BLUE
+                border_width = 4
+            pygame.draw.rect(surface, border_color, rect, border_width, border_radius=10)
             pname = players.get(pid, {}).get('name', f'Player {pid}')
             pready = players.get(pid, {}).get('ready', False)
             name_s = self.small_font.render(f"{pname} (Team {team})", True, WHITE)
             ready_s = self.small_font.render("Pronto" if pready else "In attesa", True, LIGHT_GREEN if pready else ORANGE)
             surface.blit(name_s, name_s.get_rect(left=rect.left+8, top=rect.top+8))
             surface.blit(ready_s, ready_s.get_rect(left=rect.left+8, top=rect.top+36))
+            # Draw switch seat arrows (left/right) for each seat
+            arrow_w = 24
+            arrow_h = 24
+            left_rect = pygame.Rect(rect.left + 6, rect.centery - arrow_h//2, arrow_w, arrow_h)
+            right_rect = pygame.Rect(rect.right - arrow_w - 6, rect.centery - arrow_h//2, arrow_w, arrow_h)
+            pygame.draw.polygon(surface, WHITE, [(left_rect.right, left_rect.top), (left_rect.left, left_rect.centery), (left_rect.right, left_rect.bottom)])
+            pygame.draw.polygon(surface, WHITE, [(right_rect.left, right_rect.top), (right_rect.right, right_rect.centery), (right_rect.left, right_rect.bottom)])
+            # Save for click handling
+            if not hasattr(self, 'seat_controls'):
+                self.seat_controls = {}
+            self.seat_controls[seat] = {'rect': rect, 'left': left_rect, 'right': right_rect}
         # Buttons
         self.ready_button.draw(surface)
         # Dim the start button if not host
@@ -2555,34 +2667,65 @@ class LobbyScreen(BaseScreen):
         if self.cancel_button:
             self.cancel_button.draw(surface)
         
-        # Connection info panel (host-focused)
+        # Connection info panel (visible to both host and clients)
         pygame.draw.rect(surface, (15,15,35), self.conn_info_rect, border_radius=10)
         pygame.draw.rect(surface, GOLD, self.conn_info_rect, 2, border_radius=10)
         header = self.info_font.render("Info Connessione (da condividere)", True, WHITE)
         surface.blit(header, header.get_rect(midtop=(self.conn_info_rect.centerx, self.conn_info_rect.top + 8)))
         y = self.conn_info_rect.top + 38
         line_h = 24
-        try:
-            local_ip = get_local_ip()
-        except Exception:
-            local_ip = "-"
+        # Preferisci i dati broadcastati dall'host in lobby_state
+        local_ip = "-"
         public_ip = "-"
-        if hasattr(self.app, 'network') and self.app.network and getattr(self.app.network, 'public_ip', None):
-            public_ip = self.app.network.public_ip
-        port_text = str(getattr(self.app.network, 'port', 5555)) if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network else "5555"
+        port_text = "5555"
+        lobby = {}
+        if self.app.network and isinstance(self.app.network.game_state, dict):
+            lobby = self.app.network.game_state.get('lobby_state', {})
+        conn_info = lobby.get('connection_info', {}) if isinstance(lobby, dict) else {}
+        if conn_info:
+            local_ip = str(conn_info.get('local_ip', local_ip))
+            public_ip = str(conn_info.get('public_ip', public_ip))
+            port_val = conn_info.get('port', None)
+            if port_val is not None:
+                port_text = str(port_val)
+        else:
+            # Fallbacks
+            try:
+                local_ip = get_local_ip()
+            except Exception:
+                local_ip = "-"
+            if hasattr(self.app, 'network') and self.app.network:
+                public_ip = getattr(self.app.network, 'public_ip', public_ip)
+                port_text = str(getattr(self.app.network, 'port', 5555))
         
         lines = [
-            f"IP Locale (LAN): {local_ip}",
-            f"IP Pubblico (Internet): {public_ip}",
-            f"Porta: {port_text}",
+            ("IP Locale (LAN)", local_ip),
+            ("IP Pubblico (Internet)", public_ip),
+            ("Porta", port_text),
         ]
-        # Show connections count if host
-        if self.app.network and self.app.network.is_host:
-            num_clients = len(self.app.network.clients)
-            lines.append(f"Giocatori connessi: {num_clients}/3")
-        for s in lines:
-            surf = self.small_font.render(s, True, LIGHT_GRAY)
-            surface.blit(surf, surf.get_rect(left=self.conn_info_rect.left + 12, top=y))
+        # Show connections count (both see the same type of info)
+        if self.app.network:
+            try:
+                num_clients = len(self.app.network.clients)
+                lines.append(("Giocatori connessi", f"{num_clients}/3"))
+            except Exception:
+                pass
+        # Draw each line with a copy button
+        self.copy_buttons = []
+        for label, value in lines:
+            text = f"{label}: {value}"
+            surf = self.small_font.render(text, True, LIGHT_GRAY)
+            text_rect = surf.get_rect(left=self.conn_info_rect.left + 12, top=y)
+            surface.blit(surf, text_rect)
+            # Draw copy button (small square with '⧉')
+            btn_size = int(self.small_font.get_height() * 1.2)
+            btn_rect = pygame.Rect(self.conn_info_rect.right - btn_size - 10, y - 2, btn_size, btn_size)
+            pygame.draw.rect(surface, (45,45,80), btn_rect, border_radius=6)
+            pygame.draw.rect(surface, GOLD, btn_rect, 1, border_radius=6)
+            icon_surf = self.small_font.render("⧉", True, WHITE)
+            surface.blit(icon_surf, icon_surf.get_rect(center=btn_rect.center))
+            # Store for click handling
+            self.copy_buttons.append((btn_rect, value))
             y += line_h
         # Status
         if self.status_message:
@@ -7090,6 +7233,12 @@ class ScoponeApp:
     """Main application class"""
     def __init__(self):
         pygame.init()
+        # Initialize clipboard support (pygame.scrap) if available
+        try:
+            if hasattr(pygame, 'scrap'):
+                pygame.scrap.init()
+        except Exception:
+            pass
         pygame.display.set_caption("Scopone a Coppie")
         
         # Ottieni le dimensioni dello schermo
