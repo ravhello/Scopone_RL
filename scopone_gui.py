@@ -4108,7 +4108,10 @@ class GameScreen(BaseScreen):
                 if hasattr(self, 'pending_action') and self.pending_action is not None:
                     # CRITICAL FIX: Verify the action is valid for the current player before executing
                     card_played, _ = decode_action(self.pending_action)
-                    current_player_hand = self.env.game_state["hands"].get(self.env.current_player, [])
+                    hands = {}
+                    if hasattr(self.env, 'game_state') and isinstance(self.env.game_state, dict):
+                        hands = self.env.game_state.get('hands', {}) if isinstance(self.env.game_state.get('hands', {}), dict) else {}
+                    current_player_hand = hands.get(self.env.current_player, [])
                     
                     if card_played in current_player_hand:
                         # Execute the move on the environment
@@ -4218,7 +4221,10 @@ class GameScreen(BaseScreen):
                     is_online = (mode == "online_multiplayer")
                     is_host = self.app.game_config.get("is_host", False)
                     cp = self.env.current_player
-                    hand = self.env.game_state["hands"].get(cp, [])
+                    hands = {}
+                    if hasattr(self.env, 'game_state') and isinstance(self.env.game_state, dict):
+                        hands = self.env.game_state.get('hands', {}) if isinstance(self.env.game_state.get('hands', {}), dict) else {}
+                    hand = hands.get(cp, [])
                     if len(hand) == 1:
                         the_card = hand[0]
                         valid_actions = self.env.get_valid_actions() or []
@@ -5100,8 +5106,9 @@ class GameScreen(BaseScreen):
             return
             
         # Check if all hands are empty
-        gs = self.env.game_state
-        is_game_over = all(len(gs["hands"][p]) == 0 for p in range(4))
+        gs = getattr(self.env, 'game_state', None)
+        hands = gs.get('hands', {}) if isinstance(gs, dict) else {}
+        is_game_over = bool(hands) and all(len(hands.get(p, [])) == 0 for p in range(4))
         
         if is_game_over:
             self.game_over = True
