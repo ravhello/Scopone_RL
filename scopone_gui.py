@@ -625,7 +625,17 @@ class NetworkManager:
             is_team_vs_ai = self.game_state.get('online_type') == 'team_vs_ai'
         
         # Numero di client attesi in base alla modalità
-        expected_clients = 1 if is_team_vs_ai else 3
+        online_type = None
+        try:
+            online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
+        except Exception:
+            online_type = None
+        if online_type == 'team_vs_ai' or online_type == 'humans_plus_ai':
+            expected_clients = 1
+        elif online_type == 'three_humans_one_ai':
+            expected_clients = 2
+        else:  # all_human o sconosciuto
+            expected_clients = 3
         
         while len(self.clients) < expected_clients:
             try:
@@ -687,11 +697,11 @@ class NetworkManager:
                 
                 # If all players connected
                 if len(self.clients) == expected_clients:
-                    if is_team_vs_ai:
+                    if online_type in ('team_vs_ai', 'humans_plus_ai'):
                         self.message_queue.append("All players connected, starting game...")
                         self.broadcast_start_game()
                     else:
-                        # All-human: wait in lobby, do not auto-start
+                        # All-human and three_humans_one_ai: wait in lobby, do not auto-start
                         self.message_queue.append("All players connected. Waiting in lobby...")
             except Exception as e:
                 print(f"Error accepting connection: {e}")
@@ -1794,15 +1804,15 @@ class GameModeScreen(BaseScreen):
                     # Controllo clic sui pulsanti delle modalità online
                     for i, button in enumerate(self.online_mode_buttons):
                         if button.is_clicked(pos):
-                            if i == 0 or i == 1:  # 4 Players o 2v2 with AI
+                            if i in (0, 1, 2, 3):  # quattro modalità
                                 self.selected_online_mode = i
                                 # Ora non avviamo immediatamente il gioco in nessun caso,
                                 # aspettiamo che l'utente prema il pulsante Start
-                            elif i == 2:  # Back
+                            elif i == 4:  # Back
                                 self.host_screen_active = False
                     
                     # Controllo clic sui pulsanti di difficoltà (solo per modalità Team vs AI)
-                    if self.selected_online_mode == 1 and hasattr(self, 'online_difficulty_buttons'):
+                    if self.selected_online_mode in (1, 2, 3) and hasattr(self, 'online_difficulty_buttons'):
                         for i, btn in enumerate(self.online_difficulty_buttons):
                             if btn.is_clicked(pos):
                                 self.selected_difficulty = i
@@ -1967,7 +1977,7 @@ class GameModeScreen(BaseScreen):
                 except Exception:
                     pass
                 print("DEBUG HOST GAME: Lobby avviata (all_human)")
-            else:
+            elif self.selected_online_mode == 1:
                 # 2 vs 2 (Team vs AI) - Mostra animazione di caricamento
                 self.loading = True
                 self.loading_animation = LoadingAnimation(self.app.window_width, self.app.window_height)
@@ -1996,6 +2006,52 @@ class GameModeScreen(BaseScreen):
                     self.app.network.game_state = {
                         'online_type': 'team_vs_ai'
                     }
+            elif self.selected_online_mode == 2:
+                # 2 vs 2 (Humans + AI compagni): due umani su squadre opposte, ognuno con un'AI compagna
+                self.loading = True
+                self.loading_animation = LoadingAnimation(self.app.window_width, self.app.window_height)
+                self.loading_start_time = pygame.time.get_ticks()
+                self.loading_message = "Caricamento bot AI in corso"
+
+                self.app.game_config = {
+                    "mode": "online_multiplayer",
+                    "is_host": True,
+                    "player_id": 0,
+                    "online_type": "humans_plus_ai",
+                    "difficulty": self.selected_difficulty
+                }
+                print("DEBUG HOST GAME: Setting online_type=humans_plus_ai")
+                self.waiting_for_other_player = True
+                if hasattr(self.app, 'network') and self.app.network:
+                    self.app.network.game_state = {
+                        'online_type': 'humans_plus_ai'
+                    }
+            else:
+                # 3 umani + 1 AI (lobby). Vai in lobby per la scelta dei posti. L'AI risulta pronta.
+                self.done = True
+                self.next_screen = "lobby"
+                self.app.game_config = {
+                    "mode": "online_multiplayer",
+                    "is_host": True,
+                    "player_id": 0,
+                    "online_type": "three_humans_one_ai",
+                    "difficulty": self.selected_difficulty
+                }
+                # Inizializza lobby con AI pronta su seat libero (placeholder; sarà determinato dopo i join)
+                try:
+                    lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}, 'ai_ready': True})
+                    players = lobby.setdefault('players', {})
+                    seats = lobby.setdefault('seats', {})
+                    # Host presente
+                    players.setdefault(0, {'name': 'Host', 'team': 0, 'ready': False})
+                    seats.setdefault(0, 0)
+                    # Marca flag per AI pronta
+                    lobby['ai_ready'] = True
+                    # Online type nella game_state
+                    self.app.network.game_state['online_type'] = 'three_humans_one_ai'
+                    self.app.network.broadcast_lobby_state()
+                except Exception:
+                    pass
     
     def join_online_game(self):
         """Join an online game with timeout handling"""
@@ -2027,15 +2083,15 @@ class GameModeScreen(BaseScreen):
             
             # Draw buttons
             for i, button in enumerate(self.online_mode_buttons):
-                # Highlight selected button for game modes
-                if i < 2 and i == self.selected_online_mode:
+                # Highlight selected button for game modes (first three are modes)
+                if i < 4 and i == self.selected_online_mode:
                     pygame.draw.rect(surface, GOLD, button.rect.inflate(6, 6), 3, border_radius=8)
                 button.draw(surface)
             
             # Draw instructions
             if self.selected_online_mode == 0:
                 info_text = "You'll need 3 more human players to join"
-            else:
+            elif self.selected_online_mode in (1, 2, 3):
                 info_text = "You'll need 1 more human player to join (for your team)"
             
             info_surf = self.info_font.render(info_text, True, WHITE)
@@ -2087,7 +2143,7 @@ class GameModeScreen(BaseScreen):
             # Aggiusta la posizione e il testo del pulsante in base alla modalità
             if self.selected_online_mode == 0:  # 4 Players (All Human)
                 start_y = height - int(height * 0.1)
-            else:  # 2 vs 2 (Team vs AI)
+            else:  # 2 vs 2 (Team vs AI) o Humans+AI compagni
                 start_y = height - int(height * 0.1)
                 
             self.start_button = Button(
@@ -2208,8 +2264,8 @@ class GameModeScreen(BaseScreen):
         button_height = int(height * 0.08)
         button_spacing = int(height * 0.05)
         
-        title_y = int(height * 0.25)
-        button_start_y = title_y + int(height * 0.15)
+        title_y = int(height * 0.18)
+        button_start_y = title_y + int(height * 0.08)
         
         self.online_mode_buttons = [
             Button(center_x - button_width // 2,
@@ -2226,6 +2282,18 @@ class GameModeScreen(BaseScreen):
                 
             Button(center_x - button_width // 2,
                 button_start_y + 2 * (button_height + button_spacing),
+                button_width, button_height,
+                "2 vs 2 (Humans + AI compagni)",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+
+            Button(center_x - button_width // 2,
+                button_start_y + 3 * (button_height + button_spacing),
+                button_width, button_height,
+                "3 umani + 1 AI (lobby)",
+                DARK_BLUE, WHITE, font_size=int(height * 0.03)),
+                
+            Button(center_x - button_width // 2,
+                button_start_y + 4 * (button_height + button_spacing),
                 button_width, button_height,
                 "Back",
                 HIGHLIGHT_RED, WHITE, font_size=int(height * 0.03))
@@ -2262,16 +2330,15 @@ class GameModeScreen(BaseScreen):
                 except Exception:
                     pass
                 self.done = True
-                # Heuristic: if client and no full game state yet, go to lobby
+                # Decide screen: send clients to lobby ONLY for all-human rooms or if lobby_state already present
                 try:
                     gs = self.app.network.game_state if isinstance(self.app.network.game_state, dict) else {}
                 except Exception:
                     gs = {}
                 is_client = not self.app.network.is_host
-                no_hands_yet = not gs or ('hands' not in gs)
                 all_human_flag = (gs.get('online_type') == 'all_human') if isinstance(gs, dict) else False
-                team_vs_ai_flag = (gs.get('online_type') == 'team_vs_ai') if isinstance(gs, dict) else False
-                if is_client and (go_lobby or all_human_flag or (no_hands_yet and not team_vs_ai_flag)):
+                has_lobby = ('lobby_state' in gs) if isinstance(gs, dict) else False
+                if is_client and (all_human_flag or has_lobby):
                     self.next_screen = "lobby"
                 else:
                     self.next_screen = "game"
@@ -2501,9 +2568,17 @@ class LobbyScreen(BaseScreen):
                     if self.app.network and self.app.network.is_host:
                         lobby = self.app.network.game_state.get('lobby_state', {})
                         players = lobby.get('players', {})
-                        # Host can start if the other 3 players (1,2,3) are ready
-                        others_ready = all(players.get(pid, {}).get('ready') for pid in [1,2,3]) and all(pid in players for pid in [1,2,3])
-                        if others_ready:
+                        online_type = self.app.network.game_state.get('online_type') if isinstance(self.app.network.game_state, dict) else None
+                        can_start = False
+                        if online_type == 'all_human':
+                            others_ready = all(players.get(pid, {}).get('ready') for pid in [1,2,3]) and all(pid in players for pid in [1,2,3])
+                            can_start = others_ready
+                        elif online_type == 'three_humans_one_ai':
+                            # Need 2 clients connected and 3 human ready; AI considered ready by default
+                            human_pids = [pid for pid, pdata in players.items() if not pdata.get('is_ai')]
+                            humans_ready = sum(1 for pid in human_pids if players.get(pid, {}).get('ready')) >= 3
+                            can_start = humans_ready
+                        if can_start:
                             # Build player_names mapping and store
                             names = {pid: players.get(pid, {}).get('name', f'Player {pid}') for pid in [0,1,2,3]}
                             self.app.game_config['player_names'] = names
@@ -2516,11 +2591,11 @@ class LobbyScreen(BaseScreen):
                                 "mode": "online_multiplayer",
                                 "is_host": True,
                                 "player_id": 0,
-                                "online_type": "all_human"
+                                "online_type": online_type or "all_human"
                             })
                             self.app.network.broadcast_start_game()
                         else:
-                            self.status_message = "Devono essere pronti gli altri 3 giocatori."
+                            self.status_message = "Condizioni di readiness non soddisfatte."
                     else:
                         self.status_message = "Solo l'host può avviare."
             elif event.type == pygame.KEYDOWN and self.input_active:
@@ -2616,6 +2691,7 @@ class LobbyScreen(BaseScreen):
             lobby = self.app.network.game_state.get('lobby_state', {})
         players = lobby.get('players', {})
         seats = lobby.get('seats', {})
+        online_type = (self.app.network.game_state.get('online_type') if self.app.network and isinstance(self.app.network.game_state, dict) else None)
         # Seat layout: 0,1 top row; 2,3 bottom row (or keep 0..3 order)
         seat_order = [0,1,2,3]
         start_x = center_x - (cell_w*2 + gap)//2
@@ -2637,8 +2713,17 @@ class LobbyScreen(BaseScreen):
                 border_color = LIGHT_BLUE
                 border_width = 4
             pygame.draw.rect(surface, border_color, rect, border_width, border_radius=10)
+            # AI handling for three_humans_one_ai: if a seat is unassigned to humans, show AI ready
             pname = players.get(pid, {}).get('name', f'Player {pid}')
             pready = players.get(pid, {}).get('ready', False)
+            is_ai_seat = False
+            if online_type == 'three_humans_one_ai':
+                # Consider seat is AI if no human explicitly occupies it in players mapping
+                # Heuristic: if pid not present in players or marked as AI later
+                if pid not in players or players.get(pid, {}).get('is_ai'):
+                    pname = f"AI {pid}"
+                    pready = True
+                    is_ai_seat = True
             name_s = self.small_font.render(f"{pname} (Team {team})", True, WHITE)
             ready_s = self.small_font.render("Pronto" if pready else "In attesa", True, LIGHT_GREEN if pready else ORANGE)
             surface.blit(name_s, name_s.get_rect(left=rect.left+8, top=rect.top+8))
@@ -2651,6 +2736,18 @@ class LobbyScreen(BaseScreen):
             if ready_rect.colliderect(left_rect_preview):
                 ready_rect.left = left_rect_preview.right + 6
             surface.blit(ready_s, ready_rect)
+            # Draw AI badge for 3v1 on AI seat
+            if online_type == 'three_humans_one_ai' and is_ai_seat:
+                badge_text = "AI pronta"
+                badge_surf = self.small_font.render(badge_text, True, WHITE)
+                pad_x = 8
+                pad_y = 4
+                brect = badge_surf.get_rect()
+                badge_bg = pygame.Rect(0, 0, brect.width + 2*pad_x, brect.height + 2*pad_y)
+                badge_bg.topright = (rect.right - 8, rect.top + 8)
+                pygame.draw.rect(surface, (20, 70, 20), badge_bg, border_radius=10)
+                pygame.draw.rect(surface, LIGHT_GREEN, badge_bg, 2, border_radius=10)
+                surface.blit(badge_surf, badge_surf.get_rect(center=badge_bg.center))
             # Draw switch seat arrows (left/right) for each seat
             arrow_w = 24
             arrow_h = 24
@@ -3003,6 +3100,9 @@ class GameScreen(BaseScreen):
                 if not isinstance(self.app.network.game_state, dict):
                     self.app.network.game_state = {}
                 self.app.network.game_state['rules'] = rules
+                online_type = config.get("online_type")
+                if online_type:
+                    self.app.network.game_state['online_type'] = online_type
 
     def _handle_hand_end(self, final_breakdown):
         """Handle end of a single hand and possibly continue series/match."""
@@ -3173,6 +3273,10 @@ class GameScreen(BaseScreen):
         # Determina se siamo in modalità team vs AI online
         is_online_team_vs_ai = (mode == "online_multiplayer" and 
                             config.get("online_type") == "team_vs_ai")
+        is_online_humans_plus_ai = (mode == "online_multiplayer" and 
+                            config.get("online_type") == "humans_plus_ai")
+        is_online_three_humans_one_ai = (mode == "online_multiplayer" and 
+                            config.get("online_type") == "three_humans_one_ai")
         
         # CORREZIONE: Usa is_host invece di config.get("is_host", False)
         ai_players = []
@@ -3205,6 +3309,21 @@ class GameScreen(BaseScreen):
                 if is_online_team_vs_ai:
                     is_human = player_id not in ai_players
                     is_ai = player_id in ai_players
+                elif is_online_humans_plus_ai:
+                    # In questa modalità, gli AI sono sempre 2 e 3
+                    is_human = player_id in [0, 1]
+                    is_ai = player_id in [2, 3]
+                elif is_online_three_humans_one_ai:
+                    # AI è il seat non occupato da 3 umani; per default trattiamo AI come seat 3 finché la lobby non decide
+                    # Per sicurezza: considera umani su quelli presenti in player_names (se arrivano da lobby)
+                    human_ids = [pid for pid in range(4) if (config.get('player_names', {}).get(pid) not in (None, f'Player {pid}'))]
+                    if len(human_ids) == 3:
+                        is_human = player_id in human_ids
+                        is_ai = not is_human
+                    else:
+                        # Fallback: host (0) e due client (1,2) umani, seat 3 AI
+                        is_human = player_id in [0, 1, 2]
+                        is_ai = player_id == 3
                 else:  # All human
                     is_human = True
                     is_ai = False
@@ -4089,6 +4208,29 @@ class GameScreen(BaseScreen):
                         # Sblocca il gioco
                         self.waiting_for_other_player = False
                         self.status_message = "Partner connesso. Inizia il gioco!"
+                elif online_type == "humans_plus_ai":
+                    # Attendi 1 umano (client). Ogni umano avrà un'AI compagna.
+                    needed_players = 1
+                    if self.app.network and len(self.app.network.clients) < needed_players:
+                        connected_count = len(self.app.network.clients)
+                        self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+                        self.waiting_for_other_player = True
+                    elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
+                        # Configura squadre: 0 (umano host) + AI 2 contro 1 (umano client) + AI 3
+                        self.setup_humans_plus_ai_online()
+                        self.waiting_for_other_player = False
+                        self.status_message = "Avversario connesso. Inizia il gioco!"
+                elif online_type == "three_humans_one_ai":
+                    # Attendi 2 umani (client). I 3 posti umani si scelgono in lobby; l'altro posto sarà AI.
+                    needed_players = 2
+                    if self.app.network and len(self.app.network.clients) < needed_players:
+                        connected_count = len(self.app.network.clients)
+                        self.status_message = f"Server attivo su {ip_address}:5555 | {connected_count}/{needed_players} giocatori connessi"
+                        self.waiting_for_other_player = True
+                    elif self.app.network and len(self.app.network.clients) == needed_players and self.waiting_for_other_player:
+                        # La configurazione AI specifica avverrà in setup al primo sync partita
+                        self.waiting_for_other_player = False
+                        self.status_message = "Tutti gli umani connessi. Inizia il gioco!"
             
             # CORREZIONE: Assicura che anche il client configuri correttamente i giocatori AI
             elif is_online_team_vs_ai and not self.app.game_config.get("is_host"):
@@ -4241,6 +4383,76 @@ class GameScreen(BaseScreen):
             print(f"Player {player.player_id}: {player.name}, Team {player.team_id}, AI: {player.is_ai}")
             
         self.waiting_for_other_player = False
+
+    def setup_humans_plus_ai_online(self):
+        """Configurazione per online_type=humans_plus_ai: due umani su squadre opposte con AI compagna."""
+        print("\n### CONFIGURAZIONE HUMANS + AI ONLINE ###")
+        print(f"ID giocatore locale: {self.local_player_id}")
+
+        # Squadre: (0 umano host + AI 2) vs (1 umano client + AI 3)
+        self.players[0].team_id = 0
+        self.players[2].team_id = 0
+        self.players[1].team_id = 1
+        self.players[3].team_id = 1
+
+        # Ruoli umani/AI
+        self.players[0].is_human = True
+        self.players[0].is_ai = False
+        self.players[1].is_human = True
+        self.players[1].is_ai = False
+        self.players[2].is_human = False
+        self.players[2].is_ai = True
+        self.players[3].is_human = False
+        self.players[3].is_ai = True
+
+        # Nomi dipendenti dal punto di vista locale
+        if self.local_player_id == 0:
+            self.players[0].name = "You"
+            self.players[1].name = "Opponent"
+        elif self.local_player_id == 1:
+            self.players[1].name = "You"
+            self.players[0].name = "Opponent"
+        else:
+            # Default
+            self.players[0].name = "Host"
+            self.players[1].name = "Client"
+        self.players[2].name = "AI 2"
+        self.players[3].name = "AI 3"
+
+        # Controller AI: un agente per team 0? No, solo per i giocatori AI (2 e 3) con stesso livello
+        # Creiamo un agente per ogni team AI in base alla difficoltà, ma sono indipendenti
+        difficulty = self.ai_difficulty
+        ai_agent_team0 = DQNAgent(team_id=0)
+        ai_agent_team1 = DQNAgent(team_id=1)
+        # Caricamento checkpoint opzionale
+        ck0 = "scopone_checkpoint_team0.pth"
+        ck1 = "scopone_checkpoint_team1.pth"
+        if os.path.exists(ck0):
+            ai_agent_team0.load_checkpoint(ck0)
+        if os.path.exists(ck1):
+            ai_agent_team1.load_checkpoint(ck1)
+        # Stessa epsilon in base al livello per entrambi
+        if difficulty == 0:
+            ai_agent_team0.epsilon = ai_agent_team1.epsilon = 0.3
+        elif difficulty == 1:
+            ai_agent_team0.epsilon = ai_agent_team1.epsilon = 0.1
+        else:
+            ai_agent_team0.epsilon = ai_agent_team1.epsilon = 0
+
+        # Assegna controller ai giocatori AI
+        self.ai_controllers[2] = ai_agent_team0  # AI compagno host
+        self.ai_controllers[3] = ai_agent_team1  # AI compagno client
+
+        # Sync tipo online e stato iniziale
+        if hasattr(self.app, 'network') and self.app.network and self.app.game_config.get("is_host"):
+            self.perform_initial_sync()
+            self.app.network.game_state['online_type'] = 'humans_plus_ai'
+            # Comunica quali giocatori sono AI
+            self.app.network.game_state['ai_players'] = [2, 3]
+
+        print("Squadre: (0,2) vs (1,3) con AI in 2 e 3")
+        self.messages.append("Team 0: Human 0 + AI 2")
+        self.messages.append("Team 1: Human 1 + AI 3")
     
     def update_animations(self):
         """Update and clean up animations, return True if animations are active"""
@@ -6032,8 +6244,10 @@ class GameScreen(BaseScreen):
                 surface.blit(indicator_surf, indicator_rect)
                 current_y = indicator_rect.bottom + int(height * 0.006)
 
-            # Draw difficulty info if playing against AI
-            if self.app.game_config.get("mode") in ["single_player", "team_vs_ai"]:
+            # Draw difficulty info if playing against AI (all online modes with AI)
+            online_type = self.app.game_config.get("online_type")
+            if (self.app.game_config.get("mode") == "single_player" or
+                online_type in ("team_vs_ai", "humans_plus_ai", "three_humans_one_ai")):
                 diff_text = "AI Difficulty: "
                 if self.ai_difficulty == 0:
                     diff_text += "Easy"
