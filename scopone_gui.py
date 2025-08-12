@@ -1351,6 +1351,37 @@ class NetworkManager:
         message = {"type": "chat", "player_id": player_id, "text": text}
         data = pickle.dumps(message)
         
+        # If this is the host's own message, append to local queue so host sees it immediately
+        try:
+            if player_id == self.player_id:
+                display_name = None
+                # Try lobby_state first
+                try:
+                    if isinstance(self.game_state, dict):
+                        lobby = self.game_state.get('lobby_state', {})
+                        if isinstance(lobby, dict):
+                            players = lobby.get('players', {})
+                            if isinstance(players, dict):
+                                pdata = players.get(player_id, {})
+                                if isinstance(pdata, dict):
+                                    display_name = pdata.get('name')
+                except Exception:
+                    pass
+                # Fallback to player_names mapping
+                if not display_name:
+                    try:
+                        names = self.game_state.get('player_names', {}) if isinstance(self.game_state, dict) else {}
+                        if isinstance(names, dict):
+                            display_name = names.get(player_id)
+                    except Exception:
+                        pass
+                if not display_name:
+                    display_name = f"Player {player_id}"
+                self.message_queue.append(f"{display_name}: {text}")
+        except Exception:
+            # Non-fatal
+            pass
+
         for client, _ in self.clients:
             try:
                 client.sendall(data)
