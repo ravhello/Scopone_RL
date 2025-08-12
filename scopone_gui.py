@@ -865,6 +865,23 @@ class NetworkManager:
                     print(f"Assigned player ID: {self.player_id}")
                 elif message["type"] == "game_state":
                     self.game_state = message["state"]
+                elif message.get("type") == "kicked":
+                    # Kicked by host: disconnect and mark reason
+                    try:
+                        self.connected = False
+                        kick_reason = message.get('reason')
+                        if self.socket:
+                            try:
+                                self.socket.close()
+                            except Exception:
+                                pass
+                        self.socket = None
+                        if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                            self.app.game_config['kicked_by_host'] = True
+                            if kick_reason:
+                                self.app.game_config['kicked_reason'] = str(kick_reason)
+                    except Exception:
+                        pass
                 elif message["type"] == "rules":
                     # Ricezione regole dall'host
                     if isinstance(message.get("rules"), dict):
@@ -885,6 +902,21 @@ class NetworkManager:
                     if 'online_type' in message:
                         self.game_state['online_type'] = message.get('online_type')
                     self.message_queue.append("Lobby aggiornata dall'host")
+                elif message.get("type") == "room_closed":
+                    # Host closed the room: disconnect and return to mode screen
+                    try:
+                        self.connected = False
+                        if self.socket:
+                            try:
+                                self.socket.close()
+                            except Exception:
+                                pass
+                        self.socket = None
+                        # Stash a flag in app to switch screen on next update
+                        if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                            self.app.game_config['room_closed_by_host'] = True
+                    except Exception:
+                        pass
                 elif message["type"] == "start_game":
                     # Mark start flag so UI can transition to game reliably
                     if not isinstance(self.game_state, dict):
@@ -1090,6 +1122,21 @@ class NetworkManager:
             except Exception:
                 pass
     
+    def broadcast_room_closed(self):
+        """Notify clients that the host closed the room (kick clients back to menu)."""
+        if not self.is_host:
+            return
+        try:
+            msg = {"type": "room_closed"}
+            data = pickle.dumps(msg)
+            for client, _ in self.clients:
+                try:
+                    client.sendall(data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    
     def broadcast_lobby_state(self):
         """Broadcast lobby state to clients (host only)"""
         if not self.is_host:
@@ -1106,6 +1153,56 @@ class NetworkManager:
                     pass
         except Exception as e:
             print(f"Error broadcasting lobby: {e}")
+
+    def kick_player(self, target_player_id: int, reason: str = None):
+        """Host-only: kick a specific player from the lobby and notify them."""
+        if not self.is_host:
+            return
+        # Find client socket by player_id
+        target_index = None
+        target_socket = None
+        for idx, (client, pid) in enumerate(list(self.clients)):
+            if pid == target_player_id:
+                target_index = idx
+                target_socket = client
+                break
+        # Notify client they were kicked
+        if target_socket:
+            try:
+                msg = {"type": "kicked", "reason": reason or "Removed by host"}
+                target_socket.sendall(pickle.dumps(msg))
+            except Exception:
+                pass
+            # Close their socket
+            try:
+                target_socket.close()
+            except Exception:
+                pass
+        # Remove from clients list
+        if target_index is not None:
+            try:
+                self.clients.pop(target_index)
+            except Exception:
+                pass
+        # Remove from lobby state
+        try:
+            if isinstance(self.game_state, dict):
+                lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
+                players = lobby.setdefault('players', {})
+                seats = lobby.setdefault('seats', {})
+                # Remove any seat mapping to this player
+                for seat, pid in list(seats.items()):
+                    if pid == target_player_id:
+                        seats.pop(seat, None)
+                # Remove player entry
+                players.pop(target_player_id, None)
+        except Exception:
+            pass
+        # Broadcast updated lobby
+        try:
+            self.broadcast_lobby_state()
+        except Exception:
+            pass
 
     def send_lobby_update(self, name: str = None, ready: bool = None):
         """Send a lobby update to host (for clients)."""
@@ -2389,19 +2486,19 @@ class GameModeScreen(BaseScreen):
             Button(center_x - button_width // 2,
                 button_start_y + button_height + button_spacing,
                 button_width, button_height,
-                "2 vs 2 (Team vs AI)",
+                "2 vs 2 (Human Team vs AI)",
                 DARK_BLUE, WHITE, font_size=int(height * 0.03)),
                 
             Button(center_x - button_width // 2,
                 button_start_y + 2 * (button_height + button_spacing),
                 button_width, button_height,
-                "2 vs 2 (Humans + AI compagni)",
+                "2 vs 2 (Human + AI teams)",
                 DARK_BLUE, WHITE, font_size=int(height * 0.03)),
 
             Button(center_x - button_width // 2,
                 button_start_y + 3 * (button_height + button_spacing),
                 button_width, button_height,
-                "3 umani + 1 AI (lobby)",
+                "3 umani + 1 AI",
                 DARK_BLUE, WHITE, font_size=int(height * 0.03)),
                 
             Button(center_x - button_width // 2,
@@ -2443,7 +2540,12 @@ class GameModeScreen(BaseScreen):
 
                 if is_client:
                     # Client: go to lobby for lobby-type rooms or if lobby present; go to game only after start signal
-                    if start_flag:
+                    # If host closed room, kick to mode
+                    if gs.get('room_closed_by_host'):
+                        self.app.game_config = {}
+                        self.done = True
+                        self.next_screen = "mode"
+                    elif start_flag:
                         self.done = True
                         self.next_screen = "game"
                     elif (ot in ['all_human', 'three_humans_one_ai']) or has_lobby:
@@ -2697,9 +2799,16 @@ class LobbyScreen(BaseScreen):
                             return
                 # Cancel/Exit room
                 if self.cancel_button and self.cancel_button.is_clicked(pos):
-                    # Close network and return to home
+                    # Host cancels: notify clients and close room; Client exits: just disconnect
                     try:
                         if hasattr(self.app, 'network') and self.app.network:
+                            if self.app.network.is_host:
+                                # notify clients
+                                try:
+                                    self.app.network.broadcast_room_closed()
+                                except Exception:
+                                    pass
+                            # close connection
                             self.app.network.close()
                             self.app.network = None
                     except Exception:
@@ -2929,6 +3038,18 @@ class LobbyScreen(BaseScreen):
                 pygame.draw.rect(surface, (20, 70, 20), badge_bg, border_radius=10)
                 pygame.draw.rect(surface, LIGHT_GREEN, badge_bg, 2, border_radius=10)
                 surface.blit(badge_surf, badge_surf.get_rect(center=badge_bg.center))
+            # Kick button (host only) for occupied human seats
+            if self.app.network and self.app.network.is_host and pid is not None and not is_ai_seat:
+                kick_w = int(self.small_font.get_height() * 2.2)
+                kick_h = int(self.small_font.get_height() * 1.1)
+                kick_rect = pygame.Rect(rect.right - kick_w - 8, rect.top + 8, kick_w, kick_h)
+                pygame.draw.rect(surface, (70, 20, 20), kick_rect, border_radius=8)
+                pygame.draw.rect(surface, HIGHLIGHT_RED, kick_rect, 2, border_radius=8)
+                ktxt = self.small_font.render("Kick", True, WHITE)
+                surface.blit(ktxt, ktxt.get_rect(center=kick_rect.center))
+                if not hasattr(self, 'kick_controls'):
+                    self.kick_controls = {}
+                self.kick_controls[seat] = {'rect': kick_rect, 'pid': pid}
             # Draw switch seat arrows (left/right) for each seat (disable on AI seat or libero)
             arrow_w = 24
             arrow_h = 24
