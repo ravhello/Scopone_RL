@@ -725,8 +725,32 @@ class NetworkManager:
                     # Add move to queue for processing
                     self.move_queue.append((player_id, message["move"]))
                 elif message["type"] == "chat":
-                    # Add chat message to queue
-                    self.message_queue.append(f"Player {player_id}: {message['text']}")
+                    # Broadcast chat to all clients and append locally with nickname
+                    try:
+                        text = str(message.get('text', ''))
+                    except Exception:
+                        text = ''
+                    # Determine display name from lobby or stored names
+                    name = None
+                    try:
+                        lobby = self.game_state.get('lobby_state', {}) if isinstance(self.game_state, dict) else {}
+                        if isinstance(lobby, dict):
+                            players = lobby.get('players', {})
+                            if isinstance(players, dict):
+                                pdata = players.get(player_id, {})
+                                if isinstance(pdata, dict):
+                                    name = pdata.get('name')
+                    except Exception:
+                        pass
+                    if not name and hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                        name = self.app.game_config.get('player_names', {}).get(player_id)
+                    if not name:
+                        name = f"Player {player_id}"
+                    # Append locally
+                    if text:
+                        self.message_queue.append(f"{name}: {text}")
+                        # Forward to all clients
+                        self.broadcast_chat(player_id, text)
                 elif message.get("type") == "client_leaving" and self.is_host:
                     # Client informs host they are leaving: free their seat and remove player entry
                     try:
@@ -998,7 +1022,32 @@ class NetworkManager:
                     except Exception:
                         pass
                 elif message["type"] == "chat":
-                    self.message_queue.append(f"Player {message['player_id']}: {message['text']}")
+                    # Show incoming chat with nickname
+                    try:
+                        pid = int(message.get('player_id')) if 'player_id' in message else None
+                    except Exception:
+                        pid = None
+                    text = str(message.get('text', ''))
+                    name = None
+                    # Try lobby names first
+                    try:
+                        if isinstance(self.game_state, dict):
+                            lobby = self.game_state.get('lobby_state', {})
+                            if isinstance(lobby, dict):
+                                players = lobby.get('players', {})
+                                if isinstance(players, dict) and pid is not None:
+                                    pdata = players.get(pid, {})
+                                    if isinstance(pdata, dict):
+                                        name = pdata.get('name')
+                    except Exception:
+                        pass
+                    # Fallback to app-configured player_names
+                    if not name and hasattr(self, 'app') and hasattr(self.app, 'game_config') and pid is not None:
+                        name = self.app.game_config.get('player_names', {}).get(pid)
+                    if not name:
+                        name = f"Player {pid if pid is not None else '?'}"
+                    if text:
+                        self.message_queue.append(f"{name}: {text}")
                 elif message.get("type") == "player_left":
                     # Host notifies that a player left: close and return home
                     try:
@@ -1048,9 +1097,12 @@ class NetworkManager:
         message = {"type": "chat", "text": text}
         
         if self.is_host:
-            # Add to local message queue and broadcast
-            self.message_queue.append(f"Player 0: {text}")
-            self.broadcast_chat(0, text)
+            # Host: broadcast with actual local player id
+            local_id = getattr(self, 'player_id', None)
+            if local_id is None:
+                # Fallback to 0 if not yet assigned
+                local_id = 0
+            self.broadcast_chat(local_id, text)
         else:
             # Send to server
             try:
@@ -3380,6 +3432,12 @@ class GameScreen(BaseScreen):
         self.scrollbar_thumb_height = 0
         self.scrollbar_max_offset = 0
 
+        # Message input state (for chat)
+        self.message_input_text = ""
+        self.message_input_active = False
+        self.message_input_rect = None
+        self.message_send_rect = None
+
         # Match/series configuration and tracking
         self.series_mode = "oneshot"          # "points" | "hands" | "oneshot"
         self.series_target_points = 21
@@ -4305,6 +4363,33 @@ class GameScreen(BaseScreen):
                     self.scrollbar_dragging = False
                     return
 
+            # Message input interactions (focus, click send)
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                pos = pygame.mouse.get_pos()
+                if self.message_input_rect and self.message_input_rect.collidepoint(pos):
+                    self.message_input_active = True
+                    self.message_focused = True
+                    return
+                if self.message_send_rect and self.message_send_rect.collidepoint(pos):
+                    text_to_send = (self.message_input_text or '').strip()
+                    if text_to_send:
+                        # Send chat via network layer (host or client)
+                        if hasattr(self.app, 'network') and self.app.network:
+                            try:
+                                if self.app.game_config.get('is_host'):
+                                    # Determine local player id and nickname
+                                    local_id = getattr(self, 'local_player_id', 0)
+                                    # Broadcast structured chat; UI will show nickname using mapping
+                                    self.app.network.broadcast_chat(local_id, text_to_send)
+                                else:
+                                    # Client uses network.send_chat
+                                    self.app.network.send_chat(text_to_send)
+                            except Exception:
+                                pass
+                        # Clear input after sending
+                        self.message_input_text = ""
+                    return
+
             if hasattr(pygame, 'MOUSEWHEEL') and event.type == pygame.MOUSEWHEEL:
                 mouse_pos = pygame.mouse.get_pos()
                 if self.message_log_rect.collidepoint(mouse_pos) or self.message_focused:
@@ -4313,6 +4398,32 @@ class GameScreen(BaseScreen):
                     return
 
             if event.type == pygame.KEYDOWN and self.message_focused:
+                # Typing into input when active
+                if self.message_input_active:
+                    if event.key == pygame.K_RETURN:
+                        text_to_send = (self.message_input_text or '').strip()
+                        if text_to_send:
+                            if hasattr(self.app, 'network') and self.app.network:
+                                try:
+                                    if self.app.game_config.get('is_host'):
+                                        local_id = getattr(self, 'local_player_id', 0)
+                                        self.app.network.broadcast_chat(local_id, text_to_send)
+                                    else:
+                                        self.app.network.send_chat(text_to_send)
+                                except Exception:
+                                    pass
+                        self.message_input_text = ""
+                        return
+                    elif event.key == pygame.K_BACKSPACE:
+                        self.message_input_text = self.message_input_text[:-1]
+                        return
+                    else:
+                        # Acceptable printable characters
+                        if event.unicode and 32 <= ord(event.unicode) <= 126:
+                            # Limit the length to avoid excessive payload
+                            if len(self.message_input_text) < 200:
+                                self.message_input_text += event.unicode
+                            return
                 if event.key in (pygame.K_UP, pygame.K_PAGEUP):
                     self.message_scroll_offset = max(0, self.message_scroll_offset - 1)
                     return
@@ -7255,7 +7366,8 @@ class GameScreen(BaseScreen):
             self.message_log_rect.left + 5,
             self.message_log_rect.top + self.message_header_height + 5,
             self.message_log_rect.width - 30,  # Spazio per la scrollbar
-            self.message_log_rect.height - self.message_header_height - 10
+            # Riserva spazio per la barra di input in basso
+            self.message_log_rect.height - self.message_header_height - 10 - max(26, int(self.app.window_height * 0.035)) - 6
         )
         
         # Recupera tutti i messaggi (non limitandoli più a 5)
@@ -7366,6 +7478,53 @@ class GameScreen(BaseScreen):
             self.scroll_down_rect = None
             self.scrollbar_rect = None
             self.scrollbar_thumb_rect = None
+
+        # Draw input area (text field + send button) at the bottom of the message box
+        input_height = max(26, int(self.app.window_height * 0.035))
+        input_padding = 6
+        input_area_rect = pygame.Rect(
+            self.message_log_rect.left + 6,
+            self.message_log_rect.bottom - input_height - input_padding,
+            self.message_log_rect.width - 12,
+            input_height
+        )
+        # Text field occupies most of the width, send button on right
+        send_button_width = max(52, int(input_area_rect.width * 0.18))
+        self.message_input_rect = pygame.Rect(
+            input_area_rect.left,
+            input_area_rect.top,
+            input_area_rect.width - send_button_width - 6,
+            input_area_rect.height
+        )
+        self.message_send_rect = pygame.Rect(
+            self.message_input_rect.right + 6,
+            input_area_rect.top,
+            send_button_width,
+            input_area_rect.height
+        )
+
+        # Field background
+        pygame.draw.rect(surface, (245, 245, 245), self.message_input_rect, border_radius=5)
+        pygame.draw.rect(surface, (160, 160, 160), self.message_input_rect, 1, border_radius=5)
+        # Render placeholder or text
+        input_text = self.message_input_text if self.message_input_text else "Scrivi un messaggio..."
+        color = (0, 0, 0) if self.message_input_text else (120, 120, 120)
+        text_surf = self.small_font.render(input_text, True, color)
+        text_rect = text_surf.get_rect(midleft=(self.message_input_rect.left + 8, self.message_input_rect.centery))
+        # Clip text if too long
+        if text_rect.width > self.message_input_rect.width - 16:
+            # Approximate truncation
+            max_chars = max(1, int(len(input_text) * (self.message_input_rect.width - 16) / text_rect.width) - 3)
+            truncated = (self.message_input_text[:max_chars] + '...') if self.message_input_text else "Scrivi un messaggio..."
+            text_surf = self.small_font.render(truncated, True, color)
+            text_rect = text_surf.get_rect(midleft=(self.message_input_rect.left + 8, self.message_input_rect.centery))
+        surface.blit(text_surf, text_rect)
+
+        # Send button
+        pygame.draw.rect(surface, GOLD, self.message_send_rect, border_radius=5)
+        send_label = self.small_font.render("Invia", True, DARK_BLUE)
+        send_label_rect = send_label.get_rect(center=self.message_send_rect.center)
+        surface.blit(send_label, send_label_rect)
 
         # Draw title last so it can't be hidden by border/scrollbar
         # Add a slight shadow to improve contrast
