@@ -5031,8 +5031,10 @@ class GameScreen(BaseScreen):
         card_width = int(width * 0.078)
         table_center = self.table_rect.center
         
-        # Get current table
-        table_cards = self.env.game_state["table"] if self.env else []
+        # Get current table safely
+        table_cards = []
+        if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+            table_cards = self.env.game_state.get("table", [])
         
         # Create a complete list of cards to determine positions
         all_table_cards = table_cards.copy()
@@ -5229,7 +5231,9 @@ class GameScreen(BaseScreen):
             
         elif area == "table":
             # Table cards are centered and don't change with perspective
-            table_cards = self.env.game_state["table"]
+            table_cards = []
+            if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                table_cards = self.env.game_state.get("table", [])
             
             if not table_cards:
                 return None
@@ -5422,7 +5426,9 @@ class GameScreen(BaseScreen):
             width = self.app.window_width
             card_width = int(width * 0.078)
             card_height = int(card_width * 1.5)
-            table_cards = self.env.game_state["table"] if self.env else []
+            table_cards = []
+            if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                table_cards = self.env.game_state.get("table", [])
             
             # Trova la posizione della prima carta da catturare
             original_table = table_cards.copy()
@@ -5993,7 +5999,9 @@ class GameScreen(BaseScreen):
             # Durante il replay usiamo SEMPRE lo stato del replay, anche se vuoto
             table_cards = self.replay_table_state
         else:
-            table_cards = self.env.game_state["table"]
+            table_cards = []
+            if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                table_cards = self.env.game_state.get("table", [])
             
         # Se lo stato segnala tavolo vuoto ma ci sono animazioni di "play" in corso che dovrebbero
         # aver già portato carte sul tavolo, evita di mostrare "No cards on table" e lascia lo spazio
@@ -6096,8 +6104,11 @@ class GameScreen(BaseScreen):
         if not self.env:
             return
                 
-        gs = self.env.game_state
-        captured = gs["captured_squads"]
+        gs = getattr(self.env, 'game_state', {}) if self.env else {}
+        # Safely read captured squads; fallback to two empty lists if missing
+        captured = gs.get("captured_squads")
+        if not isinstance(captured, (list, tuple)) or len(captured) != 2:
+            captured = [[], []]
         width = self.app.window_width
         height = self.app.window_height
         
