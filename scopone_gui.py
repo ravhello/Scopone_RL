@@ -4594,6 +4594,7 @@ class GameScreen(BaseScreen):
                             self.waiting_for_animation = True
                             self.pending_action = action
                             self.autoplay_sent_for_turn = True
+                            self._last_player_for_autoplay = cp
             except Exception as e:
                 # Non bloccare il gioco in caso di errore nell'auto-play
                 print(f"Auto-play error: {e}")
