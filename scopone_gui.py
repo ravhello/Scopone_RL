@@ -1308,6 +1308,12 @@ class NetworkManager:
     def close(self):
         """Close network connection"""
         self.connected = False
+        # If host, notify clients that room is closing (kick all to home)
+        try:
+            if self.is_host:
+                self.broadcast_room_closed()
+        except Exception:
+            pass
         # Best-effort notify host that this client is leaving (so lobby frees the seat)
         try:
             if not self.is_host and self.socket and self.player_id is not None:
@@ -5165,7 +5171,7 @@ class GameScreen(BaseScreen):
                         
                         # Aggiorna e stampa solo se è passato abbastanza tempo o se il giocatore è cambiato
                         if player_changed or (current_time - self.last_turn_update_time) > 0.5:  # 2 volte al secondo (0.5s)
-                            print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
+                            #print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
                             self.last_turn_update_time = current_time
                         
                         # Aggiorna sempre lo stato interno
