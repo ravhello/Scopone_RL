@@ -664,9 +664,8 @@ class NetworkManager:
                 # Add message to queue
                 self.message_queue.append(f"Player {player_id} connected")
                 
-                # Initialize/refresh lobby state ONLY for lobby-based modes
-                # (all_human or three_humans_one_ai). Do NOT create lobby for humans_plus_ai or team_vs_ai
-                if online_type in ('all_human', 'three_humans_one_ai'):
+                # Initialize/refresh lobby state for all-human mode
+                if not is_team_vs_ai:
                     try:
                         lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
                         players = lobby.setdefault('players', {})
@@ -3397,15 +3396,15 @@ class GameScreen(BaseScreen):
         width = self.app.window_width
         height = self.app.window_height
         
-        button_width = int(width * 0.22)
+        button_width = int(width * 0.2)
         button_height = int(height * 0.06)
         
         self.exit_button = Button(
-            width // 2 - button_width - int(width * 0.01),
-            int(height * 0.1),
+            width // 2 - button_width // 2,
+            height * 0.1,
             button_width,
             button_height,
-            "Return to Home",
+            "Exit Game",
             HIGHLIGHT_RED,
             WHITE,
             font_size=int(height * 0.03)
@@ -4511,52 +4510,11 @@ class GameScreen(BaseScreen):
                         else:
                             self._handle_hand_end(info.get("score_breakdown"))
         
-        # Check for connection loss in online mode (show countdown for both client and host)
-        if (self.app.game_config.get("mode") == "online_multiplayer" and self.app.network):
-            lost = False
-            if not self.app.network.is_host:
-                lost = not self.app.network.connected
-            else:
-                # Host: if any disconnect detected recently, trigger overlay; we piggyback on player_left flow which closes sockets
-                lost = not self.app.network.connected
-            if lost:
-                # If connection was just lost
-                if not self.connection_lost:
-                    self.connection_lost = True
-                    self.reconnect_start_time = time.time()
-                    self.create_exit_button()
-                    self.status_message = "Connection to host lost. Attempting to reconnect..."
-                    self.reconnection_attempts = 0
-                    self.app.resources.play_sound("card_pickup")  # Alert sound
-            
-            # Check if we should attempt reconnection
-            current_time = time.time()
-            elapsed = current_time - self.reconnect_start_time
-            
-            # Try to reconnect every 5 seconds (clients only)
-            if (not self.app.network.is_host) and elapsed > self.reconnection_attempts * 5 and not self.app.network.connection_in_progress:
-                self.reconnection_attempts += 1
-                # Start async reconnection attempt
-                self.app.network.connection_in_progress = True
-                self.app.network.connection_start_time = time.time()
-                threading.Thread(target=self.app.network._connect_async, daemon=True).start()
-            
-            # If reconnection successful
-            if (not self.app.network.is_host) and self.app.network.connected:
-                self.connection_lost = False
-                self.status_message = "Reconnected to host!"
-                self.exit_button = None
-                # Request fresh game state
-                if self.app.network.is_host:
-                    self.app.network.broadcast_game_state()
-            
-            # If timeout reached (1 minute)
-            elif elapsed > self.max_reconnection_time:
-                self.status_message = "Connection timeout. Returning to main menu..."
-                # Exit after a short delay
-                pygame.time.delay(2000)
-                self.done = True
-                self.next_screen = "mode"
+        # Immediate exit to home if connection lost (no reconnection flow)
+        if (self.app.game_config.get("mode") == "online_multiplayer" and 
+                self.app.network and not self.app.network.connected):
+            self.done = True
+            self.next_screen = "mode"
         
         # Continue with regular updates if connection is fine
         if not self.connection_lost:
@@ -5205,7 +5163,7 @@ class GameScreen(BaseScreen):
                         
                         # Aggiorna e stampa solo se è passato abbastanza tempo o se il giocatore è cambiato
                         if player_changed or (current_time - self.last_turn_update_time) > 0.5:  # 2 volte al secondo (0.5s)
-                            #print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
+                            print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
                             self.last_turn_update_time = current_time
                         
                         # Aggiorna sempre lo stato interno
@@ -5978,6 +5936,10 @@ class GameScreen(BaseScreen):
             overlay.fill((0, 0, 0, 100))  # Semi-transparent black
             surface.blit(overlay, (0, 0))
             
+            # Draw exit button
+            if self.exit_button:
+                self.exit_button.draw(surface)
+            
             # Draw reconnection status
             elapsed = time.time() - self.reconnect_start_time
             remaining = max(0, self.max_reconnection_time - elapsed)
@@ -5985,35 +5947,14 @@ class GameScreen(BaseScreen):
             # Create animated dots
             dots = "." * ((pygame.time.get_ticks() // 500) % 4)
             
-            # Draw header and messages
-            header = self.title_font.render("Connection lost", True, GOLD)
-            header_rect = header.get_rect(
-                midtop=(self.app.window_width // 2, int(self.app.window_height * 0.06))
-            )
-            surface.blit(header, header_rect)
-            
-            reconnect_text = f"Attempting to reconnect{dots}"
-            text_surf = self.info_font.render(reconnect_text, True, WHITE)
+            # Draw reconnection message
+            reconnect_text = f"Attempting to reconnect{dots} ({int(remaining)}s remaining)"
+            text_surf = self.info_font.render(reconnect_text, True, HIGHLIGHT_RED)
             text_rect = text_surf.get_rect(
-                midtop=(self.app.window_width // 2, header_rect.bottom + int(self.app.window_height * 0.01))
+                midbottom=(self.app.window_width // 2, 
+                        self.exit_button.rect.top - 10 if self.exit_button else self.app.window_height * 0.15)
             )
             surface.blit(text_surf, text_rect)
-            
-            # Countdown badge
-            badge_text = f"Time left: {int(remaining)}s"
-            badge_surf = self.info_font.render(badge_text, True, WHITE)
-            pad_x = 10
-            pad_y = 6
-            badge_rect = badge_surf.get_rect()
-            badge_bg = pygame.Rect(0, 0, badge_rect.width + 2*pad_x, badge_rect.height + 2*pad_y)
-            badge_bg.midtop = (self.app.window_width // 2, text_rect.bottom + int(self.app.window_height * 0.008))
-            pygame.draw.rect(surface, (40,40,90), badge_bg, border_radius=10)
-            pygame.draw.rect(surface, LIGHT_BLUE, badge_bg, 2, border_radius=10)
-            surface.blit(badge_surf, badge_surf.get_rect(center=badge_bg.center))
-            
-            # Draw return-to-home button on the right
-            if self.exit_button:
-                self.exit_button.draw(surface)
         
         # Continue with regular drawing
         # Draw table
