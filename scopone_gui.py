@@ -5773,6 +5773,16 @@ class GameScreen(BaseScreen):
                 card_x = start_x + leftmost_card_index * card_spacing
                 # Sovrapponi solo per il 50% della larghezza della carta (metà carta)
                 end_pos = (card_x - card_width * 0.25, table_y + card_height / 2)
+
+            # CRITICO: Mantieni visibili le carte da catturare finché non parte la loro animazione di cattura
+            # Aggiungendole a cards_in_motion, draw_table_cards le disegnerà comunque finché non parte l'animazione
+            try:
+                if not hasattr(self, 'cards_in_motion'):
+                    self.cards_in_motion = set()
+                for c in cards_captured:
+                    self.cards_in_motion.discard(c)  # Assicurati che non siano marcate come già in movimento
+            except Exception:
+                pass
             
             #print(f"Posizione finale della carta giocata: {end_pos}")
         
@@ -6358,27 +6368,13 @@ class GameScreen(BaseScreen):
         y = self.table_rect.centery - card_height // 2
         
         for i, card in enumerate(table_cards):
-            # NUOVO: Salta la carta solo se è effettivamente in animazione attiva.
-            # Se la carta è nel set ma non ha un'animazione in corso (set stantio), disegna comunque e ripulisci.
-            in_motion_flag = card in self.cards_in_motion or (self.replay_active and card in self.replay_cards_in_motion)
-            if in_motion_flag:
-                # Se è in motion, evita di disegnarla se esiste un'animazione attiva (normale o replay)
-                has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.animations)
-                if self.replay_active and not has_active_anim:
-                    has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.replay_animations)
-                if has_active_anim:
-                    continue
-                # Ripulisci flag stantio se nessuna animazione è attiva per questa carta
-                if card in self.cards_in_motion:
-                    try:
-                        self.cards_in_motion.remove(card)
-                    except KeyError:
-                        pass
-                if self.replay_active and card in getattr(self, 'replay_cards_in_motion', set()):
-                    try:
-                        self.replay_cards_in_motion.remove(card)
-                    except KeyError:
-                        pass
+            # Disegna SEMPRE le carte sul tavolo anche se stanno per essere catturate.
+            # Se la carta ha un'animazione ATTIVA (normale o replay), lascia che sia l'animazione a disegnarla e non duplicare (skip solo in quel caso).
+            has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.animations)
+            if self.replay_active and not has_active_anim:
+                has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.replay_animations)
+            if has_active_anim:
+                continue
                 
             x = start_x + i * card_spacing
             
