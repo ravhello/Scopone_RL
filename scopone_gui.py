@@ -725,6 +725,22 @@ class NetworkManager:
                 elif message["type"] == "chat":
                     # Add chat message to queue
                     self.message_queue.append(f"Player {player_id}: {message['text']}")
+                elif message.get("type") == "client_leaving" and self.is_host:
+                    # Client informs host they are leaving: free their seat and remove player entry
+                    try:
+                        leaving_id = int(message.get('player_id', player_id))
+                    except Exception:
+                        leaving_id = player_id
+                    lobby = self.game_state.get('lobby_state', {}) if isinstance(self.game_state, dict) else {}
+                    if isinstance(lobby, dict):
+                        players = lobby.setdefault('players', {})
+                        seats = lobby.setdefault('seats', {})
+                        # Free any seat occupied by this player
+                        for seat, pid in list(seats.items()):
+                            if pid == leaving_id:
+                                seats.pop(seat, None)
+                        players.pop(leaving_id, None)
+                        self.broadcast_lobby_state()
                 elif message["type"] == "lobby_update" and self.is_host:
                     # Update lobby state with client's nickname/ready/team changes
                     lobby = self.game_state.setdefault('lobby_state', {'players': {}})
@@ -789,6 +805,23 @@ class NetworkManager:
         # Client disconnected
         print(f"Player {player_id} disconnected")
         self.message_queue.append(f"Player {player_id} disconnected")
+        # Remove player from lobby seats/players and broadcast the update so seats become free
+        try:
+            if hasattr(self, 'game_state') and isinstance(self.game_state, dict):
+                lobby = self.game_state.get('lobby_state')
+                if isinstance(lobby, dict):
+                    players = lobby.setdefault('players', {})
+                    seats = lobby.setdefault('seats', {})
+                    # Remove seat mapping that points to this player
+                    seats_to_remove = [seat for seat, pid in list(seats.items()) if pid == player_id]
+                    for seat in seats_to_remove:
+                        seats.pop(seat, None)
+                    # Remove player entry
+                    players.pop(player_id, None)
+                    # Broadcast lobby update so remaining clients see freed seat
+                    self.broadcast_lobby_state()
+        except Exception as _e:
+            pass
     
     def receive_updates(self):
         """Receive game state updates from server (for clients) with improved buffer handling"""
@@ -1105,7 +1138,14 @@ class NetworkManager:
     def close(self):
         """Close network connection"""
         self.connected = False
-        
+        # Best-effort notify host that this client is leaving (so lobby frees the seat)
+        try:
+            if not self.is_host and self.socket and self.player_id is not None:
+                payload = {"type": "client_leaving", "player_id": self.player_id}
+                self.socket.sendall(pickle.dumps(payload))
+        except Exception:
+            pass
+
         if self.socket:
             try:
                 self.socket.close()
@@ -2565,15 +2605,42 @@ class LobbyScreen(BaseScreen):
                 if hasattr(self, 'copy_buttons'):
                     for btn_rect, value in self.copy_buttons:
                         if btn_rect.collidepoint(pos):
+                            text_to_copy = str(value)
+                            copied = False
+                            # Preferred: tkinter clipboard (works across OS)
                             try:
-                                text_to_copy = str(value)
-                                if hasattr(pygame, 'scrap'):
-                                    pygame.scrap.put(pygame.SCRAP_TEXT, text_to_copy.encode('utf-8'))
-                                # Fallback: try Windows clipboard via os if needed
+                                import tkinter as _tk
+                                _r = _tk.Tk()
+                                _r.withdraw()
+                                _r.clipboard_clear()
+                                _r.clipboard_append(text_to_copy)
+                                _r.update()  # now it stays on the clipboard after the window is closed
+                                _r.destroy()
+                                copied = True
                             except Exception:
                                 pass
-                            # Brief UI feedback
-                            self.status_message = f"Copiato: {text_to_copy}"
+                            # Pygame scrap fallback
+                            if not copied:
+                                try:
+                                    if hasattr(pygame, 'scrap'):
+                                        try:
+                                            pygame.scrap.init()
+                                        except Exception:
+                                            pass
+                                        pygame.scrap.put(pygame.SCRAP_TEXT, text_to_copy.encode('utf-8'))
+                                        copied = True
+                                except Exception:
+                                    pass
+                            # Windows fallback via subprocess (PowerShell)
+                            if not copied and sys.platform.startswith('win'):
+                                try:
+                                    import subprocess
+                                    subprocess.run(['powershell', '-command', f"Set-Clipboard -Value '{text_to_copy}'"], check=True)
+                                    copied = True
+                                except Exception:
+                                    pass
+                            # Final feedback
+                            self.status_message = f"Copiato: {text_to_copy}" if copied else "Copia negli appunti non riuscita"
                             return
                 # Handle seat swap clicks (left/right arrows)
                 if hasattr(self, 'seat_controls') and self.app.network:
@@ -6535,15 +6602,16 @@ class GameScreen(BaseScreen):
         if not getattr(self, 'env', None) or not getattr(self, 'players', None):
             return
 
-        # Anchor to player 0 avatar
+        # Anchor to the local player's avatar (always bottom-center for the user)
         try:
-            player0 = next(p for p in self.players if p.player_id == 0)
+            local_pid = self.local_player_id if self.local_player_id is not None else 0
+            player_local = next(p for p in self.players if p.player_id == local_pid)
         except StopIteration:
             return
 
         width = self.app.window_width
         height = self.app.window_height
-        anchor = player0.avatar_rect
+        anchor = player_local.avatar_rect
 
         panel_w = int(width * 0.16)
         panel_h = int(height * 0.08)
