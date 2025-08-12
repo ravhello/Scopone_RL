@@ -710,120 +710,120 @@ class NetworkManager:
                 break
     
     def handle_client(self, client_socket, player_id):
-        """Handle communication with a specific client"""
+        """Handle communication with a specific client with buffered multi-message parsing"""
+        import io
+        buffer = bytearray()
         while self.connected:
             try:
-                # Receive data
-                data = client_socket.recv(4096)
-                if not data:
+                chunk = client_socket.recv(4096)
+                if not chunk:
                     break
-                    
-                message = pickle.loads(data)
-                
-                # Process different message types
-                if message["type"] == "move":
-                    # Add move to queue for processing
-                    self.move_queue.append((player_id, message["move"]))
-                elif message["type"] == "chat":
-                    # Broadcast chat to all clients and append locally with nickname
+                buffer.extend(chunk)
+
+                # Try to decode as many messages as are fully available in buffer
+                while True:
                     try:
-                        text = str(message.get('text', ''))
+                        bio = io.BytesIO(buffer)
+                        message = pickle.Unpickler(bio).load()
+                        consumed = bio.tell()
                     except Exception:
-                        text = ''
-                    # Determine display name from lobby or stored names
-                    name = None
-                    try:
+                        # Incomplete or invalid message so far; wait for more data
+                        break
+
+                    # Remove the processed message bytes
+                    if consumed > 0:
+                        buffer = buffer[consumed:]
+
+                    # Process different message types
+                    if message.get("type") == "move":
+                        self.move_queue.append((player_id, message.get("move")))
+                    elif message.get("type") == "chat":
+                        try:
+                            text = str(message.get('text', ''))
+                        except Exception:
+                            text = ''
+                        name = None
+                        try:
+                            lobby = self.game_state.get('lobby_state', {}) if isinstance(self.game_state, dict) else {}
+                            if isinstance(lobby, dict):
+                                players = lobby.get('players', {})
+                                if isinstance(players, dict):
+                                    pdata = players.get(player_id, {})
+                                    if isinstance(pdata, dict):
+                                        name = pdata.get('name')
+                        except Exception:
+                            pass
+                        if not name and hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                            name = self.app.game_config.get('player_names', {}).get(player_id)
+                        if not name:
+                            name = f"Player {player_id}"
+                        if text:
+                            self.message_queue.append(f"{name}: {text}")
+                            self.broadcast_chat(player_id, text)
+                    elif message.get("type") == "client_leaving" and self.is_host:
+                        try:
+                            leaving_id = int(message.get('player_id', player_id))
+                        except Exception:
+                            leaving_id = player_id
                         lobby = self.game_state.get('lobby_state', {}) if isinstance(self.game_state, dict) else {}
                         if isinstance(lobby, dict):
-                            players = lobby.get('players', {})
-                            if isinstance(players, dict):
-                                pdata = players.get(player_id, {})
-                                if isinstance(pdata, dict):
-                                    name = pdata.get('name')
-                    except Exception:
-                        pass
-                    if not name and hasattr(self, 'app') and hasattr(self.app, 'game_config'):
-                        name = self.app.game_config.get('player_names', {}).get(player_id)
-                    if not name:
-                        name = f"Player {player_id}"
-                    # Append locally
-                    if text:
-                        self.message_queue.append(f"{name}: {text}")
-                        # Forward to all clients
-                        self.broadcast_chat(player_id, text)
-                elif message.get("type") == "client_leaving" and self.is_host:
-                    # Client informs host they are leaving: free their seat and remove player entry
-                    try:
-                        leaving_id = int(message.get('player_id', player_id))
-                    except Exception:
-                        leaving_id = player_id
-                    lobby = self.game_state.get('lobby_state', {}) if isinstance(self.game_state, dict) else {}
-                    if isinstance(lobby, dict):
-                        players = lobby.setdefault('players', {})
-                        seats = lobby.setdefault('seats', {})
-                        # Free any seat occupied by this player
-                        for seat, pid in list(seats.items()):
-                            if pid == leaving_id:
-                                seats.pop(seat, None)
-                        players.pop(leaving_id, None)
+                            players = lobby.setdefault('players', {})
+                            seats = lobby.setdefault('seats', {})
+                            for seat, pid in list(seats.items()):
+                                if pid == leaving_id:
+                                    seats.pop(seat, None)
+                            players.pop(leaving_id, None)
+                            self.broadcast_lobby_state()
+                    elif message.get("type") == "lobby_update" and self.is_host:
+                        lobby = self.game_state.setdefault('lobby_state', {'players': {}})
+                        pdata = lobby.setdefault('players', {}).setdefault(player_id, {})
+                        if 'name' in message:
+                            pdata['name'] = str(message['name'])[:20]
+                        if 'ready' in message:
+                            pdata['ready'] = bool(message['ready'])
+                        pdata['team'] = 0 if player_id in [0, 2] else 1
                         self.broadcast_lobby_state()
-                elif message["type"] == "lobby_update" and self.is_host:
-                    # Update lobby state with client's nickname/ready/team changes
-                    lobby = self.game_state.setdefault('lobby_state', {'players': {}})
-                    pdata = lobby.setdefault('players', {}).setdefault(player_id, {})
-                    # Allowed fields: name, ready; team is fixed by seat (0&2 vs 1&3)
-                    if 'name' in message:
-                        pdata['name'] = str(message['name'])[:20]
-                    if 'ready' in message:
-                        pdata['ready'] = bool(message['ready'])
-                    # Ensure team based on seat
-                    pdata['team'] = 0 if player_id in [0, 2] else 1
-                    # Broadcast updated lobby to all
-                    self.broadcast_lobby_state()
-                elif message.get("type") == "lobby_swap_request" and self.is_host:
-                    # Client requests to swap occupants between specific seats
-                    try:
-                        source_seat = int(message.get('source_seat'))
-                        target_seat = int(message.get('target_seat'))
-                    except Exception:
-                        source_seat = None
-                        target_seat = None
-                    lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
-                    seats = lobby.setdefault('seats', {})
-                    online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
-                    ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
-                    if target_seat is not None and source_seat is not None and target_seat in [0,1,2,3] and source_seat in [0,1,2,3] and target_seat != source_seat:
-                        # Move AI seat if requested in 3v1 (dragging AI seat itself)
-                        if online_type == 'three_humans_one_ai' and ai_seat == source_seat:
-                            prev_ai = ai_seat
-                            lobby['ai_seat'] = target_seat
-                            other_pid = seats.get(target_seat, None)
-                            if other_pid is None:
-                                seats.pop(prev_ai, None)
-                            else:
-                                seats[prev_ai] = other_pid
-                            seats.pop(target_seat, None)
-                        else:
-                            occ = seats.get(source_seat, None)
-                            if occ is None:
-                                return
-                            # Special case: target is AI seat in 3v1 → swap AI seat with this human
-                            if online_type == 'three_humans_one_ai' and target_seat == ai_seat:
+                    elif message.get("type") == "lobby_swap_request" and self.is_host:
+                        try:
+                            source_seat = int(message.get('source_seat'))
+                            target_seat = int(message.get('target_seat'))
+                        except Exception:
+                            source_seat = None
+                            target_seat = None
+                        lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
+                        seats = lobby.setdefault('seats', {})
+                        online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
+                        ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
+                        if target_seat is not None and source_seat is not None and target_seat in [0,1,2,3] and source_seat in [0,1,2,3] and target_seat != source_seat:
+                            if online_type == 'three_humans_one_ai' and ai_seat == source_seat:
                                 prev_ai = ai_seat
-                                lobby['ai_seat'] = source_seat
-                                # Move human to target (AI seat)
-                                seats[target_seat] = occ
-                                # Origin becomes AI seat (no human occupant mapping)
-                                seats.pop(source_seat, None)
-                            else:
+                                lobby['ai_seat'] = target_seat
                                 other_pid = seats.get(target_seat, None)
-                                seats[target_seat] = occ
                                 if other_pid is None:
+                                    seats.pop(prev_ai, None)
+                                else:
+                                    seats[prev_ai] = other_pid
+                                seats.pop(target_seat, None)
+                            else:
+                                occ = seats.get(source_seat, None)
+                                if occ is None:
+                                    continue
+                                if online_type == 'three_humans_one_ai' and target_seat == ai_seat:
+                                    prev_ai = ai_seat
+                                    lobby['ai_seat'] = source_seat
+                                    seats[target_seat] = occ
                                     seats.pop(source_seat, None)
                                 else:
-                                    seats[source_seat] = other_pid
-                        self.broadcast_lobby_state()
-                
+                                    other_pid = seats.get(target_seat, None)
+                                    seats[target_seat] = occ
+                                    if other_pid is None:
+                                        seats.pop(source_seat, None)
+                                    else:
+                                        seats[source_seat] = other_pid
+                            self.broadcast_lobby_state()
+
+                    # Continue loop to attempt parsing next message from buffer
+
             except Exception as e:
                 print(f"Error handling client {player_id}: {e}")
                 break
@@ -877,203 +877,173 @@ class NetworkManager:
             pass
     
     def receive_updates(self):
-        """Receive game state updates from server (for clients) with improved buffer handling"""
-        buffer_size = 16384  # Aumentato da 8192 a 16KB per gestire stati di gioco più grandi
-        
+        """Receive game state updates from server (for clients) with buffered multi-message parsing"""
+        import io
+        buffer = bytearray()
+        buffer_size = 16384
         while self.connected:
             try:
-                # Utilizziamo un approccio di accumulo per gestire messaggi di grandi dimensioni
-                data = bytearray()
-                
-                # Leggi i dati in più chunk se necessario
+                chunk = self.socket.recv(buffer_size)
+                if not chunk:
+                    raise ConnectionError("Connection closed by server")
+                buffer.extend(chunk)
+
+                # Extract as many messages as possible from buffer
                 while True:
-                    chunk = self.socket.recv(buffer_size)
-                    if not chunk:  # Connessione chiusa
-                        if not data:  # Nessun dato ricevuto
-                            raise ConnectionError("Connection closed by server")
+                    try:
+                        bio = io.BytesIO(buffer)
+                        message = pickle.Unpickler(bio).load()
+                        consumed = bio.tell()
+                    except Exception:
+                        # Incomplete data for one full message; wait for more
                         break
-                    
-                    data.extend(chunk)
-                    
-                    # Proviamo a vedere se abbiamo ricevuto il messaggio completo
-                    try:
-                        # Tenta di decodificare, se ha successo abbiamo il messaggio completo
-                        pickle.loads(data)
-                        break  # Messaggio completo ricevuto
-                    except (pickle.UnpicklingError, EOFError):
-                        # Dati incompleti, continua a leggere
-                        continue
-                
-                # Ora dovremmo avere un messaggio completo
-                try:
-                    message = pickle.loads(data)
-                except Exception as e:
-                    print(f"Errore nella deserializzazione del messaggio: {e}")
-                    print(f"Ricevuti {len(data)} bytes, possibilmente dati corrotti")
-                    continue  # Salta questo messaggio e continua
-                
-                # Process different message types
-                if message["type"] == "player_id":
-                    self.player_id = message["id"]
-                    print(f"Assigned player ID: {self.player_id}")
-                elif message["type"] == "game_state":
-                    self.game_state = message["state"]
-                elif message.get("type") == "kicked":
-                    # Kicked by host: disconnect and mark reason
-                    try:
-                        self.connected = False
-                        kick_reason = message.get('reason')
-                        if self.socket:
-                            try:
-                                self.socket.close()
-                            except Exception:
-                                pass
-                        self.socket = None
-                        if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
-                            self.app.game_config['kicked_by_host'] = True
-                            if kick_reason:
-                                self.app.game_config['kicked_reason'] = str(kick_reason)
-                            # Also stash a minimal game_state to trigger transition logic
-                            try:
-                                if not isinstance(self.game_state, dict):
-                                    self.game_state = {}
-                                # Clear any lobby state to avoid lingering lobby UI
-                                self.game_state.pop('lobby_state', None)
-                            except Exception:
-                                pass
-                        # Request forced transition to home
+
+                    # Trim the processed bytes
+                    if consumed > 0:
+                        buffer = buffer[consumed:]
+
+                    # Process message
+                    if message.get("type") == "player_id":
+                        self.player_id = message.get("id")
+                        print(f"Assigned player ID: {self.player_id}")
+                    elif message.get("type") == "game_state":
+                        self.game_state = message.get("state")
+                    elif message.get("type") == "kicked":
                         try:
-                            import builtins
-                            if hasattr(builtins, 'app'):
-                                builtins.app._force_screen = 'mode'
-                                builtins.app._force_cleanup_network = True
-                                builtins.app._flash_message = kick_reason or "Sei stato rimosso dall'host"
+                            self.connected = False
+                            kick_reason = message.get('reason')
+                            if self.socket:
+                                try:
+                                    self.socket.close()
+                                except Exception:
+                                    pass
+                            self.socket = None
+                            if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                                self.app.game_config['kicked_by_host'] = True
+                                if kick_reason:
+                                    self.app.game_config['kicked_reason'] = str(kick_reason)
+                                try:
+                                    if not isinstance(self.game_state, dict):
+                                        self.game_state = {}
+                                    self.game_state.pop('lobby_state', None)
+                                except Exception:
+                                    pass
+                            try:
+                                import builtins
+                                if hasattr(builtins, 'app'):
+                                    builtins.app._force_screen = 'mode'
+                                    builtins.app._force_cleanup_network = True
+                                    builtins.app._flash_message = kick_reason or "Sei stato rimosso dall'host"
+                            except Exception:
+                                pass
                         except Exception:
                             pass
-                    except Exception:
-                        pass
-                elif message["type"] == "rules":
-                    # Ricezione regole dall'host
-                    if isinstance(message.get("rules"), dict):
-                        if hasattr(self, 'game_state') and self.game_state is None:
-                            self.game_state = {}
-                        # Salva su app.game_config per uso UI
-                        if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
-                            self.app.game_config.setdefault("rules", {})
-                            self.app.game_config["rules"].update(message["rules"])
-                        # Messaggio a schermo
-                        self.message_queue.append("Regole partita sincronizzate dall'host")
-                elif message["type"] == "lobby_state":
-                    # Sync lobby state from host
-                    if not isinstance(self.game_state, dict):
-                        self.game_state = {}
-                    self.game_state['lobby_state'] = message.get('state', {})
-                    # Also store/refresh online_type when provided by host
-                    if 'online_type' in message:
-                        self.game_state['online_type'] = message.get('online_type')
-                    self.message_queue.append("Lobby aggiornata dall'host")
-                elif message.get("type") == "room_closed":
-                    # Host closed the room: disconnect and return to mode screen
-                    try:
-                        self.connected = False
-                        if self.socket:
-                            try:
-                                self.socket.close()
-                            except Exception:
-                                pass
-                        self.socket = None
-                        # Stash a flag in app to switch screen on next update
-                        if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
-                            self.app.game_config['room_closed_by_host'] = True
-                        # Request forced transition to home
-                        try:
-                            import builtins
-                            if hasattr(builtins, 'app'):
-                                builtins.app._force_screen = 'mode'
-                                builtins.app._force_cleanup_network = True
-                                builtins.app._flash_message = "La partita è stata annullata dall'host"
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                elif message["type"] == "start_game":
-                    # Mark start flag so UI can transition to game reliably
-                    if not isinstance(self.game_state, dict):
-                        self.game_state = {}
-                    self.game_state['start_game'] = True
-                    self.message_queue.append("Game starting!")
-                elif message["type"] == "player_names":
-                    # Store player names into app config for GameScreen to use
-                    try:
-                        if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
-                            self.app.game_config['player_names'] = message.get('names', {})
-                            self.message_queue.append("Nicknames sincronizzati")
-                    except Exception:
-                        pass
-                elif message["type"] == "series_state":
-                    # Update series and overlay state from host (store in network.game_state)
-                    state = message.get('state', {})
-                    # Save series state payload into network.game_state for GameScreen to consume
-                    try:
+                    elif message.get("type") == "rules":
+                        if isinstance(message.get("rules"), dict):
+                            if hasattr(self, 'game_state') and self.game_state is None:
+                                self.game_state = {}
+                            if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                                self.app.game_config.setdefault("rules", {})
+                                self.app.game_config["rules"].update(message["rules"])
+                            self.message_queue.append("Regole partita sincronizzate dall'host")
+                    elif message.get("type") == "lobby_state":
                         if not isinstance(self.game_state, dict):
                             self.game_state = {}
-                        self.game_state['series_state'] = state
-                        self.message_queue.append("Serie sincronizzata dall'host")
-                    except Exception:
-                        pass
-                elif message["type"] == "chat":
-                    # Show incoming chat with nickname
-                    try:
-                        pid = int(message.get('player_id')) if 'player_id' in message else None
-                    except Exception:
-                        pid = None
-                    text = str(message.get('text', ''))
-                    name = None
-                    # Try lobby names first
-                    try:
-                        if isinstance(self.game_state, dict):
-                            lobby = self.game_state.get('lobby_state', {})
-                            if isinstance(lobby, dict):
-                                players = lobby.get('players', {})
-                                if isinstance(players, dict) and pid is not None:
-                                    pdata = players.get(pid, {})
-                                    if isinstance(pdata, dict):
-                                        name = pdata.get('name')
-                    except Exception:
-                        pass
-                    # Fallback to app-configured player_names
-                    if not name and hasattr(self, 'app') and hasattr(self.app, 'game_config') and pid is not None:
-                        name = self.app.game_config.get('player_names', {}).get(pid)
-                    if not name:
-                        name = f"Player {pid if pid is not None else '?'}"
-                    if text:
-                        self.message_queue.append(f"{name}: {text}")
-                elif message.get("type") == "player_left":
-                    # Host notifies that a player left: close and return home
-                    try:
-                        self.connected = False
-                        if self.socket:
+                        self.game_state['lobby_state'] = message.get('state', {})
+                        if 'online_type' in message:
+                            self.game_state['online_type'] = message.get('online_type')
+                        self.message_queue.append("Lobby aggiornata dall'host")
+                    elif message.get("type") == "room_closed":
+                        try:
+                            self.connected = False
+                            if self.socket:
+                                try:
+                                    self.socket.close()
+                                except Exception:
+                                    pass
+                            self.socket = None
+                            if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                                self.app.game_config['room_closed_by_host'] = True
                             try:
-                                self.socket.close()
+                                import builtins
+                                if hasattr(builtins, 'app'):
+                                    builtins.app._force_screen = 'mode'
+                                    builtins.app._force_cleanup_network = True
+                                    builtins.app._flash_message = "La partita è stata annullata dall'host"
                             except Exception:
                                 pass
-                        self.socket = None
-                        if hasattr(self, 'app'):
-                            # Force transition to home
-                            import builtins
-                            builtins.app._force_screen = 'mode'
-                            builtins.app._force_cleanup_network = True
-                            builtins.app._flash_message = "Un giocatore ha lasciato: partita annullata"
-                    except Exception:
-                        pass
-                
+                        except Exception:
+                            pass
+                    elif message.get("type") == "start_game":
+                        if not isinstance(self.game_state, dict):
+                            self.game_state = {}
+                        self.game_state['start_game'] = True
+                        self.message_queue.append("Game starting!")
+                    elif message.get("type") == "player_names":
+                        try:
+                            if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                                self.app.game_config['player_names'] = message.get('names', {})
+                                self.message_queue.append("Nicknames sincronizzati")
+                        except Exception:
+                            pass
+                    elif message.get("type") == "series_state":
+                        state = message.get('state', {})
+                        try:
+                            if not isinstance(self.game_state, dict):
+                                self.game_state = {}
+                            self.game_state['series_state'] = state
+                            self.message_queue.append("Serie sincronizzata dall'host")
+                        except Exception:
+                            pass
+                    elif message.get("type") == "chat":
+                        try:
+                            pid = int(message.get('player_id')) if 'player_id' in message else None
+                        except Exception:
+                            pid = None
+                        text = str(message.get('text', ''))
+                        name = None
+                        try:
+                            if isinstance(self.game_state, dict):
+                                lobby = self.game_state.get('lobby_state', {})
+                                if isinstance(lobby, dict):
+                                    players = lobby.get('players', {})
+                                    if isinstance(players, dict) and pid is not None:
+                                        pdata = players.get(pid, {})
+                                        if isinstance(pdata, dict):
+                                            name = pdata.get('name')
+                        except Exception:
+                            pass
+                        if not name and hasattr(self, 'app') and hasattr(self.app, 'game_config') and pid is not None:
+                            name = self.app.game_config.get('player_names', {}).get(pid)
+                        if not name:
+                            name = f"Player {pid if pid is not None else '?'}"
+                        if text:
+                            self.message_queue.append(f"{name}: {text}")
+                    elif message.get("type") == "player_left":
+                        try:
+                            self.connected = False
+                            if self.socket:
+                                try:
+                                    self.socket.close()
+                                except Exception:
+                                    pass
+                            self.socket = None
+                            if hasattr(self, 'app'):
+                                import builtins
+                                builtins.app._force_screen = 'mode'
+                                builtins.app._force_cleanup_network = True
+                                builtins.app._flash_message = "Un giocatore ha lasciato: partita annullata"
+                        except Exception:
+                            pass
+
+                    # Continue loop to parse possible subsequent messages
+
             except socket.timeout:
-                # Timeout è normale, continua il ciclo
                 continue
             except Exception as e:
                 print(f"Error receiving updates: {e}")
                 break
-        
+
         self.connected = False
         self.message_queue.append("Disconnected from server")
     
