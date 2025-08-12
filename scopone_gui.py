@@ -4565,7 +4565,7 @@ class GameScreen(BaseScreen):
                 start_pos=end_pos,     # Stessa posizione di fine della prima animazione
                 end_pos=end_pos,       # Stessa posizione (non si muove)
                 duration=plateau_duration,
-                delay=hand_to_table_duration,  # Inizia subito dopo la prima animazione
+                delay=hand_to_table_duration + 1,  # Avvia un frame dopo la fine della play per evitare doppio disegno
                 scale_start=1.0,
                 scale_end=1.0,
                 rotation_start=0,
@@ -4577,7 +4577,7 @@ class GameScreen(BaseScreen):
             
             # FASE 3: Animazioni dal tavolo al mazzetto
             # Il tempo totale trascorso finora è hand_to_table_duration + plateau_duration
-            total_time = hand_to_table_duration + plateau_duration
+            total_time = hand_to_table_duration + 1 + plateau_duration
             
             # Creiamo una lista di tutte le carte coinvolte nella cattura, inclusa la carta catturante
             all_capture_cards = [card_played] + list(cards_captured)
@@ -4620,7 +4620,7 @@ class GameScreen(BaseScreen):
                     start_pos=starting_positions[card],  # Stessa posizione di partenza
                     end_pos=starting_positions[card],    # Stessa posizione (non si muove)
                     duration=1,                          # Dura solo 1 frame
-                    delay=card_delay,                    # Stesso delay dell'animazione di cattura
+                    delay=card_delay + 1,                # Un frame dopo l'inizio della capture per evitare overlap
                     scale_start=1.0,
                     scale_end=1.0,
                     rotation_start=0,
@@ -4635,7 +4635,7 @@ class GameScreen(BaseScreen):
                     start_pos=starting_positions[card],
                     end_pos=varied_end_pos,
                     duration=capture_duration,
-                    delay=card_delay,  # Usa il delay calcolato
+                    delay=card_delay + 1,  # Inizia un frame dopo il motion_start per non avere frame doppi
                     scale_start=1.0,
                     scale_end=0.8,
                     rotation_start=0,
