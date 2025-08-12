@@ -3342,7 +3342,8 @@ class GameScreen(BaseScreen):
         self.env = None
         self.players = []
         self.current_player_id = 0
-        self.local_player_id = 0
+        # IMPORTANT: delay assigning local player id until known from server
+        self.local_player_id = None
         self.selected_hand_card = None
         self.selected_table_cards = set()
         self.animations = []
@@ -3593,7 +3594,8 @@ class GameScreen(BaseScreen):
         
         # Set up player ID (for online games)
         if mode == "online_multiplayer":
-            self.local_player_id = config.get("player_id", 0)
+            # Do not default to 0; wait for real id from server to avoid wrong perspective
+            self.local_player_id = config.get("player_id", None)
 
         # Prepara struttura serie per host
         if is_online and is_host:
@@ -3861,7 +3863,9 @@ class GameScreen(BaseScreen):
         
         # Configura la prospettiva visuale per il multiplayer online
         if mode == "online_multiplayer":
-            self.setup_player_perspective()
+            # Only compute mapping after local_player_id is known
+            if self.local_player_id is not None:
+                self.setup_player_perspective()
         
         # Debug: stampa informazioni sui giocatori
         for player in self.players:
@@ -4738,7 +4742,8 @@ class GameScreen(BaseScreen):
                         if old_player_id != self.local_player_id:
                             # Riaggiorna player info, prospettiva e layout
                             self.setup_players()
-                            self.setup_player_perspective()
+                            if self.local_player_id is not None:
+                                self.setup_player_perspective()
                             self.setup_layout()
             
             # Auto-play when a player has exactly one card left, unless multiple capture choices exist (humans only)
@@ -5342,10 +5347,16 @@ class GameScreen(BaseScreen):
                 # Prima applicazione: sincronizzazione iniziale senza animazioni/diff
                 if not hasattr(self, 'has_received_initial_state') or not self.has_received_initial_state:
                     if self.env and isinstance(new_state, dict):
+                        # Non mostrare carte finché non sappiamo il player_id locale
+                        if self.local_player_id is None and hasattr(self.app, 'network'):
+                            self.local_player_id = self.app.network.player_id
                         self.env.game_state = new_state
                         if new_current_player is not None:
                             self.env.current_player = new_current_player
                             self.current_player_id = new_current_player
+                        # Aggiorna mappatura prospettiva quando l'id è noto
+                        if self.app.game_config.get("mode") == "online_multiplayer" and self.local_player_id is not None:
+                            self.setup_player_perspective()
                         self.update_player_hands()
                         self.has_received_initial_state = True
                         return
@@ -6248,8 +6259,8 @@ class GameScreen(BaseScreen):
             show_hand = False
 
             if is_online:
-                # Online: only local player's hand visible
-                show_hand = (player.player_id == self.local_player_id)
+                # Online: only local player's hand visible; if id not yet known, hide all
+                show_hand = (self.local_player_id is not None) and (player.player_id == self.local_player_id)
             elif mode == "local_multiplayer":
                 # Local 4 human: either all hands or only current player's hand if option enabled
                 show_hand = (player.player_id == self.current_player_id) if only_turn_local else True
