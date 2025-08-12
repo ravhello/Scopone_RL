@@ -888,6 +888,24 @@ class NetworkManager:
                                 self.game_state.pop('lobby_state', None)
                             except Exception:
                                 pass
+                        # Force immediate screen transition to home if currently in LobbyScreen
+                        try:
+                            import builtins
+                            if hasattr(builtins, 'app') and hasattr(builtins.app, 'current_screen'):
+                                if builtins.app.current_screen == 'lobby':
+                                    # Gracefully tear down lobby screen
+                                    try:
+                                        if hasattr(builtins.app, 'network') and builtins.app.network:
+                                            builtins.app.network.close()
+                                            builtins.app.network = None
+                                    except Exception:
+                                        pass
+                                    builtins.app.game_config = {}
+                                    builtins.app.screens['lobby'] = None
+                                    builtins.app.current_screen = 'mode'
+                                    # Next loop will call enter() on mode
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 elif message["type"] == "rules":
@@ -923,6 +941,22 @@ class NetworkManager:
                         # Stash a flag in app to switch screen on next update
                         if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
                             self.app.game_config['room_closed_by_host'] = True
+                        # Force immediate transition if currently in lobby
+                        try:
+                            import builtins
+                            if hasattr(builtins, 'app') and hasattr(builtins.app, 'current_screen'):
+                                if builtins.app.current_screen == 'lobby':
+                                    try:
+                                        if hasattr(builtins.app, 'network') and builtins.app.network:
+                                            builtins.app.network.close()
+                                            builtins.app.network = None
+                                    except Exception:
+                                        pass
+                                    builtins.app.game_config = {}
+                                    builtins.app.screens['lobby'] = None
+                                    builtins.app.current_screen = 'mode'
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 elif message["type"] == "start_game":
@@ -7843,6 +7877,12 @@ class ScoponeApp:
     """Main application class"""
     def __init__(self):
         pygame.init()
+        # Expose global app reference for cross-thread notifications
+        try:
+            import builtins
+            builtins.app = self
+        except Exception:
+            pass
         # Initialize clipboard support (pygame.scrap) if available
         try:
             if hasattr(pygame, 'scrap'):
