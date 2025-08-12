@@ -2512,7 +2512,12 @@ class LobbyScreen(BaseScreen):
                 if hasattr(self, 'seat_controls') and self.app.network:
                     # Identify clicked seat control
                     for seat, ctrls in self.seat_controls.items():
-                        if ctrls['left'].collidepoint(pos) or ctrls['right'].collidepoint(pos):
+                        # Disable swapping on AI seat in 3v1
+                        lobby = self.app.network.game_state.get('lobby_state', {}) if isinstance(self.app.network.game_state, dict) else {}
+                        ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
+                        if seat == ai_seat:
+                            continue
+                        if (ctrls.get('enabled', True)) and (ctrls['left'].collidepoint(pos) or ctrls['right'].collidepoint(pos)):
                             # compute target seat: prev or next in ring (0..3)
                             delta = -1 if ctrls['left'].collidepoint(pos) else 1
                             target_seat = (seat + delta) % 4
