@@ -4212,7 +4212,7 @@ class GameScreen(BaseScreen):
                                 self.message_log_rect.height = self.message_prev_height
                             self.message_minimized = False
                         return
-                    # Start dragging if click in header
+                    # Start dragging if click in header (always allow, even when other inputs are ignored)
                     header_rect = pygame.Rect(
                         self.message_log_rect.left,
                         self.message_log_rect.top,
@@ -4248,7 +4248,7 @@ class GameScreen(BaseScreen):
                         self.scrollbar_dragging = True
                         self.scrollbar_drag_offset = self.scrollbar_thumb_height / 2
                         return
-                # Start resizing if click in resize handle (only when not minimized)
+                # Start resizing if click in resize handle (only when not minimized) – always allow
                 if (not self.message_minimized) and self.message_resize_rect and self.message_resize_rect.collidepoint(pos):
                     self.message_resizing = True
                     self.message_resize_start_mouse = pos
@@ -7160,6 +7160,8 @@ class GameScreen(BaseScreen):
             self.message_log_rect.width,
             self.message_header_height,
         )
+        # Make header easier to grab on client by rendering a solid header band
+        pygame.draw.rect(surface, (20, 20, 60), header_rect, border_radius=5)
         pygame.draw.rect(surface, DARK_BLUE, header_rect, border_radius=5)
         # Minimize button at right of header
         btn_size = self.message_header_height - 8
@@ -7185,9 +7187,9 @@ class GameScreen(BaseScreen):
         )
         pygame.draw.rect(surface, LIGHT_GRAY, self.message_resize_rect, border_radius=3)
         
-        # Draw title
+        # Draw title (fixed label, not first message)
         title_surf = self.small_font.render("Messages", True, WHITE)
-        title_rect = title_surf.get_rect(midleft=(self.message_log_rect.left + 8, self.message_log_rect.top + 6))
+        title_rect = title_surf.get_rect(midleft=(self.message_log_rect.left + 10, self.message_log_rect.top + self.message_header_height // 2))
         surface.blit(title_surf, title_rect)
 
         if self.message_minimized:
