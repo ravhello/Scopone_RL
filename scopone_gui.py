@@ -844,6 +844,10 @@ class NetworkManager:
                         self.game_state['online_type'] = message.get('online_type')
                     self.message_queue.append("Lobby aggiornata dall'host")
                 elif message["type"] == "start_game":
+                    # Mark start flag so UI can transition to game reliably
+                    if not isinstance(self.game_state, dict):
+                        self.game_state = {}
+                    self.game_state['start_game'] = True
                     self.message_queue.append("Game starting!")
                 elif message["type"] == "player_names":
                     # Store player names into app config for GameScreen to use
@@ -2378,52 +2382,48 @@ class GameModeScreen(BaseScreen):
         if hasattr(self.app, 'network') and self.app.network:
             # Verifica se la connessione ha avuto successo anche se non è più in progress
             if self.app.network.connected and not self.done:
-                print("Connessione riuscita, passaggio alla schermata di gioco")
-                # Route: go to lobby when online_type indicates a lobby flow or when lobby_state already exists
-                go_lobby = False
-                try:
-                    if isinstance(self.app.network.game_state, dict):
-                        ot = self.app.network.game_state.get('online_type')
-                        go_lobby = (ot in ['all_human', 'three_humans_one_ai']) or (
-                            'lobby_state' in self.app.network.game_state
-                        )
-                except Exception:
-                    pass
-                self.done = True
-                # Decide screen: send clients to lobby ONLY for all-human rooms or if lobby_state already present
+                # Wait for a meaningful signal before leaving the connect screen
                 try:
                     gs = self.app.network.game_state if isinstance(self.app.network.game_state, dict) else {}
                 except Exception:
                     gs = {}
                 is_client = not self.app.network.is_host
                 ot = gs.get('online_type') if isinstance(gs, dict) else None
-                all_human_flag = (ot == 'all_human') if isinstance(gs, dict) else False
                 has_lobby = ('lobby_state' in gs) if isinstance(gs, dict) else False
-                # Send clients to lobby if host flagged a lobby-type room or if we already have lobby state
-                if is_client and ((ot in ['all_human', 'three_humans_one_ai']) or has_lobby):
-                    self.next_screen = "lobby"
+                start_flag = bool(gs.get('start_game')) if isinstance(gs, dict) else False
+
+                if is_client:
+                    # Client: go to lobby for lobby-type rooms or if lobby present; go to game only after start signal
+                    if start_flag:
+                        self.done = True
+                        self.next_screen = "game"
+                    elif (ot in ['all_human', 'three_humans_one_ai']) or has_lobby:
+                        self.done = True
+                        self.next_screen = "lobby"
+                    else:
+                        # Keep waiting for lobby_state or start_game; don't force game
+                        return
                 else:
-                    self.next_screen = "game"
-                
-                # FIX: Preserva il valore is_host dal NetworkManager
-                # invece di sovrascriverlo con False
+                    # Host: proceed to lobby or game based on setup
+                    self.done = True
+                    if (ot in ['all_human', 'three_humans_one_ai']) or has_lobby:
+                        self.next_screen = "lobby"
+                    else:
+                        self.next_screen = "game"
+
+                # Preserve is_host from NetworkManager
                 is_host = self.app.network.is_host
-                
-                # Preserva anche altre impostazioni esistenti
+                # Preserve existing config
                 existing_config = self.app.game_config.copy() if hasattr(self.app, 'game_config') else {}
-                
-                # Aggiorna la configurazione preservando i valori originali
+                # Update app config
                 self.app.game_config = {
                     "mode": "online_multiplayer",
-                    "is_host": is_host,  # Usa il valore corretto
-                    "player_id": self.app.network.player_id  # Usa il player_id già assegnato
+                    "is_host": is_host,
+                    "player_id": self.app.network.player_id
                 }
-                
-                # Ripristina altre impostazioni importanti
                 for key in ['online_type', 'difficulty']:
                     if key in existing_config:
                         self.app.game_config[key] = existing_config[key]
-                        
                 print(f"DEBUG: Game config dopo la connessione: {self.app.game_config}")
                 return
                 
