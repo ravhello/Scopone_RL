@@ -3314,9 +3314,8 @@ class GameScreen(BaseScreen):
         self.new_game_button = Button(20, 20, 140, 50, "Exit", 
                                      DARK_BLUE, WHITE)
         
-        # Message log
-        self.message_log_rect = pygame.Rect(20, SCREEN_HEIGHT - 150, 
-                                           300, 130)
+        # Message log (initial default; will be repositioned in setup_layout)
+        self.message_log_rect = pygame.Rect(20, SCREEN_HEIGHT - 150, 300, 130)
         
         # Fonts
         self.title_font = pygame.font.SysFont(None, 32)
@@ -4010,23 +4009,46 @@ class GameScreen(BaseScreen):
         msg_w = width * 0.25
         msg_h = height * 0.18
         margin = max(8, int(min(width, height) * 0.01))
+        # Debug removed
 
         if self.app.game_config.get("mode") == "online_multiplayer":
-            # Place relative to visual positions: right (1) and top (2) from the local perspective
+            # Robust placement: detect top and right players by geometry so it works for host and client
             try:
-                right_player = next(p for p in self.players if self.get_visual_position(p.player_id) == 1)
-                top_player = next(p for p in self.players if self.get_visual_position(p.player_id) == 2)
-                corner_x = right_player.hand_rect.left
-                corner_y = top_player.hand_rect.bottom
+                # Prefer geometry-based detection
+                by_x = sorted(self.players, key=lambda p: getattr(p, 'hand_rect', pygame.Rect(0,0,0,0)).centerx)
+                by_y = sorted(self.players, key=lambda p: getattr(p, 'hand_rect', pygame.Rect(0,0,0,0)).centery)
+                right_player = by_x[-1]   # rightmost hand
+                top_player   = by_y[0]    # topmost hand
+                # Sanity fallback to visual positions if degenerate
+                if right_player is None or top_player is None or right_player == top_player:
+                    right_player = next(p for p in self.players if self.get_visual_position(p.player_id) == 1)
+                    top_player   = next(p for p in self.players if self.get_visual_position(p.player_id) == 2)
 
-                # Position the box just inside the corner (left of right player hand, below top player hand)
-                x = corner_x - msg_w - margin
-                y = corner_y + margin
+                right_hand = getattr(right_player, 'hand_rect', pygame.Rect(0, 0, 0, 0))
+                top_hand   = getattr(top_player,   'hand_rect', pygame.Rect(0, 0, 0, 0))
+                corner_x = right_hand.left
+                corner_y = top_hand.bottom
+                # Debug removed
+
+                # Anchor the top-right corner of the box at the intersection (small inset)
+                raw_x = corner_x - msg_w - margin
+                raw_y = corner_y + margin
+                # Debug removed
+
+                # Validate measurements; if corners look invalid (e.g. not laid out yet), fall back partially
+                if corner_x <= 0:
+                    raw_x = width - msg_w - int(width * 0.02)
+                if corner_y <= 0:
+                    raw_y = int(height * 0.05)
 
                 # Clamp inside the window
-                x = max(margin, min(x, width - msg_w - margin))
-                y = max(margin, min(y, height - msg_h - margin))
+                x = max(margin, min(raw_x, width - msg_w - margin))
+                y = max(margin, min(raw_y, height - msg_h - margin))
+                # Debug removed
 
+                # If clamped to the far left (x == margin), prefer top-right fallback to avoid appearing on the left
+                if x == margin:
+                    x = width - msg_w - int(width * 0.08)
                 self.message_log_rect = pygame.Rect(x, y, msg_w, msg_h)
             except StopIteration:
                 # Fallback to top-right if players not initialized
