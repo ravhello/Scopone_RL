@@ -3007,7 +3007,7 @@ class GameScreen(BaseScreen):
                         return
 
             # Always check for the Exit button and message log interactions
-            if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 pos = pygame.mouse.get_pos()
                 
                 if self.new_game_button.is_clicked(pos):
@@ -3074,7 +3074,7 @@ class GameScreen(BaseScreen):
                     self.message_resize_start_mouse = pos
                     self.message_resize_start_rect = self.message_log_rect.copy()
                     return
-            elif event.type == pygame.MOUSEBUTTONDOWN:
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 # Click outside message box removes focus
                 pos = pygame.mouse.get_pos()
                 if not self.message_log_rect.collidepoint(pos):
@@ -3129,27 +3129,35 @@ class GameScreen(BaseScreen):
                 if self.confirm_button.is_clicked(pos):
                     self.try_make_move()
                 
-                # Process replay button
-                if self.replay_button.is_clicked(pos):
+        # Process mouse down actions (replay button and selections)
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            pos = pygame.mouse.get_pos()
+            # Replay button click only on actual click (not hover)
+            if self.replay_button.is_clicked(pos):
+                if not self.animations and not self.replay_active:
                     self.start_replay()
-                
-                # Check hand cards with visual perspective aware logic
-                hand_card = self.get_card_at_position(pos, area="hand")
-                if hand_card:
-                    if hand_card == self.selected_hand_card:
-                        self.selected_hand_card = None
-                    else:
-                        self.selected_hand_card = hand_card
-                    self.app.resources.play_sound("card_pickup")
-                
-                # Check table cards
-                table_card = self.get_card_at_position(pos, area="table")
-                if table_card:
-                    if table_card in self.selected_table_cards:
-                        self.selected_table_cards.remove(table_card)
-                    else:
-                        self.selected_table_cards.add(table_card)
-                    self.app.resources.play_sound("card_pickup")
+                # Do not fall-through to card selection when clicking the replay button
+                return
+            
+            # Card selection in hand
+            hand_card = self.get_card_at_position(pos, area="hand")
+            if hand_card:
+                if hand_card == self.selected_hand_card:
+                    self.selected_hand_card = None
+                else:
+                    self.selected_hand_card = hand_card
+                self.app.resources.play_sound("card_pickup")
+                return
+            
+            # Card selection on table
+            table_card = self.get_card_at_position(pos, area="table")
+            if table_card:
+                if table_card in self.selected_table_cards:
+                    self.selected_table_cards.remove(table_card)
+                else:
+                    self.selected_table_cards.add(table_card)
+                self.app.resources.play_sound("card_pickup")
+                return
             
             # Handle message log scrolling (legacy wheel buttons 4/5)
             if event.type == pygame.MOUSEBUTTONDOWN:
@@ -3267,7 +3275,7 @@ class GameScreen(BaseScreen):
         # Update animations
         active_animations = self.update_animations()
         
-        # Update replay animations if replay is active
+        # Update replay animations if replay is active (single source of truth for table state during replay)
         if self.replay_active:
             self.update_replay_animations()
         
@@ -3652,7 +3660,9 @@ class GameScreen(BaseScreen):
         # NUOVO: Lista temporanea per le carte da rimuovere dal set di movimento
         cards_to_remove = []
         
-        # Update existing animations
+        # Update existing animations (skip during replay to avoid duplicate animations)
+        if self.replay_active:
+            return False
         for anim in self.animations[:]:
             # Verifica se questa è un'animazione di inizio movimento
             if anim.animation_type == "start_motion" and anim.current_frame == 0:
@@ -4684,10 +4694,11 @@ class GameScreen(BaseScreen):
         # Draw table cards
         self.draw_table_cards(surface)
 
-        # Draw animations (cards in motion should appear on top)
-        self.draw_animations(surface)
+        # Draw animations; suppress normal animations while replay is active to avoid double-drawing
+        if not self.replay_active:
+            self.draw_animations(surface)
 
-        # Draw replay animations if replay is active
+        # Draw replay animations if replay is active (on top of table/cards)
         if self.replay_active:
             self.draw_replay_animations(surface)
 
@@ -5102,7 +5113,10 @@ class GameScreen(BaseScreen):
             # Se la carta è nel set ma non ha un'animazione in corso (set stantio), disegna comunque e ripulisci.
             in_motion_flag = card in self.cards_in_motion or (self.replay_active and card in self.replay_cards_in_motion)
             if in_motion_flag:
+                # Se è in motion, evita di disegnarla se esiste un'animazione attiva (normale o replay)
                 has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.animations)
+                if self.replay_active and not has_active_anim:
+                    has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.replay_animations)
                 if has_active_anim:
                     continue
                 # Ripulisci flag stantio se nessuna animazione è attiva per questa carta
@@ -5111,7 +5125,7 @@ class GameScreen(BaseScreen):
                         self.cards_in_motion.remove(card)
                     except KeyError:
                         pass
-                if self.replay_active and card in self.replay_cards_in_motion:
+                if self.replay_active and card in getattr(self, 'replay_cards_in_motion', set()):
                     try:
                         self.replay_cards_in_motion.remove(card)
                     except KeyError:
@@ -6288,15 +6302,16 @@ class GameScreen(BaseScreen):
         # Start with initial table state (empty)
         table_state = []
         
-        for i, move in enumerate(history[:first_replay_move_index]):
-            # Add the played card to the table
-            table_state.append(move["played_card"])
-            
-            # Remove captured cards from the table
-            if move["captured_cards"]:
-                for card in move["captured_cards"]:
+        for move in history[:first_replay_move_index]:
+            captured = move.get("captured_cards") or []
+            if captured:
+                # On a capture, the played card does NOT stay on table; only remove captured table cards
+                for card in captured:
                     if card in table_state:
                         table_state.remove(card)
+            else:
+                # No capture: the played card remains on table
+                table_state.append(move["played_card"])
         
         self.replay_table_state = table_state
         
@@ -6330,6 +6345,9 @@ class GameScreen(BaseScreen):
         # (aggiunta dopo mano->tavolo, rimozione dopo cattura).
         
         # Create animations for this move
+        # Nota: lo stato logico del tavolo (replay_table_state) viene aggiornato
+        # in sincronizzazione con la fine delle animazioni (no-capture: aggiunta carta giocata
+        # alla fine della play; capture: rimozione carte catturate alla fine delle animazioni di cattura)
         self.create_replay_animations(move)
         
         self.replay_current_index += 1
@@ -6525,33 +6543,30 @@ class GameScreen(BaseScreen):
         # Update all replay animations
         completed_animations = []
         for anim in self.replay_animations:
-            # NUOVO: Verifica se questa è un'animazione di inizio movimento
+            # Verifica se questa è un'animazione di inizio movimento
             if anim.animation_type == "replay_start_motion" and anim.current_frame == 0:
                 # Aggiungi la carta al set delle carte in movimento del replay
                 self.replay_cards_in_motion.add(anim.card)
                 #print(f"Replay: Carta {anim.card} aggiunta al set di carte in movimento")
             
-            # NUOVO: Quando termina l'animazione mano->tavolo, aggiungi la carta al tavolo del replay
+            # Quando termina l'animazione mano->tavolo, aggiungi la carta al tavolo del replay SOLO per mosse senza cattura
             if anim.animation_type == "replay_play" and anim.current_frame == anim.duration - 1:
-                # Aggiungi la carta al tavolo solo se non causa una presa immediata
                 causes_capture = getattr(anim, 'causes_capture', False)
-                if not causes_capture:
-                    if anim.card not in self.replay_table_state:
-                        self.replay_table_state.append(anim.card)
-                        #print(f"Replay: Carta {anim.card} aggiunta al tavolo dopo animazione play (no capture)")
+                if not causes_capture and anim.card not in self.replay_table_state:
+                    self.replay_table_state.append(anim.card)
 
-            # NUOVO: Verifica se questa è un'animazione di cattura che termina
+            # Verifica se questa è un'animazione di cattura che termina
             if anim.animation_type == "replay_capture" and anim.current_frame == anim.duration - 1:
-                # Aggiungi la carta alla lista di rimozione invece di rimuoverla immediatamente
-                replay_cards_to_remove.append(anim.card)
-                #print(f"Replay: Carta {anim.card} marcata per rimozione dal set di carte in movimento")
-                # NUOVO: Rimuovi la carta catturata dal tavolo del replay
+                # La carta catturata non deve restare sul tavolo di replay
                 if anim.card in self.replay_table_state:
                     try:
                         self.replay_table_state.remove(anim.card)
-                        #print(f"Replay: Carta {anim.card} rimossa dal tavolo dopo cattura")
                     except ValueError:
                         pass
+                # Aggiungi la carta alla lista di rimozione invece di rimuoverla immediatamente dal set motion
+                replay_cards_to_remove.append(anim.card)
+                #print(f"Replay: Carta {anim.card} marcata per rimozione dal set di carte in movimento")
+            # Non serve rimuovere la carta giocata per mosse con cattura qui: non viene mai aggiunta
             
             if anim.update():
                 completed_animations.append(anim)
