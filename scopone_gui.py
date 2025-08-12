@@ -888,22 +888,13 @@ class NetworkManager:
                                 self.game_state.pop('lobby_state', None)
                             except Exception:
                                 pass
-                        # Force immediate screen transition to home if currently in LobbyScreen
+                        # Request forced transition to home
                         try:
                             import builtins
-                            if hasattr(builtins, 'app') and hasattr(builtins.app, 'current_screen'):
-                                if builtins.app.current_screen == 'lobby':
-                                    # Gracefully tear down lobby screen
-                                    try:
-                                        if hasattr(builtins.app, 'network') and builtins.app.network:
-                                            builtins.app.network.close()
-                                            builtins.app.network = None
-                                    except Exception:
-                                        pass
-                                    builtins.app.game_config = {}
-                                    builtins.app.screens['lobby'] = None
-                                    builtins.app.current_screen = 'mode'
-                                    # Next loop will call enter() on mode
+                            if hasattr(builtins, 'app'):
+                                builtins.app._force_screen = 'mode'
+                                builtins.app._force_cleanup_network = True
+                                builtins.app._flash_message = kick_reason or "Sei stato rimosso dall'host"
                         except Exception:
                             pass
                     except Exception:
@@ -941,20 +932,13 @@ class NetworkManager:
                         # Stash a flag in app to switch screen on next update
                         if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
                             self.app.game_config['room_closed_by_host'] = True
-                        # Force immediate transition if currently in lobby
+                        # Request forced transition to home
                         try:
                             import builtins
-                            if hasattr(builtins, 'app') and hasattr(builtins.app, 'current_screen'):
-                                if builtins.app.current_screen == 'lobby':
-                                    try:
-                                        if hasattr(builtins.app, 'network') and builtins.app.network:
-                                            builtins.app.network.close()
-                                            builtins.app.network = None
-                                    except Exception:
-                                        pass
-                                    builtins.app.game_config = {}
-                                    builtins.app.screens['lobby'] = None
-                                    builtins.app.current_screen = 'mode'
+                            if hasattr(builtins, 'app'):
+                                builtins.app._force_screen = 'mode'
+                                builtins.app._force_cleanup_network = True
+                                builtins.app._flash_message = "La partita è stata annullata dall'host"
                         except Exception:
                             pass
                     except Exception:
@@ -7883,6 +7867,10 @@ class ScoponeApp:
             builtins.app = self
         except Exception:
             pass
+        # Force-screen control flags (used by network thread to request UI transitions)
+        self._force_screen = None
+        self._force_cleanup_network = False
+        self._flash_message = None
         # Initialize clipboard support (pygame.scrap) if available
         try:
             if hasattr(pygame, 'scrap'):
@@ -7942,6 +7930,34 @@ class ScoponeApp:
         already_entered = False  # Track if we've entered the current screen
         
         while running:
+            # Process any forced screen transition requested by background threads
+            if self._force_screen:
+                try:
+                    if self.current_screen != self._force_screen:
+                        # Clean up current screen
+                        try:
+                            scr = self.screens.get(self.current_screen)
+                            if scr and hasattr(scr, 'exit'):
+                                scr.exit()
+                        except Exception:
+                            pass
+                        # Network cleanup if requested
+                        if self._force_cleanup_network:
+                            try:
+                                if self.network:
+                                    self.network.close()
+                            except Exception:
+                                pass
+                            self.network = None
+                        # Clear game config minimal state
+                        self.game_config = {}
+                        # Switch screen
+                        self.current_screen = self._force_screen
+                        already_entered = False
+                finally:
+                    # Reset force flags
+                    self._force_screen = None
+                    self._force_cleanup_network = False
             # Get current screen
             screen = self.screens[self.current_screen]
             # Lazy-init LobbyScreen when needed
@@ -7952,6 +7968,13 @@ class ScoponeApp:
             # Call enter method ONLY when first accessing the screen
             if not already_entered:
                 screen.enter()
+                # Deliver any pending flash message to the screen (if it supports status_message)
+                try:
+                    if self._flash_message and hasattr(screen, 'status_message'):
+                        screen.status_message = str(self._flash_message)
+                        self._flash_message = None
+                except Exception:
+                    pass
                 already_entered = True
             
             # Handle events
