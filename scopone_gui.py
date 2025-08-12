@@ -2642,12 +2642,20 @@ class LobbyScreen(BaseScreen):
             name_s = self.small_font.render(f"{pname} (Team {team})", True, WHITE)
             ready_s = self.small_font.render("Pronto" if pready else "In attesa", True, LIGHT_GREEN if pready else ORANGE)
             surface.blit(name_s, name_s.get_rect(left=rect.left+8, top=rect.top+8))
-            surface.blit(ready_s, ready_s.get_rect(left=rect.left+8, top=rect.top+36))
+            # Place readiness text slightly lower and indented to avoid arrow overlap
+            ready_rect = ready_s.get_rect()
+            ready_rect.left = rect.left + 8
+            ready_rect.top = rect.top + 40
+            # Ensure it doesn't collide horizontally with left arrow; push right if needed
+            left_rect_preview = pygame.Rect(rect.left + 6, rect.centery - 12, 24, 24)
+            if ready_rect.colliderect(left_rect_preview):
+                ready_rect.left = left_rect_preview.right + 6
+            surface.blit(ready_s, ready_rect)
             # Draw switch seat arrows (left/right) for each seat
             arrow_w = 24
             arrow_h = 24
-            left_rect = pygame.Rect(rect.left + 6, rect.centery - arrow_h//2, arrow_w, arrow_h)
-            right_rect = pygame.Rect(rect.right - arrow_w - 6, rect.centery - arrow_h//2, arrow_w, arrow_h)
+            left_rect = pygame.Rect(rect.left + 6, rect.bottom - arrow_h - 6, arrow_w, arrow_h)
+            right_rect = pygame.Rect(rect.right - arrow_w - 6, rect.bottom - arrow_h - 6, arrow_w, arrow_h)
             pygame.draw.polygon(surface, WHITE, [(left_rect.right, left_rect.top), (left_rect.left, left_rect.centery), (left_rect.right, left_rect.bottom)])
             pygame.draw.polygon(surface, WHITE, [(right_rect.left, right_rect.top), (right_rect.right, right_rect.centery), (right_rect.left, right_rect.bottom)])
             # Save for click handling
