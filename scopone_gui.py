@@ -880,6 +880,12 @@ class NetworkManager:
                             self.app.game_config['kicked_by_host'] = True
                             if kick_reason:
                                 self.app.game_config['kicked_reason'] = str(kick_reason)
+                            # Immediate route back to home if on connect screen
+                            try:
+                                # Note: actual screen switch is handled by OnlineConnectScreen.update
+                                pass
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                 elif message["type"] == "rules":
@@ -2526,6 +2532,15 @@ class GameModeScreen(BaseScreen):
         """Update screen state with connection timeout handling"""
         # Check for network connection timeout
         if hasattr(self.app, 'network') and self.app.network:
+            # Immediate redirect if host closed room or this client was kicked
+            try:
+                if self.app.game_config.get('room_closed_by_host') or self.app.game_config.get('kicked_by_host'):
+                    self.app.game_config = {}
+                    self.done = True
+                    self.next_screen = "mode"
+                    return
+            except Exception:
+                pass
             # Verifica se la connessione ha avuto successo anche se non è più in progress
             if self.app.network.connected and not self.done:
                 # Wait for a meaningful signal before leaving the connect screen
@@ -2991,6 +3006,8 @@ class LobbyScreen(BaseScreen):
         seat_order = [0,1,2,3]
         start_x = center_x - (cell_w*2 + gap)//2
         start_y = grid_top
+        # Reset kick controls each draw to avoid stale entries
+        self.kick_controls = {}
         for idx, seat in enumerate(seat_order):
             col = idx % 2
             row = idx // 2
@@ -3050,8 +3067,8 @@ class LobbyScreen(BaseScreen):
                 pygame.draw.rect(surface, (20, 70, 20), badge_bg, border_radius=10)
                 pygame.draw.rect(surface, LIGHT_GREEN, badge_bg, 2, border_radius=10)
                 surface.blit(badge_surf, badge_surf.get_rect(center=badge_bg.center))
-            # Kick button (host only) for occupied human seats
-            if self.app.network and self.app.network.is_host and pid is not None and not is_ai_seat:
+            # Kick button (host only) for occupied human seats (never show for host/self)
+            if self.app.network and self.app.network.is_host and pid is not None and pid != 0 and not is_ai_seat:
                 kick_w = int(self.small_font.get_height() * 2.2)
                 kick_h = int(self.small_font.get_height() * 1.1)
                 kick_rect = pygame.Rect(rect.right - kick_w - 8, rect.top + 8, kick_w, kick_h)
@@ -3059,8 +3076,6 @@ class LobbyScreen(BaseScreen):
                 pygame.draw.rect(surface, HIGHLIGHT_RED, kick_rect, 2, border_radius=8)
                 ktxt = self.small_font.render("Kick", True, WHITE)
                 surface.blit(ktxt, ktxt.get_rect(center=kick_rect.center))
-                if not hasattr(self, 'kick_controls'):
-                    self.kick_controls = {}
                 self.kick_controls[seat] = {'rect': kick_rect, 'pid': pid}
             # Draw switch seat arrows (left/right) for each seat (disable on AI seat or libero)
             arrow_w = 24
