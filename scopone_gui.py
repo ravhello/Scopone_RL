@@ -982,6 +982,14 @@ class NetworkManager:
                                 self.message_queue.append("Nicknames sincronizzati")
                         except Exception:
                             pass
+                    elif message.get("type") == "initial_sync_done":
+                        # Host signals that first full state has been sent; allow reveal now
+                        try:
+                            if hasattr(self, 'app') and hasattr(self.app, 'game_config'):
+                                if self.app.game_config.get('mode') == 'online_multiplayer':
+                                    self.can_reveal_hands = (self.local_player_id is not None)
+                        except Exception:
+                            pass
                     elif message.get("type") == "series_state":
                         state = message.get('state', {})
                         try:
@@ -3439,6 +3447,9 @@ class GameScreen(BaseScreen):
         self.scrollbar_thumb_height = 0
         self.scrollbar_max_offset = 0
 
+        # Reveal-gating for online clients to avoid transient wrong-hand display
+        self.can_reveal_hands = False
+
         # Message input state (for chat)
         self.message_input_text = ""
         self.message_input_active = False
@@ -4745,6 +4756,8 @@ class GameScreen(BaseScreen):
                             if self.local_player_id is not None:
                                 self.setup_player_perspective()
                             self.setup_layout()
+                            # Non rivelare ancora le mani finché non arriva la prima sync valida
+                            self.can_reveal_hands = False
             
             # Auto-play when a player has exactly one card left, unless multiple capture choices exist (humans only)
             try:
@@ -5210,6 +5223,17 @@ class GameScreen(BaseScreen):
                 
                 # Broadcast immediato
                 self.app.network.broadcast_game_state()
+                # Dopo il broadcast iniziale, invia un segnale di sync completata perché il client possa rivelare le mani
+                try:
+                    msg = {"type": "initial_sync_done"}
+                    data = pickle.dumps(msg)
+                    for client, _ in self.app.network.clients:
+                        try:
+                            client.sendall(data)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 self.initial_sync_done = True
             
             # Process any queued moves
@@ -5344,25 +5368,28 @@ class GameScreen(BaseScreen):
                         self.team_vs_ai_configured = True
                         print("Configurazione team_vs_ai completata e bloccata per evitare ripetizioni")
                 
-                # Prima applicazione: sincronizzazione iniziale senza animazioni/diff
-                if not hasattr(self, 'has_received_initial_state') or not self.has_received_initial_state:
-                    if self.env and isinstance(new_state, dict):
-                        # Non mostrare carte finché non sappiamo il player_id locale
-                        if self.local_player_id is None and hasattr(self.app, 'network'):
-                            self.local_player_id = self.app.network.player_id
-                        self.env.game_state = new_state
-                        if new_current_player is not None:
-                            self.env.current_player = new_current_player
-                            self.current_player_id = new_current_player
-                        # Aggiorna mappatura prospettiva quando l'id è noto
-                        if self.app.game_config.get("mode") == "online_multiplayer" and self.local_player_id is not None:
-                            self.setup_player_perspective()
-                        self.update_player_hands()
-                        self.has_received_initial_state = True
-                        return
-                
-                # Apply the new state to the environment (only when it contains basic fields)
-                if self.env and isinstance(new_state, dict):
+        # Prima applicazione: sincronizzazione iniziale senza animazioni/diff
+        if not hasattr(self, 'has_received_initial_state') or not self.has_received_initial_state:
+            if self.env and isinstance(new_state, dict):
+                # Non mostrare carte finché non sappiamo il player_id locale
+                if self.local_player_id is None and hasattr(self.app, 'network'):
+                    self.local_player_id = self.app.network.player_id
+                self.env.game_state = new_state
+                if new_current_player is not None:
+                    self.env.current_player = new_current_player
+                    self.current_player_id = new_current_player
+                # Aggiorna mappatura prospettiva quando l'id è noto
+                if self.app.game_config.get("mode") == "online_multiplayer" and self.local_player_id is not None:
+                    self.setup_player_perspective()
+                self.update_player_hands()
+                self.has_received_initial_state = True
+                # Abilita la rivelazione mani solo dopo che local_player_id è noto e prima sync completata
+                if self.app.game_config.get("mode") == "online_multiplayer":
+                    self.can_reveal_hands = (self.local_player_id is not None)
+                return
+
+            # Apply the new state to the environment (only when it contains basic fields)
+            if self.env and isinstance(new_state, dict):
                     # Store hands before updating state to ensure local player's hand is preserved
                     local_hand = None
                     if self.local_player_id is not None and 'hands' in new_state:
@@ -5371,41 +5398,47 @@ class GameScreen(BaseScreen):
                     
                     # Apply the new state
                     self.env.game_state = new_state
-                    
+
                     # CRITICAL: Ensure the local player's hand is preserved and correctly updated
                     if local_hand is not None:
                         if 'hands' not in self.env.game_state:
                             self.env.game_state['hands'] = {}
                         self.env.game_state['hands'][self.local_player_id] = local_hand
-                    
-                    # SOLUZIONE CRUCIALE: Aggiorna il turno corrente con quello ricevuto dal server
-                    if new_current_player is not None:
-                        prev_player = self.env.current_player if hasattr(self.env, 'current_player') else None
-                        
-                        # Verifica se il giocatore è cambiato
-                        player_changed = prev_player != new_current_player
-                        
-                        # Throttling degli aggiornamenti
-                        current_time = time.time()
-                        if not hasattr(self, 'last_turn_update_time'):
-                            self.last_turn_update_time = 0
-                        
-                        # Aggiorna e stampa solo se è passato abbastanza tempo o se il giocatore è cambiato
-                        if player_changed or (current_time - self.last_turn_update_time) > 0.5:  # 2 volte al secondo (0.5s)
-                            #print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
-                            self.last_turn_update_time = current_time
-                        
-                        # Aggiorna sempre lo stato interno
-                        self.env.current_player = new_current_player
-                        self.current_player_id = new_current_player
-                        
-                        # Notify player if it's their turn now (questa parte rimane invariata)
-                        if prev_player != new_current_player and new_current_player == self.local_player_id:
-                            self.status_message = "It's your turn!"
-                            self.app.resources.play_sound("card_pickup")
-                            # Reset selections when it becomes the player's turn
-                            self.selected_hand_card = None
-                            self.selected_table_cards.clear()
+            # Se siamo online, abilita la rivelazione mani dopo il primo update completo
+            if self.app.game_config.get("mode") == "online_multiplayer":
+                if (self.local_player_id is not None) and not getattr(self, 'can_reveal_hands', False):
+                    # Verifica che ci sia almeno la mano del locale nello stato
+                    if 'hands' in self.env.game_state and self.local_player_id in self.env.game_state['hands']:
+                        self.can_reveal_hands = True
+
+                # SOLUZIONE CRUCIALE: Aggiorna il turno corrente con quello ricevuto dal server
+                if new_current_player is not None:
+                    prev_player = self.env.current_player if hasattr(self.env, 'current_player') else None
+
+                    # Verifica se il giocatore è cambiato
+                    player_changed = prev_player != new_current_player
+
+                    # Throttling degli aggiornamenti
+                    current_time = time.time()
+                    if not hasattr(self, 'last_turn_update_time'):
+                        self.last_turn_update_time = 0
+
+                    # Aggiorna e stampa solo se è passato abbastanza tempo o se il giocatore è cambiato
+                    if player_changed or (current_time - self.last_turn_update_time) > 0.5:  # 2 volte al secondo (0.5s)
+                        #print(f"SYNC: Aggiornamento turno da {prev_player} a {new_current_player}")
+                        self.last_turn_update_time = current_time
+
+                    # Aggiorna sempre lo stato interno
+                    self.env.current_player = new_current_player
+                    self.current_player_id = new_current_player
+
+                    # Notify player if it's their turn now (questa parte rimane invariata)
+                    if prev_player != new_current_player and new_current_player == self.local_player_id:
+                        self.status_message = "It's your turn!"
+                        self.app.resources.play_sound("card_pickup")
+                        # Reset selections when it becomes the player's turn
+                        self.selected_hand_card = None
+                        self.selected_table_cards.clear()
                     
                     # Check for card movements and update visuals
                     if old_state and old_state != new_state:
@@ -6259,8 +6292,12 @@ class GameScreen(BaseScreen):
             show_hand = False
 
             if is_online:
-                # Online: only local player's hand visible; if id not yet known, hide all
-                show_hand = (self.local_player_id is not None) and (player.player_id == self.local_player_id)
+                # Online: only local player's hand visible
+                # Gate reveal until we know the local id AND we have applied initial sync
+                if not getattr(self, 'can_reveal_hands', False):
+                    show_hand = False
+                else:
+                    show_hand = (self.local_player_id is not None) and (player.player_id == self.local_player_id)
             elif mode == "local_multiplayer":
                 # Local 4 human: either all hands or only current player's hand if option enabled
                 show_hand = (player.player_id == self.current_player_id) if only_turn_local else True
