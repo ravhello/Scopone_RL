@@ -2797,6 +2797,18 @@ class LobbyScreen(BaseScreen):
                                 except Exception:
                                     pass
                             return
+                # Handle host kick clicks
+                if hasattr(self, 'kick_controls') and self.app.network and self.app.network.is_host:
+                    for seat, kc in list(self.kick_controls.items()):
+                        if kc['rect'].collidepoint(pos):
+                            pid = kc.get('pid')
+                            if pid is not None and pid != 0:  # never kick host
+                                try:
+                                    self.app.network.kick_player(int(pid))
+                                except Exception:
+                                    pass
+                                # local UI update relies on broadcast_lobby_state
+                                return
                 # Cancel/Exit room
                 if self.cancel_button and self.cancel_button.is_clicked(pos):
                     # Host cancels: notify clients and close room; Client exits: just disconnect
@@ -3116,7 +3128,15 @@ class LobbyScreen(BaseScreen):
         if self.app.network:
             try:
                 num_clients = len(self.app.network.clients)
-                lines.append(("Giocatori connessi", f"{num_clients}/3"))
+                # Expected clients by online_type
+                online_type = (self.app.network.game_state.get('online_type') if isinstance(self.app.network.game_state, dict) else None)
+                if online_type in ('team_vs_ai', 'humans_plus_ai'):
+                    expected = 1
+                elif online_type == 'three_humans_one_ai':
+                    expected = 2
+                else:
+                    expected = 3
+                lines.append(("Giocatori connessi", f"{num_clients}/{expected}"))
             except Exception:
                 pass
         # Draw each line with a copy button
