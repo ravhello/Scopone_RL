@@ -739,25 +739,38 @@ class NetworkManager:
                     # Broadcast updated lobby to all
                     self.broadcast_lobby_state()
                 elif message.get("type") == "lobby_swap_request" and self.is_host:
-                    # Client requests to move to a target seat index (0..3)
+                    # Client requests to swap occupants between specific seats
                     try:
+                        source_seat = int(message.get('source_seat'))
                         target_seat = int(message.get('target_seat'))
                     except Exception:
+                        source_seat = None
                         target_seat = None
                     lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
                     seats = lobby.setdefault('seats', {})
-                    # Build reverse map: seat_of_player
-                    seat_of_player = None
-                    for s, pid in seats.items():
-                        if pid == player_id:
-                            seat_of_player = s
-                            break
-                    if target_seat is not None and target_seat in [0,1,2,3] and seat_of_player is not None and target_seat != seat_of_player:
-                        # Swap occupants between current seat and target seat
-                        other_pid = seats.get(target_seat, target_seat)
-                        seats[target_seat] = player_id
-                        seats[seat_of_player] = other_pid
-                        # Broadcast lobby update
+                    online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
+                    ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
+                    if target_seat is not None and source_seat is not None and target_seat in [0,1,2,3] and source_seat in [0,1,2,3] and target_seat != source_seat:
+                        # Move AI seat if requested in 3v1
+                        if online_type == 'three_humans_one_ai' and ai_seat == source_seat:
+                            prev_ai = ai_seat
+                            lobby['ai_seat'] = target_seat
+                            other_pid = seats.get(target_seat, None)
+                            if other_pid is None:
+                                seats.pop(prev_ai, None)
+                            else:
+                                seats[prev_ai] = other_pid
+                            seats.pop(target_seat, None)
+                        else:
+                            occ = seats.get(source_seat, None)
+                            if occ is None:
+                                return
+                            other_pid = seats.get(target_seat, None)
+                            seats[target_seat] = occ
+                            if other_pid is None:
+                                seats.pop(source_seat, None)
+                            else:
+                                seats[source_seat] = other_pid
                         self.broadcast_lobby_state()
                 
             except Exception as e:
@@ -2512,37 +2525,51 @@ class LobbyScreen(BaseScreen):
                 if hasattr(self, 'seat_controls') and self.app.network:
                     # Identify clicked seat control
                     for seat, ctrls in self.seat_controls.items():
-                        # Disable swapping on AI seat in 3v1
-                        lobby = self.app.network.game_state.get('lobby_state', {}) if isinstance(self.app.network.game_state, dict) else {}
-                        ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
-                        if seat == ai_seat:
-                            continue
                         if (ctrls.get('enabled', True)) and (ctrls['left'].collidepoint(pos) or ctrls['right'].collidepoint(pos)):
                             # compute target seat: prev or next in ring (0..3)
                             delta = -1 if ctrls['left'].collidepoint(pos) else 1
                             target_seat = (seat + delta) % 4
                             if self.app.network.is_host:
-                                # Host swaps on behalf of local player
+                                # Host swaps occupant of clicked seat (human) or moves AI seat in 3v1
                                 lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
                                 seats = lobby.setdefault('seats', {})
-                                local_pid = getattr(self.app.network, 'player_id', 0)
-                                # Find current seat of local player
-                                current_seat = None
-                                for s, pid in seats.items():
-                                    if pid == local_pid:
-                                        current_seat = s
-                                        break
-                                if current_seat is None:
-                                    current_seat = local_pid
-                                # Swap
-                                other_pid = seats.get(target_seat, target_seat)
-                                seats[target_seat] = local_pid
-                                seats[current_seat] = other_pid
+                                online_type = self.app.network.game_state.get('online_type') if isinstance(self.app.network.game_state, dict) else None
+                                ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
+                                if online_type == 'three_humans_one_ai' and ai_seat == seat:
+                                    # Move AI seat to target; shift any target occupant to previous AI seat
+                                    prev_ai = ai_seat
+                                    lobby['ai_seat'] = target_seat
+                                    other_pid = seats.get(target_seat, None)
+                                    if other_pid is None:
+                                        seats.pop(prev_ai, None)
+                                    else:
+                                        seats[prev_ai] = other_pid
+                                    seats.pop(target_seat, None)
+                                else:
+                                    # Move occupant from clicked seat if any
+                                    occ = seats.get(seat, None)
+                                    if occ is None:
+                                        return
+                                    # Special case: target is AI seat in 3v1 → swap AI seat with this human
+                                    if online_type == 'three_humans_one_ai' and target_seat == ai_seat:
+                                        prev_ai = ai_seat
+                                        lobby['ai_seat'] = seat
+                                        # Move human to target (AI seat)
+                                        seats[target_seat] = occ
+                                        # Origin becomes AI seat (no human occupant mapping)
+                                        seats.pop(seat, None)
+                                    else:
+                                        other_pid = seats.get(target_seat, None)
+                                        seats[target_seat] = occ
+                                        if other_pid is None:
+                                            seats.pop(seat, None)
+                                        else:
+                                            seats[seat] = other_pid
                                 self.app.network.broadcast_lobby_state()
                             else:
                                 # Client: send swap request to host
                                 try:
-                                    payload = {"type": "lobby_swap_request", "target_seat": target_seat}
+                                    payload = {"type": "lobby_swap_request", "source_seat": seat, "target_seat": target_seat}
                                     self.app.network.socket.sendall(pickle.dumps(payload))
                                 except Exception:
                                     pass
@@ -2771,7 +2798,7 @@ class LobbyScreen(BaseScreen):
             surface.blit(ready_s, ready_rect)
             # Draw AI badge for 3v1 on AI seat
             if online_type == 'three_humans_one_ai' and is_ai_seat:
-                badge_text = "AI pronta"
+                badge_text = "AI"
                 badge_surf = self.small_font.render(badge_text, True, WHITE)
                 pad_x = 8
                 pad_y = 4
@@ -2786,7 +2813,7 @@ class LobbyScreen(BaseScreen):
             arrow_h = 24
             left_rect = pygame.Rect(rect.left + 6, rect.bottom - arrow_h - 6, arrow_w, arrow_h)
             right_rect = pygame.Rect(rect.right - arrow_w - 6, rect.bottom - arrow_h - 6, arrow_w, arrow_h)
-            arrows_enabled = not (online_type == 'three_humans_one_ai' and seat == ai_seat)
+            arrows_enabled = ((pid is not None) or (online_type == 'three_humans_one_ai' and seat == ai_seat))
             if arrows_enabled:
                 pygame.draw.polygon(surface, WHITE, [(left_rect.right, left_rect.top), (left_rect.left, left_rect.centery), (left_rect.right, left_rect.bottom)])
                 pygame.draw.polygon(surface, WHITE, [(right_rect.left, right_rect.top), (right_rect.right, right_rect.centery), (right_rect.left, right_rect.bottom)])
