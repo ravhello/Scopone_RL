@@ -620,16 +620,17 @@ class NetworkManager:
         """Accept connections from other players (for host)"""
         # Ottieni la configurazione
         is_team_vs_ai = False
+        online_type = None
         if hasattr(self, 'game_state') and self.game_state:
-            # Controlla se siamo in modalità team vs AI
-            is_team_vs_ai = self.game_state.get('online_type') == 'team_vs_ai'
+            # Controlla la modalità
+            online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
+            is_team_vs_ai = online_type == 'team_vs_ai'
         
         # Numero di client attesi in base alla modalità
-        online_type = None
         try:
-            online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else None
+            online_type = self.game_state.get('online_type') if isinstance(self.game_state, dict) else online_type
         except Exception:
-            online_type = None
+            pass
         if online_type == 'team_vs_ai' or online_type == 'humans_plus_ai':
             expected_clients = 1
         elif online_type == 'three_humans_one_ai':
@@ -664,8 +665,9 @@ class NetworkManager:
                 # Add message to queue
                 self.message_queue.append(f"Player {player_id} connected")
                 
-                # Initialize/refresh lobby state for all-human mode
-                if not is_team_vs_ai:
+                # Initialize/refresh lobby state ONLY for lobby-type modes
+                mode_has_lobby = (online_type in ('all_human', 'three_humans_one_ai'))
+                if mode_has_lobby:
                     try:
                         lobby = self.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}})
                         players = lobby.setdefault('players', {})
@@ -2624,7 +2626,7 @@ class GameModeScreen(BaseScreen):
                         self.app.game_config = {}
                         self.done = True
                         self.next_screen = "mode"
-                    elif (ot in ['all_human', 'three_humans_one_ai']) or has_lobby:
+                    elif (ot in ['all_human', 'three_humans_one_ai']) and has_lobby:
                         self.done = True
                         self.next_screen = "lobby"
                     elif ot in ['team_vs_ai', 'humans_plus_ai']:
