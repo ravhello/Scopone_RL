@@ -2104,6 +2104,21 @@ class GameModeScreen(BaseScreen):
         ip_surf = self.info_font.render(ip_text, True, text_color)
         ip_rect = ip_surf.get_rect(center=self.ip_input_rect.center)
         surface.blit(ip_surf, ip_rect)
+        # Blinking caret for IP input when active
+        if self.ip_input_active:
+            # Initialize blink state if not present (backward safety)
+            if not hasattr(self, 'ip_caret_visible'):
+                self.ip_caret_visible = True
+                self.ip_caret_last_toggle = 0
+                self.ip_caret_blink_interval_ms = 500
+            # Toggle timing
+            now = pygame.time.get_ticks()
+            if now - getattr(self, 'ip_caret_last_toggle', 0) > getattr(self, 'ip_caret_blink_interval_ms', 500):
+                self.ip_caret_visible = not getattr(self, 'ip_caret_visible', True)
+                self.ip_caret_last_toggle = now
+            if getattr(self, 'ip_caret_visible', True):
+                caret_x = min(ip_rect.right + 2, self.ip_input_rect.right - 6)
+                pygame.draw.line(surface, WHITE, (caret_x, self.ip_input_rect.top + 6), (caret_x, self.ip_input_rect.bottom - 6), 2)
 
         # Draw join button (ADD THIS CODE)
         if hasattr(self, 'join_button') and self.join_button:
@@ -2290,6 +2305,8 @@ class LobbyScreen(BaseScreen):
         self.caret_blink_interval_ms = 500
         # Connection info rect
         self.conn_info_rect = None
+        # Leave/Cancel button
+        self.cancel_button = None
 
     def enter(self):
         super().enter()
@@ -2320,6 +2337,13 @@ class LobbyScreen(BaseScreen):
         # Ready/Start buttons
         self.ready_button = Button(center_x - btn_w - int(width*0.02), int(height * 0.45), btn_w, btn_h, "Pronto", DARK_GREEN, WHITE)
         self.start_button = Button(center_x + int(width*0.02), int(height * 0.45), btn_w, btn_h, "Avvia partita", HIGHLIGHT_BLUE, WHITE)
+        # Cancel/Exit button at bottom-left
+        cancel_w = int(width * 0.2)
+        cancel_h = int(height * 0.06)
+        cancel_x = int(width * 0.03)
+        cancel_y = height - cancel_h - int(height * 0.04)
+        btn_text = "Annulla partita" if (self.app.network and self.app.network.is_host) else "Esci dalla stanza"
+        self.cancel_button = Button(cancel_x, cancel_y, cancel_w, cancel_h, btn_text, HIGHLIGHT_RED, WHITE)
         # Connection info panel (top-right)
         panel_w = int(width * 0.34)
         panel_h = int(height * 0.22)
@@ -2337,6 +2361,20 @@ class LobbyScreen(BaseScreen):
                     self.input_active = True
                 else:
                     self.input_active = False
+                # Cancel/Exit room
+                if self.cancel_button and self.cancel_button.is_clicked(pos):
+                    # Close network and return to home
+                    try:
+                        if hasattr(self.app, 'network') and self.app.network:
+                            self.app.network.close()
+                            self.app.network = None
+                    except Exception:
+                        pass
+                    # Reset minimal game_config state
+                    self.app.game_config = {}
+                    self.done = True
+                    self.next_screen = "mode"
+                    return
                 # Ready toggle
                 if self.ready_button.is_clicked(pos):
                     self.ready = not self.ready
@@ -2488,6 +2526,9 @@ class LobbyScreen(BaseScreen):
             disabled.draw(surface)
         else:
             self.start_button.draw(surface)
+        # Cancel/Exit button
+        if self.cancel_button:
+            self.cancel_button.draw(surface)
         
         # Connection info panel (host-focused)
         pygame.draw.rect(surface, (15,15,35), self.conn_info_rect, border_radius=10)
