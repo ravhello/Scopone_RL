@@ -4197,6 +4197,18 @@ class GameScreen(BaseScreen):
         if not self.env:
             return
         
+        # Online client: until the first authoritative state arrives from the host,
+        # do not show any hand (avoid rendering locally randomized hands from reset()).
+        try:
+            cfg = getattr(self.app, 'game_config', {})
+            is_online_client = cfg.get('mode') == 'online_multiplayer' and not cfg.get('is_host', False)
+            if is_online_client and not getattr(self, 'has_received_initial_state', False):
+                for player in self.players:
+                    player.set_hand([])
+                return
+        except Exception:
+            pass
+
         gs = getattr(self.env, 'game_state', None)
         if not isinstance(gs, dict):
             # Clear all hands if no valid game state is present yet
