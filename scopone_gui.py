@@ -3580,6 +3580,17 @@ class GameScreen(BaseScreen):
         self.selected_hand_card = None
         self.selected_table_cards = set()
         self.animations = []
+        # Ensure consistent fresh state across consecutive matches (client-side especially)
+        self.has_received_initial_state = False
+        self.team_vs_ai_configured = False
+        # Allow recalculation of visual mapping on new match
+        try:
+            if hasattr(self, '_visual_mapping_locked'):
+                delattr(self, '_visual_mapping_locked')
+            if hasattr(self, '_warned_about_mapping'):
+                delattr(self, '_warned_about_mapping')
+        except Exception:
+            pass
         self.waiting_for_other_player = False
         self.ai_thinking = False
         self.ai_move_timer = 0
@@ -3687,12 +3698,8 @@ class GameScreen(BaseScreen):
             if is_host:
                 self.local_player_id = 0
             else:
-                # Prefer the id assigned by the server if already received; otherwise keep None
-                try:
-                    net_pid = getattr(self.app.network, 'player_id', None) if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network else None
-                except Exception:
-                    net_pid = None
-                self.local_player_id = net_pid
+                # Force a clean slate at every match start; wait for server assignment
+                self.local_player_id = None
 
         # Prepara struttura serie per host
         if is_online and is_host:
@@ -3704,6 +3711,12 @@ class GameScreen(BaseScreen):
                 online_type = config.get("online_type")
                 if online_type:
                     self.app.network.game_state['online_type'] = online_type
+                # Reset per nuova mano/partita così i client non riutilizzano vecchi flag
+                for key in ['start_game', 'series_state']:
+                    try:
+                        self.app.network.game_state.pop(key, None)
+                    except Exception:
+                        pass
 
     def _handle_hand_end(self, final_breakdown):
         """Handle end of a single hand and possibly continue series/match."""
@@ -4852,12 +4865,14 @@ class GameScreen(BaseScreen):
                         print(f"Aggiornamento player_id: da {self.local_player_id} a {self.app.network.player_id}")
                         self.local_player_id = self.app.network.player_id
                         
-                        # Aggiorna i giocatori in caso di cambio ID
-                        if old_player_id != self.local_player_id:
-                            # Riaggiorna player info, prospettiva e layout
-                            self.setup_players()
-                            self.setup_player_perspective()
-                            self.setup_layout()
+            # Aggiorna i giocatori in caso di cambio ID o prima assegnazione
+            if old_player_id != self.local_player_id:
+                # Riaggiorna player info, prospettiva e layout
+                self.setup_players()
+                self.setup_player_perspective()
+                self.setup_layout()
+                # Dopo la prima assegnazione id, ancora non mostrare mani fino a sync stato
+                # (has_received_initial_state resterà False finché non arriva lo stato dal server)
             
             # Auto-play when a player has exactly one card left, unless multiple capture choices exist (humans only)
             try:
@@ -5475,6 +5490,12 @@ class GameScreen(BaseScreen):
                             self.current_player_id = new_current_player
                         self.update_player_hands()
                         self.has_received_initial_state = True
+                        # Ensure visual mapping is recomputed in case seat perspective changed across matches
+                        try:
+                            self.setup_player_perspective()
+                            self.setup_layout()
+                        except Exception:
+                            pass
                         return
                 
                 # Apply the new state to the environment (only when it contains basic fields)
@@ -5578,6 +5599,20 @@ class GameScreen(BaseScreen):
                 self.create_move_animations(card_played, cards_captured, player_id)
                 self.app.resources.play_sound("card_play")
                 return
+
+        # Guard against false positives at game start and on non-move syncs:
+        # if the move history did not increase and there's no explicit last_move,
+        # do not infer animations from diffs (prevents phantom plays on clients).
+        try:
+            old_history_len = len(old_state.get('history', [])) if isinstance(old_state, dict) else 0
+            new_history_len = len(new_state.get('history', [])) if isinstance(new_state, dict) else 0
+        except Exception:
+            old_history_len = 0
+            new_history_len = 0
+
+        if new_history_len <= old_history_len:
+            # No new moves recorded; skip heuristic animations entirely
+            return
         
         # If no explicit move info was provided, try to detect the move
         # Find cards that disappeared from the table (likely captured)
