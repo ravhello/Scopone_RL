@@ -1663,15 +1663,29 @@ class GameOptionsScreen(BaseScreen):
     def _on_start(self):
         # Salva regole in config
         self.app.game_config["rules"] = self.rules.copy()
-        # Se stiamo ospitando online, torna alla schermata host-mode (scelta 4 umani / 2v2)
-        if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
-            # Torna alla schermata mode e apri direttamente il sottomenu host
+        # Nuovo flusso: se stiamo ospitando online, avvia direttamente l'hosting e vai a lobby/partita
+        if self.app.game_config.get("pending_online_host"):
+            # Recupera scelta modalità online fatta nel sottomenu
+            selected_online_mode = self.app.game_config.get("selected_online_mode", 0)
+            # Pulisci il flag
+            self.app.game_config.pop("pending_online_host", None)
+            # Imposta modalità online scelta e avvia server
+            if selected_online_mode == 0:
+                self.app.game_config["online_type"] = "all_human"
+            elif selected_online_mode == 1:
+                self.app.game_config["online_type"] = "team_vs_ai"
+            elif selected_online_mode == 2:
+                self.app.game_config["online_type"] = "humans_plus_ai"
+            else:
+                self.app.game_config["online_type"] = "three_humans_one_ai"
+
+            # Torna a GameModeScreen per usare la sua logica di hosting
             self.done = True
             self.next_screen = "mode"
-            # Imposta un flag per aprire la schermata host al rientro
-            self.app.game_config["open_host_screen"] = True
+            # Aggiungi flag per autohost all'ingresso di GameModeScreen
+            self.app.game_config["auto_host_after_options"] = True
         else:
-            # Avvia il gioco normalmente
+            # Avvia il gioco normalmente (offline/local)
             self.done = True
             self.next_screen = "game"
 
@@ -1976,20 +1990,32 @@ class GameModeScreen(BaseScreen):
         self.status_message = ""
         self.ip_input = ""
         self.ip_input_active = False
-        self.host_screen_active = False
+        # Se si è tornati dalle opzioni con hosting online pendente, resta nel sottomenu
+        self.host_screen_active = bool(self.app.game_config.get("pending_online_host"))
         self.loading = False
         self.waiting_for_other_player = False
         # Aggiorna l'immagine di sfondo
         self.bg_image = self.app.resources.background
         # Reimposta il layout
         self.setup_layout()
-        # Se richiesto, apri direttamente la schermata host online dopo le opzioni
-        if self.app.game_config.get("open_host_screen"):
-            self.host_screen_active = True
-            # ripristina e poi pulisci il flag
-            self.app.game_config.pop("open_host_screen", None)
-            # prepara i pulsanti della schermata host
+        # Se serve, prepara i pulsanti del sottomenu host
+        if self.host_screen_active:
             self.setup_online_choice_buttons()
+
+        # Se si deve fare autohost dopo le opzioni, eseguilo ora
+        if self.app.game_config.get("auto_host_after_options"):
+            self.app.game_config.pop("auto_host_after_options", None)
+            # Imposta la selezione corrente dal game_config
+            ot = self.app.game_config.get("online_type", "all_human")
+            mapping = {
+                "all_human": 0,
+                "team_vs_ai": 1,
+                "humans_plus_ai": 2,
+                "three_humans_one_ai": 3,
+            }
+            self.selected_online_mode = mapping.get(ot, 0)
+            # Avvia hosting con la modalità già scelta e con le regole salvate
+            self.host_online_game()
     
     def setup_layout(self):
         """Set up responsive layout for mode selection screen"""
@@ -2162,7 +2188,14 @@ class GameModeScreen(BaseScreen):
                     
                     # Controllo clic sul pulsante Start
                     if hasattr(self, 'start_button') and self.start_button.is_clicked(pos):
-                        self.host_online_game()
+                        # Nel nuovo flusso: dallo sottomenu online vai a Opzioni di Partita
+                        # e marca che il prossimo Start in Opzioni dovrà avviare l'hosting
+                        self.app.game_config.setdefault("mode", "online_multiplayer")
+                        self.app.game_config.setdefault("is_host", True)
+                        self.app.game_config["pending_online_host"] = True
+                        self.app.game_config["selected_online_mode"] = self.selected_online_mode
+                        self.done = True
+                        self.next_screen = "options"
                     
                     return
                 
@@ -2276,16 +2309,15 @@ class GameModeScreen(BaseScreen):
                 "ai_players": 0
             }
         elif button_index == 3:
-            # Host Online Game - apri prima la schermata opzioni
+            # Host Online Game -> apri SUBITO il sottomenu online
             self.app.game_config = {
                 "mode": "online_multiplayer",
                 "is_host": True,
-                "player_id": 0,
-                # salva un flag per ritornare qui dopo le opzioni
-                "open_host_screen": True
+                "player_id": 0
             }
-            self.done = True
-            self.next_screen = "options"
+            self.host_screen_active = True
+            self.setup_online_choice_buttons()
+            return
         elif button_index == 4:
             # Join Online Game
             if self.ip_input:
@@ -6879,9 +6911,17 @@ class GameScreen(BaseScreen):
         # aver già portato carte sul tavolo, evita di mostrare "No cards on table" e lascia lo spazio
         # libero per l'animazione, così l'utente non crede che manchino le carte.
         if not table_cards:
-            # Se c'è un'animazione in corso che non sia di cattura (plateau/play), non mostrare il testo.
-            if any(getattr(anim, 'animation_type', '') in ('play', 'plateau', 'replay_play') and not getattr(anim, 'done', False)
-                   for anim in getattr(self, 'animations', [])):
+            # Se c'è un'animazione in corso che mostrerà carte sul tavolo (play/plateau),
+            # non mostrare il testo. Considera sia animazioni normali sia di replay.
+            normal_showing = any(
+                getattr(anim, 'animation_type', '') in ('play', 'plateau') and not getattr(anim, 'done', False)
+                for anim in getattr(self, 'animations', [])
+            )
+            replay_showing = any(
+                getattr(anim, 'animation_type', '') in ('replay_play', 'replay_plateau') and not getattr(anim, 'done', False)
+                for anim in getattr(self, 'replay_animations', [])
+            ) if getattr(self, 'replay_active', False) else False
+            if normal_showing or replay_showing:
                 return
             # Draw "No cards on table" text
             text_surf = self.info_font.render("No cards on table", True, WHITE)
@@ -6914,10 +6954,20 @@ class GameScreen(BaseScreen):
         
         for i, card in enumerate(table_cards):
             # Disegna SEMPRE le carte sul tavolo anche se stanno per essere catturate.
-            # Se la carta ha un'animazione ATTIVA (normale o replay), lascia che sia l'animazione a disegnarla e non duplicare (skip solo in quel caso).
-            has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.animations)
+            # Evita di duplicare solo quando un'animazione per quella carta è effettivamente IN CORSO (non solo schedulata con delay).
+            has_active_anim = any(
+                getattr(anim, 'card', None) == card
+                and not getattr(anim, 'done', False)
+                and getattr(anim, 'current_frame', 0) >= 0  # attiva solo se l'animazione è iniziata
+                for anim in self.animations
+            )
             if self.replay_active and not has_active_anim:
-                has_active_anim = any(getattr(anim, 'card', None) == card and not getattr(anim, 'done', False) for anim in self.replay_animations)
+                has_active_anim = any(
+                    getattr(anim, 'card', None) == card
+                    and not getattr(anim, 'done', False)
+                    and getattr(anim, 'current_frame', 0) >= 0  # attiva solo se l'animazione è iniziata
+                    for anim in self.replay_animations
+                )
             if has_active_anim:
                 continue
                 
