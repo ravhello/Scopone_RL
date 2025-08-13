@@ -4940,6 +4940,9 @@ class GameScreen(BaseScreen):
                 while self.app.network.message_queue:
                     message = self.app.network.message_queue.popleft()
                     self.messages.append(message)
+                    # Auto-scroll to bottom when new messages arrive only if we were already at bottom
+                    if self.message_scroll_offset >= getattr(self, 'scrollbar_max_offset', 0):
+                        self.message_scroll_offset = 1000000000
                     
     def perform_initial_sync(self):
         """Invia lo stato iniziale completo dal server al client, inclusi mazzo e giocatore iniziale"""
@@ -5049,6 +5052,9 @@ class GameScreen(BaseScreen):
         print("TEAM AI: giocatori 1 e 3")
         self.messages.append("TEAM UMANO: giocatori 0 e 2") 
         self.messages.append("TEAM AI: giocatori 1 e 3")
+        # Ensure the message log scrolls to the newest entries if we are at bottom
+        if self.message_scroll_offset >= getattr(self, 'scrollbar_max_offset', 0):
+            self.message_scroll_offset = 1000000000
         
         print("\nConfigurazione finale dei giocatori:")
         for player in self.players:
@@ -5125,6 +5131,9 @@ class GameScreen(BaseScreen):
         print("Squadre: (0,2) vs (1,3) con AI in 2 e 3")
         self.messages.append("Team 0: Human 0 + AI 2")
         self.messages.append("Team 1: Human 1 + AI 3")
+        # Ensure the message log scrolls to the newest entries if we are at bottom
+        if self.message_scroll_offset >= getattr(self, 'scrollbar_max_offset', 0):
+            self.message_scroll_offset = 1000000000
     
     def update_animations(self):
         """Update and clean up animations, return True if animations are active"""
