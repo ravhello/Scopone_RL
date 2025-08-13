@@ -777,7 +777,17 @@ class NetworkManager:
                             pdata['name'] = str(message['name'])[:20]
                         if 'ready' in message:
                             pdata['ready'] = bool(message['ready'])
-                        pdata['team'] = 0 if player_id in [0, 2] else 1
+                        # Team is derived from seat index (0,2 => team 0; 1,3 => team 1). Will be enforced at game time.
+                        try:
+                            seats = lobby.setdefault('seats', {})
+                            # Find the seat of this player if assigned
+                            seat_of_player = next((int(seat) for seat, pid in seats.items() if pid == player_id), None)
+                        except Exception:
+                            seat_of_player = None
+                        if seat_of_player is not None:
+                            pdata['team'] = 0 if seat_of_player in [0, 2] else 1
+                        else:
+                            pdata['team'] = 0 if player_id in [0, 2] else 1
                         self.broadcast_lobby_state()
                     elif message.get("type") == "lobby_swap_request" and self.is_host:
                         try:
@@ -3086,10 +3096,34 @@ class LobbyScreen(BaseScreen):
                             humans_ready = sum(1 for pid in human_pids if players.get(pid, {}).get('ready')) >= 3
                             can_start = humans_ready
                         if can_start:
-                            # Build player_names mapping and store
-                            names = {pid: players.get(pid, {}).get('name', f'Player {pid}') for pid in [0,1,2,3]}
-                            self.app.game_config['player_names'] = names
-                            self.app.network.game_state['player_names'] = names
+                            # Build seating info from lobby and store it so the match respects lobby choices
+                            seats = lobby.get('seats', {}) if isinstance(lobby, dict) else {}
+                            ai_seat = lobby.get('ai_seat') if isinstance(lobby, dict) else None
+                            # Names keyed by SEAT index so game logic uses seat order, not connection ids
+                            names_by_seat = {}
+                            for seat in [0, 1, 2, 3]:
+                                if online_type == 'three_humans_one_ai' and ai_seat is not None and seat == ai_seat:
+                                    names_by_seat[seat] = f"AI {seat}"
+                                else:
+                                    pid = seats.get(seat)
+                                    if pid is not None:
+                                        names_by_seat[seat] = players.get(pid, {}).get('name', f'Player {pid}')
+                                    else:
+                                        names_by_seat[seat] = f"Seat {seat}"
+                            # Persist into config (used by GameScreen)
+                            self.app.game_config['player_names'] = names_by_seat
+                            self.app.game_config['seat_mapping'] = dict(seats)
+                            if ai_seat is not None:
+                                self.app.game_config['ai_seat'] = int(ai_seat)
+                            # Mirror into network state so clients can pick it up
+                            try:
+                                self.app.network.game_state['player_names'] = names_by_seat
+                                self.app.network.game_state.setdefault('lobby_state', {}).setdefault('seats', {})
+                                self.app.network.game_state['lobby_state']['seats'] = dict(seats)
+                                if ai_seat is not None:
+                                    self.app.network.game_state['lobby_state']['ai_seat'] = int(ai_seat)
+                            except Exception:
+                                pass
                             # Switch to game and broadcast start
                             self.done = True
                             self.next_screen = "game"
@@ -3701,6 +3735,29 @@ class GameScreen(BaseScreen):
                 # Force a clean slate at every match start; wait for server assignment
                 self.local_player_id = None
 
+            # Apply lobby seat mapping so that local player index reflects chosen seat
+            try:
+                seats_map = {}
+                # Prefer mapping from config (persisted at start)
+                cfg_seats = self.app.game_config.get('seat_mapping') if isinstance(self.app.game_config, dict) else None
+                if isinstance(cfg_seats, dict) and cfg_seats:
+                    seats_map = cfg_seats
+                # Fallback to network state lobby mapping
+                if not seats_map and hasattr(self.app, 'network') and isinstance(getattr(self.app.network, 'game_state', {}), dict):
+                    lobby = self.app.network.game_state.get('lobby_state', {})
+                    if isinstance(lobby, dict):
+                        seats_map = lobby.get('seats', {}) or {}
+                if seats_map:
+                    # Invert seat->pid to pid->seat
+                    pid_to_seat = {int(pid): int(seat) for seat, pid in seats_map.items() if pid is not None}
+                    my_pid = 0 if is_host else None
+                    if my_pid is not None and my_pid in pid_to_seat:
+                        mapped_seat = pid_to_seat[my_pid]
+                        print(f"Mappatura lobby (inizializzazione): pid {my_pid} -> seat {mapped_seat}")
+                        self.local_player_id = mapped_seat
+            except Exception:
+                pass
+
         # Prepara struttura serie per host
         if is_online and is_host:
             # Mantieni regole nello stato di rete per broadcast
@@ -3928,21 +3985,28 @@ class GameScreen(BaseScreen):
                     is_human = player_id in [0, 1]
                     is_ai = player_id in [2, 3]
                 elif is_online_three_humans_one_ai:
-                    # AI è il seat non occupato da 3 umani; per default trattiamo AI come seat 3 finché la lobby non decide
-                    # Per sicurezza: considera umani su quelli presenti in player_names (se arrivano da lobby)
-                    human_ids = [pid for pid in range(4) if (config.get('player_names', {}).get(pid) not in (None, f'Player {pid}'))]
-                    if len(human_ids) == 3:
-                        is_human = player_id in human_ids
-                        is_ai = not is_human
+                    # Rispetta il seat AI scelto in lobby
+                    ai_seat = self.app.game_config.get('ai_seat')
+                    if ai_seat is None and hasattr(self.app, 'network') and isinstance(getattr(self.app.network, 'game_state', {}), dict):
+                        try:
+                            lobby = self.app.network.game_state.get('lobby_state', {})
+                            if isinstance(lobby, dict):
+                                ai_seat = lobby.get('ai_seat')
+                        except Exception:
+                            ai_seat = None
+                    if ai_seat is not None:
+                        is_ai = (player_id == int(ai_seat))
+                        is_human = not is_ai
                     else:
-                        # Fallback: host (0) e due client (1,2) umani, seat 3 AI
-                        is_human = player_id in [0, 1, 2]
-                        is_ai = player_id == 3
+                        # Fallback: assume seat 3 is AI
+                        is_ai = (player_id == 3)
+                        is_human = not is_ai
                 else:  # All human
                     is_human = True
                     is_ai = False
             
             # Determina il nome del giocatore
+            # In online, names are keyed by seat indices; for local/single keep empty mapping
             player_names = config.get('player_names', {}) if mode == "online_multiplayer" else {}
             name = None
             if is_human:
@@ -3957,7 +4021,8 @@ class GameScreen(BaseScreen):
                     else:
                         name = f"Player {player_id}"
             else:  # AI
-                name = f"AI {player_id}"
+                # For 3v1, prefer AI name by seat (already in player_names if set by lobby)
+                name = player_names.get(player_id, f"AI {player_id}")
             
             # Crea l'oggetto PlayerInfo
             player = PlayerInfo(
@@ -3970,6 +4035,35 @@ class GameScreen(BaseScreen):
             
             # Aggiungi alla lista
             self.players.append(player)
+        
+        # Se 3v1 online: assicurati che esista un controller AI per il seat AI deciso in lobby
+        if mode == "online_multiplayer" and is_online_three_humans_one_ai:
+            try:
+                ai_seat = self.app.game_config.get('ai_seat')
+                if ai_seat is None and hasattr(self.app, 'network') and isinstance(getattr(self.app.network, 'game_state', {}), dict):
+                    lobby = self.app.network.game_state.get('lobby_state', {})
+                    if isinstance(lobby, dict):
+                        ai_seat = lobby.get('ai_seat')
+                if ai_seat is not None:
+                    ai_seat = int(ai_seat)
+                    if self.players[ai_seat].is_ai and ai_seat not in self.ai_controllers:
+                        ai_team_id = 0 if ai_seat in [0, 2] else 1
+                        ai_agent = DQNAgent(team_id=ai_team_id)
+                        ck_path = f"scopone_checkpoint_team{ai_team_id}.pth"
+                        if os.path.exists(ck_path):
+                            try:
+                                ai_agent.load_checkpoint(ck_path)
+                            except Exception:
+                                pass
+                        if self.ai_difficulty == 0:
+                            ai_agent.epsilon = 0.3
+                        elif self.ai_difficulty == 1:
+                            ai_agent.epsilon = 0.1
+                        else:
+                            ai_agent.epsilon = 0
+                        self.ai_controllers[ai_seat] = ai_agent
+            except Exception:
+                pass
         
         # Configura la prospettiva visuale per il multiplayer online
         if mode == "online_multiplayer":
@@ -4288,8 +4382,13 @@ class GameScreen(BaseScreen):
         else:
             # Top-right; align under difficulty label when present
             top_base = int(height * 0.02)
-            if self.app.game_config.get("mode") in ["single_player", "team_vs_ai"]:
+            mode_val = self.app.game_config.get("mode")
+            if mode_val in ["single_player", "team_vs_ai"]:
                 top_base = int(height * 0.026) + self.small_font.get_height() + int(height * 0.012)
+            elif mode_val == "online_multiplayer":
+                online_type = self.app.game_config.get("online_type")
+                if online_type in ("team_vs_ai", "humans_plus_ai", "three_humans_one_ai"):
+                    top_base = int(height * 0.026) + self.small_font.get_height() + int(height * 0.012)
             left = width - margin_w - pile_width
             top = top_base
             return pygame.Rect(left, top, pile_width, pile_height)
@@ -4856,15 +4955,36 @@ class GameScreen(BaseScreen):
         
         # Continue with regular updates if connection is fine
         if not self.connection_lost:
-        
-            # Aggiorna local_player_id dal network se necessario
+            # Ensure old_player_id is defined for subsequent comparison
+            try:
+                old_player_id = self.local_player_id
+            except Exception:
+                old_player_id = None
+            
+            # Aggiorna local_player_id dal network se necessario (mappa al seat scelto in lobby)
             if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host"):
                 if self.app.network and self.app.network.player_id is not None:
-                    old_player_id = self.local_player_id
-                    if self.local_player_id != self.app.network.player_id:
-                        print(f"Aggiornamento player_id: da {self.local_player_id} a {self.app.network.player_id}")
-                        self.local_player_id = self.app.network.player_id
-                        
+                    net_pid = self.app.network.player_id
+                    target_local_id = net_pid
+                    try:
+                        seats_map = {}
+                        cfg_seats = self.app.game_config.get('seat_mapping') if isinstance(self.app.game_config, dict) else None
+                        if isinstance(cfg_seats, dict) and cfg_seats:
+                            seats_map = cfg_seats
+                        if not seats_map and isinstance(getattr(self.app.network, 'game_state', {}), dict):
+                            lobby = self.app.network.game_state.get('lobby_state', {})
+                            if isinstance(lobby, dict):
+                                seats_map = lobby.get('seats', {}) or {}
+                        if seats_map:
+                            pid_to_seat = {int(pid): int(seat) for seat, pid in seats_map.items() if pid is not None}
+                            if net_pid in pid_to_seat:
+                                target_local_id = pid_to_seat[net_pid]
+                    except Exception:
+                        pass
+                    if self.local_player_id != target_local_id:
+                        print(f"Aggiornamento player_id: da {self.local_player_id} a {target_local_id} (pid {net_pid})")
+                        self.local_player_id = target_local_id
+            
             # Aggiorna i giocatori in caso di cambio ID o prima assegnazione
             if old_player_id != self.local_player_id:
                 # Riaggiorna player info, prospettiva e layout
@@ -5351,11 +5471,31 @@ class GameScreen(BaseScreen):
             
             # Process any queued moves
             while self.app.network.move_queue:
-                player_id, move = self.app.network.move_queue.popleft()
+                net_pid, move = self.app.network.move_queue.popleft()
                 
-                # Verify it's the player's turn
-                if player_id != self.env.current_player:
-                    print(f"Ignoring move from player {player_id}, it's player {self.env.current_player}'s turn")
+                # Map network player id -> logical seat according to lobby seats
+                mapped_player_id = net_pid
+                try:
+                    seats_map = {}
+                    # Prefer mapping persisted in config
+                    cfg_seats = self.app.game_config.get('seat_mapping') if isinstance(self.app.game_config, dict) else None
+                    if isinstance(cfg_seats, dict) and cfg_seats:
+                        seats_map = cfg_seats
+                    # Fallback to network lobby mapping
+                    if not seats_map and isinstance(getattr(self.app.network, 'game_state', {}), dict):
+                        lobby = self.app.network.game_state.get('lobby_state', {})
+                        if isinstance(lobby, dict):
+                            seats_map = lobby.get('seats', {}) or {}
+                    if seats_map:
+                        pid_to_seat = {int(pid): int(seat) for seat, pid in seats_map.items() if pid is not None}
+                        if net_pid in pid_to_seat:
+                            mapped_player_id = pid_to_seat[net_pid]
+                except Exception:
+                    pass
+
+                # Verify it's the mapped player's turn
+                if mapped_player_id != self.env.current_player:
+                    print(f"Ignoring move from player {net_pid} (seat {mapped_player_id}), it's player {self.env.current_player}'s turn")
                     continue
                 
                 # Execute the move and create animations
@@ -5364,8 +5504,8 @@ class GameScreen(BaseScreen):
                     card_played, cards_captured = decode_action(move)
                     #print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
                     
-                    # Create animations for the move
-                    self.create_move_animations(card_played, cards_captured, player_id)
+                    # Create animations for the move from the correct seat
+                    self.create_move_animations(card_played, cards_captured, mapped_player_id)
                     
                     # Execute the move in the environment
                     _, _, done, info = self.env.step(move)
@@ -5393,7 +5533,7 @@ class GameScreen(BaseScreen):
                     
                     # Add information about the move that was just made
                     self.app.network.game_state['last_move'] = {
-                        'player': player_id,
+                        'player': mapped_player_id,
                         'card_played': card_played,
                         'cards_captured': cards_captured
                     }
@@ -7086,9 +7226,9 @@ class GameScreen(BaseScreen):
                 surface.blit(indicator_surf, indicator_rect)
                 current_y = indicator_rect.bottom + int(height * 0.006)
 
-            # Draw difficulty info if playing against AI (all online modes with AI)
+            # Draw difficulty info if playing against AI (local single/team_vs_ai and all online AI modes)
             online_type = self.app.game_config.get("online_type")
-            if (self.app.game_config.get("mode") == "single_player" or
+            if (self.app.game_config.get("mode") in ("single_player", "team_vs_ai") or
                 online_type in ("team_vs_ai", "humans_plus_ai", "three_humans_one_ai")):
                 diff_text = "AI Difficulty: "
                 if self.ai_difficulty == 0:
