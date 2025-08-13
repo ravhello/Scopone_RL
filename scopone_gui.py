@@ -2184,8 +2184,37 @@ class GameModeScreen(BaseScreen):
                 elif event.key == pygame.K_BACKSPACE:
                     self.ip_input = self.ip_input[:-1]
                 else:
-                    if len(self.ip_input) < 25:  # Increased limit for longer IP addresses or hostnames
-                        self.ip_input += event.unicode
+                    # Support paste via Ctrl+V / Cmd+V / Shift+Insert
+                    try:
+                        mods = getattr(event, 'mod', 0)
+                    except Exception:
+                        mods = 0
+                    is_ctrl = bool(mods & (getattr(pygame, 'KMOD_CTRL', 0)))
+                    is_cmd = bool(mods & (getattr(pygame, 'KMOD_META', 0)))
+                    is_shift = bool(mods & (getattr(pygame, 'KMOD_SHIFT', 0)))
+
+                    pasted = None
+                    if (is_ctrl or is_cmd) and event.key == pygame.K_v:
+                        pasted = self._get_clipboard_text()
+                    elif is_shift and event.key == pygame.K_INSERT:
+                        pasted = self._get_clipboard_text()
+
+                    if pasted:
+                        # Sanitize and respect length limit
+                        try:
+                            allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:_[]"
+                            sanitized = ''.join(ch for ch in pasted if ch in allowed_chars)
+                            sanitized = sanitized.strip()
+                        except Exception:
+                            sanitized = str(pasted).strip()
+                        if sanitized:
+                            max_len = 25
+                            remaining = max_len - len(self.ip_input)
+                            if remaining > 0:
+                                self.ip_input += sanitized[:remaining]
+                    else:
+                        if len(self.ip_input) < 25:  # Increased limit for longer IP addresses or hostnames
+                            self.ip_input += event.unicode
     
 
     def handle_button_click(self, button_index):
@@ -2406,6 +2435,44 @@ class GameModeScreen(BaseScreen):
         
         # Show status message
         self.status_message = f"Connecting to {host}..."
+
+    def _get_clipboard_text(self):
+        """Return clipboard text using multiple backends; empty string if none."""
+        # Try tkinter (robust across OS)
+        try:
+            import tkinter as _tk
+            _r = _tk.Tk()
+            _r.withdraw()
+            data = _r.clipboard_get()
+            _r.destroy()
+            if isinstance(data, str):
+                return data
+        except Exception:
+            pass
+        # Try pygame.scrap
+        try:
+            if hasattr(pygame, 'scrap'):
+                try:
+                    pygame.scrap.init()
+                except Exception:
+                    pass
+                raw = pygame.scrap.get(pygame.SCRAP_TEXT)
+                if raw:
+                    try:
+                        return raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else str(raw)
+                    except Exception:
+                        return str(raw)
+        except Exception:
+            pass
+        # Windows fallback via PowerShell
+        try:
+            if sys.platform.startswith('win'):
+                import subprocess
+                out = subprocess.run(['powershell', '-command', 'Get-Clipboard'], capture_output=True, text=True, check=True)
+                return out.stdout.strip()
+        except Exception:
+            pass
+        return ""
     
     def draw(self, surface):
         # Draw background
@@ -3096,6 +3163,28 @@ class LobbyScreen(BaseScreen):
                 self.done = True
                 self.next_screen = "mode"
                 return
+        except Exception:
+            pass
+
+        # If we're a client and the host has started the game, transition to the game screen
+        try:
+            if hasattr(self.app, 'network') and self.app.network:
+                net = self.app.network
+                if not net.is_host:
+                    gs = net.game_state if isinstance(net.game_state, dict) else {}
+                    start_flag = bool(gs.get('start_game')) if isinstance(gs, dict) else False
+                    has_game_payload = isinstance(gs, dict) and any(k in gs for k in ['hands', 'table', 'current_player', 'deck'])
+                    if start_flag or has_game_payload:
+                        # Preserve/ensure required flags for the game screen
+                        self.app.game_config.update({
+                            "mode": "online_multiplayer",
+                            "is_host": False,
+                            "player_id": getattr(net, 'player_id', None),
+                            "online_type": (gs.get('online_type') if isinstance(gs, dict) else None) or self.app.game_config.get('online_type') or 'all_human'
+                        })
+                        self.done = True
+                        self.next_screen = "game"
+                        return
         except Exception:
             pass
 
