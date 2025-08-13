@@ -3607,6 +3607,9 @@ class GameScreen(BaseScreen):
         self.series_scores = [0, 0]
         self.series_hands_played = 0
         self.series_prev_starter = None
+        # Dealer tracking for current hand
+        self.hand_starting_player = None  # player who started the current hand
+        self.current_dealer_id = None     # player who is last to play in current hand (mazziere)
         # Storico punteggi per mano (solo per modalità a punti)
         self.points_history = []  # list[(team0_points:int, team1_points:int)]
         # Conteggio mani vinte (modalità a mani)
@@ -3752,6 +3755,9 @@ class GameScreen(BaseScreen):
                 random_starter = 1
             print(f"Host/locale: inizializzazione con giocatore random {random_starter}")
             self.env.reset(starting_player=random_starter)
+            # Track starter and dealer for this hand
+            self.hand_starting_player = random_starter
+            self.current_dealer_id = (random_starter + 3) % 4
         
         # Set up AI controllers if needed
         if mode in ["single_player", "team_vs_ai"]:
@@ -3806,6 +3812,11 @@ class GameScreen(BaseScreen):
                         self.app.network.game_state.pop(key, None)
                     except Exception:
                         pass
+                # Broadcast starter/dealer info for clients to display correct badge
+                try:
+                    self.app.network.game_state['starting_player'] = self.hand_starting_player
+                except Exception:
+                    pass
 
     def _handle_hand_end(self, final_breakdown):
         """Handle end of a single hand and possibly continue series/match."""
@@ -3874,6 +3885,9 @@ class GameScreen(BaseScreen):
                 # Start a new hand immediately (modalità a mani)
                 next_starter = (self.series_prev_starter + 1) % 4 if self.series_prev_starter is not None else random.randint(0, 3)
                 self.series_prev_starter = next_starter
+                # Track starter and dealer for the new hand
+                self.hand_starting_player = next_starter
+                self.current_dealer_id = (next_starter + 3) % 4
                 self.game_over = False
                 self.final_breakdown = None
                 self.status_message = ""
@@ -4483,6 +4497,9 @@ class GameScreen(BaseScreen):
                         if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
                             next_starter = self._pending_next_starter if self._pending_next_starter is not None else random.randint(0, 3)
                             self.series_prev_starter = next_starter
+                            # Track starter and dealer for the new hand
+                            self.hand_starting_player = next_starter
+                            self.current_dealer_id = (next_starter + 3) % 4
                             self.game_over = False
                             self.final_breakdown = None
                             self.status_message = ""
@@ -5660,6 +5677,14 @@ class GameScreen(BaseScreen):
                         if new_current_player is not None:
                             self.env.current_player = new_current_player
                             self.current_player_id = new_current_player
+                        # Track current hand starter/dealer if provided by host
+                        try:
+                            sp = new_state.get('starting_player')
+                            if sp is not None:
+                                self.hand_starting_player = int(sp)
+                                self.current_dealer_id = (self.hand_starting_player + 3) % 4
+                        except Exception:
+                            pass
                         self.update_player_hands()
                         self.has_received_initial_state = True
                         # Ensure visual mapping is recomputed in case seat perspective changed across matches
@@ -5680,6 +5705,14 @@ class GameScreen(BaseScreen):
                     
                     # Apply the new state
                     self.env.game_state = new_state
+                    # Update starter/dealer info if provided
+                    try:
+                        sp = new_state.get('starting_player')
+                        if sp is not None:
+                            self.hand_starting_player = int(sp)
+                            self.current_dealer_id = (self.hand_starting_player + 3) % 4
+                    except Exception:
+                        pass
                     
                     # CRITICAL: Ensure the local player's hand is preserved and correctly updated
                     if local_hand is not None:
@@ -6614,6 +6647,25 @@ class GameScreen(BaseScreen):
         # Draw border if it's current player's turn
         if player.player_id == self.current_player_id:
             pygame.draw.rect(surface, GOLD, player.avatar_rect.inflate(6, 6), 3, border_radius=12)
+
+        # Dealer badge inside avatar for the player who is last to play (mazziere)
+        # Determination: dealer is the one immediately before the starting player of the hand
+        try:
+            dealer_id = self.current_dealer_id
+        except Exception:
+            dealer_id = None
+        if dealer_id is not None and player.player_id == dealer_id:
+            # Draw a small circular badge in the top-left of the avatar with a 'D'
+            badge_radius = max(10, int(min(player.avatar_rect.width, player.avatar_rect.height) * 0.12))
+            badge_center = (player.avatar_rect.left + badge_radius + 6, player.avatar_rect.top + badge_radius + 6)
+            # Badge base
+            pygame.draw.circle(surface, (240, 220, 40), badge_center, badge_radius)  # golden yellow
+            pygame.draw.circle(surface, (120, 90, 0), badge_center, badge_radius, 2)  # darker border
+            # Letter 'D'
+            badge_font = pygame.font.SysFont(None, int(badge_radius * 1.6))
+            d_surf = badge_font.render("D", True, BLACK)
+            d_rect = d_surf.get_rect(center=badge_center)
+            surface.blit(d_surf, d_rect)
         
         # Calculate text positions inside the avatar box
         # Create a smaller font for fitting text in the box
@@ -7020,6 +7072,12 @@ class GameScreen(BaseScreen):
         width = self.app.window_width
         height = self.app.window_height
         
+        # Dealer badge also next to team pile area for clarity (optional subtle marker)
+        try:
+            dealer_id = self.current_dealer_id
+        except Exception:
+            dealer_id = None
+
         # Mini card size ~ 1/3 of hand card size
         mini_w = max(1, int(CARD_WIDTH * 0.33))
         mini_h = max(1, int(CARD_HEIGHT * 0.33))
@@ -7067,6 +7125,16 @@ class GameScreen(BaseScreen):
             text = f"Team {team_id}: {count} cards"
             text_surf = self.small_font.render(text, True, WHITE)
             surface.blit(text_surf, (rect.left + 10, rect.top + 5))
+
+            # Optional tiny dealer marker near the label, indicating which team includes the dealer
+            if dealer_id is not None:
+                dealer_team = 0 if dealer_id in [0, 2] else 1
+                if dealer_team == team_id:
+                    r = max(6, int(min(width, height) * 0.008))
+                    cx = rect.left + 10 + text_surf.get_width() + r + 8
+                    cy = rect.top + 8 + r
+                    pygame.draw.circle(surface, (240, 220, 40), (cx, cy), r)
+                    pygame.draw.circle(surface, (120, 90, 0), (cx, cy), r, 2)
 
             # Pre-scale card back for this team
             back_img = self.app.resources.get_card_back(team_id)
