@@ -8360,10 +8360,35 @@ class GameScreen(BaseScreen):
         border_thickness = 1  # Sottile bordo nero
         border_radius = 8     # Angoli smussati
         
-        # Calculate positions for table layout - use table width to determine spacing
-        max_spacing = self.table_rect.width * 0.8 / max(len(table_cards), 1)
+        # Determine reference layout for spacing and indexing.
+        # If any active animation (normal or replay) carries a table snapshot (e.g., slide/plateau during no-capture),
+        # use that snapshot to avoid computing positions from the old table and causing a flash.
+        layout_cards = list(table_cards)
+        try:
+            # If a persistent replay layout snapshot is set, prefer it
+            if getattr(self, 'replay_active', False) and getattr(self, 'replay_table_layout_snapshot', None):
+                layout_cards = list(self.replay_table_layout_snapshot)
+            # First prefer replay snapshots when replay is active
+            elif getattr(self, 'replay_active', False) and getattr(self, 'replay_animations', None):
+                for a in reversed(self.replay_animations):
+                    snap = getattr(a, 'table_snapshot', None)
+                    if isinstance(snap, list) and snap:
+                        layout_cards = list(snap)
+                        break
+            # Otherwise fall back to normal animations' snapshots
+            if layout_cards == list(table_cards) and self.animations:
+                for a in reversed(self.animations):
+                    snap = getattr(a, 'table_snapshot', None)
+                    if isinstance(snap, list) and snap:
+                        layout_cards = list(snap)
+                        break
+        except Exception:
+            pass
+        
+        # Calculate positions for table layout based on reference list
+        max_spacing = self.table_rect.width * 0.8 / max(len(layout_cards), 1)
         card_spacing = min(card_width * 1.1, max_spacing)
-        start_x = self.table_rect.centerx - (len(table_cards) * card_spacing) // 2
+        start_x = self.table_rect.centerx - (len(layout_cards) * card_spacing) // 2
         y = self.table_rect.centery - card_height // 2
         
         # Evita il doppio disegno: non disegnare staticamente le carte che hanno animazioni attive
@@ -8391,6 +8416,20 @@ class GameScreen(BaseScreen):
                                          and getattr(a, 'table_snapshot', None) is not None), None)
                 except Exception:
                     sliding_snap = None
+                # Consider replay snapshots as well (including persistent replay layout)
+                if getattr(self, 'replay_active', False) and (not isinstance(sliding_snap, list)):
+                    try:
+                        sliding_snap = next((a.table_snapshot for a in self.replay_animations
+                                             if getattr(a, 'animation_type', '') in ('replay_table_slide', 'replay_plateau')
+                                             and getattr(a, 'table_snapshot', None) is not None), None)
+                    except Exception:
+                        pass
+                    if not isinstance(sliding_snap, list):
+                        try:
+                            if getattr(self, 'replay_table_layout_snapshot', None):
+                                sliding_snap = list(self.replay_table_layout_snapshot)
+                        except Exception:
+                            pass
                 if isinstance(sliding_snap, list) and card not in sliding_snap:
                     continue
             # Multipresa: se abbiamo carte catturate in sospeso, non disegnare staticamente nessuna delle carte catturate
@@ -8402,9 +8441,16 @@ class GameScreen(BaseScreen):
             # Evita ricomparse lampo dopo slide/capture: se esiste uno snapshot della tavola sulla
             # quale sono basate le animazioni correnti, disegna solo carte presenti in quello snapshot
             # quando stiamo ancora animando (finché esistono animazioni attive con snapshot).
-            if self.animations:
+            if self.animations or (getattr(self, 'replay_active', False) and getattr(self, 'replay_animations', None)):
                 try:
-                    snapshots = [a.table_snapshot for a in self.animations if getattr(a, 'table_snapshot', None)]
+                    snapshots = []
+                    if self.animations:
+                        snapshots.extend([a.table_snapshot for a in self.animations if getattr(a, 'table_snapshot', None)])
+                    if getattr(self, 'replay_active', False) and getattr(self, 'replay_animations', None):
+                        snapshots.extend([a.table_snapshot for a in self.replay_animations if getattr(a, 'table_snapshot', None)])
+                    # Persistent replay layout snapshot last
+                    if getattr(self, 'replay_active', False) and getattr(self, 'replay_table_layout_snapshot', None):
+                        snapshots.append(list(self.replay_table_layout_snapshot))
                     if snapshots:
                         # Usa l'ultimo snapshot valido
                         snap = None
@@ -8428,7 +8474,12 @@ class GameScreen(BaseScreen):
             if has_active_anim:
                 continue
                 
-            x = start_x + i * card_spacing
+            # Use the index from the reference layout when available to place the card
+            try:
+                idx = layout_cards.index(card)
+            except ValueError:
+                idx = i
+            x = start_x + idx * card_spacing
             
             # Get card image
             card_img = self.app.resources.get_card_image(card)
@@ -9881,6 +9932,12 @@ class GameScreen(BaseScreen):
         
         move = self.replay_moves[self.replay_current_index]
         
+        # Reset persistent layout snapshot for this move (used by draw_table_cards during replay)
+        try:
+            self.replay_table_layout_snapshot = None
+        except Exception:
+            pass
+        
         # Non modifichiamo più subito lo stato del tavolo del replay.
         # Le modifiche al tavolo avverranno sincronizzate con la fine delle animazioni
         # (aggiunta dopo mano->tavolo, rimozione dopo cattura).
@@ -9999,6 +10056,11 @@ class GameScreen(BaseScreen):
                         self.replay_animations.append(motion_start_anim)
                     except Exception:
                         pass
+            # Persist final layout snapshot for static draw during/after slide
+            try:
+                self.replay_table_layout_snapshot = list(new_table)
+            except Exception:
+                pass
         
         # Use the same animation parameters as regular game animations
         hand_to_table_duration = 15
@@ -10050,6 +10112,7 @@ class GameScreen(BaseScreen):
             )
             try:
                 plateau_anim.is_played_card = True
+                plateau_anim.table_snapshot = list(original_table + [played_card])
             except Exception:
                 pass
             self.replay_animations.append(plateau_anim)
@@ -10147,6 +10210,10 @@ class GameScreen(BaseScreen):
                                 rotation_end=0,
                                 animation_type="replay_table_slide"
                             )
+                            try:
+                                slide_after_cap.table_snapshot = list(remaining_after_capture)
+                            except Exception:
+                                pass
                             self.replay_animations.append(slide_after_cap)
                             try:
                                 motion_start_anim = CardAnimation(
@@ -10160,6 +10227,11 @@ class GameScreen(BaseScreen):
                                 self.replay_animations.append(motion_start_anim)
                             except Exception:
                                 pass
+                # Persist final layout snapshot for remaining cards during/after capture slides
+                try:
+                    self.replay_table_layout_snapshot = list(remaining_after_capture)
+                except Exception:
+                    pass
             except Exception:
                 pass
     
