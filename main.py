@@ -49,6 +49,7 @@ EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
 # Nota: BATCH_SIZE non più utilizzato - processiamo tutti i dati in un'unica passata
+BATCH_SIZE = 32  # definito per compatibilità con i test
 REPLAY_SIZE = 10000      # capacità massima del replay buffer
 TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target (ora usato solo per sincronizzazione globale)
 CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"

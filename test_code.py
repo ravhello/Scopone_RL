@@ -160,7 +160,8 @@ def test_get_valid_actions_no_direct_capture(env_fixture):
     env.current_player = 0
 
     valids = env.get_valid_actions()
-    
+    assert len(valids) == 2, "Dovrebbero esserci esattamente 2 azioni valide"
+
     # Decodifichiamo le azioni valide e verifichiamo che corrispondano alle aspettative
     valid_plays = []
     for action_vec in valids:
