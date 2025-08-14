@@ -2331,6 +2331,13 @@ class GameModeScreen(BaseScreen):
         """Host an online game with internet support"""
         print("\nDEBUG HOST GAME: Creating NetworkManager with is_host=True")
         self.app.network = NetworkManager(is_host=True)
+        # Conserva le regole correnti configurate nelle Opzioni
+        try:
+            preserved_rules = {}
+            if hasattr(self.app, 'game_config'):
+                preserved_rules = dict(self.app.game_config.get("rules", {}))
+        except Exception:
+            preserved_rules = {}
         
         # CORREZIONE: Imposta SEMPRE l'online_type PRIMA di avviare il server (evita race in accept_connections)
         try:
@@ -2379,7 +2386,8 @@ class GameModeScreen(BaseScreen):
                     "mode": "online_multiplayer",
                     "is_host": True,
                     "player_id": 0,
-                    "online_type": "all_human"
+                    "online_type": "all_human",
+                    "rules": preserved_rules,
                 }
                 # Initialize basic lobby state for host
                 try:
@@ -2403,7 +2411,8 @@ class GameModeScreen(BaseScreen):
                     "is_host": True,  # CRITICAL: Set is_host flag
                     "player_id": 0,
                     "online_type": "team_vs_ai",
-                    "difficulty": self.selected_difficulty
+                    "difficulty": self.selected_difficulty,
+                    "rules": preserved_rules,
                 }
                 print(f"DEBUG HOST GAME: Setting game_config with is_host=True, online_type=team_vs_ai")
                 
@@ -2431,7 +2440,8 @@ class GameModeScreen(BaseScreen):
                     "is_host": True,
                     "player_id": 0,
                     "online_type": "humans_plus_ai",
-                    "difficulty": self.selected_difficulty
+                    "difficulty": self.selected_difficulty,
+                    "rules": preserved_rules,
                 }
                 print("DEBUG HOST GAME: Setting online_type=humans_plus_ai")
                 self.waiting_for_other_player = True
@@ -2448,7 +2458,8 @@ class GameModeScreen(BaseScreen):
                     "is_host": True,
                     "player_id": 0,
                     "online_type": "three_humans_one_ai",
-                    "difficulty": self.selected_difficulty
+                    "difficulty": self.selected_difficulty,
+                    "rules": preserved_rules,
                 }
                 # Inizializza lobby con AI pronta su seat libero (placeholder; sarà determinato dopo i join)
                 try:
@@ -2835,9 +2846,18 @@ class GameModeScreen(BaseScreen):
                     "is_host": is_host,
                     "player_id": self.app.network.player_id
                 }
-                for key in ['online_type', 'difficulty']:
+                # Preserve known fields from previous selection
+                for key in ['online_type', 'difficulty', 'rules']:
                     if key in existing_config:
                         self.app.game_config[key] = existing_config[key]
+                # If rules are still missing, try to fetch them from the network game state (host populated them)
+                try:
+                    if 'rules' not in self.app.game_config:
+                        gs = self.app.network.game_state if hasattr(self.app, 'network') and self.app.network else None
+                        if isinstance(gs, dict) and 'rules' in gs and isinstance(gs['rules'], dict):
+                            self.app.game_config['rules'] = gs['rules']
+                except Exception:
+                    pass
                 print(f"DEBUG: Game config dopo la connessione: {self.app.game_config}")
                 return
                 
@@ -4494,8 +4514,57 @@ class GameScreen(BaseScreen):
                     pos = pygame.mouse.get_pos()
                     if self.next_hand_button.is_clicked(pos):
                         # Avanza alla mano successiva
-                        if self.app.game_config.get("mode") == "online_multiplayer" and self.app.game_config.get("is_host"):
-                            next_starter = self._pending_next_starter if self._pending_next_starter is not None else random.randint(0, 3)
+                        mode = self.app.game_config.get("mode")
+                        is_host = self.app.game_config.get("is_host")
+                        next_starter = self._pending_next_starter if self._pending_next_starter is not None else random.randint(0, 3)
+                        if mode == "online_multiplayer":
+                            if is_host:
+                                self.series_prev_starter = next_starter
+                                # Track starter and dealer for the new hand
+                                self.hand_starting_player = next_starter
+                                self.current_dealer_id = (next_starter + 3) % 4
+                                self.game_over = False
+                                self.final_breakdown = None
+                                self.status_message = ""
+                                self.selected_hand_card = None
+                                self.selected_table_cards = set()
+                                self.animations = []
+                                rules = self.app.game_config.get("rules", {})
+                                self.env = ScoponeEnvMA(rules=rules)
+                                self.env.reset(starting_player=next_starter)
+                                self.setup_players()
+                                self.setup_layout()
+                                # Chiudi overlay
+                                self.show_intermediate_recap = False
+                                self.last_hand_breakdown = None
+                                self._pending_next_starter = None
+                                self.next_hand_button = None
+                                self.exit_overlay_button = None
+                                # Broadcast nuovo stato per i client: stato completo della nuova mano
+                                try:
+                                    self.perform_initial_sync()
+                                except Exception:
+                                    try:
+                                        # Fallback realistico nel caso perform_initial_sync non sia disponibile
+                                        if hasattr(self.app, 'network') and self.app.network:
+                                            online_type = self.app.game_config.get("online_type")
+                                            self.app.network.game_state = self.env.game_state.copy()
+                                            if online_type:
+                                                self.app.network.game_state['online_type'] = online_type
+                                                if online_type == 'team_vs_ai':
+                                                    self.app.network.game_state['ai_players'] = [1, 3]
+                                            self.app.network.game_state['current_player'] = getattr(self.env, 'current_player', None)
+                                            self.app.network.broadcast_game_state()
+                                    except Exception:
+                                        pass
+                                # Inoltre, sincronizza lo stato di serie/overlay
+                                self._broadcast_series_state()
+                            else:
+                                # Client: aspetta host; non deve avanzare
+                                pass
+                            return
+                        else:
+                            # Modalità locali (single_player, team_vs_ai, local_multiplayer)
                             self.series_prev_starter = next_starter
                             # Track starter and dealer for the new hand
                             self.hand_starting_player = next_starter
@@ -4517,11 +4586,6 @@ class GameScreen(BaseScreen):
                             self._pending_next_starter = None
                             self.next_hand_button = None
                             self.exit_overlay_button = None
-                            # Broadcast nuovo stato per i client
-                            self._broadcast_series_state()
-                            return
-                        else:
-                            # Client: aspetta host; non deve avanzare
                             return
                     if getattr(self, 'exit_overlay_button', None) and self.exit_overlay_button.is_clicked(pos):
                         # Esci al menu
@@ -5624,6 +5688,22 @@ class GameScreen(BaseScreen):
                             for k, v in self.app.network.game_state.items()}
                 # Apply series overlay/state if present (from series_state messages)
                 series_state = new_state.pop('series_state', None)
+                # CRITICO: Applica SUBITO lo stato di serie, così evitiamo di mostrare Game Over
+                # quando in realtà c'è un recap intermedio (show_intermediate_recap)
+                if series_state and isinstance(series_state, dict):
+                    for key in [
+                        'series_mode','series_target_points','series_num_hands','series_tiebreak',
+                        'series_scores','series_hands_played','points_history','hands_won',
+                        'show_intermediate_recap','last_hand_breakdown','_pending_next_starter']:
+                        if key in series_state:
+                            setattr(self, key, series_state[key])
+                    # Se il server segnala recap intermedio, nascondi qualsiasi game over lato client
+                    try:
+                        if bool(series_state.get('show_intermediate_recap', False)):
+                            # Recap intermedio → mai game over ora
+                            self.game_over = False
+                    except Exception:
+                        pass
                 
                 # Extract special fields from game state
                 new_current_player = new_state.pop('current_player', None)
@@ -5755,26 +5835,58 @@ class GameScreen(BaseScreen):
                         self.detect_and_animate_changes(old_state, new_state, old_current_player)
                         self.waiting_for_other_player = False
                         
-                        # Check for game over only if 'hands' exists in new_state
+                        # Check for end-of-hand only if 'hands' exists in new_state
                         if 'hands' in new_state:
                             try:
-                                if all(len(new_state["hands"].get(p, [])) == 0 for p in range(4)):
-                                    self.game_over = True
-                                    from rewards import compute_final_score_breakdown
-                                    # Usa le regole correnti per il breakdown
+                                hands_empty = all(len(new_state["hands"].get(p, [])) == 0 for p in range(4))
+                            except Exception:
+                                hands_empty = False
+                            if hands_empty:
+                                # Calcola il breakdown finale per recap/game over
+                                try:
                                     from rewards import compute_final_score_breakdown
                                     self.final_breakdown = compute_final_score_breakdown(new_state, rules=self.app.game_config.get("rules", {}))
-                            except Exception:
-                                pass
+                                except Exception:
+                                    pass
+                                is_online = self.app.game_config.get("mode") == "online_multiplayer"
+                                is_host = self.app.game_config.get("is_host", False)
+                                if not (is_online and not is_host):
+                                    # Host o modalità locali: segna game over subito
+                                    self.game_over = True
+                                else:
+                                    # Client online: aspetta lo stato serie dell'host per decidere
+                                    try:
+                                        # Se in questo update abbiamo ricevuto series_state e indica recap → niente game over
+                                        if series_state and bool(series_state.get('show_intermediate_recap', False)):
+                                            self.game_over = False
+                                        elif series_state:
+                                            # Calcola serie_over usando i valori del series_state ricevuto ORA
+                                            mode = series_state.get('series_mode', getattr(self, 'series_mode', 'oneshot'))
+                                            series_over = False
+                                            if mode == 'hands':
+                                                num_h = int(series_state.get('series_num_hands', getattr(self, 'series_num_hands', 1)) or 1)
+                                                played = int(series_state.get('series_hands_played', getattr(self, 'series_hands_played', 0)) or 0)
+                                                if played >= num_h:
+                                                    series_over = True
+                                            elif mode == 'points':
+                                                scores = list(series_state.get('series_scores', getattr(self, 'series_scores', [0,0])) or [0,0])
+                                                target = int(series_state.get('series_target_points', getattr(self, 'series_target_points', 21)) or 21)
+                                                if max(scores) >= target:
+                                                    series_over = True
+                                            else:
+                                                # oneshot: una mano sola termina sempre
+                                                series_over = True
+                                            if series_over:
+                                                self.game_over = True
+                                        else:
+                                            # Nessun series_state ancora ricevuto: non decidere game over ora
+                                            self.game_over = False
+                                    except Exception:
+                                        pass
                     
-                    # Apply series fields if provided by host
+                    # Apply series fields if provided by host (idempotente; già applicato sopra)
                     if series_state and isinstance(series_state, dict):
-                        for key in [
-                            'series_mode','series_target_points','series_num_hands','series_tiebreak',
-                            'series_scores','series_hands_played','points_history','hands_won',
-                            'show_intermediate_recap','last_hand_breakdown','_pending_next_starter']:
-                            if key in series_state:
-                                setattr(self, key, series_state[key])
+                        pass
 
                     # CRITICAL: Update player hands after applying the state
                     self.update_player_hands()
@@ -6019,25 +6131,39 @@ class GameScreen(BaseScreen):
         is_game_over = bool(hands) and all(len(hands.get(p, [])) == 0 for p in range(4))
         
         if is_game_over:
-            self.game_over = True
-            
-            # Calculate final score
+            # Online client: non decidere qui il game over; aspetta lo stato serie dall'host
+            is_online = self.app.game_config.get("mode") == "online_multiplayer"
+            is_host = self.app.game_config.get("is_host", False)
+
+            # Calcola comunque il breakdown, utile sia per recap intermedio che per game over
             from rewards import compute_final_score_breakdown
-            from rewards import compute_final_score_breakdown
-            self.final_breakdown = compute_final_score_breakdown(gs, rules=self.app.game_config.get("rules", {}))
-            
-            # Determine winner
-            team0_score = self.final_breakdown[0]["total"]
-            team1_score = self.final_breakdown[1]["total"]
-            
-            if team0_score > team1_score:
-                self.status_message = "Team 0 wins!"
-                self.app.resources.play_sound("win" if self.local_player_id in [0, 2] else "lose")
-            elif team1_score > team0_score:
-                self.status_message = "Team 1 wins!"
-                self.app.resources.play_sound("win" if self.local_player_id in [1, 3] else "lose")
+            try:
+                self.final_breakdown = compute_final_score_breakdown(gs, rules=self.app.game_config.get("rules", {}))
+            except Exception:
+                pass
+
+            if is_online and not is_host:
+                # Se c'è recap intermedio in corso, non mostrare game over
+                if getattr(self, 'show_intermediate_recap', False):
+                    self.game_over = False
+                    return
+                # Altrimenti, attendi una decisione dall'host via series_state
+                return
             else:
-                self.status_message = "It's a tie!"
+                # Host o modalità locali: imposta game over e feedback audio
+                self.game_over = True
+                # Determine winner
+                if isinstance(self.final_breakdown, dict):
+                    team0_score = self.final_breakdown[0]["total"]
+                    team1_score = self.final_breakdown[1]["total"]
+                    if team0_score > team1_score:
+                        self.status_message = "Team 0 wins!"
+                        self.app.resources.play_sound("win" if self.local_player_id in [0, 2] else "lose")
+                    elif team1_score > team0_score:
+                        self.status_message = "Team 1 wins!"
+                        self.app.resources.play_sound("win" if self.local_player_id in [1, 3] else "lose")
+                    else:
+                        self.status_message = "It's a tie!"
     
     def get_card_at_position(self, pos, area="hand"):
         """Get the card at a position with visual perspective handling"""
@@ -8187,6 +8313,24 @@ class GameScreen(BaseScreen):
         y_btn = panel_rect.bottom - btn_h - int(height * 0.04)
         self.next_hand_button = Button(left_x, y_btn, btn_w, btn_h, "Avanti", DARK_GREEN, WHITE, font_size=int(height * 0.03))
         self.exit_overlay_button = Button(right_x, y_btn, btn_w, btn_h, "Exit", HIGHLIGHT_RED, WHITE, font_size=int(height * 0.03))
+        
+        # Se online client, disabilita il tasto Avanti e mostra spiegazione
+        try:
+            mode_val = self.app.game_config.get("mode")
+            is_online = (mode_val == "online_multiplayer")
+            is_host = bool(self.app.game_config.get("is_host", False))
+        except Exception:
+            is_online = False
+            is_host = False
+        
+        if is_online and not is_host:
+            self.next_hand_button.disabled = True
+            # Spiegazione piccola sopra il tasto quando è disabilitato
+            explain_text = "Solo l'host può avviare la mano successiva"
+            explain_surf = self.small_font.render(explain_text, True, LIGHT_GRAY)
+            explain_rect = explain_surf.get_rect(center=(self.next_hand_button.rect.centerx, self.next_hand_button.rect.top - int(height * 0.015)))
+            surface.blit(explain_surf, explain_rect)
+
         self.next_hand_button.draw(surface)
         self.exit_overlay_button.draw(surface)
 
