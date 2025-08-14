@@ -490,8 +490,8 @@ def compute_primiera_status(game_state):
     
     # Calcolo originale se non in cache
     # Inizializza gli array per i valori primiera
-    team0_primiera = np.zeros(4, dtype=np.float32)
-    team1_primiera = np.zeros(4, dtype=np.float32)
+    team0_primiera = np.zeros(4, dtype=np.float64)
+    team1_primiera = np.zeros(4, dtype=np.float64)
     
     suit_to_idx = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
     
@@ -546,7 +546,7 @@ def compute_denari_count(game_state):
     team1_denari = sum(1 for card in game_state["captured_squads"][1] if card[1] == 'denari')
     
     # Normalizza
-    result = np.array([team0_denari / 10.0, team1_denari / 10.0], dtype=np.float32)
+    result = np.array([team0_denari / 10.0, team1_denari / 10.0], dtype=np.float64)
     
     # Salva in cache
     denari_cache[cache_key] = result.copy()
@@ -592,7 +592,7 @@ def compute_settebello_status(game_state):
         status = 0
     
     # Normalizza
-    result = np.array([status / 3.0], dtype=np.float32)
+    result = np.array([status / 3.0], dtype=np.float64)
     
     # Salva in cache
     settebello_cache[cache_key] = result.copy()
