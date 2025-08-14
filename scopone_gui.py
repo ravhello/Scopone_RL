@@ -6631,6 +6631,17 @@ class GameScreen(BaseScreen):
         table_for_positions: optional list of cards representing the table layout
         to compute animation targets. If None, falls back to current env table.
         """
+        # Avoid creating duplicate animations for the same card which would result
+        # in two identical animations playing simultaneously. This can happen if
+        # the function is inadvertently invoked multiple times for the same move
+        # (e.g., due to network sync or AI/autoplay loops). If an active animation
+        # for the played card already exists, skip adding another set.
+        if any(
+            getattr(anim, "card", None) == card_played and not getattr(anim, "done", False)
+            for anim in getattr(self, "animations", [])
+        ):
+            return
+
         # Get player ID - use current player if no source player specified
         player_id = source_player_id if source_player_id is not None else self.current_player_id
         current_player = self.players[player_id]
@@ -8898,6 +8909,15 @@ class GameScreen(BaseScreen):
         player = move["player"]
         played_card = move["played_card"]
         captured_cards = move["captured_cards"]
+
+        # Prevent duplicate replay animations for the same card. When replay moves
+        # are processed quickly or the function is triggered twice for the same
+        # move, duplicate animations would make cards appear to animate twice.
+        if any(
+            getattr(anim, "card", None) == played_card and not getattr(anim, "done", False)
+            for anim in getattr(self, "replay_animations", [])
+        ):
+            return
         
         # Get player's visual position
         visual_pos = self.get_visual_position(player)
