@@ -6775,25 +6775,37 @@ class GameScreen(BaseScreen):
         # Get screen dimensions
         width = self.app.window_width
         height = self.app.window_height
-        
-        # Draw avatar background (team-colored box)
-        avatar_color = LIGHT_BLUE if player.team_id == 0 else HIGHLIGHT_RED
-        pygame.draw.rect(surface, avatar_color, player.avatar_rect, border_radius=10)
-        
-        # Draw border if it's current player's turn
-        if player.player_id == self.current_player_id:
-            pygame.draw.rect(surface, GOLD, player.avatar_rect.inflate(6, 6), 3, border_radius=12)
 
-        # Dealer badge inside avatar for the player who is last to play (mazziere)
-        # Determination: dealer is the one immediately before the starting player of the hand
+        # Determine if this player is the dealer for this hand
         try:
             dealer_id = self.current_dealer_id
         except Exception:
             dealer_id = None
-        if dealer_id is not None and player.player_id == dealer_id:
-            # Draw a small circular badge in the top-left of the avatar with a 'D'
-            badge_radius = max(10, int(min(player.avatar_rect.width, player.avatar_rect.height) * 0.12))
-            badge_center = (player.avatar_rect.left + badge_radius + 6, player.avatar_rect.top + badge_radius + 6)
+        is_dealer = dealer_id is not None and player.player_id == dealer_id
+
+        # Compute an effective avatar rect that is slightly larger when the dealer badge is present
+        effective_rect = player.avatar_rect.copy()
+        if is_dealer:
+            extra_w = max(6, int(player.avatar_rect.width * 0.20))
+            extra_h = max(6, int(player.avatar_rect.height * 0.20))
+            effective_rect = effective_rect.inflate(extra_w, extra_h)
+
+        # Draw avatar background (team-colored box)
+        avatar_color = LIGHT_BLUE if player.team_id == 0 else HIGHLIGHT_RED
+        pygame.draw.rect(surface, avatar_color, effective_rect, border_radius=10)
+
+        # Draw border if it's current player's turn
+        if player.player_id == self.current_player_id:
+            pygame.draw.rect(surface, GOLD, effective_rect.inflate(6, 6), 3, border_radius=12)
+
+        # Dealer badge inside avatar for the player who is last to play (mazziere)
+        # Determination: dealer is the one immediately before the starting player of the hand
+        if is_dealer:
+            # Keep badge size based on the base avatar size to avoid scaling the badge too much
+            base_w = player.avatar_rect.width
+            base_h = player.avatar_rect.height
+            badge_radius = max(10, int(min(base_w, base_h) * 0.12))
+            badge_center = (effective_rect.left + badge_radius + 6, effective_rect.top + badge_radius + 6)
             # Badge base
             pygame.draw.circle(surface, (240, 220, 40), badge_center, badge_radius)  # golden yellow
             pygame.draw.circle(surface, (120, 90, 0), badge_center, badge_radius, 2)  # darker border
@@ -6802,37 +6814,59 @@ class GameScreen(BaseScreen):
             d_surf = badge_font.render("D", True, BLACK)
             d_rect = d_surf.get_rect(center=badge_center)
             surface.blit(d_surf, d_rect)
-        
-        # Calculate text positions inside the avatar box
-        # Create a smaller font for fitting text in the box
+
+        # Text layout inside the avatar box
         info_font = pygame.font.SysFont(None, int(height * 0.022))
-        
-        # Player name at top
+
+        # Prepare texts
         name_text = player.name
         if player.is_ai:
             name_text += " (AI)"
-        
-        name_surf = info_font.render(name_text, True, WHITE)
-        name_rect = name_surf.get_rect(
-            midtop=(player.avatar_rect.centerx, player.avatar_rect.top + 5)
-        )
-        surface.blit(name_surf, name_rect)
-        
-        # Team info in middle
         team_text = f"Team {player.team_id}"
-        team_surf = info_font.render(team_text, True, WHITE)
-        team_rect = team_surf.get_rect(
-            center=(player.avatar_rect.centerx, player.avatar_rect.centery)
-        )
-        surface.blit(team_surf, team_rect)
-        
-        # Card count at bottom
         count_text = f"Cards: {len(player.hand_cards)}"
+
+        name_surf = info_font.render(name_text, True, WHITE)
+        team_surf = info_font.render(team_text, True, WHITE)
         count_surf = info_font.render(count_text, True, WHITE)
-        count_rect = count_surf.get_rect(
-            midbottom=(player.avatar_rect.centerx, player.avatar_rect.bottom - 5)
-        )
+
+        # Vertical layout: name at top (below badge if present), cards at bottom, team centered between them
+        top_padding = 5
+        if is_dealer:
+            base_w = player.avatar_rect.width
+            base_h = player.avatar_rect.height
+            badge_radius = max(10, int(min(base_w, base_h) * 0.12))
+            top_padding = max(top_padding, badge_radius * 2 + 10)
+
+        bottom_padding = 6
+
+        # Name position
+        name_rect = name_surf.get_rect(midtop=(effective_rect.centerx, effective_rect.top + top_padding))
+        # Cards position (bottom)
+        count_rect = count_surf.get_rect(midbottom=(effective_rect.centerx, effective_rect.bottom - bottom_padding))
+        # Team position: mid between name bottom and count top
+        available_top = name_rect.bottom
+        available_bottom = count_rect.top
+        mid_y = available_top + (available_bottom - available_top) // 2
+        team_rect = team_surf.get_rect(center=(effective_rect.centerx, mid_y))
+
+        surface.blit(name_surf, name_rect)
+        surface.blit(team_surf, team_rect)
         surface.blit(count_surf, count_rect)
+    
+    def get_effective_avatar_rect(self, player) -> pygame.Rect:
+        """Return the avatar rect, enlarged slightly if the dealer badge is present.
+        This helps avoid overlapping the badge with the text rendered inside the avatar.
+        """
+        rect = player.avatar_rect.copy()
+        try:
+            dealer_id = self.current_dealer_id
+        except Exception:
+            dealer_id = None
+        if dealer_id is not None and player.player_id == dealer_id:
+            extra_w = max(6, int(player.avatar_rect.width * 0.10))
+            extra_h = max(6, int(player.avatar_rect.height * 0.10))
+            rect = rect.inflate(extra_w, extra_h)
+        return rect
     
     def draw_player_hand(self, surface, player):
         """Draw the player's hand with card faces visible and properly centered - modified to hide visually removed cards"""
@@ -7642,7 +7676,11 @@ class GameScreen(BaseScreen):
 
         width = self.app.window_width
         height = self.app.window_height
-        anchor = player_local.avatar_rect
+        # Use effective rect to account for dealer badge enlargement
+        try:
+            anchor = self.get_effective_avatar_rect(player_local)
+        except Exception:
+            anchor = player_local.avatar_rect
 
         panel_w = int(width * 0.16)
         panel_h = int(height * 0.08)
