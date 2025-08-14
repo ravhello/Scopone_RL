@@ -734,7 +734,15 @@ class NetworkManager:
 
                     # Process different message types
                     if message.get("type") == "move":
-                        self.move_queue.append((player_id, message.get("move")))
+                        # Preserve optional flags so host can apply special one-shot rules (e.g., ace self-capture on empty table)
+                        try:
+                            queued_move = {"player_id": player_id, "move": message.get("move")}
+                            if isinstance(message, dict) and "flags" in message and isinstance(message.get("flags"), dict):
+                                queued_move["flags"] = dict(message.get("flags"))
+                            self.move_queue.append(queued_move)
+                        except Exception:
+                            # Fallback to legacy tuple if anything goes wrong
+                            self.move_queue.append((player_id, message.get("move")))
                     elif message.get("type") == "chat":
                         try:
                             text = str(message.get('text', ''))
@@ -3603,6 +3611,8 @@ class GameScreen(BaseScreen):
         self.replay_current_index = 0
         self.replay_animations = []
         self.replay_table_state = []
+        # Suppress duplicating our own network move animation (e.g., ace self-capture on empty table)
+        self.suppress_next_network_own_move = False
         # Prompt state for Ace choices (place vs self-capture)
         self.ace_choice_active = False
         self.ace_choice_for_card = None
@@ -3713,8 +3723,27 @@ class GameScreen(BaseScreen):
         cards_captured = move.get('cards_captured') or []
         table_snapshot = move.get('table') or []
 
+        # Infer direct self-capture animation hint for ace on empty table
+        force_self_cap_anim = False
+        try:
+            if card_played and isinstance(cards_captured, list) and len(cards_captured) == 1:
+                if cards_captured[0] == card_played and (not table_snapshot or len(table_snapshot) == 0):
+                    # Host encoded this as a capture of the played card on an empty table
+                    # → animate directly to pile to match local client behavior
+                    rank = card_played[0] if isinstance(card_played, (list, tuple)) and len(card_played) > 0 else None
+                    if rank == 1:
+                        force_self_cap_anim = True
+        except Exception:
+            force_self_cap_anim = False
+
         # Create animations using the table snapshot to keep spatial refs stable
-        self.create_move_animations(card_played, cards_captured, source_player_id=player_id, table_for_positions=table_snapshot)
+        self.create_move_animations(
+            card_played,
+            cards_captured,
+            source_player_id=player_id,
+            table_for_positions=table_snapshot,
+            force_self_capture=force_self_cap_anim
+        )
         self.app.resources.play_sound("card_play")
         # Do NOT set waiting_for_animation/pending_action here: client waits for next state from host
         return True
@@ -5271,6 +5300,17 @@ class GameScreen(BaseScreen):
                 
                 # Client-side: after an animation cycle completes, play next queued move (serialized)
                 try:
+                    # If we just committed a local ace self-capture on empty table in online mode (client),
+                    # suppress duplicating the same animation when host echoes last_move
+                    if (self.app.game_config.get("mode") == "online_multiplayer"
+                        and not self.app.game_config.get("is_host", False)):
+                        try:
+                            pc, cc = decode_action(self.pending_action) if self.pending_action is not None else (None, [])
+                        except Exception:
+                            pc, cc = None, []
+                        if pc and pc[0] == 1 and isinstance(cc, list) and len(cc) == 0:
+                            # We signaled the flag earlier when sending; set suppression now to be safe
+                            self.suppress_next_network_own_move = True
                     self._play_next_queued_client_move()
                     # After a client animation cycle completes, pace the next queued move
                     if not self.animations:
@@ -5734,7 +5774,8 @@ class GameScreen(BaseScreen):
             # Per le animazioni di slide mano/tavolo, permetti il ripristino del disegno statico
             # dopo la fine dello slide (se non ci sono altre animazioni attive per la stessa carta).
             # NOTA: le carte catturate rimangono in cards_in_motion fino al commit dello stato.
-            if anim.animation_type in ("table_slide", "hand_slide") and anim.current_frame == anim.duration - 1:
+            # Inoltre, quando termina un plateau (hold temporaneo sul tavolo), sblocca il disegno statico.
+            if anim.animation_type in ("table_slide", "hand_slide", "plateau") and anim.current_frame == anim.duration - 1:
                 cards_to_remove.append(anim.card)
             
             # Debug dettagliato
@@ -5833,6 +5874,7 @@ class GameScreen(BaseScreen):
                         net_pid = None
                     move = queued.get('move') if isinstance(queued, dict) else None
                     flags = queued.get('flags') if isinstance(queued, dict) else None
+                print(f"HOST: recv move from pid={net_pid}, mapped=?, flags={flags}")
                 
                 # Map network player id -> logical seat according to lobby seats
                 mapped_player_id = net_pid
@@ -5863,18 +5905,43 @@ class GameScreen(BaseScreen):
                 try:
                     # Decode the move
                     card_played, cards_captured = decode_action(move)
+                    print(f"HOST: processing move seat={mapped_player_id} card={card_played} captured={cards_captured} table={self.env.game_state.get('table', [])}")
                     #print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
 
-                    # Create animations for the move from the correct seat
-                    self.create_move_animations(card_played, cards_captured, mapped_player_id)
+                    # Snapshot table BEFORE applying step (for client/host animation hints)
+                    try:
+                        pre_step_table = list(self.env.game_state.get('table', []))
+                    except Exception:
+                        pre_step_table = []
+
+                    # Create animations for the move from the correct seat.
+                    # Special case: if client requested ace self-capture on empty table, reflect this visually on the host too.
+                    force_self_cap_anim = False
+                    try:
+                        if isinstance(flags, dict) and flags.get('force_ace_self_capture_on_empty_once'):
+                            rnk = card_played[0] if isinstance(card_played, (list, tuple)) and len(card_played) > 0 else None
+                            if rnk == 1 and len(pre_step_table) == 0 and not cards_captured:
+                                force_self_cap_anim = True
+                    except Exception:
+                        force_self_cap_anim = False
+
+                    self.create_move_animations(
+                        card_played,
+                        cards_captured,
+                        mapped_player_id,
+                        table_for_positions=pre_step_table,
+                        force_self_capture=force_self_cap_anim
+                    )
 
                     # Execute the move in the environment (apply flags if present)
                     try:
                         if isinstance(flags, dict) and flags.get('force_ace_self_capture_on_empty_once'):
+                            print("HOST: applying flag force_ace_self_capture_on_empty_once before step")
                             self.env.rules['force_ace_self_capture_on_empty_once'] = True
                     except Exception:
                         pass
                     _, _, done, info = self.env.step(move)
+                    print(f"HOST: after step table={self.env.game_state.get('table', [])} last_move={self.env.game_state.get('history', [])[-1] if self.env.game_state.get('history') else None}")
 
                     # Update game/series if hand is over (host)
                     if done:
@@ -5898,11 +5965,26 @@ class GameScreen(BaseScreen):
                     self.app.network.game_state['current_player'] = self.env.current_player
 
                     # Add information about the move that was just made
+                    # Special case: if client requested forced ace self-capture on empty table, serialize as capture of played card
+                    try:
+                        rank, _ = card_played
+                    except Exception:
+                        rank = None
+                    broadcast_cards_captured = list(cards_captured) if isinstance(cards_captured, list) else list(cards_captured or [])
+                    try:
+                        if isinstance(flags, dict) and flags.get('force_ace_self_capture_on_empty_once') and rank == 1 and len(pre_step_table) == 0:
+                            # Induce client animation of played card to pile
+                            broadcast_cards_captured = [card_played]
+                    except Exception:
+                        pass
                     self.app.network.game_state['last_move'] = {
                         'player': mapped_player_id,
                         'card_played': card_played,
-                        'cards_captured': cards_captured
+                        'cards_captured': broadcast_cards_captured,
+                        # Include a hint of the pre-step table so clients can compute stable positions
+                        'table': list(pre_step_table)
                     }
+                    print(f"HOST: broadcasting last_move={self.app.network.game_state['last_move']}")
 
                     # Use the enhanced broadcast method
                     self.app.network.broadcast_game_state()
@@ -5931,6 +6013,13 @@ class GameScreen(BaseScreen):
         # Client logic: update local state from network
         else:
             if self.app.network.game_state:
+                try:
+                    dbg_table = list(self.app.network.game_state.get('table', [])) if isinstance(self.app.network.game_state, dict) else []
+                    dbg_cp = self.app.network.game_state.get('current_player', None)
+                    dbg_lm = self.app.network.game_state.get('last_move', None)
+                    #print(f"CLIENT: received state current_player={dbg_cp} table={dbg_table} last_move={dbg_lm}")
+                except Exception:
+                    pass
                 # Keep a copy of old state for comparison
                 old_state = None
                 old_current_player = None
@@ -6013,6 +6102,10 @@ class GameScreen(BaseScreen):
                         if new_current_player is not None:
                             self.env.current_player = new_current_player
                             self.current_player_id = new_current_player
+                        try:
+                            print(f"CLIENT: initial sync applied current_player={self.current_player_id} table={self.env.game_state.get('table', [])}")
+                        except Exception:
+                            pass
                         # Track current hand starter/dealer if provided by host
                         try:
                             sp = new_state.get('starting_player')
@@ -6040,6 +6133,7 @@ class GameScreen(BaseScreen):
                             local_hand = new_state['hands'][self.local_player_id]
                     
                     # Apply the new state
+                    #print(f"CLIENT: applying new_state table(old)={old_state.get('table', []) if isinstance(old_state, dict) else []} -> table(new)={new_state.get('table', [])}")
                     self.env.game_state = new_state
                     # Update starter/dealer info if provided
                     try:
@@ -6097,12 +6191,32 @@ class GameScreen(BaseScreen):
                                 # If host provided explicit last_move, use it to queue
                                 lm = new_state.get('last_move') if isinstance(new_state, dict) else None
                                 if isinstance(lm, dict) and 'card_played' in lm:
-                                    self.queued_client_moves.append({
-                                        'player': lm.get('player'),
-                                        'card_played': lm.get('card_played'),
-                                        'cards_captured': lm.get('cards_captured') or [],
-                                        'table': list(old_state.get('table', [])) if isinstance(old_state, dict) else []
-                                    })
+                                    try:
+                                        # Check if we should suppress re-animating our own just-played ace self-capture on empty table
+                                        own_id = self.local_player_id
+                                        lm_player = lm.get('player')
+                                        lm_card = lm.get('card_played')
+                                        lm_caps = lm.get('cards_captured') or []
+                                        is_own = (lm_player == own_id)
+                                        is_ace_self_cap_empty = bool(lm_card) and isinstance(lm_caps, list) and len(lm_caps) == 1 and lm_caps[0] == lm_card
+                                        if is_own and is_ace_self_cap_empty and getattr(self, 'suppress_next_network_own_move', False):
+                                            self.suppress_next_network_own_move = False
+                                        else:
+                                            self.queued_client_moves.append({
+                                                'player': lm.get('player'),
+                                                'card_played': lm.get('card_played'),
+                                                'cards_captured': lm.get('cards_captured') or [],
+                                                'table': list(old_state.get('table', [])) if isinstance(old_state, dict) else []
+                                            })
+                                            print(f"CLIENT: queued move from host {self.queued_client_moves[-1]}")
+                                    except Exception:
+                                        # Fallback: queue move if any error in suppression logic
+                                        self.queued_client_moves.append({
+                                            'player': lm.get('player'),
+                                            'card_played': lm.get('card_played'),
+                                            'cards_captured': lm.get('cards_captured') or [],
+                                            'table': list(old_state.get('table', [])) if isinstance(old_state, dict) else []
+                                        })
                             except Exception:
                                 pass
                         self.waiting_for_other_player = False
@@ -6211,7 +6325,16 @@ class GameScreen(BaseScreen):
             cards_captured = last_move.get('cards_captured')
             
             if player_id is not None and card_played:
-                print(f"Detected explicit move: Player {player_id} played {card_played} and captured {cards_captured}")
+                # Suppress echoing our own just-played ace self-capture on empty table once
+                try:
+                    is_own = (player_id == self.local_player_id)
+                    ace_self_cap = bool(card_played) and isinstance(cards_captured, list) and len(cards_captured) == 1 and cards_captured[0] == card_played
+                    if is_own and ace_self_cap and getattr(self, 'suppress_next_network_own_move', False):
+                        self.suppress_next_network_own_move = False
+                        return
+                except Exception:
+                    pass
+                print(f"CLIENT: detected explicit move player={player_id} played={card_played} captured={cards_captured}")
                 # Serialize client animations: enqueue and let update() play them one at a time
                 table_snapshot = old_state.get('table', []) if isinstance(old_state, dict) else []
                 self.queued_client_moves.append({
@@ -6785,6 +6908,49 @@ class GameScreen(BaseScreen):
             traceback.print_exc()
             self.status_message = "Error making move"
             return False
+
+    def send_move(self, move, flags=None):
+        """Handle sending a move from the GameScreen context.
+
+        - Client: forwards the move (and optional flags) to the host via network.
+        - Host: do not enqueue the move into the network queue to avoid double-processing;
+                store any one-shot flags locally so they are applied when the pending action commits.
+        """
+        try:
+            # If no networking or not in online mode, nothing to do here
+            if not hasattr(self.app, 'game_config') or self.app.game_config.get("mode") != "online_multiplayer":
+                return
+            if not hasattr(self.app, 'network') or self.app.network is None:
+                return
+
+            # Client path: send to server
+            if not self.app.network.is_host:
+                # If this is an ace self-capture on empty table indicated by one-shot flag,
+                # preemptively suppress the echoed network animation from host for this same move
+                try:
+                    if isinstance(flags, dict) and flags.get('force_ace_self_capture_on_empty_once'):
+                        pc, cc = decode_action(move)
+                        if pc and pc[0] == 1 and isinstance(cc, list) and len(cc) == 0:
+                            self.suppress_next_network_own_move = True
+                except Exception:
+                    pass
+                try:
+                    self.app.network.send_move(move, flags=flags)
+                except Exception:
+                    pass
+                return
+
+            # Host path: don't forward into NetworkManager queue to prevent duplicate handling.
+            # Apply one-shot flags locally so they affect the commit when animations finish.
+            if isinstance(flags, dict) and flags:
+                try:
+                    # Store for local commit in update loop when pending_action is stepped
+                    self.pending_action_flags = dict(flags)
+                except Exception:
+                    self.pending_action_flags = flags
+        except Exception:
+            # Best-effort; failures here should not crash gameplay
+            pass
 
     
     def make_ai_move(self):
@@ -7887,7 +8053,8 @@ class GameScreen(BaseScreen):
             # Se c'è un'animazione in corso che mostrerà carte sul tavolo (play/plateau),
             # non mostrare il testo. Considera sia animazioni normali sia di replay.
             normal_showing = any(
-                getattr(anim, 'animation_type', '') in ('play', 'plateau') and not getattr(anim, 'done', False)
+                getattr(anim, 'animation_type', '') in ('play', 'plateau', 'capture', 'plateau_captured')
+                and not getattr(anim, 'done', False)
                 for anim in getattr(self, 'animations', [])
             )
             replay_showing = any(
@@ -7935,7 +8102,7 @@ class GameScreen(BaseScreen):
         for i, card in enumerate(table_cards):
             # Disegna SEMPRE le carte sul tavolo anche se stanno per essere catturate.
             # Evita di duplicare solo quando un'animazione per quella carta è effettivamente IN CORSO (non solo schedulata con delay).
-            has_active_anim = (card in animating_table_cards) or (card in getattr(self, 'cards_in_motion', set())) or any(
+            has_active_anim = (card in animating_table_cards) or any(
                 getattr(anim, 'card', None) == card
                 and not getattr(anim, 'done', False)
                 and getattr(anim, 'current_frame', 0) >= 0  # attiva solo se l'animazione è iniziata
@@ -9328,12 +9495,17 @@ class GameScreen(BaseScreen):
         
         for move in history[:first_replay_move_index]:
             captured = move.get("captured_cards") or []
+            capture_type = move.get("capture_type")
             if captured:
                 # On a capture, the played card does NOT stay on table; only remove captured table cards
                 for card in captured:
                     if card in table_state:
                         table_state.remove(card)
             else:
+                # Handle special self-capture cases (e.g., Ace piglia tutto on empty table):
+                # captured is empty but capture_type is not 'no_capture' → do NOT add played card to table.
+                if str(capture_type) not in (None, '', 'no_capture'):
+                    continue
                 # No capture: the played card remains on table
                 table_state.append(move["played_card"])
         
@@ -9415,7 +9587,7 @@ class GameScreen(BaseScreen):
         old_start_x = self.table_rect.centerx - (old_count * old_card_spacing) // 2
         table_y_center = self.table_rect.centery - card_height // 2
         
-        if captured_cards:
+        if captured_cards or (played_card and move.get('capture_type') and move.get('capture_type') != 'no_capture'):
             # Use original_table + captured to compute overlap position
             layout_for_capture = original_table.copy()
             for card in captured_cards:
@@ -9512,7 +9684,7 @@ class GameScreen(BaseScreen):
         self.replay_animations.append(hand_to_table)
         
         # If there are captured cards, create capture animations
-        if captured_cards:
+        if captured_cards or (played_card and move.get('capture_type') and move.get('capture_type') != 'no_capture'):
             # Calculate pile rect for the capturing team (use new pile positions)
             current_player = self.players[player]
             team_id = current_player.team_id
