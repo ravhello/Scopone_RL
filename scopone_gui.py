@@ -4957,20 +4957,85 @@ class GameScreen(BaseScreen):
                 if place_btn and place_btn.is_clicked(pos):
                     try:
                         ace_card = self.ace_choice_for_card
-                        action = encode_action(ace_card, [])
-                        valid_actions = self.env.get_valid_actions()
-                        chosen = None
-                        for v in valid_actions:
-                            try:
-                                pc, cc = decode_action(v)
-                                if pc == ace_card and len(cc) == 0:
-                                    chosen = v
-                                    break
-                            except ValueError:
-                                continue
-                        if chosen is None:
-                            chosen = action
-                        self.create_move_animations(ace_card, [], source_player_id=self.current_player_id)
+                        # Se sul tavolo ci sono carte di rank uguale (assi), catturale automaticamente
+                        table_cards = []
+                        if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                            table_cards = list(self.env.game_state.get("table", []))
+                        same_rank = [c for c in table_cards if c and isinstance(c, (list, tuple)) and len(c) > 0 and c[0] == ace_card[0]]
+
+                        if same_rank:
+                            # Se c'è una sola carta di pari rank: auto-cattura quella
+                            if len(same_rank) == 1:
+                                action = encode_action(ace_card, list(same_rank))
+                                valid_actions = self.env.get_valid_actions()
+                                chosen = None
+                                for v in valid_actions:
+                                    try:
+                                        pc, cc = decode_action(v)
+                                        if pc == ace_card and set(cc) == set(same_rank):
+                                            chosen = v
+                                            break
+                                    except ValueError:
+                                        continue
+                                if chosen is None:
+                                    chosen = action
+                                # Online client: invia e attendi host; no animazione locale
+                                if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
+                                    try:
+                                        self.send_move(chosen)
+                                    except Exception:
+                                        pass
+                                    self.status_message = "Mossa inviata, in attesa di conferma..."
+                                    self.waiting_for_other_player = True
+                                    # Chiudi prompt e pulisci selezioni
+                                    self.ace_choice_active = False
+                                    self.ace_choice_for_card = None
+                                    self.ace_choice_buttons = {}
+                                    self.selected_hand_card = None
+                                    self.selected_table_cards.clear()
+                                    return
+                                # Offline/host: anima subito
+                                self.create_move_animations(ace_card, list(same_rank), source_player_id=self.current_player_id)
+                            else:
+                                # Più carte di pari rank: richiedi selezione manuale di una di esse
+                                self.status_message = "Seleziona quale asso prendere dal tavolo"
+                                # Non chiudere il prompt; consenti di selezionare la carta sul tavolo e poi confermare
+                                # Imposta la selezione del tavolo solo ad una carta di pari rank
+                                self.selected_table_cards.clear()
+                                # Mantieni attivo il prompt finché non avviene la conferma o selezione valida
+                                return
+                        else:
+                            # Nessuna carta di ugual rank: posa consentita (nessuna presa)
+                            action = encode_action(ace_card, [])
+                            valid_actions = self.env.get_valid_actions()
+                            chosen = None
+                            for v in valid_actions:
+                                try:
+                                    pc, cc = decode_action(v)
+                                    if pc == ace_card and len(cc) == 0:
+                                        chosen = v
+                                        break
+                                except ValueError:
+                                    continue
+                            if chosen is None:
+                                chosen = action
+                            # Online client: invia e attendi host; no animazione locale
+                            if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
+                                try:
+                                    self.send_move(chosen)
+                                except Exception:
+                                    pass
+                                self.status_message = "Mossa inviata, in attesa di conferma..."
+                                self.waiting_for_other_player = True
+                                # Chiudi prompt e pulisci selezioni
+                                self.ace_choice_active = False
+                                self.ace_choice_for_card = None
+                                self.ace_choice_buttons = {}
+                                self.selected_hand_card = None
+                                self.selected_table_cards.clear()
+                                return
+                            # Offline/host: anima subito
+                            self.create_move_animations(ace_card, [], source_player_id=self.current_player_id)
                         self.app.resources.play_sound("card_play")
                         self.waiting_for_animation = True
                         self.pending_action = chosen
@@ -4991,20 +5056,43 @@ class GameScreen(BaseScreen):
                         # Se tavolo vuoto → auto-presa dell'asso senza posarlo
                         if len(table_cards) == 0:
                             action = encode_action(ace_card, [])
-                            # Anima self-capture dell'asso senza posarlo
+                            if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
+                                # Client online: invia e attendi; nessuna animazione locale
+                                try:
+                                    self.send_move(action, flags={"force_ace_self_capture_on_empty_once": True})
+                                except Exception:
+                                    pass
+                                self.status_message = "Mossa inviata, in attesa di conferma..."
+                                self.waiting_for_other_player = True
+                                self.ace_choice_active = False
+                                self.ace_choice_for_card = None
+                                self.ace_choice_buttons = {}
+                                self.selected_hand_card = None
+                                self.selected_table_cards.clear()
+                                return
+                            # Offline/host: anima self-capture
                             self.create_move_animations(ace_card, [], source_player_id=self.current_player_id, force_self_capture=True)
                             self.app.resources.play_sound("card_play")
                             self.waiting_for_animation = True
                             self.pending_action = action
                             self.pending_action_flags = {"force_ace_self_capture_on_empty_once": True}
-                            # Segnala one-shot all'host in online per logica coerente lato env
-                            if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
-                                try:
-                                    self.send_move(action, flags={"force_ace_self_capture_on_empty_once": True})
-                                except Exception:
-                                    pass
                         else:
                             action = encode_action(ace_card, list(table_cards))
+                            if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
+                                # Client online: invia e attendi; nessuna animazione locale
+                                try:
+                                    self.send_move(action)
+                                except Exception:
+                                    pass
+                                self.status_message = "Mossa inviata, in attesa di conferma..."
+                                self.waiting_for_other_player = True
+                                self.ace_choice_active = False
+                                self.ace_choice_for_card = None
+                                self.ace_choice_buttons = {}
+                                self.selected_hand_card = None
+                                self.selected_table_cards.clear()
+                                return
+                            # Offline/host: anima cattura totale
                             self.create_move_animations(ace_card, list(table_cards), source_player_id=self.current_player_id)
                             self.app.resources.play_sound("card_play")
                             self.waiting_for_animation = True
@@ -6805,6 +6893,18 @@ class GameScreen(BaseScreen):
                 card, captured = decode_action(valid_act)
             except ValueError:
                 continue
+            # Regola speciale: se esistono carte di pari rank sul tavolo, permetti solo la cattura di UNA di esse
+            # (non una combinazione). Quindi, se selected_table_cards contiene più carte dello stesso rank, invalida.
+            try:
+                if self.selected_hand_card and self.selected_hand_card[0] == card[0]:
+                    table_same_rank = [c for c in (self.env.game_state.get("table", []) if self.env else []) if c[0] == card[0]]
+                else:
+                    table_same_rank = []
+            except Exception:
+                table_same_rank = []
+            if table_same_rank and card == self.selected_hand_card:
+                if len(self.selected_table_cards) > 1:
+                    continue
             if card == self.selected_hand_card and set(captured) == self.selected_table_cards:
                 valid_action = valid_act
                 break
