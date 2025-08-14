@@ -353,13 +353,13 @@ class ResourceManager:
             self.original_card_images = self.card_images.copy()
             self.original_card_backs = self.card_backs.copy()
         
-        # Rescale all card images
+        # Rescale all card images (use smoothscale for better quality)
         for key, original_img in self.original_card_images.items():
-            self.card_images[key] = pygame.transform.scale(original_img, (card_width, card_height))
+            self.card_images[key] = pygame.transform.smoothscale(original_img, (card_width, card_height))
         
-        # Rescale card backs
+        # Rescale card backs (use smoothscale for better quality)
         for team_id, original_back in self.original_card_backs.items():
-            self.card_backs[team_id] = pygame.transform.scale(original_back, (card_width, card_height))
+            self.card_backs[team_id] = pygame.transform.smoothscale(original_back, (card_width, card_height))
 
     def load_card_images(self, folder="assets"):
         """Load card images from the assets folder"""
@@ -376,8 +376,8 @@ class ResourceManager:
             # Use the same retro for both teams
             self.original_card_backs[0] = retro
             self.original_card_backs[1] = retro
-            self.card_backs[0] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
-            self.card_backs[1] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
+            self.card_backs[0] = pygame.transform.smoothscale(retro, (CARD_WIDTH, CARD_HEIGHT))
+            self.card_backs[1] = pygame.transform.smoothscale(retro, (CARD_WIDTH, CARD_HEIGHT))
             #print("Caricato retro.jpg per dorso carte")
         except Exception as e:
             print(f"Errore caricamento retro.jpg: {e}")
@@ -387,8 +387,8 @@ class ResourceManager:
                 back_red = pygame.image.load(os.path.join(folder, "card_back_red.jpg"))
                 self.original_card_backs[0] = back_blue
                 self.original_card_backs[1] = back_red
-                self.card_backs[0] = pygame.transform.scale(back_blue, (CARD_WIDTH, CARD_HEIGHT))
-                self.card_backs[1] = pygame.transform.scale(back_red, (CARD_WIDTH, CARD_HEIGHT))
+                self.card_backs[0] = pygame.transform.smoothscale(back_blue, (CARD_WIDTH, CARD_HEIGHT))
+                self.card_backs[1] = pygame.transform.smoothscale(back_red, (CARD_WIDTH, CARD_HEIGHT))
                 print("Caricati card_back_blue.jpg e card_back_red.jpg per dorso carte")
             except:
                 # Create default card backs if images not found
@@ -412,7 +412,7 @@ class ResourceManager:
                 try:
                     img = pygame.image.load(filename)
                     self.original_card_images[key] = img
-                    self.card_images[key] = pygame.transform.scale(img, (CARD_WIDTH, CARD_HEIGHT))
+                    self.card_images[key] = pygame.transform.smoothscale(img, (CARD_WIDTH, CARD_HEIGHT))
                 except:
                     # Create a placeholder if image not found
                     card_img = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
@@ -439,7 +439,7 @@ class ResourceManager:
         try:
             bg = pygame.image.load(os.path.join(folder, "background.jpg"))
             self.original_background = bg  # Store the original unscaled image
-            self.background = pygame.transform.scale(bg, (SCREEN_WIDTH, SCREEN_HEIGHT))
+            self.background = pygame.transform.smoothscale(bg, (SCREEN_WIDTH, SCREEN_HEIGHT))
         except:
             # Create a default background if image not found
             self.original_background = pygame.Surface((1024, 768))
@@ -450,7 +450,7 @@ class ResourceManager:
         try:
             table = pygame.image.load(os.path.join(folder, "table_texture.jpg"))
             self.original_table_texture = table
-            self.table_texture = pygame.transform.scale(table, (750, 450))
+            self.table_texture = pygame.transform.smoothscale(table, (750, 450))
         except:
             # Create a default table texture if image not found
             self.original_table_texture = pygame.Surface((750, 450))
@@ -8601,7 +8601,7 @@ class GameScreen(BaseScreen):
 
             # Pre-scale card back for this team
             back_img = self.app.resources.get_card_back(team_id)
-            scaled_back = pygame.transform.scale(back_img, (mini_w, mini_h))
+            scaled_back = pygame.transform.smoothscale(back_img, (mini_w, mini_h))
 
             # Starting position for top of the pile
             cur_x = rect.left + padding
@@ -8635,7 +8635,7 @@ class GameScreen(BaseScreen):
                     if played_card:
                         face_img = self.app.resources.get_card_image(played_card)
                         if face_img:
-                            scaled_face = pygame.transform.scale(face_img, (mini_w, mini_h))
+                            scaled_face = pygame.transform.smoothscale(face_img, (mini_w, mini_h))
                             # Compose rounded card with border BEFORE rotation so the border rotates with the card
                             base_card = pygame.Surface((mini_w, mini_h), pygame.SRCALPHA)
                             base_card.fill((0, 0, 0, 0))
@@ -8774,7 +8774,7 @@ class GameScreen(BaseScreen):
             scale = anim.get_current_scale()
             scaled_width = int(CARD_WIDTH * scale)
             scaled_height = int(CARD_HEIGHT * scale)
-            scaled_img = pygame.transform.scale(card_img, (scaled_width, scaled_height))
+            scaled_img = pygame.transform.smoothscale(card_img, (scaled_width, scaled_height))
             
             # Apply rotation
             rotation = anim.get_current_rotation()
@@ -10345,7 +10345,7 @@ class GameScreen(BaseScreen):
                 # Scale the image
                 scaled_width = int(self.card_width * current_scale)
                 scaled_height = int(self.card_height * current_scale)
-                scaled_img = pygame.transform.scale(card_img, (scaled_width, scaled_height))
+                scaled_img = pygame.transform.smoothscale(card_img, (scaled_width, scaled_height))
                 
                 # Compose rounded card with border BEFORE rotation
                 base_card = pygame.Surface((scaled_width, scaled_height), pygame.SRCALPHA)
