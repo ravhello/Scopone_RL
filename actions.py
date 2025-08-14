@@ -42,6 +42,9 @@ def decode_action(action_vec):
     
     Returns:
         Tupla (card, cards_to_capture)
+
+    Raises:
+        ValueError: se nessun bit è attivo per la carta giocata
     """
     # Separa la carta giocata e le carte catturate
     played_card_flat = action_vec[:40]
@@ -61,7 +64,9 @@ def decode_action(action_vec):
         suit = col_to_suit[col]
         played_card = (rank, suit)
     else:
-        played_card = (1, 'denari')  # Default se nessun bit è attivo
+        # In precedenza veniva restituita una carta di default.
+        # Ora solleviamo un'eccezione per segnalare un'azione non valida.
+        raise ValueError("Nessuna carta giocata codificata nell'azione")
     
     # Trova le carte catturate (tutti i bit attivi nella matrice)
     cards_to_capture = []
