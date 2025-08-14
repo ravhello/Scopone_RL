@@ -247,6 +247,8 @@ class CardAnimation:
         self.rotation_start = rotation_start
         self.rotation_end = rotation_end
         self.animation_type = animation_type  # "play" per carta giocata, "capture" per cattura
+        # Optional snapshot of table state at animation creation time (for client serialization)
+        self.table_snapshot = None
         
         self.current_frame = -delay
         self.done = False
@@ -2891,7 +2893,7 @@ class GameModeScreen(BaseScreen):
             self.loading_animation.update()
             
             # Dopo 2 secondi, completa il caricamento e vai alla schermata di gioco
-            if elapsed > 2000:  # 2 secondi di animazione
+            if elapsed > 3000:  # 2 secondi di animazione
                 self.loading = False
                 self.done = True
                 self.next_screen = "game"
@@ -3572,6 +3574,13 @@ class GameScreen(BaseScreen):
         # Game over button (for click detection)
         self.game_over_button_rect = None
         
+        # Queue to serialize client-side animations received via network
+        self.queued_client_moves = deque()
+
+        # Autoplay pacing between consecutive auto turns
+        self.autoplay_delay_until = 0.0
+        self.autoplay_move_in_progress = False
+        
         # Add connection loss tracking variables
         self.connection_lost = False
         self.reconnect_start_time = 0
@@ -3616,6 +3625,11 @@ class GameScreen(BaseScreen):
         # Scrollbar state
         self.scrollbar_dragging = False
         self.scrollbar_drag_offset = 0
+        # Alias names used in event handling
+        self.scroll_up_rect = None
+        self.scroll_down_rect = None
+        self.scrollbar_rect = None
+        # Detailed parts
         self.scrollbar_up_rect = None
         self.scrollbar_down_rect = None
         self.scrollbar_track_rect = None
@@ -3649,6 +3663,43 @@ class GameScreen(BaseScreen):
         self.last_hand_breakdown = None
         self._pending_next_starter = None
         self.next_hand_button = None
+
+    def _play_next_queued_client_move(self):
+        """Play the next queued client move, ensuring strict serialization.
+
+        Only triggers when there are no active animations and we're not already
+        waiting on a previous animation to commit a local env step.
+        """
+        if not getattr(self, 'queued_client_moves', None):
+            return False
+        if self.animations or getattr(self, 'waiting_for_animation', False):
+            return False
+        try:
+            move = self.queued_client_moves.popleft()
+        except IndexError:
+            return False
+
+        # Special sweep: capture-only animation for remaining table cards to last-capturing team
+        if move.get('sweep'):
+            player_id = int(move.get('player')) if move.get('player') is not None else 0
+            captured_cards = list(move.get('cards_captured') or [])
+            if captured_cards:
+                # Prefer table snapshot for stable positions
+                table_snapshot = list(move.get('table') or [])
+                self.animate_captures_only(captured_cards, player_id, table_for_positions=table_snapshot)
+                self.app.resources.play_sound("card_play")
+            return True
+
+        player_id = move.get('player')
+        card_played = move.get('card_played')
+        cards_captured = move.get('cards_captured') or []
+        table_snapshot = move.get('table') or []
+
+        # Create animations using the table snapshot to keep spatial refs stable
+        self.create_move_animations(card_played, cards_captured, source_player_id=player_id, table_for_positions=table_snapshot)
+        self.app.resources.play_sound("card_play")
+        # Do NOT set waiting_for_animation/pending_action here: client waits for next state from host
+        return True
     
     def create_exit_button(self):
         """Create a prominent exit button when connection is lost"""
@@ -3902,6 +3953,11 @@ class GameScreen(BaseScreen):
         if proceed_new_hand:
             # In modalità a punti o a mani mostra prima un recap dell'ultima mano
             if self.series_mode in ("points", "hands"):
+                # Delay 2s to let players see the last capture before showing overlay
+                try:
+                    pygame.time.delay(3000)
+                except Exception:
+                    pass
                 self.show_intermediate_recap = True
                 self.last_hand_breakdown = final_breakdown
                 # Calcola in anticipo il prossimo starter ma non resettare ancora
@@ -3933,7 +3989,11 @@ class GameScreen(BaseScreen):
                 self.setup_layout()
         else:
             # Series ended; show final scoreboard by setting final_breakdown to last hand (already set)
-            pass
+            # Delay 2s to let players see the last capture before showing final overlay
+            try:
+                pygame.time.delay(3000)
+            except Exception:
+                pass
 
     
     def setup_ai_controllers(self):
@@ -4666,7 +4726,8 @@ class GameScreen(BaseScreen):
                         self.scrollbar_drag_offset = self.scrollbar_thumb_height / 2
                         return
                 # Start resizing if click in resize handle (only when not minimized)
-                if (not self.message_minimized) and self.message_resize_rect and self.message_resize_rect.collidepoint(pos):
+                resize_rect = getattr(self, 'message_resize_rect', None)
+                if (not self.message_minimized) and resize_rect and resize_rect.collidepoint(pos):
                     self.message_resizing = True
                     self.message_resize_start_mouse = pos
                     self.message_resize_start_rect = self.message_log_rect.copy()
@@ -4703,7 +4764,7 @@ class GameScreen(BaseScreen):
                     new_h = min(new_h, max_h)
                     self.message_log_rect.size = (new_w, new_h)
                     handled_motion = True
-                if self.scrollbar_dragging and getattr(self, 'scrollbar_rect', None):
+                if getattr(self, 'scrollbar_dragging', False) and getattr(self, 'scrollbar_rect', None):
                     track_top = self.scrollbar_rect.top
                     track_height = self.scrollbar_rect.height
                     rel_y = my - track_top - self.scrollbar_drag_offset
@@ -4716,7 +4777,7 @@ class GameScreen(BaseScreen):
                     return
 
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                if self.message_dragging or self.message_resizing or self.scrollbar_dragging:
+                if self.message_dragging or self.message_resizing or getattr(self, 'scrollbar_dragging', False):
                     self.message_dragging = False
                     self.message_resizing = False
                     self.scrollbar_dragging = False
@@ -5017,6 +5078,11 @@ class GameScreen(BaseScreen):
                     if card_played in current_player_hand:
                         # Execute the move on the environment
                         prev_cp = getattr(self.env, 'current_player', None)
+                        # Snapshot table before applying final step (for potential sweep animation)
+                        try:
+                            pre_step_table = list(self.env.game_state.get('table', []))
+                        except Exception:
+                            pre_step_table = []
                         _, _, done, info = self.env.step(self.pending_action)
                         
                         # If game is finished, set final state
@@ -5024,6 +5090,30 @@ class GameScreen(BaseScreen):
                             self.game_over = True
                             if "score_breakdown" in info:
                                 self.final_breakdown = info["score_breakdown"]
+                                # If last move did NOT capture and rules assign remaining cards to last taker,
+                                # animate a sweep of remaining cards (table before step + played card)
+                                try:
+                                    rules = self.app.game_config.get("rules", {})
+                                    give_last = bool(rules.get('last_cards_to_dealer', True))
+                                except Exception:
+                                    give_last = True
+                                if give_last and not cards_captured:
+                                    # Determine last capturing player from history AFTER step
+                                    last_player = None
+                                    try:
+                                        for m in reversed(self.env.game_state.get('history', [])):
+                                            if m.get('capture_type') in ('capture','scopa'):
+                                                last_player = int(m.get('player'))
+                                                break
+                                    except Exception:
+                                        last_player = None
+                                    if last_player is not None:
+                                        sweep_cards = list(pre_step_table)
+                                        if card_played not in sweep_cards:
+                                            sweep_cards.append(card_played)
+                                        # Use sweep_cards also as table snapshot for accurate positions
+                                        self.animate_captures_only(sweep_cards, last_player, table_for_positions=list(sweep_cards))
+                                        self.app.resources.play_sound("card_play")
                         
                         # If host in online mode, broadcast updated state to clients (AI or local moves)
                         try:
@@ -5079,6 +5169,15 @@ class GameScreen(BaseScreen):
                                     self._broadcast_series_state()
                         else:
                             self._handle_hand_end(info.get("score_breakdown"))
+                
+                # Client-side: after an animation cycle completes, play next queued move (serialized)
+                try:
+                    self._play_next_queued_client_move()
+                    # After a client animation cycle completes, pace the next queued move
+                    if not self.animations:
+                        self.autoplay_delay_until = time.time() + 1.0
+                except Exception:
+                    pass
         
         # Immediate exit to home if connection lost (no reconnection flow)
         if (self.app.game_config.get("mode") == "online_multiplayer" and 
@@ -5133,6 +5232,12 @@ class GameScreen(BaseScreen):
                         and not getattr(self, 'waiting_for_animation', False)
                         and not getattr(self, 'show_intermediate_recap', False)
                         and not getattr(self, 'autoplay_sent_for_turn', False)):
+                    # Respect pacing between auto turns
+                    if getattr(self, 'autoplay_delay_until', 0.0) > 0.0:
+                        if time.time() < self.autoplay_delay_until:
+                            raise Exception("autoplay_pacing_delay")
+                        else:
+                            self.autoplay_delay_until = 0.0
                     mode = self.app.game_config.get("mode")
                     is_online = (mode == "online_multiplayer")
                     is_host = self.app.game_config.get("is_host", False)
@@ -5169,26 +5274,37 @@ class GameScreen(BaseScreen):
                             chosen = no_cap
                         action, card_played, cards_captured = chosen
                         if is_online and not is_host:
-                            # Client: never auto-play; also suppress click selection when not your turn
+                            # Client: never auto-play; host will broadcast authoritative move and animation cues
                             self.status_message = "Waiting for host..."
-                            # Do not exit update; allow network updates to proceed
-                        # Local or Host: perform animations and schedule env step
-                        if (not multiple_captures) or (not current_is_human):
-                            self.create_move_animations(card_played, cards_captured)
-                            self.app.resources.play_sound("card_play")
-                            self.waiting_for_animation = True
-                            self.pending_action = action
-                            self.autoplay_sent_for_turn = True
-                            self._last_player_for_autoplay = cp
+                        else:
+                            # Local or Host: perform animations and schedule env step
+                            if (not multiple_captures) or (not current_is_human):
+                                # Guard: during serialized client animations, don't inject extra local autoplay
+                                if not getattr(self, 'queued_client_moves', None):
+                                    self.create_move_animations(card_played, cards_captured, source_player_id=cp)
+                                    self.app.resources.play_sound("card_play")
+                                    self.waiting_for_animation = True
+                                    self.pending_action = action
+                                    self.autoplay_sent_for_turn = True
+                                    self._last_player_for_autoplay = cp
+                                    # Schedule 1s pacing for next auto turn
+                                    self.autoplay_delay_until = time.time() + 1.0
             except Exception as e:
                 # Non bloccare il gioco in caso di errore nell'auto-play
-                print(f"Auto-play error: {e}")
+                if str(e) != "autoplay_pacing_delay":
+                    print(f"Auto-play error: {e}")
 
             # Handle AI turns (solo il server lo fa in modalità online)
             self.handle_ai_turns()
             
             # Handle network updates
             self.handle_network_updates()
+
+            # Client-side: if we have queued network moves and no animations are active, play next
+            try:
+                self._play_next_queued_client_move()
+            except Exception:
+                pass
             
             # Check for game over
             if self.env and not self.game_over:
@@ -5575,7 +5691,7 @@ class GameScreen(BaseScreen):
         if self.ai_thinking:
             current_time = pygame.time.get_ticks()
             # Adjust delay based on difficulty (faster for hard, slower for easy)
-            base_delay = 2000 if self.ai_difficulty == 0 else 1000 if self.ai_difficulty == 1 else 500
+            base_delay = 3000 if self.ai_difficulty == 0 else 1000 if self.ai_difficulty == 1 else 500
             delay = base_delay
             if current_time - self.ai_move_timer > delay:
                 self.make_ai_move()
@@ -5852,7 +5968,23 @@ class GameScreen(BaseScreen):
                     # Check for card movements and update visuals
                     if old_state and old_state != new_state:
                         # Generate animations for changes (only if both states have 'table' or 'hands')
-                        self.detect_and_animate_changes(old_state, new_state, old_current_player)
+                        # IMPORTANT: If a serialized animation is already running, just queue the next
+                        # move and don't start overlapping animations
+                        if not self.animations:
+                            self.detect_and_animate_changes(old_state, new_state, old_current_player)
+                        else:
+                            try:
+                                # If host provided explicit last_move, use it to queue
+                                lm = new_state.get('last_move') if isinstance(new_state, dict) else None
+                                if isinstance(lm, dict) and 'card_played' in lm:
+                                    self.queued_client_moves.append({
+                                        'player': lm.get('player'),
+                                        'card_played': lm.get('card_played'),
+                                        'cards_captured': lm.get('cards_captured') or [],
+                                        'table': list(old_state.get('table', [])) if isinstance(old_state, dict) else []
+                                    })
+                            except Exception:
+                                pass
                         self.waiting_for_other_player = False
                         
                         # Check for end-of-hand only if 'hands' exists in new_state
@@ -5862,6 +5994,33 @@ class GameScreen(BaseScreen):
                             except Exception:
                                 hands_empty = False
                             if hands_empty:
+                                # If rules say remaining cards go to last-capturing team and the previous table was not empty,
+                                # enqueue a sweep animation (clients only) to visualize remaining cards moving to last taker's pile
+                                try:
+                                    rules = new_state.get('rules', {}) if isinstance(new_state, dict) else {}
+                                    give_last = bool(rules.get('last_cards_to_dealer', True))
+                                except Exception:
+                                    give_last = True
+                                try:
+                                    prev_table = old_state.get('table', []) if isinstance(old_state, dict) else []
+                                except Exception:
+                                    prev_table = []
+                                if give_last and prev_table:
+                                    last_player = None
+                                    try:
+                                        for m in reversed(new_state.get('history', [])):
+                                            if m.get('capture_type') in ('capture','scopa'):
+                                                last_player = int(m.get('player'))
+                                                break
+                                    except Exception:
+                                        last_player = None
+                                    if last_player is not None:
+                                        self.queued_client_moves.append({
+                                            'sweep': True,
+                                            'player': last_player,
+                                            'cards_captured': list(prev_table),
+                                            'table': list(prev_table)
+                                        })
                                 # Calcola il breakdown finale per recap/game over
                                 try:
                                     from rewards import compute_final_score_breakdown
@@ -5933,8 +6092,14 @@ class GameScreen(BaseScreen):
             
             if player_id is not None and card_played:
                 print(f"Detected explicit move: Player {player_id} played {card_played} and captured {cards_captured}")
-                self.create_move_animations(card_played, cards_captured, player_id)
-                self.app.resources.play_sound("card_play")
+                # Serialize client animations: enqueue and let update() play them one at a time
+                table_snapshot = old_state.get('table', []) if isinstance(old_state, dict) else []
+                self.queued_client_moves.append({
+                    'player': player_id,
+                    'card_played': card_played,
+                    'cards_captured': cards_captured,
+                    'table': list(table_snapshot)
+                })
                 return
 
         # Guard against false positives at game start and on non-move syncs:
@@ -5987,11 +6152,15 @@ class GameScreen(BaseScreen):
                         player_id = p_id
                         print(f"Card {card} was likely played by player {p_id}")
         
-        # If we found a played card and player, create animations
+        # If we found a played card and player, enqueue animations to serialize
         if played_card and player_id is not None:
-            print(f"Creating animations for detected play: Player {player_id} played {played_card} and captured {captured_cards}")
-            self.create_move_animations(played_card, captured_cards, player_id)
-            self.app.resources.play_sound("card_play")
+            print(f"Queueing animations for detected play: Player {player_id} played {played_card} and captured {captured_cards}")
+            self.queued_client_moves.append({
+                'player': player_id,
+                'card_played': played_card,
+                'cards_captured': captured_cards,
+                'table': list(old_table)
+            })
         # If only captures detected, animate them
         elif captured_cards:
             # Use most likely player (previous turn player)
@@ -6002,8 +6171,13 @@ class GameScreen(BaseScreen):
             played_card = new_cards[0] if new_cards else None
             
             if played_card:
-                print(f"Creating animations for partial detection: Player {likely_player} played {played_card} and captured {captured_cards}")
-                self.create_move_animations(played_card, captured_cards, likely_player)
+                print(f"Queueing animations for partial detection: Player {likely_player} played {played_card} and captured {captured_cards}")
+                self.queued_client_moves.append({
+                    'player': likely_player,
+                    'card_played': played_card,
+                    'cards_captured': captured_cards,
+                    'table': list(old_table)
+                })
             else:
                 print(f"Creating animations for captures only: {captured_cards}")
                 self.animate_captures_only(captured_cards, likely_player)
@@ -6019,6 +6193,28 @@ class GameScreen(BaseScreen):
                 self.app.resources.play_sound("card_play")
             else:
                 print("Table changed, but could not determine specific changes")
+                # End-of-hand sweep case on clients: hands empty and old_table had leftovers
+                try:
+                    hands_empty = all(len(new_state.get('hands', {}).get(p, [])) == 0 for p in range(4))
+                except Exception:
+                    hands_empty = False
+                if hands_empty and old_table:
+                    # Determine last capturing player
+                    last_player = None
+                    try:
+                        for m in reversed(new_state.get('history', [])):
+                            if m.get('capture_type') in ('capture','scopa'):
+                                last_player = int(m.get('player'))
+                                break
+                    except Exception:
+                        last_player = None
+                    if last_player is not None:
+                        self.queued_client_moves.append({
+                            'sweep': True,
+                            'player': last_player,
+                            'cards_captured': list(old_table)
+                        })
+                        return
                 self.animate_table_refresh(new_table)
             
     # Add a method to animate table refresh for when specific changes can't be determined
@@ -6053,8 +6249,12 @@ class GameScreen(BaseScreen):
             )
             self.animations.append(appear_anim)
 
-    def animate_captures_only(self, captured_cards, player_id):
-        """Animate cards being captured without showing a played card"""
+    def animate_captures_only(self, captured_cards, player_id, table_for_positions=None):
+        """Animate cards being captured without showing a played card.
+
+        table_for_positions: optional list of cards representing the table layout
+        to compute starting positions. If None, falls back to current env table.
+        """
         if not captured_cards:
             return
                 
@@ -6069,10 +6269,13 @@ class GameScreen(BaseScreen):
         card_width = int(width * 0.078)
         table_center = self.table_rect.center
         
-        # Get current table safely
-        table_cards = []
-        if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-            table_cards = self.env.game_state.get("table", [])
+        # Get table snapshot safely
+        if isinstance(table_for_positions, list):
+            table_cards = list(table_for_positions)
+        else:
+            table_cards = []
+            if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                table_cards = self.env.game_state.get("table", [])
         
         # Create a complete list of cards to determine positions
         all_table_cards = table_cards.copy()
@@ -6358,7 +6561,7 @@ class GameScreen(BaseScreen):
                     return True
             
             # IMPORTANTE: Creiamo le animazioni che ora rimuovono automaticamente la carta dalla mano
-            self.create_move_animations(card_played, cards_captured)
+            self.create_move_animations(card_played, cards_captured, source_player_id=self.current_player_id)
             
             # Play sound
             self.app.resources.play_sound("card_play")
@@ -6409,7 +6612,7 @@ class GameScreen(BaseScreen):
         
         try:
             # FASE 1: Create animations for the played card
-            self.create_move_animations(card_played, cards_captured)
+            self.create_move_animations(card_played, cards_captured, source_player_id=self.current_player_id)
             
             # Play sound
             self.app.resources.play_sound("card_play")
@@ -6422,8 +6625,12 @@ class GameScreen(BaseScreen):
             print(f"Error making AI move: {e}")
             import traceback
             traceback.print_exc()
-    def create_move_animations(self, card_played, cards_captured, source_player_id=None):
-        """Create animations for a move with improved positioning"""
+    def create_move_animations(self, card_played, cards_captured, source_player_id=None, table_for_positions=None):
+        """Create animations for a move with improved positioning
+
+        table_for_positions: optional list of cards representing the table layout
+        to compute animation targets. If None, falls back to current env table.
+        """
         # Get player ID - use current player if no source player specified
         player_id = source_player_id if source_player_id is not None else self.current_player_id
         current_player = self.players[player_id]
@@ -6442,35 +6649,53 @@ class GameScreen(BaseScreen):
         if not hasattr(self, 'cards_in_motion'):
             self.cards_in_motion = set()
         
-        # Start position depends on player position
-        if player_id == self.local_player_id:
-            # Calculate position in hand
-            hand_rect = current_player.hand_rect
-            hand = current_player.hand_cards
-            
-            # Cerca la posizione della carta nella mano per un'animazione più precisa
-            try:
-                card_index = hand.index(card_played)
-                # Calculate position with current dimensions
-                width = self.app.window_width
-                card_width = int(width * 0.078)
-                center_x = hand_rect.centerx
-                card_spread = card_width * 0.7
-                
-                # Calculate position
-                start_x = center_x + (card_index - len(hand) // 2) * card_spread
-                if self.get_visual_position(player_id) == 0:  # Bottom player
-                    start_y = hand_rect.bottom - card_width * 1.5
-                    start_pos = (start_x + card_width // 2, start_y + card_width * 1.5 // 2)
-                else:
-                    # Adjust for other positions
-                    start_pos = hand_rect.center
-            except ValueError:
-                # Card not found in hand (fallback)
-                start_pos = hand_rect.center
+        # Start position depends on player position (accurate per visual seat for all players)
+        hand_rect = current_player.hand_rect
+        hand = current_player.hand_cards
+        visual_pos = self.get_visual_position(player_id)
+        # Calculate current card size and spreads
+        width = self.app.window_width
+        card_width = int(width * 0.078)
+        card_height = int(card_width * 1.5)
+        horiz_spread = card_width * 0.7
+        vert_spread = card_height * 0.4
+
+        # Try to locate exact index of the card in hand (may fail on clients that don't know opponents' hands)
+        card_index = None
+        try:
+            card_index = hand.index(card_played)
+        except Exception:
+            card_index = None
+
+        if visual_pos in (0, 2):
+            # Horizontal layout (bottom or top)
+            center_x = hand_rect.centerx
+            total_width = (max(len(hand), 1) - 1) * horiz_spread + card_width
+            start_x = center_x - (total_width / 2)
+            if card_index is not None:
+                x = start_x + card_index * horiz_spread + card_width / 2
+            else:
+                # Fallback to middle of the hand
+                x = hand_rect.centerx
+            if visual_pos == 0:
+                y = hand_rect.bottom - card_height / 2
+            else:
+                y = hand_rect.top + card_height / 2
+            start_pos = (x, y)
         else:
-            # Card comes from another player's hand
-            start_pos = current_player.hand_rect.center
+            # Vertical layout (left or right)
+            center_y = hand_rect.centery
+            total_height = (max(len(hand), 1) - 1) * vert_spread + card_height
+            start_y = center_y - (total_height / 2)
+            if card_index is not None:
+                y = start_y + card_index * vert_spread + card_height / 2
+            else:
+                y = hand_rect.centery
+            if visual_pos == 1:
+                x = hand_rect.left + card_width / 2
+            else:
+                x = hand_rect.right - card_width / 2
+            start_pos = (x, y)
         
         # Determina la posizione finale della carta giocata in base alle carte da catturare
         table_center = self.table_rect.center
@@ -6482,9 +6707,13 @@ class GameScreen(BaseScreen):
             width = self.app.window_width
             card_width = int(width * 0.078)
             card_height = int(card_width * 1.5)
-            table_cards = []
-            if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                table_cards = self.env.game_state.get("table", [])
+            # Preferisci un'istantanea del tavolo se fornita (utile lato client per serializzare animazioni)
+            if isinstance(table_for_positions, list):
+                table_cards = list(table_for_positions)
+            else:
+                table_cards = []
+                if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                    table_cards = self.env.game_state.get("table", [])
             
             # Trova la posizione della prima carta da catturare
             original_table = table_cards.copy()
@@ -6546,6 +6775,12 @@ class GameScreen(BaseScreen):
             rotation_end=0,
             animation_type="play"
         )
+        # Attach optional table snapshot if provided
+        try:
+            if isinstance(table_for_positions, list):
+                hand_to_table.table_snapshot = list(table_for_positions)
+        except Exception:
+            pass
         # Mark as the played card for z-ordering
         try:
             hand_to_table.is_played_card = True
@@ -6574,6 +6809,11 @@ class GameScreen(BaseScreen):
                 rotation_end=0,
                 animation_type="plateau"  # Nuovo tipo di animazione
             )
+            try:
+                if isinstance(table_for_positions, list):
+                    plateau_anim.table_snapshot = list(table_for_positions)
+            except Exception:
+                pass
             # Mark as the played card for z-ordering
             try:
                 plateau_anim.is_played_card = True
@@ -6666,6 +6906,11 @@ class GameScreen(BaseScreen):
                     rotation_end=random.randint(-10, 10),
                     animation_type="capture"
                 )
+                try:
+                    if isinstance(table_for_positions, list):
+                        capture_anim.table_snapshot = list(table_for_positions)
+                except Exception:
+                    pass
                 # Ensure the played card's capture renders above captured cards
                 if card == card_played:
                     try:
@@ -7154,6 +7399,13 @@ class GameScreen(BaseScreen):
             table_cards = []
             if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                 table_cards = self.env.game_state.get("table", [])
+            # While a client-side serialized animation is in progress, prefer the snapshot table
+            # passed in via plateau/capture animations to keep spatial references stable.
+            if getattr(self, 'queued_client_moves', None) and self.animations:
+                # If any plateau/capture animation embeds table snapshot, keep using current env table;
+                # the start/end positions were precomputed from that snapshot in create_move_animations.
+                # No change required here; logic above stays but comment documents intent.
+                pass
             
         # Se lo stato segnala tavolo vuoto ma ci sono animazioni di "play" in corso che dovrebbero
         # aver già portato carte sul tavolo, evita di mostrare "No cards on table" e lascia lo spazio
@@ -7209,6 +7461,15 @@ class GameScreen(BaseScreen):
                 and getattr(anim, 'current_frame', 0) >= 0  # attiva solo se l'animazione è iniziata
                 for anim in self.animations
             )
+            # If we are serializing client animations and we have a stable table snapshot, suppress drawing
+            # for cards that are not part of that snapshot to avoid flicker/reorder during captures
+            if not has_active_anim and getattr(self, 'queued_client_moves', None) and self.animations:
+                try:
+                    snap = next((a.table_snapshot for a in self.animations if getattr(a, 'table_snapshot', None)), None)
+                except Exception:
+                    snap = None
+                if isinstance(snap, list) and card not in snap:
+                    continue
             if self.replay_active and not has_active_anim:
                 has_active_anim = any(
                     getattr(anim, 'card', None) == card
@@ -7493,6 +7754,14 @@ class GameScreen(BaseScreen):
             
             # Draw rotated card surface directly (already has rounded corners and border)
             surface.blit(rotated_img, rect)
+
+        # Optional: if client has queued moves and there are no active animations,
+        # trigger the next one immediately for snappier sequencing
+        if getattr(self, 'queued_client_moves', None) is not None and not self.animations:
+            try:
+                self._play_next_queued_client_move()
+            except Exception:
+                pass
     
     def draw_status_info(self, surface):
         """Draw game status information with emphasis on player turn"""
