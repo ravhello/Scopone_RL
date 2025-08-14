@@ -127,9 +127,11 @@ class ScoponeEnvMA(gym.Env):
                                         valid_actions.append(place_vec)
 
                     # Se AP è attivo ma la posa non è consentita nelle condizioni attuali,
-                    # rimuovi eventuali azioni di "posa" dell'asso (no-capture)
+                    # rimuovi eventuali azioni di "posa" dell'asso (no-capture).
+                    # Eccezione importante: a tavolo vuoto manteniamo l'azione "asso + []"
+                    # per rappresentare (lato UI) la presa forzata su tavolo vuoto.
                     allow_place_now = ap_posabile and (not ap_only_empty or (len(table_cards) == 0))
-                    if not allow_place_now:
+                    if not allow_place_now and len(table_cards) > 0:
                         filtered = []
                         for v in valid_actions:
                             keep = True
@@ -193,15 +195,23 @@ class ScoponeEnvMA(gym.Env):
         ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
         ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
         forced_ace_capture_on_empty = False
+        # Override one-shot: la UI può impostare questo flag per auto-presa su tavolo vuoto anche se posabile è ON
+        force_self_capture_once = bool(self.rules.get("force_ace_self_capture_on_empty_once", False))
         if ap_enabled and rank == 1:
             can_place_now = ap_posabile and (not ap_only_empty or (ap_only_empty and len(table) == 0))
-            if not can_place_now and len(cards_to_capture) == 0:
+            if (not can_place_now and len(cards_to_capture) == 0) or (force_self_capture_once and len(table) == 0 and len(cards_to_capture) == 0):
                 if len(table) > 0:
                     # Forza presa di tutto il tavolo
                     cards_to_capture = list(table)
                 else:
                     # Tavolo vuoto: la posa è vietata, tratta come cattura forzata per scopa
                     forced_ace_capture_on_empty = True
+                # Consuma l'override one-shot, se presente
+                if force_self_capture_once:
+                    try:
+                        self.rules["force_ace_self_capture_on_empty_once"] = False
+                    except Exception:
+                        pass
         
         # Verifica regole di cattura
         same_rank_cards = [tc for tc in table if tc[0] == rank]

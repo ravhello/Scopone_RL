@@ -1055,13 +1055,21 @@ class NetworkManager:
         self.connected = False
         self.message_queue.append("Disconnected from server")
     
-    def send_move(self, move):
-        """Send a move to the server (for clients) or broadcast it (for host)"""
+    def send_move(self, move, flags=None):
+        """Send a move to the server (for clients) or queue it locally (for host).
+
+        flags: optional dict with extra instructions (e.g., force_ace_self_capture_on_empty_once).
+        """
         message = {"type": "move", "move": move}
+        if isinstance(flags, dict) and flags:
+            message["flags"] = flags
         
         if self.is_host:
             # Process move locally and broadcast updated state
-            self.move_queue.append((0, move))  # Host is player 0
+            try:
+                self.move_queue.append({"player_id": 0, "move": move, "flags": flags})  # Host is player 0
+            except Exception:
+                self.move_queue.append((0, move))
         else:
             # Send move to server
             try:
@@ -3599,6 +3607,12 @@ class GameScreen(BaseScreen):
         self.ace_choice_active = False
         self.ace_choice_for_card = None
         self.ace_choice_buttons = {}
+        # Optional flags to apply when committing the pending action to the env
+        self.pending_action_flags = None
+        # Prompt state for Ace choices (place vs self-capture)
+        self.ace_choice_active = False
+        self.ace_choice_for_card = None
+        self.ace_choice_buttons = {}
         # Ensure motion-tracking sets are fresh per match
         if hasattr(self, 'cards_in_motion'):
             self.cards_in_motion.clear()
@@ -4907,6 +4921,73 @@ class GameScreen(BaseScreen):
         # Process mouse down actions (replay button and selections)
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             pos = pygame.mouse.get_pos()
+            # Handle Ace choice prompt
+            if getattr(self, 'ace_choice_active', False) and self.is_current_player_controllable():
+                place_btn = self.ace_choice_buttons.get('place') if isinstance(getattr(self, 'ace_choice_buttons', {}), dict) else None
+                take_btn = self.ace_choice_buttons.get('take') if isinstance(getattr(self, 'ace_choice_buttons', {}), dict) else None
+                if place_btn and place_btn.is_clicked(pos):
+                    try:
+                        ace_card = self.ace_choice_for_card
+                        action = encode_action(ace_card, [])
+                        valid_actions = self.env.get_valid_actions()
+                        chosen = None
+                        for v in valid_actions:
+                            try:
+                                pc, cc = decode_action(v)
+                                if pc == ace_card and len(cc) == 0:
+                                    chosen = v
+                                    break
+                            except ValueError:
+                                continue
+                        if chosen is None:
+                            chosen = action
+                        self.create_move_animations(ace_card, [], source_player_id=self.current_player_id)
+                        self.app.resources.play_sound("card_play")
+                        self.waiting_for_animation = True
+                        self.pending_action = chosen
+                    except Exception:
+                        self.status_message = "Errore nella scelta dell'asso"
+                    self.ace_choice_active = False
+                    self.ace_choice_for_card = None
+                    self.ace_choice_buttons = {}
+                    self.selected_hand_card = None
+                    self.selected_table_cards.clear()
+                    return
+                if take_btn and take_btn.is_clicked(pos):
+                    try:
+                        ace_card = self.ace_choice_for_card
+                        table_cards = []
+                        if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                            table_cards = list(self.env.game_state.get("table", []))
+                        # Se tavolo vuoto → auto-presa dell'asso senza posarlo
+                        if len(table_cards) == 0:
+                            action = encode_action(ace_card, [])
+                            # Anima self-capture dell'asso senza posarlo
+                            self.create_move_animations(ace_card, [], source_player_id=self.current_player_id, force_self_capture=True)
+                            self.app.resources.play_sound("card_play")
+                            self.waiting_for_animation = True
+                            self.pending_action = action
+                            self.pending_action_flags = {"force_ace_self_capture_on_empty_once": True}
+                            # Segnala one-shot all'host in online per logica coerente lato env
+                            if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
+                                try:
+                                    self.send_move(action, flags={"force_ace_self_capture_on_empty_once": True})
+                                except Exception:
+                                    pass
+                        else:
+                            action = encode_action(ace_card, list(table_cards))
+                            self.create_move_animations(ace_card, list(table_cards), source_player_id=self.current_player_id)
+                            self.app.resources.play_sound("card_play")
+                            self.waiting_for_animation = True
+                            self.pending_action = action
+                    except Exception:
+                        self.status_message = "Errore nella scelta dell'asso"
+                    self.ace_choice_active = False
+                    self.ace_choice_for_card = None
+                    self.ace_choice_buttons = {}
+                    self.selected_hand_card = None
+                    self.selected_table_cards.clear()
+                    return
             # Replay button click only on actual click (not hover), and only on own turn
             if self.replay_button.is_clicked(pos):
                 if self.is_current_player_controllable() and not self.animations and not self.replay_active:
@@ -5090,7 +5171,15 @@ class GameScreen(BaseScreen):
                             pre_step_table = list(self.env.game_state.get('table', []))
                         except Exception:
                             pre_step_table = []
+                        # Applica eventuali override one-shot ai rules prima dello step
+                        try:
+                            if isinstance(self.pending_action_flags, dict) and self.pending_action_flags.get('force_ace_self_capture_on_empty_once'):
+                                self.env.rules['force_ace_self_capture_on_empty_once'] = True
+                        except Exception:
+                            pass
                         _, _, done, info = self.env.step(self.pending_action)
+                        # Pulisci flags one-shot locali
+                        self.pending_action_flags = None
                         
                         # If game is finished, set final state
                         if done:
@@ -5733,7 +5822,17 @@ class GameScreen(BaseScreen):
             
             # Process any queued moves
             while self.app.network.move_queue:
-                net_pid, move = self.app.network.move_queue.popleft()
+                queued = self.app.network.move_queue.popleft()
+                if isinstance(queued, tuple) and len(queued) == 2:
+                    net_pid, move = queued
+                    flags = None
+                else:
+                    try:
+                        net_pid = int(queued.get('player_id'))
+                    except Exception:
+                        net_pid = None
+                    move = queued.get('move') if isinstance(queued, dict) else None
+                    flags = queued.get('flags') if isinstance(queued, dict) else None
                 
                 # Map network player id -> logical seat according to lobby seats
                 mapped_player_id = net_pid
@@ -5769,7 +5868,12 @@ class GameScreen(BaseScreen):
                     # Create animations for the move from the correct seat
                     self.create_move_animations(card_played, cards_captured, mapped_player_id)
 
-                    # Execute the move in the environment
+                    # Execute the move in the environment (apply flags if present)
+                    try:
+                        if isinstance(flags, dict) and flags.get('force_ace_self_capture_on_empty_once'):
+                            self.env.rules['force_ace_self_capture_on_empty_once'] = True
+                    except Exception:
+                        pass
                     _, _, done, info = self.env.step(move)
 
                     # Update game/series if hand is over (host)
@@ -6545,6 +6649,27 @@ class GameScreen(BaseScreen):
             self.status_message = "Select a card from your hand first"
             return False
         
+        # If Ace and Asso piglia tutto with dual options available, prompt before encoding
+        try:
+            rules = self.app.game_config.get("rules", {}) if hasattr(self.app, 'game_config') else {}
+            ap_enabled = bool(rules.get("asso_piglia_tutto", False))
+            ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
+            ap_only_empty = bool(rules.get("asso_piglia_tutto_posabile_only_empty", False))
+            if ap_enabled and self.selected_hand_card and self.selected_hand_card[0] == 1:
+                table_cards = []
+                if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                    table_cards = list(self.env.game_state.get("table", []))
+                allow_place_now = ap_posabile and (not ap_only_empty or (len(table_cards) == 0))
+                if allow_place_now:
+                    # Offer prompt (posa vs prendi tutto) when play is clicked
+                    if not getattr(self, 'ace_choice_active', False):
+                        self.ace_choice_active = True
+                        self.ace_choice_for_card = self.selected_hand_card
+                        self.status_message = "Asso: vuoi posarlo o prendere tutto?"
+                        return False
+        except Exception:
+            pass
+
         # Encode the action
         action_vec = encode_action(self.selected_hand_card, list(self.selected_table_cards))
         
@@ -6562,6 +6687,31 @@ class GameScreen(BaseScreen):
                 break
         
         if valid_action is None:
+            # Special case: AP enabled, table empty, posabile OFF → auto self-capture ace without placing
+            try:
+                rules = self.app.game_config.get("rules", {}) if hasattr(self.app, 'game_config') else {}
+                ap_enabled = bool(rules.get("asso_piglia_tutto", False))
+                ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
+                table_cards = []
+                if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                    table_cards = list(self.env.game_state.get("table", []))
+                if ap_enabled and not ap_posabile and self.selected_hand_card and self.selected_hand_card[0] == 1 and len(table_cards) == 0:
+                    forced_action = encode_action(self.selected_hand_card, [])
+                    self.create_move_animations(self.selected_hand_card, [], source_player_id=self.current_player_id, force_self_capture=True)
+                    self.app.resources.play_sound("card_play")
+                    self.waiting_for_animation = True
+                    self.pending_action = forced_action
+                    # In online client, invia flag one-shot all'host per forzare self-capture coerente lato env
+                    if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
+                        try:
+                            self.send_move(forced_action, flags={"force_ace_self_capture_on_empty_once": True})
+                        except Exception:
+                            pass
+                    self.selected_hand_card = None
+                    self.selected_table_cards.clear()
+                    return True
+            except Exception:
+                pass
             self.status_message = "Invalid move. Try again."
             return False
         
@@ -6576,15 +6726,45 @@ class GameScreen(BaseScreen):
         try:
             # If online multiplayer, send move to server/other players
             if self.app.game_config.get("mode") == "online_multiplayer":
-                self.app.network.send_move(valid_action)
+                # Invia anche flags se necessarie (es. auto-presa asso a tavolo vuoto)
+                flags = None
+                try:
+                    rules = self.app.game_config.get("rules", {}) if hasattr(self.app, 'game_config') else {}
+                    ap_enabled = bool(rules.get("asso_piglia_tutto", False))
+                    ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
+                    table_cards = []
+                    if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                        table_cards = list(self.env.game_state.get("table", []))
+                    pc, cc = decode_action(valid_action)
+                    if ap_enabled and pc[0] == 1 and len(table_cards) == 0 and len(cc) == 0 and not ap_posabile:
+                        flags = {"force_ace_self_capture_on_empty_once": True}
+                except Exception:
+                    flags = None
+                # Host o client: usa send_move del GameScreen (non NetworkManager)
+                if flags:
+                    self.send_move(valid_action, flags=flags)
+                else:
+                    self.send_move(valid_action)
                 if not self.app.network.is_host:
                     # Client waits for server to update game state
                     self.waiting_for_other_player = True
                     self.status_message = "Mossa inviata, in attesa di conferma..."
                     return True
             
-            # IMPORTANTE: Creiamo le animazioni che ora rimuovono automaticamente la carta dalla mano
-            self.create_move_animations(card_played, cards_captured, source_player_id=self.current_player_id)
+            # IMPORTANTE: Creiamo le animazioni. Se AP e tavolo vuoto e posa non consentita, forza self-capture anim
+            force_self_cap_anim = False
+            try:
+                rules = self.app.game_config.get("rules", {}) if hasattr(self.app, 'game_config') else {}
+                ap_enabled = bool(rules.get("asso_piglia_tutto", False))
+                ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
+                table_cards = []
+                if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
+                    table_cards = list(self.env.game_state.get("table", []))
+                if ap_enabled and card_played[0] == 1 and len(table_cards) == 0 and not ap_posabile and len(cards_captured) == 0:
+                    force_self_cap_anim = True
+            except Exception:
+                pass
+            self.create_move_animations(card_played, cards_captured, source_player_id=self.current_player_id, force_self_capture=force_self_cap_anim)
             
             # Play sound
             self.app.resources.play_sound("card_play")
@@ -6651,7 +6831,7 @@ class GameScreen(BaseScreen):
             print(f"Error making AI move: {e}")
             import traceback
             traceback.print_exc()
-    def create_move_animations(self, card_played, cards_captured, source_player_id=None, table_for_positions=None):
+    def create_move_animations(self, card_played, cards_captured, source_player_id=None, table_for_positions=None, force_self_capture=False):
         """Create animations for a move with improved positioning
 
         table_for_positions: optional list of cards representing the table layout
@@ -6745,28 +6925,31 @@ class GameScreen(BaseScreen):
         table_y_center = self.table_rect.centery - card_height // 2
 
         # Se ci sono carte da catturare → end_pos verso la cattura
+        # Caso speciale: force_self_capture (asso su tavolo vuoto) → porta la carta direttamente al mazzetto
         # Altrimenti (no capture) → end_pos verso la posizione finale dopo lo slide
-        if cards_captured:
+        if cards_captured or force_self_capture:
             # Usa la tabella originale + eventuali carte catturate aggiunte per calcolare la sovrapposizione
             layout_for_capture = original_table.copy()
-            for card in cards_captured:
-                if card not in layout_for_capture:
-                    layout_for_capture.append(card)
+            if cards_captured:
+                for card in cards_captured:
+                    if card not in layout_for_capture:
+                        layout_for_capture.append(card)
             max_spacing_cap = self.table_rect.width * 0.8 / max(len(layout_for_capture), 1)
             spacing_cap = min(card_width * 1.1, max_spacing_cap)
             start_x_cap = self.table_rect.centerx - (len(layout_for_capture) * spacing_cap) // 2
             # Trova l'indice della carta catturata più a sinistra
             leftmost_card_index = float('inf')
-            for card in cards_captured:
-                try:
-                    idx = layout_for_capture.index(card)
-                    if idx < leftmost_card_index:
-                        leftmost_card_index = idx
-                except ValueError:
-                    pass
-            if leftmost_card_index != float('inf'):
-                card_x = start_x_cap + leftmost_card_index * spacing_cap
-                end_pos = (card_x - card_width * 0.25, table_y_center + card_height / 2)
+            if cards_captured:
+                for card in cards_captured:
+                    try:
+                        idx = layout_for_capture.index(card)
+                        if idx < leftmost_card_index:
+                            leftmost_card_index = idx
+                    except ValueError:
+                        pass
+                if leftmost_card_index != float('inf'):
+                    card_x = start_x_cap + leftmost_card_index * spacing_cap
+                    end_pos = (card_x - card_width * 0.25, table_y_center + card_height / 2)
         else:
             # NO CAPTURE: prepara slide laterale delle carte già in tavola e target finale della carta giocata
             new_table = original_table + [card_played]
@@ -6977,8 +7160,8 @@ class GameScreen(BaseScreen):
         self.animations.append(hand_to_table)
         #print(f"Creata animazione mano->tavolo per carta {card_played}")
         
-        # Se ci sono carte da catturare, crea le animazioni di cattura
-        if cards_captured:
+        # Se ci sono carte da catturare, o se è una self-capture forzata dell'asso, crea le animazioni di cattura
+        if cards_captured or force_self_capture:
             # Calculate pile rect for the capturing team (use new pile positions)
             team_id = current_player.team_id
             pile_rect = self.get_team_pile_rect(team_id)
@@ -7015,7 +7198,7 @@ class GameScreen(BaseScreen):
             total_time = hand_to_table_duration + 1 + plateau_duration
             
             # Creiamo una lista di tutte le carte coinvolte nella cattura, inclusa la carta catturante
-            all_capture_cards = [card_played] + list(cards_captured)
+            all_capture_cards = [card_played] + (list(cards_captured) if cards_captured else [])
             card_width = int(self.app.window_width * 0.078)
             
             # Calcola posizioni di partenza per tutte le carte
@@ -7023,7 +7206,7 @@ class GameScreen(BaseScreen):
             starting_positions[card_played] = end_pos  # La carta catturante parte dalla sua posizione sul tavolo
             
             # Calcola le posizioni delle carte sul tavolo
-            for card in cards_captured:
+            for card in (cards_captured or []):
                 try:
                     # Find card position in the original table
                     card_index = original_table.index(card)
@@ -7249,13 +7432,40 @@ class GameScreen(BaseScreen):
         self.new_game_button.text = "Exit"
         self.new_game_button.draw(surface)
 
-        # Draw confirm button if current player is controllable
-        if self.env and self.is_current_player_controllable() and not self.game_over:
+        # Draw confirm button if current player is controllable (hide during ace prompt)
+        if self.env and self.is_current_player_controllable() and not self.game_over and not getattr(self, 'ace_choice_active', False):
             self.confirm_button.draw(surface)
 
-        # Draw replay button only on the local player's turn (like Play)
-        if not self.replay_active and self.env and not self.game_over and self.is_current_player_controllable():
+        # Draw replay button only on the local player's turn (like Play) (hide during ace prompt)
+        if not self.replay_active and self.env and not self.game_over and self.is_current_player_controllable() and not getattr(self, 'ace_choice_active', False):
             self.replay_button.draw(surface)
+
+        # Ace prompt overlay
+        if getattr(self, 'ace_choice_active', False) and self.is_current_player_controllable():
+            overlay = pygame.Surface((self.app.window_width, self.app.window_height), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 140))
+            surface.blit(overlay, (0, 0))
+            panel_w = int(self.app.window_width * 0.5)
+            panel_h = int(self.app.window_height * 0.22)
+            panel_rect = pygame.Rect((self.app.window_width - panel_w)//2, (self.app.window_height - panel_h)//2, panel_w, panel_h)
+            pygame.draw.rect(surface, (10,10,40), panel_rect, border_radius=10)
+            pygame.draw.rect(surface, GOLD, panel_rect, 2, border_radius=10)
+            title = self.title_font.render("Asso piglia tutto", True, GOLD)
+            surface.blit(title, title.get_rect(midtop=(panel_rect.centerx, panel_rect.top + 14)))
+            info_txt = "Vuoi posare l'asso o prendere tutto il tavolo?"
+            info_surf = self.info_font.render(info_txt, True, WHITE)
+            surface.blit(info_surf, info_surf.get_rect(center=(panel_rect.centerx, panel_rect.centery - 10)))
+            btn_w = int(panel_w * 0.35)
+            btn_h = 44
+            gap = 20
+            left_x = panel_rect.centerx - btn_w - gap//2
+            right_x = panel_rect.centerx + gap//2
+            y = panel_rect.bottom - btn_h - 18
+            place_btn = Button(left_x, y, btn_w, btn_h, "Posa l'asso", DARK_BLUE, WHITE)
+            take_btn = Button(right_x, y, btn_w, btn_h, "Prendi tutto", (0, 150, 0), WHITE)
+            self.ace_choice_buttons = {"place": place_btn, "take": take_btn}
+            place_btn.draw(surface)
+            take_btn.draw(surface)
 
         # Intermediate recap overlay between hands (points mode) - draw on TOP of everything
         if self.show_intermediate_recap and self.last_hand_breakdown:
