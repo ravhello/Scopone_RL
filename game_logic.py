@@ -17,7 +17,10 @@ def update_game_state(game_state, action_id, current_player, rules=None):
         return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
 
     # Decodifica l'azione
-    played_card, cards_to_capture = decode_action(action_id)
+    try:
+        played_card, cards_to_capture = decode_action(action_id)
+    except ValueError as e:
+        raise ValueError(f"Azione non valida: {e}")
     
     # Cerca la carta nella mano del giocatore corrente
     if played_card not in hand:

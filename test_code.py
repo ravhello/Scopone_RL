@@ -108,6 +108,13 @@ def test_encode_action_decode_action():
     assert set(dec_captured3) == set(cards_to_capture3)
 
 
+def test_decode_action_invalid_vector():
+    """Verifica che decode_action sollevi ValueError quando la carta giocata non è specificata."""
+    invalid_vec = np.zeros(80, dtype=np.float32)
+    with pytest.raises(ValueError):
+        decode_action(invalid_vec)
+
+
 def test_get_valid_actions_direct_capture(env_fixture):
     """
     Test 'get_valid_actions' in un caso dove esiste la cattura diretta.

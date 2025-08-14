@@ -138,8 +138,9 @@ class ScoponeEnvMA(gym.Env):
                                 if pc[0] == 1 and len(cc) == 0:
                                     # è una posa di asso → vietata ora
                                     keep = False
-                            except Exception:
-                                pass
+                            except ValueError:
+                                # Azione non decodificabile -> scartala
+                                keep = False
                             if keep:
                                 filtered.append(v)
                         valid_actions = filtered
@@ -168,7 +169,10 @@ class ScoponeEnvMA(gym.Env):
             raise ValueError("Partita già finita: non puoi fare altri step.")
         
         # Decodifica l'azione - nessun trasferimento CPU-GPU qui
-        played_card, cards_to_capture = decode_action(action_vec)
+        try:
+            played_card, cards_to_capture = decode_action(action_vec)
+        except ValueError as e:
+            raise ValueError(f"Azione non valida: {e}")
         
         # Verifica validità (come prima)
         current_player = self.current_player
