@@ -180,6 +180,8 @@ class ScoponeEnvMA(gym.Env):
         current_player = self.current_player
         hand = self.game_state["hands"][current_player]
         table = self.game_state["table"]
+        # Snapshot length of table before modifications for scopa logic nuances
+        pre_table_len = len(table)
         
         if played_card not in hand:
             raise ValueError(f"La carta {played_card} non è nella mano del giocatore {current_player}.")
@@ -221,9 +223,9 @@ class ScoponeEnvMA(gym.Env):
             ace_take_all = (rank == 1 and self.rules.get("asso_piglia_tutto", False) 
                             and set(cards_to_capture) == set(table))
             if not ace_take_all:
-                # Cattura diretta obbligatoria
-                if set(cards_to_capture) != set(same_rank_cards):
-                    raise ValueError(f"Quando esistono carte di rank uguale, devi catturarle tutte.")
+                # Nuova regola: devi catturare UNA carta di pari rank (non una combinazione né sottoinsiemi di somma)
+                if not (len(cards_to_capture) == 1 and cards_to_capture[0] in same_rank_cards):
+                    raise ValueError("Quando esistono carte di rank uguale, devi catturarne una (non una combinazione).")
         elif cards_to_capture:
             # Verifica somma
             # Eccezione: Asso piglia tutto
@@ -281,9 +283,18 @@ class ScoponeEnvMA(gym.Env):
             "captured_cards": cards_to_capture
         }
         # Eccezione: Asso piglia tutto non conta scopa (a meno di opzione esplicita)
+        # Tuttavia, se sul tavolo c'era solo un asso ed è stato preso (anche usando AP),
+        # deve comunque contare come scopa come nella presa diretta normale.
         if (move_info["capture_type"] == "scopa" and rank == 1 and 
             self.rules.get("asso_piglia_tutto", False) and not self.rules.get("scopa_on_asso_piglia_tutto", False)):
-            move_info["capture_type"] = "capture"
+            try:
+                # Se prima della mossa c'era una sola carta sul tavolo ed era un asso,
+                # manteniamo la scopa.
+                single_ace_sweep = (pre_table_len == 1 and len(cards_to_capture) == 1 and cards_to_capture[0][0] == 1)
+            except Exception:
+                single_ace_sweep = False
+            if not single_ace_sweep:
+                move_info["capture_type"] = "capture"
 
         # Limite scope consecutive per team
         if move_info["capture_type"] == "scopa":
