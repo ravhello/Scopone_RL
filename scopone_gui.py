@@ -4842,9 +4842,9 @@ class GameScreen(BaseScreen):
         # Process mouse down actions (replay button and selections)
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             pos = pygame.mouse.get_pos()
-            # Replay button click only on actual click (not hover)
+            # Replay button click only on actual click (not hover), and only on own turn
             if self.replay_button.is_clicked(pos):
-                if not self.animations and not self.replay_active:
+                if self.is_current_player_controllable() and not self.animations and not self.replay_active:
                     self.start_replay()
                 # Do not fall-through to card selection when clicking the replay button
                 return
@@ -6751,8 +6751,8 @@ class GameScreen(BaseScreen):
         if self.env and self.is_current_player_controllable() and not self.game_over:
             self.confirm_button.draw(surface)
 
-        # Draw replay button (always visible when not in replay mode)
-        if not self.replay_active and self.env and not self.game_over:
+        # Draw replay button only on the local player's turn (like Play)
+        if not self.replay_active and self.env and not self.game_over and self.is_current_player_controllable():
             self.replay_button.draw(surface)
 
         # Intermediate recap overlay between hands (points mode) - draw on TOP of everything
@@ -7461,6 +7461,9 @@ class GameScreen(BaseScreen):
         for anim in anims:
             if anim.current_frame < 0:
                 continue  # Animation in delay phase
+            # Do not render sentinel animations used only for state tracking
+            if getattr(anim, 'animation_type', '') in ('start_motion',):
+                continue
                 
             # Get card image
             card_img = self.app.resources.get_card_image(anim.card)
@@ -8895,6 +8898,9 @@ class GameScreen(BaseScreen):
             pass
         for anim in anims:
             if anim.current_frame < 0:  # Still in delay
+                continue
+            # Do not render sentinel animations used only for state tracking
+            if getattr(anim, 'animation_type', '') in ('replay_start_motion',):
                 continue
                 
             current_pos = anim.get_current_pos()
