@@ -4974,6 +4974,16 @@ class GameScreen(BaseScreen):
             if getattr(self, '_last_player_for_autoplay', None) != self.current_player_id:
                 self.autoplay_sent_for_turn = False
                 self._last_player_for_autoplay = self.current_player_id
+
+        # Ensure selected table cards remain valid: drop any that are no longer on the table
+        try:
+            current_table = set(self.env.game_state.get("table", [])) if (self.env and isinstance(getattr(self.env, 'game_state', None), dict)) else set()
+        except Exception:
+            current_table = set()
+        if getattr(self, 'selected_table_cards', None):
+            stale_selected = {card for card in list(self.selected_table_cards) if card not in current_table}
+            if stale_selected:
+                self.selected_table_cards.difference_update(stale_selected)
         
         # Debug: stampa numero di animazioni attive
         if hasattr(self, 'animations') and self.animations:
