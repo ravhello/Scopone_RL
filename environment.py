@@ -323,7 +323,7 @@ class ScoponeEnvMA(gym.Env):
                 "team_rewards": [final_reward[0], final_reward[1]]
             }
             
-            # OTTIMIZZAZIONE: Crea uno stato final di zeri senza GPU
+            # OTTIMIZZAZIONE: Crea uno stato finale di zeri senza GPU
             # No need to call get_observation for final state - just return zeros
             obs_shape = self._get_observation(self.current_player).shape
             obs_final = np.zeros(obs_shape, dtype=np.float32)
