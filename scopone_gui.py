@@ -6546,6 +6546,11 @@ class GameScreen(BaseScreen):
             rotation_end=0,
             animation_type="play"
         )
+        # Mark as the played card for z-ordering
+        try:
+            hand_to_table.is_played_card = True
+        except Exception:
+            pass
         self.animations.append(hand_to_table)
         #print(f"Creata animazione mano->tavolo per carta {card_played}")
         
@@ -6569,6 +6574,11 @@ class GameScreen(BaseScreen):
                 rotation_end=0,
                 animation_type="plateau"  # Nuovo tipo di animazione
             )
+            # Mark as the played card for z-ordering
+            try:
+                plateau_anim.is_played_card = True
+            except Exception:
+                pass
             self.animations.append(plateau_anim)
             #print(f"Creata animazione di plateau per carta {card_played}")
             
@@ -6656,6 +6666,12 @@ class GameScreen(BaseScreen):
                     rotation_end=random.randint(-10, 10),
                     animation_type="capture"
                 )
+                # Ensure the played card's capture renders above captured cards
+                if card == card_played:
+                    try:
+                        capture_anim.is_played_card = True
+                    except Exception:
+                        pass
                 self.animations.append(capture_anim)
                 #print(f"  Creata animazione tavolo->mazzetto per carta {card} con delay {card_delay}")
     
@@ -7436,7 +7452,13 @@ class GameScreen(BaseScreen):
         border_thickness = 1  # Sottile bordo nero
         border_radius = 8     # Angoli smussati
         
-        for anim in self.animations:
+        # Draw animations with played-card animations last to keep them on top
+        anims = list(self.animations)
+        try:
+            anims.sort(key=lambda a: 0 if getattr(a, 'is_played_card', False) else -1)
+        except Exception:
+            pass
+        for anim in anims:
             if anim.current_frame < 0:
                 continue  # Animation in delay phase
                 
@@ -8683,6 +8705,8 @@ class GameScreen(BaseScreen):
         # Indica se questa giocata causerà una presa
         try:
             hand_to_table.causes_capture = bool(captured_cards)
+            # Mark as the played card for z-ordering in replay
+            hand_to_table.is_played_card = True
         except Exception:
             hand_to_table.causes_capture = False
         self.replay_animations.append(hand_to_table)
@@ -8707,6 +8731,10 @@ class GameScreen(BaseScreen):
                 rotation_end=0,
                 animation_type="replay_plateau"
             )
+            try:
+                plateau_anim.is_played_card = True
+            except Exception:
+                pass
             self.replay_animations.append(plateau_anim)
             
             # Phase 3: Capture animations
@@ -8765,6 +8793,11 @@ class GameScreen(BaseScreen):
                     rotation_end=random.randint(-10, 10),
                     animation_type="replay_capture"
                 )
+                if card == played_card:
+                    try:
+                        capture_anim.is_played_card = True
+                    except Exception:
+                        pass
                 self.replay_animations.append(capture_anim)
     
     def update_replay_animations(self):
@@ -8854,7 +8887,13 @@ class GameScreen(BaseScreen):
         border_thickness = 1  # Sottile bordo nero
         border_radius = 8     # Angoli smussati
         
-        for anim in self.replay_animations:
+        # Draw with played-card animations last to keep them on top
+        anims = list(self.replay_animations)
+        try:
+            anims.sort(key=lambda a: 0 if getattr(a, 'is_played_card', False) else -1)
+        except Exception:
+            pass
+        for anim in anims:
             if anim.current_frame < 0:  # Still in delay
                 continue
                 
