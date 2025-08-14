@@ -108,7 +108,7 @@ def compute_final_score_breakdown(game_state, rules=None):
 
 def compute_final_reward_from_breakdown(breakdown):
     """
-    Calcola la differenza tra breakdown[0]["total"] e breakdown[1]["total"] * 10
+    Calcola (breakdown[0]['total'] - breakdown[1]['total']) * 10 restituendo le ricompense per i due team.
     """
     diff = breakdown[0]["total"] - breakdown[1]["total"]
     return {
