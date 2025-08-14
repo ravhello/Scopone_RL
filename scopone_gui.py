@@ -2331,6 +2331,11 @@ class GameModeScreen(BaseScreen):
         """Host an online game with internet support"""
         print("\nDEBUG HOST GAME: Creating NetworkManager with is_host=True")
         self.app.network = NetworkManager(is_host=True)
+        # Collega l'app al network manager per permettere al client di aggiornare le regole nell'app
+        try:
+            self.app.network.app = self.app
+        except Exception:
+            pass
         # Conserva le regole correnti configurate nelle Opzioni
         try:
             preserved_rules = {}
@@ -2482,6 +2487,11 @@ class GameModeScreen(BaseScreen):
         # Use localhost if no IP entered
         host = self.ip_input if self.ip_input else "localhost"
         self.app.network = NetworkManager(is_host=False, host=host)
+        # Collega l'app al network manager anche lato client per sincronizzare le regole
+        try:
+            self.app.network.app = self.app
+        except Exception:
+            pass
         
         # Start connection attempt
         self.app.network.connect_to_server()
@@ -7489,7 +7499,12 @@ class GameScreen(BaseScreen):
                 diff_rect = diff_surf.get_rect(topright=(width - int(width * 0.02), int(height * 0.026)))
                 surface.blit(diff_surf, diff_rect)
 
-            # Live series recap (points/hands)
+        # Live series recap (points/hands) - show here ONLY if rules box is not available
+        try:
+            rules_present = bool(self.app.game_config.get("rules", {}))
+        except Exception:
+            rules_present = False
+        if not rules_present:
             if self.series_mode == "points":
                 hist_text = ", ".join([f"{a}-{b}" for (a, b) in self.points_history]) if self.points_history else "-"
                 tot0 = sum(x for x, _ in self.points_history)
@@ -8272,8 +8287,9 @@ class GameScreen(BaseScreen):
         overlay.fill((0, 0, 0, 160))
         surface.blit(overlay, (0, 0))
 
-        panel_w = int(width * 0.6)
-        panel_h = int(height * 0.5)
+        # Pannello più ampio per evitare sovrapposizioni
+        panel_w = int(width * 0.66)
+        panel_h = int(height * 0.6)
         panel_rect = pygame.Rect(width//2 - panel_w//2, height//2 - panel_h//2, panel_w, panel_h)
         pygame.draw.rect(surface, DARK_BLUE, panel_rect, border_radius=10)
         pygame.draw.rect(surface, GOLD, panel_rect, 4, border_radius=10)
@@ -8282,7 +8298,8 @@ class GameScreen(BaseScreen):
         detail_font = pygame.font.SysFont(None, int(height * 0.03))
 
         title = title_font.render("Fine mano - riepilogo", True, GOLD)
-        surface.blit(title, title.get_rect(midtop=(panel_rect.centerx, panel_rect.top + int(height * 0.03))))
+        title_rect = title.get_rect(midtop=(panel_rect.centerx, panel_rect.top + int(height * 0.03)))
+        surface.blit(title, title_rect)
 
         bd = self.last_hand_breakdown or {}
         p0 = int(bd.get(0, {}).get("total", 0))
@@ -8290,9 +8307,18 @@ class GameScreen(BaseScreen):
         tot0 = sum(x for x, _ in self.points_history)
         tot1 = sum(x for _, x in self.points_history)
 
+        # Flusso verticale sequenziale per evitare sovrapposizioni
+        spacing_s = int(height * 0.015)
+        spacing_m = int(height * 0.022)
+        spacing_l = int(height * 0.03)
+
+        current_y = title_rect.bottom + spacing_m
+
         # Riga punteggi mano
-        hand_text = detail_font.render(f"Mano: {p0} - {p1}", True, WHITE)
-        surface.blit(hand_text, hand_text.get_rect(midtop=(panel_rect.centerx, panel_rect.top + int(height * 0.14))))
+        hand_surf = detail_font.render(f"Mano: {p0} - {p1}", True, WHITE)
+        hand_rect = hand_surf.get_rect(midtop=(panel_rect.centerx, current_y))
+        surface.blit(hand_surf, hand_rect)
+        current_y = hand_rect.bottom + spacing_s
 
         # Riga cumulativi
         if self.series_mode == "points":
@@ -8301,8 +8327,67 @@ class GameScreen(BaseScreen):
             extra = f" | Mani vinte: {self.hands_won[0]}-{self.hands_won[1]} / {self.series_num_hands}"
         else:
             extra = ""
-        tot_text = detail_font.render(f"Totale serie: {tot0} - {tot1}{extra}", True, WHITE)
-        surface.blit(tot_text, tot_text.get_rect(midtop=(panel_rect.centerx, panel_rect.top + int(height * 0.2))))
+        tot_surf = detail_font.render(f"Totale serie: {tot0} - {tot1}{extra}", True, WHITE)
+        tot_rect = tot_surf.get_rect(midtop=(panel_rect.centerx, current_y))
+        surface.blit(tot_surf, tot_rect)
+        current_y = tot_rect.bottom + spacing_l
+
+        # Dettaglio tipi di punti dell'ultima mano per squadra (come nel riepilogo finale)
+        rules = self.app.game_config.get("rules", {})
+        category_font = pygame.font.SysFont(None, int(height * 0.038))
+
+        # Colonne punteggio: partono sotto il riepilogo centrale
+        columns_top_y = current_y
+
+        # Colonna sinistra: Team 0
+        team0_title = category_font.render("Team 0 Score", True, LIGHT_BLUE)
+        team0_title_rect = team0_title.get_rect(
+            topleft=(panel_rect.left + int(panel_w * 0.06), columns_top_y)
+        )
+        surface.blit(team0_title, team0_title_rect)
+
+        score_x = panel_rect.left + int(panel_w * 0.09)
+        score_y = team0_title_rect.bottom + spacing_s
+        for category, score in bd.get(0, {}).items():
+            if category == "total":
+                continue
+            if category == "napola" and not rules.get("napola", False):
+                continue
+            if category == "re_bello" and not rules.get("re_bello", False):
+                continue
+            text = f"{category.capitalize()}: {score}"
+            text_surf = detail_font.render(text, True, WHITE)
+            surface.blit(text_surf, (score_x, score_y))
+            score_y += int(height * 0.033)
+
+        total0_text = f"Total: {bd.get(0, {}).get('total', 0)}"
+        total0_surf = category_font.render(total0_text, True, LIGHT_BLUE)
+        surface.blit(total0_surf, (score_x, score_y + int(height * 0.01)))
+
+        # Colonna destra: Team 1
+        team1_title = category_font.render("Team 1 Score", True, HIGHLIGHT_RED)
+        team1_title_rect = team1_title.get_rect(
+            topleft=(panel_rect.centerx + int(panel_w * 0.06), columns_top_y)
+        )
+        surface.blit(team1_title, team1_title_rect)
+
+        score_x = panel_rect.centerx + int(panel_w * 0.09)
+        score_y = team1_title_rect.bottom + spacing_s
+        for category, score in bd.get(1, {}).items():
+            if category == "total":
+                continue
+            if category == "napola" and not rules.get("napola", False):
+                continue
+            if category == "re_bello" and not rules.get("re_bello", False):
+                continue
+            text = f"{category.capitalize()}: {score}"
+            text_surf = detail_font.render(text, True, WHITE)
+            surface.blit(text_surf, (score_x, score_y))
+            score_y += int(height * 0.033)
+
+        total1_text = f"Total: {bd.get(1, {}).get('total', 0)}"
+        total1_surf = category_font.render(total1_text, True, HIGHLIGHT_RED)
+        surface.blit(total1_surf, (score_x, score_y + int(height * 0.01)))
 
         # Pulsanti Avanti ed Exit sull'overlay
         btn_w = int(panel_w * 0.28)
@@ -8310,7 +8395,7 @@ class GameScreen(BaseScreen):
         gap = int(width * 0.02)
         left_x = panel_rect.centerx - btn_w - gap//2
         right_x = panel_rect.centerx + gap//2
-        y_btn = panel_rect.bottom - btn_h - int(height * 0.04)
+        y_btn = panel_rect.bottom - btn_h - int(height * 0.035)
         self.next_hand_button = Button(left_x, y_btn, btn_w, btn_h, "Avanti", DARK_GREEN, WHITE, font_size=int(height * 0.03))
         self.exit_overlay_button = Button(right_x, y_btn, btn_w, btn_h, "Exit", HIGHLIGHT_RED, WHITE, font_size=int(height * 0.03))
         
