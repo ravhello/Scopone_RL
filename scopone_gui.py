@@ -3632,6 +3632,8 @@ class GameScreen(BaseScreen):
             self.replay_cards_in_motion.clear()
         else:
             self.replay_cards_in_motion = set()
+        # Virtual inserts for last no-capture card placement before sweep
+        self.virtual_table_inserts = set()
         # Cancel any leftover staged animation state from previous match
         self.waiting_for_animation = False
         self.pending_action = None
@@ -4000,9 +4002,9 @@ class GameScreen(BaseScreen):
         if proceed_new_hand:
             # In modalità a punti o a mani mostra prima un recap dell'ultima mano
             if self.series_mode in ("points", "hands"):
-                # Delay 2s to let players see the last capture before showing overlay
+                # Delay to let players see the sweep before showing overlay (increased)
                 try:
-                    pygame.time.delay(3000)
+                    pygame.time.delay(4500)
                 except Exception:
                     pass
                 self.show_intermediate_recap = True
@@ -4036,9 +4038,9 @@ class GameScreen(BaseScreen):
                 self.setup_layout()
         else:
             # Series ended; show final scoreboard by setting final_breakdown to last hand (already set)
-            # Delay 2s to let players see the last capture before showing final overlay
+            # Delay to let players see the final sweep before showing final overlay (increased)
             try:
-                pygame.time.delay(3000)
+                pygame.time.delay(4500)
             except Exception:
                 pass
 
@@ -5295,6 +5297,14 @@ class GameScreen(BaseScreen):
                         except Exception:
                             pass
                         _, _, done, info = self.env.step(self.pending_action)
+                        # Aggiorna SUBITO le mani in questo stesso frame per evitare un frame di layout vecchio
+                        try:
+                            self.update_player_hands()
+                        except Exception:
+                            pass
+                        # Se avevamo marcato carte catturate pendenti, rimuovi il filtro perché lo stato è aggiornato
+                        if hasattr(self, 'pending_captured_cards'):
+                            self.pending_captured_cards.clear()
                         # Pulisci flags one-shot locali
                         self.pending_action_flags = None
                         
@@ -5863,7 +5873,7 @@ class GameScreen(BaseScreen):
             # dopo la fine dello slide (se non ci sono altre animazioni attive per la stessa carta).
             # NOTA: le carte catturate rimangono in cards_in_motion fino al commit dello stato.
             # Inoltre, quando termina un plateau (hold temporaneo sul tavolo), sblocca il disegno statico.
-            if anim.animation_type in ("table_slide", "hand_slide", "plateau") and anim.current_frame == anim.duration - 1:
+            if anim.animation_type in ("table_slide", "hand_slide", "hand_plateau", "plateau") and anim.current_frame == anim.duration - 1:
                 cards_to_remove.append(anim.card)
             
             # Debug dettagliato
@@ -7218,7 +7228,8 @@ class GameScreen(BaseScreen):
                     end_pos = (card_x - card_width * 0.25, table_y_center + card_height / 2)
         else:
             # NO CAPTURE: prepara slide laterale delle carte già in tavola e target finale della carta giocata
-            new_table = original_table + [card_played]
+            # NO CAPTURE layout uses table snapshot if available to avoid old->new flicker
+            new_table = (list(table_for_positions) if isinstance(table_for_positions, list) else original_table) + [card_played]
             new_count = len(new_table)
             new_max_spacing = self.table_rect.width * 0.8 / max(new_count, 1)
             new_card_spacing = min(card_width * 1.1, new_max_spacing)
@@ -7270,7 +7281,7 @@ class GameScreen(BaseScreen):
                             card=c,
                             start_pos=new_center,
                             end_pos=new_center,
-                            duration=2,
+                            duration=3,
                             delay=15,  # subito dopo lo slide (durata 15)
                             scale_start=1.0,
                             scale_end=1.0,
@@ -7284,7 +7295,7 @@ class GameScreen(BaseScreen):
 
         # Anima lo slide laterale della mano del giocatore che ha giocato la carta
         try:
-            # Esegui lo slide mano solo se la mano del giocatore è visibile (coerente con draw_players)
+            # Determina se la mano è visibile per decidere se renderizzare fronte o dorso
             do_hand_slide = True
             try:
                 mode = self.app.game_config.get("mode")
@@ -7309,10 +7320,23 @@ class GameScreen(BaseScreen):
                 do_hand_slide = bool(show_hand)
             except Exception:
                 pass
-            if do_hand_slide and isinstance(hand, list) and len(hand) > 1 and card_played in hand:
+            owner_hidden = not do_hand_slide
+            # Blocca subito il disegno statico della carta giocata nella mano fino al commit
+            try:
+                if not hasattr(self, 'visually_hidden_cards'):
+                    self.visually_hidden_cards = {}
+                arr = self.visually_hidden_cards.get(player_id)
+                if arr is None:
+                    self.visually_hidden_cards[player_id] = [card_played]
+                elif card_played not in arr:
+                    arr.append(card_played)
+            except Exception:
+                pass
+            if isinstance(hand, list) and len(hand) > 1 and card_played in hand:
                 # Layout pre (con la carta ancora presente)
                 if visual_pos in (0, 2):
                     center_x = hand_rect.centerx
+                    # Allinea i centri anche su passaggi pari->dispari e dispari->pari usando stesso spread
                     total_w_pre = (len(hand) - 1) * horiz_spread + card_width
                     start_x_pre = center_x - (total_w_pre / 2)
                     base_y = hand_rect.bottom - card_height / 2 if visual_pos == 0 else hand_rect.top + card_height / 2
@@ -7343,10 +7367,39 @@ class GameScreen(BaseScreen):
                                 rotation_end=(0 if visual_pos == 0 else 180),
                                 animation_type="hand_slide"
                             )
+                            # Per le mani nascoste, rendi lo slide con il dorso
+                            try:
+                                hand_slide.owner_id = player_id
+                                hand_slide.render_back = owner_hidden
+                            except Exception:
+                                pass
                             self.animations.append(hand_slide)
+                            # Aggiungi un breve plateau a fine slide per evitare flash nel passaggio a disegno statico
+                            try:
+                                hand_plateau = CardAnimation(
+                                    card=c,
+                                    start_pos=new_center,
+                                    end_pos=new_center,
+                                    duration=2,
+                                    delay=15,
+                                    scale_start=1.0,
+                                    scale_end=1.0,
+                                    rotation_start=(0 if visual_pos == 0 else 180),
+                                    rotation_end=(0 if visual_pos == 0 else 180),
+                                    animation_type="hand_plateau"
+                                )
+                                try:
+                                    hand_plateau.owner_id = player_id
+                                    hand_plateau.render_back = owner_hidden
+                                except Exception:
+                                    pass
+                                self.animations.append(hand_plateau)
+                            except Exception:
+                                pass
                 else:
                     # Vertical (left/right)
                     center_y = hand_rect.centery
+                    # Allinea i centri anche su passaggi pari->dispari/dispari->pari
                     total_h_pre = (len(hand) - 1) * vert_spread + card_height
                     start_y_pre = center_y - (total_h_pre / 2)
                     base_x = hand_rect.left + card_width / 2 if visual_pos == 1 else hand_rect.right - card_width / 2
@@ -7375,7 +7428,35 @@ class GameScreen(BaseScreen):
                                 rotation_end=(270 if visual_pos == 1 else 90),
                                 animation_type="hand_slide"
                             )
+                            # Per le mani nascoste, rendi lo slide con il dorso
+                            try:
+                                hand_slide.owner_id = player_id
+                                hand_slide.render_back = owner_hidden
+                            except Exception:
+                                pass
                             self.animations.append(hand_slide)
+                            # Aggiungi un breve plateau a fine slide per evitare flash nel passaggio a disegno statico
+                            try:
+                                hand_plateau = CardAnimation(
+                                    card=c,
+                                    start_pos=new_center,
+                                    end_pos=new_center,
+                                    duration=2,
+                                    delay=15,
+                                    scale_start=1.0,
+                                    scale_end=1.0,
+                                    rotation_start=(270 if visual_pos == 1 else 90),
+                                    rotation_end=(270 if visual_pos == 1 else 90),
+                                    animation_type="hand_plateau"
+                                )
+                                try:
+                                    hand_plateau.owner_id = player_id
+                                    hand_plateau.render_back = owner_hidden
+                                except Exception:
+                                    pass
+                                self.animations.append(hand_plateau)
+                            except Exception:
+                                pass
         except Exception:
             pass
 
@@ -7395,9 +7476,9 @@ class GameScreen(BaseScreen):
         
         # Parametri animazione
         hand_to_table_duration = 15   # Durata della prima fase (mano -> tavolo)
-        plateau_duration = 30         # Durata della pausa sul tavolo
+        plateau_duration = 12         # Pausa più breve sul tavolo prima di catture/sweep
         capture_duration = 25         # Durata della fase di cattura
-        inter_card_delay = 10         # Delay tra le carte nella fase di cattura
+        inter_card_delay = 5          # Ancora più rapido per lo sweep multi-carta
         
         # FASE 1: Animazione della carta dalla mano al tavolo
         hand_to_table = CardAnimation(
@@ -7421,6 +7502,7 @@ class GameScreen(BaseScreen):
         # Mark as the played card for z-ordering
         try:
             hand_to_table.is_played_card = True
+            hand_to_table.owner_id = player_id
         except Exception:
             pass
         self.animations.append(hand_to_table)
@@ -7428,6 +7510,11 @@ class GameScreen(BaseScreen):
         
         # Se ci sono carte da catturare, o se è una self-capture forzata dell'asso, crea le animazioni di cattura
         if cards_captured or force_self_capture:
+            # Sopprimi il disegno statico delle carte catturate fino al commit/apply dello stato
+            try:
+                self.pending_captured_cards = set(cards_captured) if cards_captured else set()
+            except Exception:
+                self.pending_captured_cards = set()
             # Calculate pile rect for the capturing team (use new pile positions)
             team_id = current_player.team_id
             pile_rect = self.get_team_pile_rect(team_id)
@@ -7454,6 +7541,7 @@ class GameScreen(BaseScreen):
             # Mark as the played card for z-ordering
             try:
                 plateau_anim.is_played_card = True
+                plateau_anim.owner_id = player_id
             except Exception:
                 pass
             self.animations.append(plateau_anim)
@@ -7504,7 +7592,7 @@ class GameScreen(BaseScreen):
                         card=card,
                         start_pos=starting_positions[card],
                         end_pos=starting_positions[card],
-                        duration=card_delay + 1,  # Fino all'avvio della sua animazione di cattura
+                        duration=card_delay,   # allinea al frame di start della capture
                         delay=0,
                         scale_start=1.0,
                         scale_end=1.0,
@@ -7521,7 +7609,7 @@ class GameScreen(BaseScreen):
                     start_pos=starting_positions[card],  # Stessa posizione di partenza
                     end_pos=starting_positions[card],    # Stessa posizione (non si muove)
                     duration=1,                          # Dura solo 1 frame
-                    delay=card_delay + 1,                # Un frame dopo l'inizio della capture per evitare overlap
+                    delay=card_delay,                    # stesso frame dell'inizio della capture
                     scale_start=1.0,
                     scale_end=1.0,
                     rotation_start=0,
@@ -7536,7 +7624,7 @@ class GameScreen(BaseScreen):
                     start_pos=starting_positions[card],
                     end_pos=varied_end_pos,
                     duration=capture_duration,
-                    delay=card_delay + 1,  # Inizia un frame dopo il motion_start per non avere frame doppi
+                    delay=card_delay,      # parte esattamente al termine del plateau
                     scale_start=1.0,
                     scale_end=0.8,
                     rotation_start=0,
@@ -7552,6 +7640,7 @@ class GameScreen(BaseScreen):
                 if card == card_played:
                     try:
                         capture_anim.is_played_card = True
+                        capture_anim.owner_id = player_id
                     except Exception:
                         pass
                 self.animations.append(capture_anim)
@@ -7582,7 +7671,7 @@ class GameScreen(BaseScreen):
                                 start_pos=old_center,
                                 end_pos=new_center,
                                 duration=capture_duration,
-                                delay=total_time + 1,
+                                delay=total_time,  # in parallelo alle capture
                                 scale_start=1.0,
                                 scale_end=1.0,
                                 rotation_start=0,
@@ -7605,7 +7694,7 @@ class GameScreen(BaseScreen):
                                 pass
                             # Fase 2: plateau di hold in posizione finale fino alla fine di tutte le catture
                             try:
-                                hold_delay = total_time + 1 + capture_duration
+                                hold_delay = total_time + capture_duration
                                 # Un piccolo margine per garantire che le capture abbiano davvero finito
                                 hold_duration = inter_card_delay + 2
                                 plateau_hold = CardAnimation(
@@ -7623,6 +7712,60 @@ class GameScreen(BaseScreen):
                                 self.animations.append(plateau_hold)
                             except Exception:
                                 pass
+            except Exception:
+                pass
+        else:
+            # NO CAPTURE: la carta va posata come le altre sul tavolo e resta ferma prima dello sweep.
+            # Rileva se questo è l'ULTIMO movimento della mano (tutti gli altri hanno 0 carte e questo giocatore ha 1 carta).
+            is_last_move_no_capture = False
+            try:
+                gs = getattr(self.env, 'game_state', {}) if self.env else {}
+                hands_map = gs.get('hands', {}) if isinstance(gs, dict) else {}
+                last_candidate = True
+                for pid in range(4):
+                    cards_len = len(hands_map.get(pid, [])) if isinstance(hands_map.get(pid, []), list) else 0
+                    if pid == player_id:
+                        if cards_len != 1:
+                            last_candidate = False
+                            break
+                    else:
+                        if cards_len != 0:
+                            last_candidate = False
+                            break
+                is_last_move_no_capture = last_candidate
+            except Exception:
+                is_last_move_no_capture = False
+
+            # Aggiorna lo snapshot del tavolo per il disegno coerente delle altre carte durante lo slide.
+            try:
+                table_snapshot_nc = (list(table_for_positions) if isinstance(table_for_positions, list) else original_table) + [card_played]
+            except Exception:
+                table_snapshot_nc = original_table + [card_played]
+            try:
+                # Marca inserimento virtuale sul tavolo per layout uniforme prima dello sweep
+                try:
+                    if is_last_move_no_capture:
+                        if not hasattr(self, 'virtual_table_inserts'):
+                            self.virtual_table_inserts = set()
+                        self.virtual_table_inserts.add(card_played)
+                except Exception:
+                    pass
+                plateau_no_cap = CardAnimation(
+                    card=card_played,
+                    start_pos=end_pos,
+                    end_pos=end_pos,
+                    duration=(20 if is_last_move_no_capture else 10),
+                    delay=hand_to_table_duration + 1,
+                    scale_start=1.0,
+                    scale_end=1.0,
+                    rotation_start=0,
+                    rotation_end=0,
+                    animation_type="plateau"
+                )
+                plateau_no_cap.is_played_card = True
+                plateau_no_cap.owner_id = player_id
+                plateau_no_cap.table_snapshot = table_snapshot_nc
+                self.animations.append(plateau_no_cap)
             except Exception:
                 pass
     
@@ -7878,10 +8021,11 @@ class GameScreen(BaseScreen):
         if not hand:
             return
         
-        # Evita il doppio disegno: non disegnare staticamente le carte che stanno animando uno "hand_slide"
+        # Evita il doppio disegno: non disegnare staticamente le carte che stanno animando uno "hand_slide" o un breve "hand_plateau"
         animating_hand_cards = set(
             getattr(anim, 'card', None) for anim in getattr(self, 'animations', [])
-            if getattr(anim, 'animation_type', '') == 'hand_slide' and not getattr(anim, 'done', False) and getattr(anim, 'current_frame', 0) >= 0
+            if getattr(anim, 'animation_type', '') in ('hand_slide', 'hand_plateau')
+            and not getattr(anim, 'done', False) and getattr(anim, 'current_frame', 0) >= 0
         )
         
         # MODIFICA: Controlla se ci sono carte da nascondere visivamente
@@ -8021,13 +8165,34 @@ class GameScreen(BaseScreen):
                 surface.blit(rounded_card, card_rect)
     
     def draw_player_hidden_hand(self, surface, player):
-        """Draw another player's hand with card backs rotated toward the table center"""
+        """Draw another player's hand with card backs rotated toward the table center.
+
+        Enhanced to:
+        - Respect `visually_hidden_cards` so the just-played card disappears immediately
+          from hidden hands (fixes: opponent card appears to remain in hand).
+        - Avoid double-drawing cards currently animating a hand slide by filtering them
+          similarly to visible hands.
+        """
         hand = player.hand_cards
         if not hand:
             return
         
         # Get card back image for this player's team
         card_back = self.app.resources.get_card_back(player.team_id)
+
+        # Do not draw hidden-hand cards that are currently animating a hand slide
+        animating_hand_cards = set(
+            getattr(anim, 'card', None) for anim in getattr(self, 'animations', [])
+            if getattr(anim, 'animation_type', '') == 'hand_slide' and not getattr(anim, 'done', False) and getattr(anim, 'current_frame', 0) >= 0
+        )
+
+        # Respect visually hidden cards (e.g., the just-played card)
+        visually_hidden = []
+        if hasattr(self, 'visually_hidden_cards') and player.player_id in self.visually_hidden_cards:
+            visually_hidden = self.visually_hidden_cards[player.player_id]
+        visible_hand = [c for c in hand if c not in visually_hidden and c not in animating_hand_cards]
+        if not visible_hand:
+            return
         
         # Calculate the current card width based on window size
         width = self.app.window_width
@@ -8051,7 +8216,7 @@ class GameScreen(BaseScreen):
         if is_horizontal:
             # Horizontal hand layout (bottom or top)
             card_spread = card_width * 0.7  # Cards overlap horizontally
-            total_width = (len(hand) - 1) * card_spread + card_width
+            total_width = (len(visible_hand) - 1) * card_spread + card_width
             start_x = hand_rect.centerx - total_width / 2
             
             # Y position depends on whether it's top or bottom
@@ -8062,7 +8227,7 @@ class GameScreen(BaseScreen):
                 base_y = hand_rect.top
                 rotation = 180  # Rotate 180 degrees for top player
             
-            for i in range(len(hand)):
+            for i in range(len(visible_hand)):
                 # Calculate x position for this card
                 x = start_x + i * card_spread
                 
@@ -8089,7 +8254,7 @@ class GameScreen(BaseScreen):
         else:
             # Vertical hand layout (left or right)
             card_spread = card_height * 0.4  # Less overlap for vertical cards
-            total_height = (len(hand) - 1) * card_spread + card_height
+            total_height = (len(visible_hand) - 1) * card_spread + card_height
             start_y = hand_rect.centery - total_height / 2
             
             # X position depends on whether it's left or right
@@ -8100,7 +8265,7 @@ class GameScreen(BaseScreen):
                 base_x = hand_rect.right - card_width
                 rotation = 90  # Rotate 90 degrees for right player
             
-            for i in range(len(hand)):
+            for i in range(len(visible_hand)):
                 # Calculate y position for this card
                 y = start_y + i * card_spread
                 
@@ -8138,6 +8303,14 @@ class GameScreen(BaseScreen):
             table_cards = []
             if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                 table_cards = self.env.game_state.get("table", [])
+            # Se presente un inserimento virtuale per ultima carta senza presa: includila nel layout statico
+            try:
+                if hasattr(self, 'virtual_table_inserts') and self.virtual_table_inserts:
+                    for vc in list(self.virtual_table_inserts):
+                        if vc not in table_cards:
+                            table_cards = list(table_cards) + [vc]
+            except Exception:
+                pass
             # While a client-side serialized animation is in progress, prefer the snapshot table
             # passed in via plateau/capture animations to keep spatial references stable.
             if getattr(self, 'queued_client_moves', None) and self.animations:
@@ -8146,19 +8319,20 @@ class GameScreen(BaseScreen):
                 # No change required here; logic above stays but comment documents intent.
                 pass
             
-        # Se lo stato segnala tavolo vuoto ma ci sono animazioni di "play" in corso che dovrebbero
-        # aver già portato carte sul tavolo, evita di mostrare "No cards on table" e lascia lo spazio
-        # libero per l'animazione, così l'utente non crede che manchino le carte.
+        # Se lo stato segnala tavolo vuoto ma ci sono animazioni in corso che coinvolgono carte sul tavolo,
+        # evita di mostrare "No cards on table" e lascia lo spazio libero per le animazioni.
         if not table_cards:
-            # Se c'è un'animazione in corso che mostrerà carte sul tavolo (play/plateau),
+            # Se c'è un'animazione in corso che mostrerà carte sul tavolo (play/plateau/capture/sweep),
             # non mostrare il testo. Considera sia animazioni normali sia di replay.
             normal_showing = any(
                 getattr(anim, 'animation_type', '') in ('play', 'plateau', 'capture', 'plateau_captured')
                 and not getattr(anim, 'done', False)
+                and getattr(anim, 'current_frame', 0) >= 0
                 for anim in getattr(self, 'animations', [])
             )
             replay_showing = any(
-                getattr(anim, 'animation_type', '') in ('replay_play', 'replay_plateau') and not getattr(anim, 'done', False)
+                getattr(anim, 'animation_type', '') in ('replay_play', 'replay_plateau', 'replay_capture') and not getattr(anim, 'done', False)
+                and getattr(anim, 'current_frame', 0) >= 0
                 for anim in getattr(self, 'replay_animations', [])
             ) if getattr(self, 'replay_active', False) else False
             if normal_showing or replay_showing:
@@ -8195,7 +8369,7 @@ class GameScreen(BaseScreen):
         # Evita il doppio disegno: non disegnare staticamente le carte che hanno animazioni attive
         animating_table_cards = set(
             getattr(anim, 'card', None) for anim in getattr(self, 'animations', [])
-            if getattr(anim, 'animation_type', '') in ('table_slide', 'capture', 'plateau', 'plateau_captured')
+            if getattr(anim, 'animation_type', '') in ('table_slide', 'capture', 'plateau', 'plateau_captured', 'play')
             and not getattr(anim, 'done', False) and getattr(anim, 'current_frame', 0) >= 0
         )
 
@@ -8208,11 +8382,38 @@ class GameScreen(BaseScreen):
                 and getattr(anim, 'current_frame', 0) >= 0  # attiva solo se l'animazione è iniziata
                 for anim in self.animations
             )
-            # If we are serializing client animations and we have a stable table snapshot, suppress drawing
-            # for cards that are not part of that snapshot to avoid flicker/reorder during captures
-            if not has_active_anim and getattr(self, 'queued_client_moves', None) and self.animations:
+            # Durante uno slide di riallineamento post-posata (senza presa), usa lo snapshot per evitare di disegnare
+            # le carte nella vecchia posizione una volta che lo slide è iniziato.
+            if not has_active_anim:
                 try:
-                    snap = next((a.table_snapshot for a in self.animations if getattr(a, 'table_snapshot', None)), None)
+                    sliding_snap = next((a.table_snapshot for a in self.animations
+                                         if getattr(a, 'animation_type', '') in ('table_slide', 'plateau')
+                                         and getattr(a, 'table_snapshot', None) is not None), None)
+                except Exception:
+                    sliding_snap = None
+                if isinstance(sliding_snap, list) and card not in sliding_snap:
+                    continue
+            # Multipresa: se abbiamo carte catturate in sospeso, non disegnare staticamente nessuna delle carte catturate
+            try:
+                if hasattr(self, 'pending_captured_cards') and card in getattr(self, 'pending_captured_cards', set()):
+                    continue
+            except Exception:
+                pass
+            # Evita ricomparse lampo dopo slide/capture: se esiste uno snapshot della tavola sulla
+            # quale sono basate le animazioni correnti, disegna solo carte presenti in quello snapshot
+            # quando stiamo ancora animando (finché esistono animazioni attive con snapshot).
+            if self.animations:
+                try:
+                    snapshots = [a.table_snapshot for a in self.animations if getattr(a, 'table_snapshot', None)]
+                    if snapshots:
+                        # Usa l'ultimo snapshot valido
+                        snap = None
+                        for s in reversed(snapshots):
+                            if isinstance(s, list):
+                                snap = s
+                                break
+                    else:
+                        snap = None
                 except Exception:
                     snap = None
                 if isinstance(snap, list) and card not in snap:
@@ -8253,6 +8454,13 @@ class GameScreen(BaseScreen):
             # Draw card with border
             pygame.draw.rect(surface, BLACK, card_rect.inflate(2, 2), border_radius=border_radius)
             surface.blit(rounded_card, card_rect)
+        # Se siamo arrivati qui e non ci sono più animazioni e abbiamo inserimenti virtuali, puliscili
+        if not getattr(self, 'animations', None):
+            try:
+                if hasattr(self, 'virtual_table_inserts'):
+                    self.virtual_table_inserts.clear()
+            except Exception:
+                pass
     def draw_capture_piles(self, surface):
         """Draw realistic capture piles for both teams with scopa highlights.
 
@@ -8463,7 +8671,15 @@ class GameScreen(BaseScreen):
         # Draw animations with played-card animations last to keep them on top
         anims = list(self.animations)
         try:
-            anims.sort(key=lambda a: 0 if getattr(a, 'is_played_card', False) else -1)
+            # Garantisci ordine: hand_slide e hand_plateau vengono disegnate per ultime tra le animazioni normali
+            def _prio(a):
+                if getattr(a, 'is_played_card', False):
+                    return 2
+                t = getattr(a, 'animation_type', '')
+                if t in ('hand_slide', 'hand_plateau'):
+                    return 1
+                return 0
+            anims.sort(key=_prio)
         except Exception:
             pass
         for anim in anims:
@@ -8473,8 +8689,35 @@ class GameScreen(BaseScreen):
             if getattr(anim, 'animation_type', '') in ('start_motion',):
                 continue
                 
-            # Get card image
-            card_img = self.app.resources.get_card_image(anim.card)
+            # Get card image (allow rendering back for hidden-hand slides)
+            render_back = getattr(anim, 'render_back', False)
+            if render_back:
+                try:
+                    owner_id = getattr(anim, 'owner_id', None)
+                    team_id = self.players[owner_id].team_id if owner_id is not None else 0
+                    card_img = self.app.resources.get_card_back(team_id)
+                except Exception:
+                    card_img = self.app.resources.get_card_image(anim.card)
+            else:
+                card_img = self.app.resources.get_card_image(anim.card)
+
+            # RUOTAZIONE COERENTE: usa la prospettiva del proprietario per animazioni della mano
+            rotation_override = None
+            try:
+                if getattr(anim, 'animation_type', '') == 'hand_slide':
+                    owner_id = getattr(anim, 'owner_id', None)
+                    if owner_id is not None:
+                        vis = self.get_visual_position(owner_id)
+                        if vis == 2:
+                            rotation_override = 180
+                        elif vis == 1:
+                            rotation_override = 270
+                        elif vis == 3:
+                            rotation_override = 90
+                        else:
+                            rotation_override = 0
+            except Exception:
+                rotation_override = None
             
             # Apply scaling
             scale = anim.get_current_scale()
@@ -8484,6 +8727,8 @@ class GameScreen(BaseScreen):
             
             # Apply rotation
             rotation = anim.get_current_rotation()
+            if rotation_override is not None:
+                rotation = rotation_override
             # Compose rounded card with border BEFORE rotation so border/rounding rotate with the card
             base_card = pygame.Surface((scaled_width, scaled_height), pygame.SRCALPHA)
             base_card.fill((0, 0, 0, 0))
@@ -9756,10 +10001,10 @@ class GameScreen(BaseScreen):
                         pass
         
         # Use the same animation parameters as regular game animations
-        hand_to_table_duration = 15   # Same as regular game
-        plateau_duration = 30         # Same as regular game
-        capture_duration = 25         # Same as regular game
-        inter_card_delay = 10         # Same as regular game
+        hand_to_table_duration = 15
+        plateau_duration = 12
+        capture_duration = 25
+        inter_card_delay = 5
         
         # Phase 1: Card from hand to table
         hand_to_table = CardAnimation(
@@ -9895,7 +10140,7 @@ class GameScreen(BaseScreen):
                                 start_pos=old_center,
                                 end_pos=new_center,
                                 duration=capture_duration,
-                                delay=total_time + 1,
+                                delay=total_time,
                                 scale_start=1.0,
                                 scale_end=1.0,
                                 rotation_start=0,
@@ -9909,7 +10154,7 @@ class GameScreen(BaseScreen):
                                     start_pos=old_center,
                                     end_pos=old_center,
                                     duration=1,
-                                    delay=total_time + 1,
+                                    delay=total_time,
                                     animation_type="replay_start_motion"
                                 )
                                 self.replay_animations.append(motion_start_anim)
