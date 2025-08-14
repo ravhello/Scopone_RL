@@ -15,6 +15,10 @@ from tqdm import tqdm
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Configurazione per autocast in base alla disponibilità di CUDA
+autocast_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
+
 # Configurazione GPU avanzata
 if torch.cuda.is_available():
     # Ottimizza per performance CUDA
@@ -48,7 +52,11 @@ LR = 1e-3
 EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
-# Nota: BATCH_SIZE non più utilizzato - processiamo tutti i dati in un'unica passata
+# BATCH_SIZE è mantenuto per retro‑compatibilità con vecchi script e test
+# anche se l'implementazione corrente elabora l'intero buffer in una singola
+# passata. Mantenerlo definito evita import error nei moduli esterni che si
+# aspettano ancora questa costante.
+BATCH_SIZE = 128
 REPLAY_SIZE = 10000      # capacità massima del replay buffer
 TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target (ora usato solo per sincronizzazione globale)
 CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"
@@ -236,10 +244,14 @@ class DQNAgent:
         self.epsilon = EPSILON_START
         self.train_steps = 0
         self.episodic_buffer = EpisodicReplayBuffer()
-        
+
         # Aggiunte per ottimizzazione GPU
         torch.backends.cudnn.benchmark = True  # Ottimizzazione per dimensioni di input fisse
-        self.scaler = torch.amp.GradScaler('cuda')  # Per mixed precision training
+        # Usa GradScaler solo se CUDA è disponibile
+        if torch.cuda.is_available():
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
     
     #@profile
     def pick_action(self, obs, valid_actions, env):
@@ -287,7 +299,7 @@ class DQNAgent:
                     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     
                 # OTTIMIZZAZIONE: Usa mixed precision per accelerare l'inferenza
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     action_values = self.online_qnet(obs_t)
                     q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
                 
@@ -350,7 +362,7 @@ class DQNAgent:
         all_returns_t = self.train_returns_buffer[:idx]
         
         # OTTIMIZZAZIONE: Usa mixed precision con un singolo forward pass per tutti i dati
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
             # OTTIMIZZAZIONE: Zero gradients - usa set_to_none=True per maggiore efficienza di memoria
             self.optimizer.zero_grad(set_to_none=True)
             
@@ -362,14 +374,17 @@ class DQNAgent:
             loss = nn.MSELoss()(q_values_for_actions, all_returns_t)
             
             # OTTIMIZZAZIONE: Backward e optimizer step con gradient scaling per mixed precision
-            self.scaler.scale(loss).backward()
-            
-            # OTTIMIZZAZIONE: Clip gradient con una norma moderata per stabilità di training
-            torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
-            
-            # OTTIMIZZAZIONE: Optimizer step con scaling
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                # OTTIMIZZAZIONE: Clip gradient con una norma moderata per stabilità di training
+                torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
+                # OTTIMIZZAZIONE: Optimizer step con scaling
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.online_qnet.parameters(), max_norm=10.0)
+                self.optimizer.step()
             
             # Aggiorna epsilon una sola volta
             self.update_epsilon()
@@ -746,7 +761,7 @@ def train_agents(num_episodes=10):
             # Ottiene batch con dimensione ottimale
             team0_obs_t, team0_actions_t, team0_rewards_t = team0_batch
             
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                 # Processa tutto l'episodio in un'unica passata (no batching)
                 # Zero gradients efficienti
                 agent_team0.optimizer.zero_grad(set_to_none=True)
@@ -777,7 +792,7 @@ def train_agents(num_episodes=10):
             
             team1_obs_t, team1_actions_t, team1_rewards_t = team1_batch
             
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                 # Processa tutto l'episodio in un'unica passata (no batching)
                 agent_team1.optimizer.zero_grad(set_to_none=True)
                 
@@ -846,7 +861,7 @@ def train_agents(num_episodes=10):
                                 idx += 1
                 
                 # Training su tutti gli episodi passati in un'unica passata
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     # Utilizza tutti i dati in un'unica forward pass
                     agent_team0.optimizer.zero_grad(set_to_none=True)
                     
@@ -897,7 +912,7 @@ def train_agents(num_episodes=10):
                                 team1_rewards_buffer[idx] = episode_reward
                                 idx += 1
                 
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     # Utilizza tutti i dati in un'unica forward pass
                     agent_team1.optimizer.zero_grad(set_to_none=True)
                     
