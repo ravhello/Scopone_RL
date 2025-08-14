@@ -5069,7 +5069,10 @@ class GameScreen(BaseScreen):
                 # Check for pending action and execute it
                 if hasattr(self, 'pending_action') and self.pending_action is not None:
                     # CRITICAL FIX: Verify the action is valid for the current player before executing
-                    card_played, cards_captured = decode_action(self.pending_action)
+                    try:
+                        card_played, cards_captured = decode_action(self.pending_action)
+                    except ValueError:
+                        card_played, cards_captured = None, []
                     hands = {}
                     if hasattr(self.env, 'game_state') and isinstance(self.env.game_state, dict):
                         hands = self.env.game_state.get('hands', {}) if isinstance(self.env.game_state.get('hands', {}), dict) else {}
@@ -5256,7 +5259,7 @@ class GameScreen(BaseScreen):
                                 pc, cc = decode_action(act)
                                 if pc == the_card:
                                     filtered.append((act, pc, cc))
-                            except Exception:
+                            except ValueError:
                                 continue
                         # No valid action yet (e.g., state not fully synced): do nothing but continue update
                         if not filtered:
@@ -5752,13 +5755,13 @@ class GameScreen(BaseScreen):
                     # Decode the move
                     card_played, cards_captured = decode_action(move)
                     #print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
-                    
+
                     # Create animations for the move from the correct seat
                     self.create_move_animations(card_played, cards_captured, mapped_player_id)
-                    
+
                     # Execute the move in the environment
                     _, _, done, info = self.env.step(move)
-                    
+
                     # Update game/series if hand is over (host)
                     if done:
                         self.game_over = True
@@ -5769,30 +5772,30 @@ class GameScreen(BaseScreen):
                                 self._handle_hand_end(info.get("score_breakdown"))
                             except Exception:
                                 pass
-                    
+
                     # ENHANCED: Prepare a deep copy of the game state for broadcasting
                     online_type = self.app.game_config.get("online_type")
                     self.app.network.game_state = self.env.game_state.copy()
                     if online_type:
                         self.app.network.game_state['online_type'] = online_type
                         self.app.network.game_state['ai_players'] = [1, 3]  # In team vs AI mode, players 1 and 3 are always AI
-                    
+
                     # Add the current player to the state
                     self.app.network.game_state['current_player'] = self.env.current_player
-                    
+
                     # Add information about the move that was just made
                     self.app.network.game_state['last_move'] = {
                         'player': mapped_player_id,
                         'card_played': card_played,
                         'cards_captured': cards_captured
                     }
-                    
+
                     # Use the enhanced broadcast method
                     self.app.network.broadcast_game_state()
-                    
+
                     # Play a sound effect
                     self.app.resources.play_sound("card_play")
-                    
+
                     # NEW: Diagnostic message
                     table_cards = self.env.game_state.get("table", [])
                     print(f"Host broadcasting after player move - Current player: {self.env.current_player}, Table: {table_cards}")
@@ -5802,7 +5805,10 @@ class GameScreen(BaseScreen):
                         self._broadcast_series_state()
                     except Exception:
                         pass
-                    
+
+                except ValueError as e:
+                    print(f"Invalid move received: {e}")
+                    continue
                 except Exception as e:
                     print(f"Error processing move: {e}")
                     import traceback
@@ -6537,7 +6543,10 @@ class GameScreen(BaseScreen):
         
         valid_action = None
         for valid_act in valid_actions:
-            card, captured = decode_action(valid_act)
+            try:
+                card, captured = decode_action(valid_act)
+            except ValueError:
+                continue
             if card == self.selected_hand_card and set(captured) == self.selected_table_cards:
                 valid_action = valid_act
                 break
@@ -6547,7 +6556,11 @@ class GameScreen(BaseScreen):
             return False
         
         # Get the card played and cards captured for animation
-        card_played, cards_captured = decode_action(valid_action)
+        try:
+            card_played, cards_captured = decode_action(valid_action)
+        except ValueError:
+            self.status_message = "Invalid move. Try again."
+            return False
         
         # Make the move
         try:
@@ -6605,7 +6618,10 @@ class GameScreen(BaseScreen):
         action = ai.pick_action(obs, valid_actions, self.env)
         
         # Get the card played and cards captured for animation
-        card_played, cards_captured = decode_action(action)
+        try:
+            card_played, cards_captured = decode_action(action)
+        except ValueError:
+            return
         
         # Print detailed information about the move
         #print(f"AI {self.current_player_id} plays {card_played} and captures {cards_captured}")
