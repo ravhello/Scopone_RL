@@ -353,13 +353,13 @@ class ResourceManager:
             self.original_card_images = self.card_images.copy()
             self.original_card_backs = self.card_backs.copy()
         
-        # Rescale all card images
+        # Rescale all card images (use smoothscale for better quality)
         for key, original_img in self.original_card_images.items():
-            self.card_images[key] = pygame.transform.scale(original_img, (card_width, card_height))
+            self.card_images[key] = pygame.transform.smoothscale(original_img, (card_width, card_height))
         
-        # Rescale card backs
+        # Rescale card backs (use smoothscale for better quality)
         for team_id, original_back in self.original_card_backs.items():
-            self.card_backs[team_id] = pygame.transform.scale(original_back, (card_width, card_height))
+            self.card_backs[team_id] = pygame.transform.smoothscale(original_back, (card_width, card_height))
 
     def load_card_images(self, folder="assets"):
         """Load card images from the assets folder"""
@@ -376,8 +376,8 @@ class ResourceManager:
             # Use the same retro for both teams
             self.original_card_backs[0] = retro
             self.original_card_backs[1] = retro
-            self.card_backs[0] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
-            self.card_backs[1] = pygame.transform.scale(retro, (CARD_WIDTH, CARD_HEIGHT))
+            self.card_backs[0] = pygame.transform.smoothscale(retro, (CARD_WIDTH, CARD_HEIGHT))
+            self.card_backs[1] = pygame.transform.smoothscale(retro, (CARD_WIDTH, CARD_HEIGHT))
             #print("Caricato retro.jpg per dorso carte")
         except Exception as e:
             print(f"Errore caricamento retro.jpg: {e}")
@@ -387,8 +387,8 @@ class ResourceManager:
                 back_red = pygame.image.load(os.path.join(folder, "card_back_red.jpg"))
                 self.original_card_backs[0] = back_blue
                 self.original_card_backs[1] = back_red
-                self.card_backs[0] = pygame.transform.scale(back_blue, (CARD_WIDTH, CARD_HEIGHT))
-                self.card_backs[1] = pygame.transform.scale(back_red, (CARD_WIDTH, CARD_HEIGHT))
+                self.card_backs[0] = pygame.transform.smoothscale(back_blue, (CARD_WIDTH, CARD_HEIGHT))
+                self.card_backs[1] = pygame.transform.smoothscale(back_red, (CARD_WIDTH, CARD_HEIGHT))
                 print("Caricati card_back_blue.jpg e card_back_red.jpg per dorso carte")
             except:
                 # Create default card backs if images not found
@@ -412,7 +412,7 @@ class ResourceManager:
                 try:
                     img = pygame.image.load(filename)
                     self.original_card_images[key] = img
-                    self.card_images[key] = pygame.transform.scale(img, (CARD_WIDTH, CARD_HEIGHT))
+                    self.card_images[key] = pygame.transform.smoothscale(img, (CARD_WIDTH, CARD_HEIGHT))
                 except:
                     # Create a placeholder if image not found
                     card_img = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
@@ -439,7 +439,7 @@ class ResourceManager:
         try:
             bg = pygame.image.load(os.path.join(folder, "background.jpg"))
             self.original_background = bg  # Store the original unscaled image
-            self.background = pygame.transform.scale(bg, (SCREEN_WIDTH, SCREEN_HEIGHT))
+            self.background = pygame.transform.smoothscale(bg, (SCREEN_WIDTH, SCREEN_HEIGHT))
         except:
             # Create a default background if image not found
             self.original_background = pygame.Surface((1024, 768))
@@ -450,7 +450,7 @@ class ResourceManager:
         try:
             table = pygame.image.load(os.path.join(folder, "table_texture.jpg"))
             self.original_table_texture = table
-            self.table_texture = pygame.transform.scale(table, (750, 450))
+            self.table_texture = pygame.transform.smoothscale(table, (750, 450))
         except:
             # Create a default table texture if image not found
             self.original_table_texture = pygame.Surface((750, 450))
@@ -3701,6 +3701,8 @@ class GameScreen(BaseScreen):
         self.last_hand_breakdown = None
         self._pending_next_starter = None
         self.next_hand_button = None
+        # Defer overlay drawing until state sync/animations are handled (prevents overlay-before-sweep)
+        self.defer_overlays_until_state_sync = False
 
     def _play_next_queued_client_move(self):
         """Play the next queued client move, ensuring strict serialization.
@@ -4010,12 +4012,11 @@ class GameScreen(BaseScreen):
         if proceed_new_hand:
             # In modalità a punti o a mani mostra prima un recap dell'ultima mano
             if self.series_mode in ("points", "hands"):
-                # Delay to let players see the sweep before showing overlay (increased)
-                try:
-                    pygame.time.delay(4500)
-                except Exception:
-                    pass
+                # Do not block the loop here; overlays will be gated in draw() until animations finish
+                # Keeping a small optional grace handled by gating logic
                 self.show_intermediate_recap = True
+                # Gate overlays until any pending serialized client moves (like sweep) are consumed
+                self.defer_overlays_until_state_sync = True
                 self.last_hand_breakdown = final_breakdown
                 # Calcola in anticipo il prossimo starter ma non resettare ancora
                 next_starter = (self.series_prev_starter + 1) % 4 if self.series_prev_starter is not None else random.randint(0, 3)
@@ -4046,11 +4047,9 @@ class GameScreen(BaseScreen):
                 self.setup_layout()
         else:
             # Series ended; show final scoreboard by setting final_breakdown to last hand (already set)
-            # Delay to let players see the final sweep before showing final overlay (increased)
-            try:
-                pygame.time.delay(4500)
-            except Exception:
-                pass
+            # Do not block the loop; overlays will be gated in draw() until animations finish
+            self.defer_overlays_until_state_sync = True
+            pass
 
     
     def setup_ai_controllers(self):
@@ -6153,6 +6152,8 @@ class GameScreen(BaseScreen):
                         if bool(series_state.get('show_intermediate_recap', False)):
                             # Recap intermedio → mai game over ora
                             self.game_over = False
+                            # Defer overlays until we consume any pending sweep queued from state diff
+                            self.defer_overlays_until_state_sync = True
                     except Exception:
                         pass
                 
@@ -7115,42 +7116,58 @@ class GameScreen(BaseScreen):
             print(f"Error making AI move: {e}")
             import traceback
             traceback.print_exc()
-    def create_move_animations(self, card_played, cards_captured, source_player_id=None, table_for_positions=None, force_self_capture=False):
-        """Create animations for a move with improved positioning
+    def build_move_animations(self, *, player_id, played_card, captured_cards,
+                              table_for_positions=None, force_self_capture=False,
+                              origin_strategy="hand", type_prefix="",
+                              apply_visual_side_effects=True):
+        """Build the full animation sequence for a move.
 
-        table_for_positions: optional list of cards representing the table layout
-        to compute animation targets. If None, falls back to current env table.
+        Parameters:
+        - player_id: logical seat of the player making the move
+        - played_card: tuple(rank, suit)
+        - captured_cards: list[tuple(rank, suit)] possibly empty
+        - table_for_positions: list of cards representing the table layout snapshot
+        - force_self_capture: if True, treat like capture of the played card (ace on empty table)
+        - origin_strategy: "hand" to compute start position from the player's hand;
+                           "seat_anchor" to use seat-based anchor (for replay)
+        - type_prefix: "" for live, "replay_" for replay (affects animation_type values)
+        - apply_visual_side_effects: if True, update visual-only helpers like
+                                     visually_hidden_cards / virtual_table_inserts (live only)
+
+        Returns:
+            { "animations": list[CardAnimation], "layout_snapshot": Optional[list] }
         """
-        # Get player ID - use current player if no source player specified
-        player_id = source_player_id if source_player_id is not None else self.current_player_id
+        def _t(name: str) -> str:
+            return f"{type_prefix}{name}" if type_prefix else name
+
+        animations = []
+        layout_snapshot = None
+
         current_player = self.players[player_id]
-        
-        # *** MODIFICA: Non modifichiamo più direttamente lo stato del gioco ***
-        # Invece, memorizziamo la carta in una lista di carte visivamente nascoste
-        if not hasattr(self, 'visually_hidden_cards'):
-            self.visually_hidden_cards = {}
-        
-        # Aggiungiamo la carta alle carte nascoste di questo giocatore
-        if player_id not in self.visually_hidden_cards:
-            self.visually_hidden_cards[player_id] = []
-        self.visually_hidden_cards[player_id].append(card_played)
-        
-        # NUOVO: Inizializza il set di carte in movimento se non esiste
-        if not hasattr(self, 'cards_in_motion'):
+
+        # Live-only: hide the just-played card from the hand immediately
+        if apply_visual_side_effects:
+            if not hasattr(self, 'visually_hidden_cards'):
+                self.visually_hidden_cards = {}
+            if player_id not in self.visually_hidden_cards:
+                self.visually_hidden_cards[player_id] = []
+            if played_card not in self.visually_hidden_cards[player_id]:
+                self.visually_hidden_cards[player_id].append(played_card)
+
+        # Ensure tracking set exists (used by draw to avoid double-draws)
+        if apply_visual_side_effects and not hasattr(self, 'cards_in_motion'):
             self.cards_in_motion = set()
-        
-        # Start position depends on player position (accurate per visual seat for all players)
+
+        # Start position
         hand_rect = current_player.hand_rect
-        hand = current_player.hand_cards
+        hand = getattr(current_player, 'hand_cards', []) or []
         visual_pos = self.get_visual_position(player_id)
-        # Calculate current card size and spreads
         width = self.app.window_width
         card_width = int(width * 0.078)
         card_height = int(card_width * 1.5)
         horiz_spread = card_width * 0.7
         vert_spread = card_height * 0.4
 
-        # Precompute a snapshot of the current table for layout purposes
         if isinstance(table_for_positions, list):
             table_cards = list(table_for_positions)
         else:
@@ -7159,74 +7176,81 @@ class GameScreen(BaseScreen):
                 table_cards = self.env.game_state.get("table", [])
         original_table = table_cards.copy()
 
-        # Try to locate exact index of the card in hand (may fail on clients that don't know opponents' hands)
         card_index = None
-        try:
-            card_index = hand.index(card_played)
-        except Exception:
-            card_index = None
+        if origin_strategy == "hand":
+            try:
+                card_index = hand.index(played_card)
+            except Exception:
+                card_index = None
 
-        if visual_pos in (0, 2):
-            # Horizontal layout (bottom or top)
-            center_x = hand_rect.centerx
-            total_width = (max(len(hand), 1) - 1) * horiz_spread + card_width
-            start_x = center_x - (total_width / 2)
-            if card_index is not None:
-                x = start_x + card_index * horiz_spread + card_width / 2
+        # Compute start_pos
+        if origin_strategy == "hand":
+            if visual_pos in (0, 2):
+                center_x = hand_rect.centerx
+                total_width = (max(len(hand), 1) - 1) * horiz_spread + card_width
+                start_x = center_x - (total_width / 2)
+                if card_index is not None:
+                    x = start_x + card_index * horiz_spread + card_width / 2
+                else:
+                    x = hand_rect.centerx
+                if visual_pos == 0:
+                    y = hand_rect.bottom - card_height / 2
+                else:
+                    y = hand_rect.top + card_height / 2
+                start_pos = (x, y)
             else:
-                # Fallback to middle of the hand
-                x = hand_rect.centerx
-            if visual_pos == 0:
-                y = hand_rect.bottom - card_height / 2
-            else:
-                y = hand_rect.top + card_height / 2
-            start_pos = (x, y)
+                center_y = hand_rect.centery
+                total_height = (max(len(hand), 1) - 1) * vert_spread + card_height
+                start_y = center_y - (total_height / 2)
+                if card_index is not None:
+                    y = start_y + card_index * vert_spread + card_height / 2
+                else:
+                    y = hand_rect.centery
+                if visual_pos == 1:
+                    x = hand_rect.left + card_width / 2
+                else:
+                    x = hand_rect.right - card_width / 2
+                start_pos = (x, y)
         else:
-            # Vertical layout (left or right)
-            center_y = hand_rect.centery
-            total_height = (max(len(hand), 1) - 1) * vert_spread + card_height
-            start_y = center_y - (total_height / 2)
-            if card_index is not None:
-                y = start_y + card_index * vert_spread + card_height / 2
-            else:
-                y = hand_rect.centery
-            if visual_pos == 1:
-                x = hand_rect.left + card_width / 2
-            else:
-                x = hand_rect.right - card_width / 2
-            start_pos = (x, y)
-        
-        # Determina la posizione finale della carta giocata
-        # e (novità) prepara lo slide laterale delle carte già in tavola
+            # Seat-based anchor (replay)
+            if visual_pos == 0:  # Bottom
+                start_x = self.app.window_width // 2
+                start_y = self.app.window_height - self.card_height - self.app.window_height * 0.05
+            elif visual_pos == 1:  # Left
+                start_x = self.app.window_width * 0.02
+                start_y = self.app.window_height // 2
+            elif visual_pos == 2:  # Top
+                start_x = self.app.window_width // 2
+                start_y = self.app.window_height * 0.05
+            else:  # Right
+                start_x = self.app.window_width - self.card_width - self.app.window_width * 0.02
+                start_y = self.app.window_height // 2
+            start_pos = (start_x, start_y)
+
+        # Table layout helpers
         table_center = self.table_rect.center
         end_pos = table_center
-        
-        # Calcoli comuni per layout del tavolo (old/new)
         old_count = len(original_table)
         old_max_spacing = self.table_rect.width * 0.8 / max(old_count if old_count > 0 else 1, 1)
         old_card_spacing = min(card_width * 1.1, old_max_spacing)
         old_start_x = self.table_rect.centerx - (old_count * old_card_spacing) // 2
         table_y_center = self.table_rect.centery - card_height // 2
 
-        # Se ci sono carte da catturare → end_pos verso la cattura
-        # Caso speciale: force_self_capture (asso su tavolo vuoto) → porta la carta direttamente al mazzetto
-        # Altrimenti (no capture) → end_pos verso la posizione finale dopo lo slide
-        if cards_captured or force_self_capture:
-            # Usa la tabella originale + eventuali carte catturate aggiunte per calcolare la sovrapposizione
+        # Determine end_pos and pre-slides
+        if captured_cards or force_self_capture:
             layout_for_capture = original_table.copy()
-            if cards_captured:
-                for card in cards_captured:
-                    if card not in layout_for_capture:
-                        layout_for_capture.append(card)
+            if captured_cards:
+                for c in captured_cards:
+                    if c not in layout_for_capture:
+                        layout_for_capture.append(c)
             max_spacing_cap = self.table_rect.width * 0.8 / max(len(layout_for_capture), 1)
             spacing_cap = min(card_width * 1.1, max_spacing_cap)
             start_x_cap = self.table_rect.centerx - (len(layout_for_capture) * spacing_cap) // 2
-            # Trova l'indice della carta catturata più a sinistra
             leftmost_card_index = float('inf')
-            if cards_captured:
-                for card in cards_captured:
+            if captured_cards:
+                for c in captured_cards:
                     try:
-                        idx = layout_for_capture.index(card)
+                        idx = layout_for_capture.index(c)
                         if idx < leftmost_card_index:
                             leftmost_card_index = idx
                     except ValueError:
@@ -7235,18 +7259,15 @@ class GameScreen(BaseScreen):
                     card_x = start_x_cap + leftmost_card_index * spacing_cap
                     end_pos = (card_x - card_width * 0.25, table_y_center + card_height / 2)
         else:
-            # NO CAPTURE: prepara slide laterale delle carte già in tavola e target finale della carta giocata
-            # NO CAPTURE layout uses table snapshot if available to avoid old->new flicker
-            new_table = (list(table_for_positions) if isinstance(table_for_positions, list) else original_table) + [card_played]
+            new_table = (list(table_for_positions) if isinstance(table_for_positions, list) else original_table) + [played_card]
             new_count = len(new_table)
             new_max_spacing = self.table_rect.width * 0.8 / max(new_count, 1)
             new_card_spacing = min(card_width * 1.1, new_max_spacing)
             new_start_x = self.table_rect.centerx - (new_count * new_card_spacing) // 2
-            # Target della carta giocata: sua posizione finale dopo lo slide
             played_index = new_count - 1
             end_pos = (new_start_x + played_index * new_card_spacing + card_width / 2,
                        table_y_center + card_height / 2)
-            # Crea lo slide per le carte già in tavola verso le nuove posizioni
+            # Slides for existing table cards
             for i, c in enumerate(original_table):
                 old_center = (old_start_x + i * old_card_spacing + card_width / 2,
                               table_y_center + card_height / 2)
@@ -7254,23 +7275,23 @@ class GameScreen(BaseScreen):
                               table_y_center + card_height / 2)
                 if old_center != new_center:
                     slide_anim = CardAnimation(
-                            card=c,
-                            start_pos=old_center,
-                            end_pos=new_center,
-                            duration=15,
-                            delay=0,
-                            scale_start=1.0,
-                            scale_end=1.0,
-                            rotation_start=0,
-                            rotation_end=0,
-                            animation_type="table_slide"
-                        )
+                        card=c,
+                        start_pos=old_center,
+                        end_pos=new_center,
+                        duration=15,
+                        delay=0,
+                        scale_start=1.0,
+                        scale_end=1.0,
+                        rotation_start=0,
+                        rotation_end=0,
+                        animation_type=_t("table_slide")
+                    )
                     try:
-                            slide_anim.table_snapshot = list(new_table)
+                        slide_anim.table_snapshot = list(new_table)
                     except Exception:
-                            pass
-                    self.animations.append(slide_anim)
-                    # Segnala inizio movimento per evitare disegni statici durante e subito dopo
+                        pass
+                    animations.append(slide_anim)
+                    # Mark motion start to suppress static draws
                     try:
                         motion_start_anim = CardAnimation(
                             card=c,
@@ -7278,37 +7299,23 @@ class GameScreen(BaseScreen):
                             end_pos=old_center,
                             duration=1,
                             delay=0,
-                            animation_type="start_motion"
+                            animation_type=_t("start_motion")
                         )
-                        self.animations.append(motion_start_anim)
+                        animations.append(motion_start_anim)
                     except Exception:
                         pass
-                    # Aggiungi un breve hold plateau per evitare "rimbalzi" visivi a fine slide
-                    try:
-                        plateau_hold = CardAnimation(
-                            card=c,
-                            start_pos=new_center,
-                            end_pos=new_center,
-                            duration=3,
-                            delay=15,  # subito dopo lo slide (durata 15)
-                            scale_start=1.0,
-                            scale_end=1.0,
-                            rotation_start=0,
-                            rotation_end=0,
-                            animation_type="plateau"
-                        )
-                        self.animations.append(plateau_hold)
-                    except Exception:
-                        pass
+            # Persist layout snapshot for replay draw stability
+            if type_prefix:
+                try:
+                    layout_snapshot = list(new_table)
+                except Exception:
+                    layout_snapshot = None
 
-        # Anima lo slide laterale della mano del giocatore che ha giocato la carta
-        try:
-            # Determina se la mano è visibile per decidere se renderizzare fronte o dorso
-            do_hand_slide = True
+        # Optional hand slide of owner's remaining hand (live only). For hidden hands, render back.
+        if apply_visual_side_effects:
             try:
                 mode = self.app.game_config.get("mode")
                 is_online = (mode == "online_multiplayer")
-                online_type = self.app.game_config.get("online_type")
                 rules = self.app.game_config.get("rules", {}) if hasattr(self.app, 'game_config') else {}
                 only_turn_local = bool(rules.get("show_only_current_turn_cards", False))
                 show_hand = False
@@ -7327,35 +7334,33 @@ class GameScreen(BaseScreen):
                     show_hand = True
                 do_hand_slide = bool(show_hand)
             except Exception:
-                pass
+                do_hand_slide = False
+
             owner_hidden = not do_hand_slide
-            # Blocca subito il disegno statico della carta giocata nella mano fino al commit
+            # Ensure visually hidden map contains the card
             try:
                 if not hasattr(self, 'visually_hidden_cards'):
                     self.visually_hidden_cards = {}
                 arr = self.visually_hidden_cards.get(player_id)
                 if arr is None:
-                    self.visually_hidden_cards[player_id] = [card_played]
-                elif card_played not in arr:
-                    arr.append(card_played)
+                    self.visually_hidden_cards[player_id] = [played_card]
+                elif played_card not in arr:
+                    arr.append(played_card)
             except Exception:
                 pass
-            if isinstance(hand, list) and len(hand) > 1 and card_played in hand:
-                # Layout pre (con la carta ancora presente)
+
+            if isinstance(hand, list) and len(hand) > 1 and played_card in hand:
                 if visual_pos in (0, 2):
                     center_x = hand_rect.centerx
-                    # Allinea i centri anche su passaggi pari->dispari e dispari->pari usando stesso spread
                     total_w_pre = (len(hand) - 1) * horiz_spread + card_width
                     start_x_pre = center_x - (total_w_pre / 2)
                     base_y = hand_rect.bottom - card_height / 2 if visual_pos == 0 else hand_rect.top + card_height / 2
-                    # Layout post (senza la carta giocata)
-                    remaining = [c for c in hand if c != card_played]
+                    remaining = [c for c in hand if c != played_card]
                     total_w_post = (len(remaining) - 1) * horiz_spread + card_width
                     start_x_post = hand_rect.centerx - (total_w_post / 2)
-                    # Mappa posizioni
                     post_index_map = {c: j for j, c in enumerate(remaining)}
                     for i, c in enumerate(hand):
-                        if c == card_played:
+                        if c == played_card:
                             continue
                         j = post_index_map.get(c, None)
                         if j is None:
@@ -7373,16 +7378,14 @@ class GameScreen(BaseScreen):
                                 scale_end=1.0,
                                 rotation_start=(0 if visual_pos == 0 else 180),
                                 rotation_end=(0 if visual_pos == 0 else 180),
-                                animation_type="hand_slide"
+                                animation_type=_t("hand_slide")
                             )
-                            # Per le mani nascoste, rendi lo slide con il dorso
                             try:
                                 hand_slide.owner_id = player_id
                                 hand_slide.render_back = owner_hidden
                             except Exception:
                                 pass
-                            self.animations.append(hand_slide)
-                            # Aggiungi un breve plateau a fine slide per evitare flash nel passaggio a disegno statico
+                            animations.append(hand_slide)
                             try:
                                 hand_plateau = CardAnimation(
                                     card=c,
@@ -7394,29 +7397,24 @@ class GameScreen(BaseScreen):
                                     scale_end=1.0,
                                     rotation_start=(0 if visual_pos == 0 else 180),
                                     rotation_end=(0 if visual_pos == 0 else 180),
-                                    animation_type="hand_plateau"
+                                    animation_type=_t("hand_plateau")
                                 )
-                                try:
-                                    hand_plateau.owner_id = player_id
-                                    hand_plateau.render_back = owner_hidden
-                                except Exception:
-                                    pass
-                                self.animations.append(hand_plateau)
+                                hand_plateau.owner_id = player_id
+                                hand_plateau.render_back = owner_hidden
+                                animations.append(hand_plateau)
                             except Exception:
                                 pass
                 else:
-                    # Vertical (left/right)
                     center_y = hand_rect.centery
-                    # Allinea i centri anche su passaggi pari->dispari/dispari->pari
                     total_h_pre = (len(hand) - 1) * vert_spread + card_height
                     start_y_pre = center_y - (total_h_pre / 2)
                     base_x = hand_rect.left + card_width / 2 if visual_pos == 1 else hand_rect.right - card_width / 2
-                    remaining = [c for c in hand if c != card_played]
+                    remaining = [c for c in hand if c != played_card]
                     total_h_post = (len(remaining) - 1) * vert_spread + card_height
                     start_y_post = hand_rect.centery - (total_h_post / 2)
                     post_index_map = {c: j for j, c in enumerate(remaining)}
                     for i, c in enumerate(hand):
-                        if c == card_played:
+                        if c == played_card:
                             continue
                         j = post_index_map.get(c, None)
                         if j is None:
@@ -7434,16 +7432,14 @@ class GameScreen(BaseScreen):
                                 scale_end=1.0,
                                 rotation_start=(270 if visual_pos == 1 else 90),
                                 rotation_end=(270 if visual_pos == 1 else 90),
-                                animation_type="hand_slide"
+                                animation_type=_t("hand_slide")
                             )
-                            # Per le mani nascoste, rendi lo slide con il dorso
                             try:
                                 hand_slide.owner_id = player_id
                                 hand_slide.render_back = owner_hidden
                             except Exception:
                                 pass
-                            self.animations.append(hand_slide)
-                            # Aggiungi un breve plateau a fine slide per evitare flash nel passaggio a disegno statico
+                            animations.append(hand_slide)
                             try:
                                 hand_plateau = CardAnimation(
                                     card=c,
@@ -7455,42 +7451,33 @@ class GameScreen(BaseScreen):
                                     scale_end=1.0,
                                     rotation_start=(270 if visual_pos == 1 else 90),
                                     rotation_end=(270 if visual_pos == 1 else 90),
-                                    animation_type="hand_plateau"
+                                    animation_type=_t("hand_plateau")
                                 )
-                                try:
-                                    hand_plateau.owner_id = player_id
-                                    hand_plateau.render_back = owner_hidden
-                                except Exception:
-                                    pass
-                                self.animations.append(hand_plateau)
+                                hand_plateau.owner_id = player_id
+                                hand_plateau.render_back = owner_hidden
+                                animations.append(hand_plateau)
                             except Exception:
                                 pass
-        except Exception:
-            pass
 
-            # CRITICO: Mantieni visibili le carte da catturare finché non parte la loro animazione di cattura
-            # Aggiungendole a cards_in_motion, draw_table_cards le disegnerà comunque finché non parte l'animazione
+        # Keep captured cards visible until their capture animation starts
+        if apply_visual_side_effects:
             try:
                 if not hasattr(self, 'cards_in_motion'):
                     self.cards_in_motion = set()
-                for c in cards_captured:
-                    self.cards_in_motion.discard(c)  # Assicurati che non siano marcate come già in movimento
+                for c in (captured_cards or []):
+                    self.cards_in_motion.discard(c)
             except Exception:
                 pass
-            
-            #print(f"Posizione finale della carta giocata: {end_pos}")
-        
-        # NUOVA SEQUENZA DI ANIMAZIONE A TRE FASI
-        
-        # Parametri animazione
-        hand_to_table_duration = 15   # Durata della prima fase (mano -> tavolo)
-        plateau_duration = 12         # Pausa più breve sul tavolo prima di catture/sweep
-        capture_duration = 25         # Durata della fase di cattura
-        inter_card_delay = 5          # Ancora più rapido per lo sweep multi-carta
-        
-        # FASE 1: Animazione della carta dalla mano al tavolo
+
+        # Animation parameters
+        hand_to_table_duration = 15
+        plateau_duration = 12
+        capture_duration = 25
+        inter_card_delay = 5
+
+        # Phase 1: hand -> table (or seat anchor -> table for replay)
         hand_to_table = CardAnimation(
-            card=card_played,
+            card=played_card,
             start_pos=start_pos,
             end_pos=end_pos,
             duration=hand_to_table_duration,
@@ -7499,170 +7486,140 @@ class GameScreen(BaseScreen):
             scale_end=1.0,
             rotation_start=0,
             rotation_end=0,
-            animation_type="play"
+            animation_type=_t("play")
         )
-        # Attach optional table snapshot if provided
         try:
             if isinstance(table_for_positions, list):
                 hand_to_table.table_snapshot = list(table_for_positions)
         except Exception:
             pass
-        # Mark as the played card for z-ordering
         try:
             hand_to_table.is_played_card = True
             hand_to_table.owner_id = player_id
+            # Useful for replay update to know when to add card to table
+            if type_prefix:
+                hand_to_table.causes_capture = bool(captured_cards or force_self_capture)
         except Exception:
             pass
-        self.animations.append(hand_to_table)
-        #print(f"Creata animazione mano->tavolo per carta {card_played}")
-        
-        # Se ci sono carte da catturare, o se è una self-capture forzata dell'asso, crea le animazioni di cattura
-        if cards_captured or force_self_capture:
-            # Sopprimi il disegno statico delle carte catturate fino al commit/apply dello stato
-            try:
-                self.pending_captured_cards = set(cards_captured) if cards_captured else set()
-            except Exception:
-                self.pending_captured_cards = set()
-            # Calculate pile rect for the capturing team (use new pile positions)
+        animations.append(hand_to_table)
+
+        # Capture path
+        if captured_cards or force_self_capture:
+            # Live-only: suppress static draw of captured cards until env commit
+            if apply_visual_side_effects:
+                try:
+                    self.pending_captured_cards = set(captured_cards) if captured_cards else set()
+                except Exception:
+                    self.pending_captured_cards = set()
+
             team_id = current_player.team_id
             pile_rect = self.get_team_pile_rect(team_id)
-            
-            # FASE 2: NUOVO - Animazione esplicita di "plateau" per mantenere la carta visibile
-            # Questa animazione mantiene la carta ferma nella stessa posizione per tutto il tempo del plateau
+
             plateau_anim = CardAnimation(
-                card=card_played,
-                start_pos=end_pos,     # Stessa posizione di fine della prima animazione
-                end_pos=end_pos,       # Stessa posizione (non si muove)
+                card=played_card,
+                start_pos=end_pos,
+                end_pos=end_pos,
                 duration=plateau_duration,
-                delay=hand_to_table_duration + 1,  # Avvia un frame dopo la fine della play per evitare doppio disegno
+                delay=hand_to_table_duration + 1,
                 scale_start=1.0,
                 scale_end=1.0,
                 rotation_start=0,
                 rotation_end=0,
-                animation_type="plateau"  # Nuovo tipo di animazione
+                animation_type=_t("plateau")
             )
             try:
                 if isinstance(table_for_positions, list):
                     plateau_anim.table_snapshot = list(table_for_positions)
-            except Exception:
-                pass
-            # Mark as the played card for z-ordering
-            try:
                 plateau_anim.is_played_card = True
                 plateau_anim.owner_id = player_id
             except Exception:
                 pass
-            self.animations.append(plateau_anim)
-            #print(f"Creata animazione di plateau per carta {card_played}")
-            
-            # FASE 3: Animazioni dal tavolo al mazzetto
-            # Il tempo totale trascorso finora è hand_to_table_duration + plateau_duration
+            animations.append(plateau_anim)
+
             total_time = hand_to_table_duration + 1 + plateau_duration
-            
-            # Creiamo una lista di tutte le carte coinvolte nella cattura, inclusa la carta catturante
-            all_capture_cards = [card_played] + (list(cards_captured) if cards_captured else [])
-            card_width = int(self.app.window_width * 0.078)
-            
-            # Calcola posizioni di partenza per tutte le carte
-            starting_positions = {}
-            starting_positions[card_played] = end_pos  # La carta catturante parte dalla sua posizione sul tavolo
-            
-            # Calcola le posizioni delle carte sul tavolo
-            for card in (cards_captured or []):
+
+            all_capture_cards = [played_card] + (list(captured_cards) if captured_cards else [])
+
+            starting_positions = {played_card: end_pos}
+            for c in (captured_cards or []):
                 try:
-                    # Find card position in the original table
-                    card_index = original_table.index(card)
+                    card_index = original_table.index(c)
                     card_x = old_start_x + card_index * old_card_spacing
                     card_pos = (card_x + CARD_WIDTH // 2, table_y_center + CARD_HEIGHT // 2)
-                    starting_positions[card] = card_pos
+                    starting_positions[c] = card_pos
                 except ValueError:
-                    # Fallback con posizione centrale
-                    starting_positions[card] = table_center
-            
-            # Ora creiamo le animazioni di cattura per ciascuna carta
-            for i, card in enumerate(all_capture_cards):
-                # Leggera variazione nella posizione finale per evitare sovrapposizione
-                staggered_offset = card_width * 0.3  # Ridotto per evitare sovrapposizioni eccessive
+                    starting_positions[c] = table_center
+
+            for i, c in enumerate(all_capture_cards):
+                staggered_offset = card_width * 0.3
                 end_x = pile_rect.centerx + random.randint(-5, 5) + i * staggered_offset
                 end_y = pile_rect.centery + random.randint(-5, 5) + i * 3
                 varied_end_pos = (end_x, end_y)
-                
-                # Calcola il delay per questa carta
-                # Base: tempo totale trascorso finora + delay incrementale
-                card_delay = total_time + i * inter_card_delay
-                
-                #print(f"Carta {card} - delay cattura: {card_delay} frame")
 
-                # VISIBILITÀ: Mantieni visibili le carte da catturare sul tavolo finché
-                # non parte la loro animazione di cattura, disegnandole via animazione statica.
-                if card != card_played:
+                card_delay = total_time + i * inter_card_delay
+
+                if c != played_card:
                     plateau_captured = CardAnimation(
-                        card=card,
-                        start_pos=starting_positions[card],
-                        end_pos=starting_positions[card],
-                        duration=card_delay,   # allinea al frame di start della capture
+                        card=c,
+                        start_pos=starting_positions[c],
+                        end_pos=starting_positions[c],
+                        duration=card_delay,
                         delay=0,
                         scale_start=1.0,
                         scale_end=1.0,
                         rotation_start=0,
                         rotation_end=0,
-                        animation_type="plateau_captured"
+                        animation_type=_t("plateau_captured")
                     )
-                    self.animations.append(plateau_captured)
-                
-                # NUOVO: Aggiungi la carta al set di carte in movimento quando inizia l'animazione
-                # Creiamo un'animazione speciale "start_motion" che aggiungerà la carta a cards_in_motion
+                    animations.append(plateau_captured)
+
                 motion_start_anim = CardAnimation(
-                    card=card,
-                    start_pos=starting_positions[card],  # Stessa posizione di partenza
-                    end_pos=starting_positions[card],    # Stessa posizione (non si muove)
-                    duration=1,                          # Dura solo 1 frame
-                    delay=card_delay,                    # stesso frame dell'inizio della capture
+                    card=c,
+                    start_pos=starting_positions[c],
+                    end_pos=starting_positions[c],
+                    duration=1,
+                    delay=card_delay,
                     scale_start=1.0,
                     scale_end=1.0,
                     rotation_start=0,
                     rotation_end=0,
-                    animation_type="start_motion"        # Tipo speciale per tracciare l'inizio del movimento
+                    animation_type=_t("start_motion")
                 )
-                self.animations.append(motion_start_anim)
-                
-                # Crea l'animazione con il delay calcolato
+                animations.append(motion_start_anim)
+
                 capture_anim = CardAnimation(
-                    card=card,
-                    start_pos=starting_positions[card],
+                    card=c,
+                    start_pos=starting_positions[c],
                     end_pos=varied_end_pos,
                     duration=capture_duration,
-                    delay=card_delay,      # parte esattamente al termine del plateau
+                    delay=card_delay,
                     scale_start=1.0,
                     scale_end=0.8,
                     rotation_start=0,
                     rotation_end=random.randint(-10, 10),
-                    animation_type="capture"
+                    animation_type=_t("capture")
                 )
                 try:
                     if isinstance(table_for_positions, list):
                         capture_anim.table_snapshot = list(table_for_positions)
                 except Exception:
                     pass
-                # Ensure the played card's capture renders above captured cards
-                if card == card_played:
+                if c == played_card:
                     try:
                         capture_anim.is_played_card = True
                         capture_anim.owner_id = player_id
                     except Exception:
                         pass
-                self.animations.append(capture_anim)
-                #print(f"  Creata animazione tavolo->mazzetto per carta {card} con delay {card_delay}")
-            
-            # NUOVO: slide laterale delle carte rimanenti sul tavolo dopo la presa
+                animations.append(capture_anim)
+
+            # Table slides of remaining cards after capture
             try:
-                remaining_after_capture = [c for c in original_table if c not in cards_captured]
+                remaining_after_capture = [c for c in original_table if c not in (captured_cards or [])]
                 if remaining_after_capture:
                     new_count_cap = len(remaining_after_capture)
                     new_max_spacing_cap = self.table_rect.width * 0.8 / max(new_count_cap, 1)
                     new_card_spacing_cap = min(card_width * 1.1, new_max_spacing_cap)
                     new_start_x_cap = self.table_rect.centerx - (new_count_cap * new_card_spacing_cap) // 2
-                    # Crea slide per ogni carta rimanente
                     for idx_new, c in enumerate(remaining_after_capture):
                         try:
                             idx_old = original_table.index(c)
@@ -7673,21 +7630,19 @@ class GameScreen(BaseScreen):
                         new_center = (new_start_x_cap + idx_new * new_card_spacing_cap + card_width / 2,
                                       table_y_center + card_height / 2)
                         if old_center != new_center:
-                            # Fase 1: slide verso la nuova posizione, in sync con le catture
                             slide_after_cap = CardAnimation(
                                 card=c,
                                 start_pos=old_center,
                                 end_pos=new_center,
                                 duration=capture_duration,
-                                delay=total_time,  # in parallelo alle capture
+                                delay=total_time,
                                 scale_start=1.0,
                                 scale_end=1.0,
                                 rotation_start=0,
                                 rotation_end=0,
-                                animation_type="table_slide"
+                                animation_type=_t("table_slide")
                             )
-                            self.animations.append(slide_after_cap)
-                            # Assicurati che la carta resti soppressa staticamente per tutta la cattura
+                            animations.append(slide_after_cap)
                             try:
                                 motion_start_anim = CardAnimation(
                                     card=c,
@@ -7695,15 +7650,13 @@ class GameScreen(BaseScreen):
                                     end_pos=old_center,
                                     duration=1,
                                     delay=total_time + 1,
-                                    animation_type="start_motion"
+                                    animation_type=_t("start_motion")
                                 )
-                                self.animations.append(motion_start_anim)
+                                animations.append(motion_start_anim)
                             except Exception:
                                 pass
-                            # Fase 2: plateau di hold in posizione finale fino alla fine di tutte le catture
                             try:
                                 hold_delay = total_time + capture_duration
-                                # Un piccolo margine per garantire che le capture abbiano davvero finito
                                 hold_duration = inter_card_delay + 2
                                 plateau_hold = CardAnimation(
                                     card=c,
@@ -7715,67 +7668,102 @@ class GameScreen(BaseScreen):
                                     scale_end=1.0,
                                     rotation_start=0,
                                     rotation_end=0,
-                                    animation_type="plateau"
+                                    animation_type=_t("plateau")
                                 )
-                                self.animations.append(plateau_hold)
+                                animations.append(plateau_hold)
                             except Exception:
                                 pass
+                # Persist layout snapshot for replay draw stability
+                if type_prefix:
+                    try:
+                        layout_snapshot = list(remaining_after_capture)
+                    except Exception:
+                        layout_snapshot = None
             except Exception:
                 pass
         else:
-            # NO CAPTURE: la carta va posata come le altre sul tavolo e resta ferma prima dello sweep.
-            # Rileva se questo è l'ULTIMO movimento della mano (tutti gli altri hanno 0 carte e questo giocatore ha 1 carta).
+            # No capture: keep the played card briefly plateaued
             is_last_move_no_capture = False
-            try:
-                gs = getattr(self.env, 'game_state', {}) if self.env else {}
-                hands_map = gs.get('hands', {}) if isinstance(gs, dict) else {}
-                last_candidate = True
-                for pid in range(4):
-                    cards_len = len(hands_map.get(pid, [])) if isinstance(hands_map.get(pid, []), list) else 0
-                    if pid == player_id:
-                        if cards_len != 1:
-                            last_candidate = False
-                            break
-                    else:
-                        if cards_len != 0:
-                            last_candidate = False
-                            break
-                is_last_move_no_capture = last_candidate
-            except Exception:
-                is_last_move_no_capture = False
+            if apply_visual_side_effects:
+                try:
+                    gs = getattr(self.env, 'game_state', {}) if self.env else {}
+                    hands_map = gs.get('hands', {}) if isinstance(gs, dict) else {}
+                    last_candidate = True
+                    for pid in range(4):
+                        cards_len = len(hands_map.get(pid, [])) if isinstance(hands_map.get(pid, []), list) else 0
+                        if pid == player_id:
+                            if cards_len != 1:
+                                last_candidate = False
+                                break
+                        else:
+                            if cards_len != 0:
+                                last_candidate = False
+                                break
+                    is_last_move_no_capture = last_candidate
+                except Exception:
+                    is_last_move_no_capture = False
 
-            # Aggiorna lo snapshot del tavolo per il disegno coerente delle altre carte durante lo slide.
             try:
-                table_snapshot_nc = (list(table_for_positions) if isinstance(table_for_positions, list) else original_table) + [card_played]
+                table_snapshot_nc = (list(table_for_positions) if isinstance(table_for_positions, list) else original_table) + [played_card]
             except Exception:
-                table_snapshot_nc = original_table + [card_played]
-            try:
-                # Marca inserimento virtuale sul tavolo per layout uniforme prima dello sweep
+                table_snapshot_nc = original_table + [played_card]
+
+            if apply_visual_side_effects:
                 try:
                     if is_last_move_no_capture:
                         if not hasattr(self, 'virtual_table_inserts'):
                             self.virtual_table_inserts = set()
-                        self.virtual_table_inserts.add(card_played)
+                        self.virtual_table_inserts.add(played_card)
                 except Exception:
                     pass
-                plateau_no_cap = CardAnimation(
-                    card=card_played,
-                    start_pos=end_pos,
-                    end_pos=end_pos,
-                    duration=(20 if is_last_move_no_capture else 10),
-                    delay=hand_to_table_duration + 1,
-                    scale_start=1.0,
-                    scale_end=1.0,
-                    rotation_start=0,
-                    rotation_end=0,
-                    animation_type="plateau"
-                )
+
+            plateau_no_cap = CardAnimation(
+                card=played_card,
+                start_pos=end_pos,
+                end_pos=end_pos,
+                duration=(20 if (apply_visual_side_effects and is_last_move_no_capture) else 10),
+                delay=hand_to_table_duration + 1,
+                scale_start=1.0,
+                scale_end=1.0,
+                rotation_start=0,
+                rotation_end=0,
+                animation_type=_t("plateau")
+            )
+            try:
                 plateau_no_cap.is_played_card = True
                 plateau_no_cap.owner_id = player_id
                 plateau_no_cap.table_snapshot = table_snapshot_nc
-                self.animations.append(plateau_no_cap)
             except Exception:
                 pass
+            animations.append(plateau_no_cap)
+
+            # For replay, persist the layout snapshot so static draw follows it during slide
+            if type_prefix:
+                try:
+                    layout_snapshot = list(table_snapshot_nc)
+                except Exception:
+                    layout_snapshot = None
+
+        return {"animations": animations, "layout_snapshot": layout_snapshot}
+    def create_move_animations(self, card_played, cards_captured, source_player_id=None, table_for_positions=None, force_self_capture=False):
+        """Create animations for a move with improved positioning
+
+        table_for_positions: optional list of cards representing the table layout
+        to compute animation targets. If None, falls back to current env table.
+        """
+        # Get player ID - use current player if no source player specified
+        player_id = source_player_id if source_player_id is not None else self.current_player_id
+        result = self.build_move_animations(
+            player_id=player_id,
+            played_card=card_played,
+            captured_cards=cards_captured,
+            table_for_positions=table_for_positions,
+            force_self_capture=force_self_capture,
+            origin_strategy="hand",
+            type_prefix="",
+            apply_visual_side_effects=True,
+        )
+        self.animations.extend(result.get("animations", []))
     
     def draw(self, surface):
         """Draw the game screen with connection loss indicators"""
@@ -7885,11 +7873,40 @@ class GameScreen(BaseScreen):
             take_btn.draw(surface)
 
         # Intermediate recap overlay between hands (points mode) - draw on TOP of everything
-        if self.show_intermediate_recap and self.last_hand_breakdown:
+        # Ensure any pending sweep animation starts before overlays and delay overlays until animations/queue finish
+        try:
+            wants_overlay = self.show_intermediate_recap or (self.game_over and not self.show_intermediate_recap)
+            if wants_overlay:
+                # If a client-side move is queued (e.g., end-of-hand sweep) and no animation is active, start it now
+                if getattr(self, 'queued_client_moves', None) and not self.animations and not getattr(self, 'waiting_for_animation', False):
+                    # Only try to start if queue is non-empty
+                    try:
+                        has_queued = bool(self.queued_client_moves)
+                    except Exception:
+                        has_queued = False
+                    if has_queued:
+                        played = self._play_next_queued_client_move()
+                        if played:
+                            self.defer_overlays_until_state_sync = True
+                        # After triggering a sweep, keep overlays blocked this frame
+                        self.defer_overlays_until_state_sync = True
+        except Exception:
+            pass
+
+        try:
+            has_queued = bool(self.queued_client_moves) if getattr(self, 'queued_client_moves', None) is not None else False
+        except Exception:
+            has_queued = False
+        # If overlays are explicitly deferred until state sync (set at hand end), keep blocking until queue empty and no animations
+        if getattr(self, 'defer_overlays_until_state_sync', False) and not (has_queued or self.animations or getattr(self, 'waiting_for_animation', False)):
+            # Clear the deferral once safe
+            self.defer_overlays_until_state_sync = False
+        overlays_blocked = bool(self.animations) or has_queued or bool(getattr(self, 'waiting_for_animation', False)) or bool(getattr(self, 'defer_overlays_until_state_sync', False))
+        if self.show_intermediate_recap and self.last_hand_breakdown and not overlays_blocked:
             self.draw_intermediate_recap(surface)
 
         # Draw game over screen if game is over (but not during intermediate recap)
-        if self.game_over and self.final_breakdown and not self.show_intermediate_recap:
+        if self.game_over and self.final_breakdown and not self.show_intermediate_recap and not overlays_blocked:
             self.draw_game_over(surface)
     
     def draw_players(self, surface):
@@ -8609,7 +8626,7 @@ class GameScreen(BaseScreen):
 
             # Pre-scale card back for this team
             back_img = self.app.resources.get_card_back(team_id)
-            scaled_back = pygame.transform.scale(back_img, (mini_w, mini_h))
+            scaled_back = pygame.transform.smoothscale(back_img, (mini_w, mini_h))
 
             # Starting position for top of the pile
             cur_x = rect.left + padding
@@ -8643,7 +8660,7 @@ class GameScreen(BaseScreen):
                     if played_card:
                         face_img = self.app.resources.get_card_image(played_card)
                         if face_img:
-                            scaled_face = pygame.transform.scale(face_img, (mini_w, mini_h))
+                            scaled_face = pygame.transform.smoothscale(face_img, (mini_w, mini_h))
                             # Compose rounded card with border BEFORE rotation so the border rotates with the card
                             base_card = pygame.Surface((mini_w, mini_h), pygame.SRCALPHA)
                             base_card.fill((0, 0, 0, 0))
@@ -8782,7 +8799,7 @@ class GameScreen(BaseScreen):
             scale = anim.get_current_scale()
             scaled_width = int(CARD_WIDTH * scale)
             scaled_height = int(CARD_HEIGHT * scale)
-            scaled_img = pygame.transform.scale(card_img, (scaled_width, scaled_height))
+            scaled_img = pygame.transform.smoothscale(card_img, (scaled_width, scaled_height))
             
             # Apply rotation
             rotation = anim.get_current_rotation()
@@ -8813,7 +8830,10 @@ class GameScreen(BaseScreen):
         # trigger the next one immediately for snappier sequencing
         if getattr(self, 'queued_client_moves', None) is not None and not self.animations:
             try:
-                self._play_next_queued_client_move()
+                played = self._play_next_queued_client_move()
+                if played:
+                    # Ensure overlays remain blocked if we just started a queued animation (e.g., sweep)
+                    self.defer_overlays_until_state_sync = True
             except Exception:
                 pass
     
@@ -9961,287 +9981,32 @@ class GameScreen(BaseScreen):
         self.replay_current_index += 1
     
     def create_replay_animations(self, move):
-        """Create animations for a replay move using the same parameters as regular game animations"""
-        player = move["player"]
-        played_card = move["played_card"]
-        captured_cards = move["captured_cards"]
-        
-        # Get player's visual position
-        visual_pos = self.get_visual_position(player)
-        
-        # Calculate start position (from player's hand) - same as regular game
-        if visual_pos == 0:  # Bottom player
-            start_x = self.app.window_width // 2
-            start_y = self.app.window_height - self.card_height - self.app.window_height * 0.05
-        elif visual_pos == 1:  # Left player
-            start_x = self.app.window_width * 0.02
-            start_y = self.app.window_height // 2
-        elif visual_pos == 2:  # Top player
-            start_x = self.app.window_width // 2
-            start_y = self.app.window_height * 0.05
-        else:  # Right player
-            start_x = self.app.window_width - self.card_width - self.app.window_width * 0.02
-            start_y = self.app.window_height // 2
-        
-        start_pos = (start_x, start_y)
-        
-        # Calculate end position and prepare slide like regular animations
-        table_center = (self.app.window_width // 2, self.app.window_height // 2)
-        end_pos = table_center
-        # Snapshot of current replay table
-        original_table = list(self.replay_table_state)
-        width = self.app.window_width
-        card_width = int(width * 0.078)
-        card_height = int(card_width * 1.5)
-        old_count = len(original_table)
-        old_max_spacing = self.table_rect.width * 0.8 / max(old_count if old_count > 0 else 1, 1)
-        old_card_spacing = min(card_width * 1.1, old_max_spacing)
-        old_start_x = self.table_rect.centerx - (old_count * old_card_spacing) // 2
-        table_y_center = self.table_rect.centery - card_height // 2
-        
-        if captured_cards or (played_card and move.get('capture_type') and move.get('capture_type') != 'no_capture'):
-            # Use original_table + captured to compute overlap position
-            layout_for_capture = original_table.copy()
-            for card in captured_cards:
-                if card not in layout_for_capture:
-                    layout_for_capture.append(card)
-            max_spacing_cap = self.table_rect.width * 0.8 / max(len(layout_for_capture), 1)
-            spacing_cap = min(card_width * 1.1, max_spacing_cap)
-            start_x_cap = self.table_rect.centerx - (len(layout_for_capture) * spacing_cap) // 2
-            # Find leftmost captured card
-            leftmost_card_index = float('inf')
-            for card in captured_cards:
-                try:
-                    idx = layout_for_capture.index(card)
-                    if idx < leftmost_card_index:
-                        leftmost_card_index = idx
-                except ValueError:
-                    pass
-            if leftmost_card_index != float('inf'):
-                card_x = start_x_cap + leftmost_card_index * spacing_cap
-                end_pos = (card_x - card_width * 0.25, table_y_center + card_height / 2)
-        else:
-            # NO CAPTURE: compute final slot and slide current table cards
-            new_table = original_table + [played_card]
-            new_count = len(new_table)
-            new_max_spacing = self.table_rect.width * 0.8 / max(new_count, 1)
-            new_card_spacing = min(card_width * 1.1, new_max_spacing)
-            new_start_x = self.table_rect.centerx - (new_count * new_card_spacing) // 2
-            played_index = new_count - 1
-            end_pos = (new_start_x + played_index * new_card_spacing + card_width / 2,
-                       table_y_center + card_height / 2)
-            # Slide existing table cards
-            for i, c in enumerate(original_table):
-                old_center = (old_start_x + i * old_card_spacing + card_width / 2,
-                              table_y_center + card_height / 2)
-                new_center = (new_start_x + i * new_card_spacing + card_width / 2,
-                              table_y_center + card_height / 2)
-                if old_center != new_center:
-                    slide_anim = CardAnimation(
-                        card=c,
-                        start_pos=old_center,
-                        end_pos=new_center,
-                        duration=15,
-                        delay=0,
-                        scale_start=1.0,
-                        scale_end=1.0,
-                        rotation_start=0,
-                        rotation_end=0,
-                        animation_type="replay_table_slide"
-                    )
-                    try:
-                        slide_anim.table_snapshot = list(new_table)
-                    except Exception:
-                        pass
-                    self.replay_animations.append(slide_anim)
-                    try:
-                        motion_start_anim = CardAnimation(
-                            card=c,
-                            start_pos=old_center,
-                            end_pos=old_center,
-                            duration=1,
-                            delay=0,
-                            animation_type="replay_start_motion"
-                        )
-                        self.replay_animations.append(motion_start_anim)
-                    except Exception:
-                        pass
-            # Persist final layout snapshot for static draw during/after slide
-            try:
-                self.replay_table_layout_snapshot = list(new_table)
-            except Exception:
-                pass
-        
-        # Use the same animation parameters as regular game animations
-        hand_to_table_duration = 15
-        plateau_duration = 12
-        capture_duration = 25
-        inter_card_delay = 5
-        
-        # Phase 1: Card from hand to table
-        hand_to_table = CardAnimation(
-            card=played_card,
-            start_pos=start_pos,
-            end_pos=end_pos,
-            duration=hand_to_table_duration,
-            delay=0,
-            scale_start=1.0,
-            scale_end=1.0,
-            rotation_start=0,
-            rotation_end=0,
-            animation_type="replay_play"
-        )
-        # Indica se questa giocata causerà una presa
-        try:
-            hand_to_table.causes_capture = bool(captured_cards)
-            # Mark as the played card for z-ordering in replay
-            hand_to_table.is_played_card = True
-        except Exception:
-            hand_to_table.causes_capture = False
-        self.replay_animations.append(hand_to_table)
-        
-        # If there are captured cards, create capture animations
-        if captured_cards or (played_card and move.get('capture_type') and move.get('capture_type') != 'no_capture'):
-            # Calculate pile rect for the capturing team (use new pile positions)
-            current_player = self.players[player]
-            team_id = current_player.team_id
-            pile_rect = self.get_team_pile_rect(team_id)
-            
-            # Phase 2: Plateau animation (keep card visible)
-            plateau_anim = CardAnimation(
-                card=played_card,
-                start_pos=end_pos,
-                end_pos=end_pos,
-                duration=plateau_duration,
-                delay=hand_to_table_duration,
-                scale_start=1.0,
-                scale_end=1.0,
-                rotation_start=0,
-                rotation_end=0,
-                animation_type="replay_plateau"
-            )
-            try:
-                plateau_anim.is_played_card = True
-                plateau_anim.table_snapshot = list(original_table + [played_card])
-            except Exception:
-                pass
-            self.replay_animations.append(plateau_anim)
-            
-            # Phase 3: Capture animations
-            total_time = hand_to_table_duration + plateau_duration
-            all_capture_cards = [played_card] + list(captured_cards)
-            
-            # Calculate starting positions for all cards
-            starting_positions = {}
-            starting_positions[played_card] = end_pos
-            
-            # Calculate positions of cards on the table
-            for card in captured_cards:
-                try:
-                    card_index = original_table.index(card)
-                    card_x = old_start_x + card_index * old_card_spacing
-                    card_pos = (card_x + card_width // 2, table_y_center + card_height // 2)
-                    starting_positions[card] = card_pos
-                except ValueError:
-                    starting_positions[card] = table_center
-            
-            # Create capture animations for each card
-            for i, card in enumerate(all_capture_cards):
-                # Slight variation in final position to avoid overlap
-                staggered_offset = card_width * 0.3
-                end_x = pile_rect.centerx + random.randint(-5, 5) + i * staggered_offset
-                end_y = pile_rect.centery + random.randint(-5, 5) + i * 3
-                varied_end_pos = (end_x, end_y)
-                
-                # Calculate delay for this card
-                card_delay = total_time + i * inter_card_delay
-                
-                # NUOVO: Crea un'animazione speciale "start_motion" per tracciare l'inizio del movimento
-                motion_start_anim = CardAnimation(
-                    card=card,
-                    start_pos=starting_positions[card],  # Stessa posizione di partenza
-                    end_pos=starting_positions[card],    # Stessa posizione (non si muove)
-                    duration=1,                          # Dura solo 1 frame
-                    delay=card_delay,                    # Stesso delay dell'animazione di cattura
-                    scale_start=1.0,
-                    scale_end=1.0,
-                    rotation_start=0,
-                    rotation_end=0,
-                    animation_type="replay_start_motion"  # Tipo speciale per tracciare l'inizio del movimento
-                )
-                self.replay_animations.append(motion_start_anim)
-                
-                capture_anim = CardAnimation(
-                    card=card,
-                    start_pos=starting_positions[card],
-                    end_pos=varied_end_pos,
-                    duration=capture_duration,
-                    delay=card_delay,
-                    scale_start=1.0,
-                    scale_end=0.8,
-                    rotation_start=0,
-                    rotation_end=random.randint(-10, 10),
-                    animation_type="replay_capture"
-                )
-                if card == played_card:
-                    try:
-                        capture_anim.is_played_card = True
-                    except Exception:
-                        pass
-                self.replay_animations.append(capture_anim)
+        """Create animations for a replay move using the unified builder"""
+        player = move.get("player")
+        played_card = move.get("played_card")
+        captured_cards = move.get("captured_cards") or []
+        capture_type = move.get('capture_type')
 
-            # Slide remaining table cards to re-center during captures
+        table_snapshot = list(self.replay_table_state)
+
+        force_self_capture = bool(played_card and not captured_cards and str(capture_type) not in (None, '', 'no_capture'))
+
+        result = self.build_move_animations(
+            player_id=player,
+            played_card=played_card,
+            captured_cards=captured_cards,
+            table_for_positions=table_snapshot,
+            force_self_capture=force_self_capture,
+            origin_strategy="seat_anchor",
+            type_prefix="replay_",
+            apply_visual_side_effects=False,
+        )
+
+        self.replay_animations.extend(result.get("animations", []))
+        layout_snapshot = result.get("layout_snapshot")
+        if isinstance(layout_snapshot, list):
             try:
-                remaining_after_capture = [c for c in original_table if c not in captured_cards]
-                if remaining_after_capture:
-                    new_count_cap = len(remaining_after_capture)
-                    new_max_spacing_cap = self.table_rect.width * 0.8 / max(new_count_cap, 1)
-                    new_card_spacing_cap = min(card_width * 1.1, new_max_spacing_cap)
-                    new_start_x_cap = self.table_rect.centerx - (new_count_cap * new_card_spacing_cap) // 2
-                    for idx_new, c in enumerate(remaining_after_capture):
-                        try:
-                            idx_old = original_table.index(c)
-                        except ValueError:
-                            continue
-                        old_center = (old_start_x + idx_old * old_card_spacing + card_width / 2,
-                                      table_y_center + card_height / 2)
-                        new_center = (new_start_x_cap + idx_new * new_card_spacing_cap + card_width / 2,
-                                      table_y_center + card_height / 2)
-                        if old_center != new_center:
-                            slide_after_cap = CardAnimation(
-                                card=c,
-                                start_pos=old_center,
-                                end_pos=new_center,
-                                duration=capture_duration,
-                                delay=total_time,
-                                scale_start=1.0,
-                                scale_end=1.0,
-                                rotation_start=0,
-                                rotation_end=0,
-                                animation_type="replay_table_slide"
-                            )
-                            try:
-                                slide_after_cap.table_snapshot = list(remaining_after_capture)
-                            except Exception:
-                                pass
-                            self.replay_animations.append(slide_after_cap)
-                            try:
-                                motion_start_anim = CardAnimation(
-                                    card=c,
-                                    start_pos=old_center,
-                                    end_pos=old_center,
-                                    duration=1,
-                                    delay=total_time,
-                                    animation_type="replay_start_motion"
-                                )
-                                self.replay_animations.append(motion_start_anim)
-                            except Exception:
-                                pass
-                # Persist final layout snapshot for remaining cards during/after capture slides
-                try:
-                    self.replay_table_layout_snapshot = list(remaining_after_capture)
-                except Exception:
-                    pass
+                self.replay_table_layout_snapshot = list(layout_snapshot)
             except Exception:
                 pass
     
@@ -10355,7 +10120,7 @@ class GameScreen(BaseScreen):
                 # Scale the image
                 scaled_width = int(self.card_width * current_scale)
                 scaled_height = int(self.card_height * current_scale)
-                scaled_img = pygame.transform.scale(card_img, (scaled_width, scaled_height))
+                scaled_img = pygame.transform.smoothscale(card_img, (scaled_width, scaled_height))
                 
                 # Compose rounded card with border BEFORE rotation
                 base_card = pygame.Surface((scaled_width, scaled_height), pygame.SRCALPHA)
