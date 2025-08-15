@@ -103,9 +103,10 @@ def get_valid_actions(game_state, current_player):
         # 1) Verifica se sul tavolo c'è almeno una carta di rank uguale (cattura diretta)
         same_rank_cards = [t_c for t_c in table if t_c[0] == rank]
         if same_rank_cards:
-            # Cattura diretta obbligatoria
-            action_vec = encode_action(card, same_rank_cards)
-            valid_actions.append(action_vec)
+            # Cattura diretta obbligatoria: una sola carta di pari rank
+            for direct_card in same_rank_cards:
+                action_vec = encode_action(card, [direct_card])
+                valid_actions.append(action_vec)
         else:
             # 2) Cerca possibili somme
             captures_found = False
