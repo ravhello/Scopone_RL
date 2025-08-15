@@ -418,8 +418,8 @@ class ScoponeEnvMA(gym.Env):
     
     def reset(self, starting_player=None):
         """Versione ottimizzata di reset"""
-        # Reimposta lo stato del gioco
-        self.game_state = initialize_game()
+        # Reimposta lo stato del gioco rispettando le regole/varianti
+        self.game_state = initialize_game(rules=self.rules)
         self.done = False
         self.current_player = starting_player if starting_player is not None else 0
         self.rewards = [0, 0]

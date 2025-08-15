@@ -1671,6 +1671,8 @@ class GameOptionsScreen(BaseScreen):
             self._cycle("starting_team", ["random", "team0", "team1"])
         if getattr(self, 'last_cards_rect', None) and self.last_cards_rect.collidepoint(pos):
             self._toggle("last_cards_to_dealer")
+        if getattr(self, 'start_4_table_rect', None) and self.start_4_table_rect.collidepoint(pos):
+            self._toggle("start_with_4_on_table")
 
         # Visibility (only if rect exists)
         if getattr(self, 'only_turn_cards_rect', None) and self.only_turn_cards_rect.collidepoint(pos):
@@ -1885,6 +1887,10 @@ class GameOptionsScreen(BaseScreen):
         self.last_cards_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 28)
         self.draw_toggle(surface, self.last_cards_rect, "Ultime carte al team dell'ultima presa", self.rules.get("last_cards_to_dealer", True))
         y_offset += 36
+        # Variante: Scopone non scientifico
+        self.start_4_table_rect = pygame.Rect(setup_ai_rect.left+10, y_offset, setup_ai_rect.width-20, 28)
+        self.draw_toggle(surface, self.start_4_table_rect, "Inizia con 4 carte sul tavolo (9 carte a testa)", self.rules.get("start_with_4_on_table", False))
+        y_offset += 36
 
         # (Sezione AI rimossa)
 
@@ -1998,6 +2004,8 @@ class GameModeScreen(BaseScreen):
             # Setup
             "starting_team": "random",     # random | team0 | team1
             "last_cards_to_dealer": True,
+            # Scopone non scientifico: 4 carte scoperte iniziali sul tavolo, 9 in mano
+            "start_with_4_on_table": False,
             # AI/tempo mossa
             "move_time_ms": 0,
         }
@@ -8952,6 +8960,8 @@ class GameScreen(BaseScreen):
             lim = rules.get("max_consecutive_scope")
             if lim is not None:
                 lines.append(f"Limite scope: {int(lim)}")
+            if rules.get("start_with_4_on_table", False):
+                lines.append("Avvio: 4 carte sul tavolo")
             if not rules.get("last_cards_to_dealer", True):
                 lines.append("Ultime al team dell'ultima presa: OFF")
             # Tempo per mossa AI rimosso

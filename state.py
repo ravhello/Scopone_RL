@@ -11,24 +11,54 @@ def create_deck():
     deck = [(r, s) for s in SUITS for r in RANKS]
     return deck
 
-def initialize_game():
+def initialize_game(rules=None):
     """
     Inizializza lo stato 'completo' del gioco:
-      - 4 giocatori, 10 carte ciascuno
-      - Tavolo vuoto
+      - Default: 4 giocatori, 10 carte ciascuno, tavolo vuoto (Scopone scientifico)
+      - Variante opzionale (scopone non scientifico): 4 carte scoperte sul tavolo e 9 carte a testa
       - captured_squads -> {0:[], 1:[]}
       - history -> lista di mosse
     """
+    rules = rules or {}
+    # Abilita la variante se esplicitata via flag o alias di variant
+    start_with_4_on_table = bool(rules.get("start_with_4_on_table", False))
+    variant = rules.get("variant")
+    if isinstance(variant, str) and variant.lower() in ("scopone_non_scientifico", "non_scientifico", "scopone-non-scientifico"):
+        start_with_4_on_table = True
+
     deck = create_deck()
     random.shuffle(deck)
 
-    hands = {}
-    for i in range(4):
-        hands[i] = deck[i*10 : (i+1)*10]
+    if start_with_4_on_table:
+        # 4 carte scoperte sul tavolo, 9 carte ciascuno (36 carte in mano totali)
+        # Regola "a monte": se all'apertura ci sono 3 o 4 Re (rank=10) sul tavolo, si ridistribuisce
+        attempts = 0
+        while True:
+            random.shuffle(deck)
+            table_cards = deck[:4]
+            kings_on_table = sum(1 for (r, _) in table_cards if r == 10)
+            if kings_on_table < 3:
+                break
+            attempts += 1
+            if attempts > 2000:
+                # fallback di sicurezza: accetta la distribuzione corrente per evitare loop infiniti
+                break
+
+        start_idx = 4
+        hands = {}
+        for i in range(4):
+            hands[i] = deck[start_idx + i*9 : start_idx + (i+1)*9]
+        table = list(table_cards)
+    else:
+        # Comportamento standard: 10 carte a testa, tavolo vuoto
+        hands = {}
+        for i in range(4):
+            hands[i] = deck[i*10 : (i+1)*10]
+        table = []
 
     state = {
         "hands": hands,               # dict: {0: [...], 1: [...], 2: [...], 3: [...]}
-        "table": [],                  # carte sul tavolo
+        "table": table,               # carte sul tavolo
         "captured_squads": {0:[], 1:[]}, 
         "history": []
     }
