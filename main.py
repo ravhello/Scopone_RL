@@ -52,11 +52,6 @@ LR = 1e-3
 EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 10000    # passi totali di training per passare da 1.0 a 0.01
-# BATCH_SIZE è mantenuto per retro‑compatibilità con vecchi script e test
-# anche se l'implementazione corrente elabora l'intero buffer in una singola
-# passata. Mantenerlo definito evita import error nei moduli esterni che si
-# aspettano ancora questa costante.
-BATCH_SIZE = 128
 REPLAY_SIZE = 10000      # capacità massima del replay buffer
 TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target (ora usato solo per sincronizzazione globale)
 CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"
@@ -68,6 +63,7 @@ if torch.cuda.is_available():
     torch.cuda.memory_stats()
 
 # Regole di default per l'ambiente (modalità standard senza varianti)
+# Nota: la variante "asso_piglia_tutto" è disattivata e quindi ignorata in questa modalità.
 DEFAULT_RULES = {
     'start_with_4_on_table': False,
     'asso_piglia_tutto': False,
@@ -262,9 +258,13 @@ class DQNAgent:
 
         # Aggiunte per ottimizzazione GPU
         torch.backends.cudnn.benchmark = True  # Ottimizzazione per dimensioni di input fisse
-        # Usa GradScaler solo se CUDA è disponibile
+        # Usa GradScaler solo se CUDA è disponibile (API moderna torch.amp)
         if torch.cuda.is_available():
-            self.scaler = torch.cuda.amp.GradScaler()
+            try:
+                self.scaler = torch.amp.GradScaler('cuda')
+            except Exception:
+                # Fallback per versioni PyTorch più vecchie
+                self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
     
@@ -568,11 +568,6 @@ def train_agents(num_episodes=10):
     inference_times = []
     
     # OTTIMIZZAZIONE: Pre-alloca buffer di tensori per evitare allocazioni ripetute
-    # Buffer per carte
-    card_buffer = {}
-    for suit in ['denari', 'coppe', 'spade', 'bastoni']:
-        for rank in range(1, 11):
-            card_buffer[(rank, suit)] = torch.zeros(80, dtype=torch.float32, device=device)
     
     # Buffer per batch di training
     max_transitions = 40  # Numero massimo di transizioni atteso in un episodio
@@ -626,6 +621,7 @@ def train_agents(num_episodes=10):
 
         # Loop principale della partita
         inference_start = time.time()
+        info = {}
         while not done:
             cp = env.current_player
             team_id = 0 if cp in [0,2] else 1

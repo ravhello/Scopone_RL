@@ -40,6 +40,8 @@ class ScoponeEnvMA(gym.Env):
         self.rewards = [0,0]
         
         # Regole/varianti opzionali della partita
+        # Nota: negli script con modalità di default, "asso_piglia_tutto" è disattivato
+        # e quindi ignorato (cioè non viene applicata la variante AP).
         # Esempi di chiavi supportate:
         #  - asso_piglia_tutto: bool
         #  - scopa_on_asso_piglia_tutto: bool
@@ -85,24 +87,30 @@ class ScoponeEnvMA(gym.Env):
             # Variante: Asso piglia tutto → aggiungi azioni extra (asso cattura tutto il tavolo)
             try:
                 if self.rules.get("asso_piglia_tutto", False):
+                    # Chiavi compatte per deduplicare in O(1) evitando decode per confronto
+                    def _action_key(vec):
+                        try:
+                            return tuple(np.flatnonzero(vec).tolist())
+                        except Exception:
+                            return None
+                    existing_keys = set()
+                    for v in valid_actions:
+                        k = _action_key(v)
+                        if k is not None:
+                            existing_keys.add(k)
+
                     hand_cards = self.game_state["hands"].get(self.current_player, [])
                     table_cards = self.game_state.get("table", [])
                     if table_cards:
                         for card in hand_cards:
                             if card[0] == 1:  # Asso
                                 extra = encode_action(card, list(table_cards))
-                                # Evita duplicati
-                                exists = False
-                                for v in valid_actions:
-                                    try:
-                                        # v è un np.array
-                                        if (extra == v).all():
-                                            exists = True
-                                            break
-                                    except Exception:
-                                        pass
-                                if not exists:
+                                # Evita duplicati con chiave rapida
+                                extra_key = _action_key(extra)
+                                if extra_key is None or extra_key not in existing_keys:
                                     valid_actions.append(extra)
+                                    if extra_key is not None:
+                                        existing_keys.add(extra_key)
 
                     # Nuova regola: posabilità dell'asso piglia tutto
                     # Se posabile è consentito, aggiungi anche l'azione di "posa" (nessuna presa)
@@ -115,16 +123,11 @@ class ScoponeEnvMA(gym.Env):
                                 if can_place_now:
                                     # Verifica se esiste già l'azione di posa (cattura vuota)
                                     place_vec = encode_action(card, [])
-                                    exists = False
-                                    for v in valid_actions:
-                                        try:
-                                            if (place_vec == v).all():
-                                                exists = True
-                                                break
-                                        except Exception:
-                                            pass
-                                    if not exists:
+                                    place_key = _action_key(place_vec)
+                                    if place_key is None or place_key not in existing_keys:
                                         valid_actions.append(place_vec)
+                                        if place_key is not None:
+                                            existing_keys.add(place_key)
 
                     # Se AP è attivo ma la posa non è consentita nelle condizioni attuali,
                     # rimuovi eventuali azioni di "posa" dell'asso (no-capture).
@@ -134,17 +137,19 @@ class ScoponeEnvMA(gym.Env):
                     if not allow_place_now and len(table_cards) > 0:
                         filtered = []
                         for v in valid_actions:
-                            keep = True
+                            # Rileva posa di asso direttamente dalla codifica 80-dim
                             try:
-                                pc, cc = decode_action(v)
-                                if pc[0] == 1 and len(cc) == 0:
-                                    # è una posa di asso → vietata ora
-                                    keep = False
-                            except ValueError:
-                                # Azione non decodificabile -> scartala
-                                keep = False
-                            if keep:
-                                filtered.append(v)
+                                played = v[:40].reshape(10, 4)
+                                captured = v[40:]
+                                is_ace_play = played[0, :].any()  # rank 1
+                                is_no_capture = not np.any(captured)
+                                if is_ace_play and is_no_capture:
+                                    # vietata ora
+                                    continue
+                            except Exception:
+                                # Azione non interpretabile -> scarta
+                                continue
+                            filtered.append(v)
                         valid_actions = filtered
             except Exception:
                 # In caso di qualunque errore, non interrompere il flusso

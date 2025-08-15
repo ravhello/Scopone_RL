@@ -30,6 +30,10 @@ from rewards import compute_final_score_breakdown, compute_final_reward_from_bre
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Utilizzo device: {device}")
 
+# Autocast configuration (CPU fallback safe)
+autocast_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
+
 # Configurazione GPU
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
@@ -226,7 +230,13 @@ class DQNAgent:
         
         # Ottimizzazione GPU
         torch.backends.cudnn.benchmark = True
-        self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            try:
+                self.scaler = torch.amp.GradScaler('cuda')
+            except Exception:
+                self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
     
     def pick_action(self, obs, valid_actions, env):
         if not valid_actions:
@@ -269,7 +279,7 @@ class DQNAgent:
                     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     
                 # Usa mixed precision per accelerare l'inferenza
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     action_values = self.online_qnet(obs_t)
                     q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
                 
@@ -339,8 +349,8 @@ class DQNAgent:
         total_loss = 0.0
         batch_count = 0
         
-        # Usa mixed precision in modo più efficiente con float16
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        # Usa mixed precision in modo più efficiente (CPU fallback sicuro)
+        with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, idx)
@@ -653,6 +663,7 @@ def profiled_train_agents(num_episodes=200):
         with record_function("Initial_Observation"):
             obs_current = env._get_observation(env.current_player)
             done = False
+            info = {}
         
         # Conteggio transizioni per team
         team0_transitions = 0

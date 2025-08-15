@@ -1225,3 +1225,346 @@ def test_pick_action_gpu():
     
     # Should return one of the valid actions
     assert any(np.array_equal(action, va) for va in valid_actions), "Action should be one of the valid actions"
+
+
+def test_reset_starting_player():
+    """
+    Verify that reset(starting_player=idx) sets the current player correctly.
+    """
+    env = ScoponeEnvMA()
+    env.reset(starting_player=2)
+    assert env.current_player == 2
+
+
+def test_decode_action_wrong_length_raises():
+    """
+    decode_action should raise an error when the vector length is not 80.
+    """
+    import numpy as np
+    bad_vec = np.zeros(79, dtype=np.float32)
+    with pytest.raises(Exception):
+        decode_action(bad_vec)
+
+
+def test_ace_take_all_valid_action_added():
+    """
+    With asso_piglia_tutto enabled, valid actions should include the ace capturing the entire table.
+    """
+    env = ScoponeEnvMA(rules={"asso_piglia_tutto": True})
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"][0] = [(1, 'denari'), (5, 'spade')]
+    env.game_state["table"] = [(2, 'coppe'), (3, 'spade')]
+
+    valids = env.get_valid_actions()
+
+    found_take_all = False
+    for v in valids:
+        pc, cc = decode_action(v)
+        if pc == (1, 'denari') and set(cc) == set(env.game_state["table"]):
+            found_take_all = True
+            break
+    assert found_take_all, "Ace take-all action should be present among valid actions"
+
+    # Ensure no ace place action [] when posability is disabled by default
+    assert not any(decode_action(v)[0] == (1, 'denari') and decode_action(v)[1] == [] for v in valids)
+
+
+def test_ace_place_only_when_allowed_by_rules():
+    """
+    Ace placement (no capture) must be allowed only when rules permit it and, if only_empty, only on empty table.
+    """
+    rules = {
+        "asso_piglia_tutto": True,
+        "asso_piglia_tutto_posabile": True,
+        "asso_piglia_tutto_posabile_only_empty": True,
+    }
+    env = ScoponeEnvMA(rules=rules)
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"][0] = [(1, 'coppe')]
+
+    # Non-empty table: no place action
+    env.game_state["table"] = [(4, 'denari')]
+    valids = env.get_valid_actions()
+    assert not any(decode_action(v)[0] == (1, 'coppe') and decode_action(v)[1] == [] for v in valids)
+
+    # Empty table: place action should exist
+    env.game_state["table"] = []
+    valids2 = env.get_valid_actions()
+    assert any(decode_action(v)[0] == (1, 'coppe') and decode_action(v)[1] == [] for v in valids2)
+
+
+def test_step_forced_ace_capture_on_nonempty_table():
+    """
+    If ace placement is not allowed and table is not empty, stepping with ace+[] should force take-all.
+    Also verify scopa demotion when scopa_on_asso_piglia_tutto is False.
+    """
+    env = ScoponeEnvMA(rules={"asso_piglia_tutto": True, "scopa_on_asso_piglia_tutto": False})
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"][0] = [(1, 'denari')]
+    env.game_state["hands"][1] = [(2, 'coppe')]
+    env.game_state["hands"][2] = []
+    env.game_state["hands"][3] = []
+    env.game_state["table"] = [(2, 'spade'), (4, 'coppe')]
+
+    action_vec = encode_action((1, 'denari'), [])
+    obs_after, rew, done, info = env.step(action_vec)
+
+    # Table should be emptied by forced capture
+    assert len(env.game_state["table"]) == 0
+    last_move = env.game_state["history"][-1]
+    # Scopa should be demoted to capture for ace take-all when disabled by rules
+    assert last_move["capture_type"] == "capture"
+
+
+def test_scopa_on_last_capture_toggle():
+    """
+    On last capture, capture_type should depend on scopa_on_last_capture rule.
+    """
+    # Case 1: scopa_on_last_capture = False -> capture
+    env = ScoponeEnvMA(rules={"scopa_on_last_capture": False})
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"][0] = [(3, 'denari')]
+    env.game_state["hands"][1] = []
+    env.game_state["hands"][2] = []
+    env.game_state["hands"][3] = []
+    env.game_state["table"] = [(1, 'spade'), (2, 'coppe')]
+
+    act = encode_action((3, 'denari'), [(1, 'spade'), (2, 'coppe')])
+    obs_after, r, done, info = env.step(act)
+    assert done is True
+    assert env.game_state["history"][-1]["capture_type"] == "capture"
+
+    # Case 2: scopa_on_last_capture = True -> scopa
+    env2 = ScoponeEnvMA(rules={"scopa_on_last_capture": True})
+    env2.reset()
+    env2.current_player = 0
+    env2.game_state["hands"][0] = [(3, 'denari')]
+    env2.game_state["hands"][1] = []
+    env2.game_state["hands"][2] = []
+    env2.game_state["hands"][3] = []
+    env2.game_state["table"] = [(1, 'spade'), (2, 'coppe')]
+
+    act2 = encode_action((3, 'denari'), [(1, 'spade'), (2, 'coppe')])
+    obs_after2, r2, done2, info2 = env2.step(act2)
+    assert done2 is True
+    assert env2.game_state["history"][-1]["capture_type"] == "scopa"
+
+
+def test_last_cards_to_dealer_toggle():
+    """
+    Verify last cards assignment to the last capturing team depending on the rule.
+    """
+    # Enabled: leftover table cards go to last capturing team
+    env = ScoponeEnvMA(rules={"last_cards_to_dealer": True})
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"] = {0: [(5, 'denari')], 1: [], 2: [], 3: []}
+    env.game_state["table"] = [(9, 'coppe')]
+    env.game_state["captured_squads"] = {0: [], 1: []}
+    env.game_state["history"] = [{"player": 1, "played_card": (2, 'denari'), "capture_type": "capture", "captured_cards": [(2, 'spade')]}]
+
+    act = encode_action((5, 'denari'), [])
+    obs_after, r, done, info = env.step(act)
+    assert done is True
+    assert (9, 'coppe') in env.game_state["captured_squads"][1]
+    assert (5, 'denari') in env.game_state["captured_squads"][1]
+
+    # Disabled: leftover table cards are not assigned
+    env2 = ScoponeEnvMA(rules={"last_cards_to_dealer": False})
+    env2.reset()
+    env2.current_player = 0
+    env2.game_state["hands"] = {0: [(5, 'denari')], 1: [], 2: [], 3: []}
+    env2.game_state["table"] = [(9, 'coppe')]
+    env2.game_state["captured_squads"] = {0: [], 1: []}
+    env2.game_state["history"] = [{"player": 1, "played_card": (2, 'denari'), "capture_type": "capture", "captured_cards": [(2, 'spade')]}]
+
+    act2 = encode_action((5, 'denari'), [])
+    obs_after2, r2, done2, info2 = env2.step(act2)
+    assert done2 is True
+    assert len(env2.game_state["captured_squads"][1]) == 0
+
+
+def test_valid_actions_cache_hit_increments():
+    """
+    Repeated get_valid_actions() calls without state change should hit the cache.
+    """
+    env = ScoponeEnvMA()
+    env.reset()
+    _ = env.get_valid_actions()
+    hits_before = env._cache_hits
+    _ = env.get_valid_actions()
+    assert env._cache_hits > hits_before
+
+
+def test_table_empty_only_throw_actions():
+    """
+    If the table is empty, valid actions should be only 'throw' actions for each card in hand.
+    """
+    env = ScoponeEnvMA()
+    env.reset()
+    env.current_player = 0
+    env.game_state["table"] = []
+    env.game_state["hands"][0] = [(2, 'coppe'), (4, 'bastoni')]
+
+    valids = env.get_valid_actions()
+    assert len(valids) == 2
+    for v in valids:
+        pc, cc = decode_action(v)
+        assert pc in [(2, 'coppe'), (4, 'bastoni')]
+        assert cc == []
+
+
+def test_step_sum_mismatch_raises():
+    """
+    Stepping with a capture set whose sum doesn't match played rank should raise ValueError.
+    """
+    env = ScoponeEnvMA()
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"][0] = [(6, 'denari')]
+    env.game_state["table"] = [(1, 'spade'), (2, 'coppe')]
+
+    # Attempt to capture 1+2 with a 6 -> invalid
+    bad_action = encode_action((6, 'denari'), [(1, 'spade'), (2, 'coppe')])
+    with pytest.raises(ValueError):
+        env.step(bad_action)
+
+
+def test_variant_non_scientifico_deal(env_fixture):
+    """
+    The 'scopone_non_scientifico' variant must deal 9 cards to each player and 4 cards face-up on the table.
+    """
+    env = ScoponeEnvMA(rules={"variant": "scopone_non_scientifico"})
+    obs = env.reset()
+    assert obs.shape == (10823,)
+    # Hands should have 9 cards each, table 4 cards
+    for p in range(4):
+        assert len(env.game_state["hands"][p]) == 9
+    assert len(env.game_state["table"]) == 4
+
+
+def test_direct_capture_takes_precedence_over_sum(env_fixture):
+    """
+    When same-rank cards exist on table, valid actions for that rank must be only direct captures, not sums.
+    """
+    env = env_fixture
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"][0] = [(6, 'denari')]
+    # Table contains a 6 (direct) and also 1+5 that sum to 6
+    env.game_state["table"] = [(6, 'coppe'), (1, 'spade'), (5, 'bastoni')]
+
+    valids = env.get_valid_actions()
+    # Only one action: play 6 and capture exactly one 6 from table
+    assert len(valids) == 1
+    pc, cc = decode_action(valids[0])
+    assert pc == (6, 'denari')
+    assert set(cc) == {(6, 'coppe')}
+
+
+def test_max_consecutive_scope_rule_limiting():
+    """
+    With max_consecutive_scope=1, a second consecutive scopa by the same team should be demoted to 'capture'.
+    """
+    env = ScoponeEnvMA(rules={"max_consecutive_scope": 1})
+    env.reset()
+    env.current_player = 0
+    # Prepare history: last move was a scopa by team 0 (player 2)
+    env.game_state["history"] = [
+        {"player": 2, "played_card": (7, 'spade'), "capture_type": "scopa", "captured_cards": [(3, 'denari'), (4, 'coppe')]}
+    ]
+    # Now current player 0 can also make a scopa
+    env.game_state["hands"][0] = [(7, 'denari')]
+    env.game_state["hands"][1] = [(1, 'coppe')]
+    env.game_state["hands"][2] = []
+    env.game_state["hands"][3] = []
+    env.game_state["table"] = [(3, 'spade'), (4, 'bastoni')]
+
+    act = encode_action((7, 'denari'), [(3, 'spade'), (4, 'bastoni')])
+    obs_after, r, done, info = env.step(act)
+    assert env.game_state["history"][-1]["capture_type"] == "capture"
+
+
+def test_compute_final_score_breakdown_rules():
+    """
+    Validate correctness of scoring with re_bello and napola variants.
+    """
+    game_state = {
+        "captured_squads": {
+            0: [(10, 'denari'), (7, 'denari'), (2, 'coppe'), (3, 'spade'), (1, 'denari'), (2, 'denari'), (3, 'denari')],
+            1: [(4, 'bastoni'), (5, 'spade')]
+        },
+        "history": [
+            {"player": 1, "played_card": (7, 'coppe'), "capture_type": "scopa", "captured_cards": [(7, 'spade')]},
+            {"player": 0, "played_card": (1, 'denari'), "capture_type": "capture", "captured_cards": [(1, 'coppe')]},
+            {"player": 3, "played_card": (2, 'bastoni'), "capture_type": "no_capture", "captured_cards": []}
+        ]
+    }
+
+    # Base scoring without variants
+    b0 = compute_final_score_breakdown(game_state, rules={})
+    base0 = b0[0]["total"]
+    base1 = b0[1]["total"]
+
+    # re_bello adds +1 to team 0 because it has (10, 'denari')
+    b1 = compute_final_score_breakdown(game_state, rules={"re_bello": True})
+    assert b1[0]["re_bello"] == 1
+    assert b1[0]["total"] == base0 + 1
+
+    # napola fixed3 adds +3 if team 0 has at least A-2-3 of denari
+    b2 = compute_final_score_breakdown(game_state, rules={"napola": True, "napola_scoring": "fixed3"})
+    assert b2[0]["napola"] == 3
+    assert b2[0]["total"] == base0 + 3
+
+    # napola length counts the length of the run from A upward; here A-2-3 present -> 3 points
+    b3 = compute_final_score_breakdown(game_state, rules={"napola": True, "napola_scoring": "length"})
+    assert b3[0]["napola"] == 3
+    assert b3[0]["total"] == base0 + 3
+
+    # Combine rules
+    b4 = compute_final_score_breakdown(game_state, rules={"re_bello": True, "napola": True, "napola_scoring": "fixed3"})
+    assert b4[0]["total"] == base0 + 1 + 3
+
+
+def test_leftover_cards_go_to_last_capturing_team_on_done():
+    """
+    Ensure leftover table cards go to last capturing team at end of hand.
+    """
+    env = ScoponeEnvMA(rules={"last_cards_to_dealer": True})
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"] = {0: [(5, 'denari')], 1: [], 2: [], 3: []}
+    env.game_state["table"] = [(9, 'coppe')]
+    env.game_state["captured_squads"] = {0: [], 1: []}
+    # Last capture was by team 1 (player 3)
+    env.game_state["history"] = [{"player": 3, "played_card": (7, 'spade'), "capture_type": "capture", "captured_cards": [(7, 'bastoni')]}]
+
+    act = encode_action((5, 'denari'), [])
+    obs_after, r, done, info = env.step(act)
+    assert done is True
+    assert (9, 'coppe') in env.game_state["captured_squads"][1]
+
+
+def test_encode_state_for_player_order_invariance():
+    """
+    Observation encoding should be invariant to ordering of cards in hands/table since internal encoders sort.
+    """
+    from copy import deepcopy
+
+    gs = initialize_game()
+    gs["hands"][0] = [(3, 'coppe'), (1, 'denari'), (2, 'spade')]
+    gs["table"] = [(4, 'bastoni'), (2, 'denari')]
+    gs["captured_squads"] = {0: [(7, 'denari')], 1: [(5, 'coppe')]}
+    gs["history"] = []
+
+    gs_perm = deepcopy(gs)
+    gs_perm["hands"][0] = list(reversed(gs_perm["hands"][0]))
+    gs_perm["table"] = list(reversed(gs_perm["table"]))
+
+    enc1 = encode_state_for_player(gs, 0)
+    enc2 = encode_state_for_player(gs_perm, 0)
+    assert np.array_equal(enc1, enc2)

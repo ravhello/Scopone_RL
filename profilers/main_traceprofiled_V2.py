@@ -17,6 +17,10 @@ from torch.profiler import profile, record_function, ProfilerActivity, schedule
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Autocast configuration
+autocast_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
+
 # Advanced GPU Configuration
 if torch.cuda.is_available():
     # Optimize for CUDA performance
@@ -224,7 +228,13 @@ class DQNAgent:
         
         # Additions for GPU optimization
         torch.backends.cudnn.benchmark = True  # Optimization for fixed input sizes
-        self.scaler = torch.amp.GradScaler('cuda')  # For mixed precision training
+        if torch.cuda.is_available():
+            try:
+                self.scaler = torch.amp.GradScaler('cuda')
+            except Exception:
+                self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None  # For mixed precision training
     
     def pick_action(self, obs, valid_actions, env):
         """GPU-optimized epsilon-greedy"""
@@ -271,7 +281,7 @@ class DQNAgent:
                     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     
                 # OPTIMIZATION: Use mixed precision to speed up inference
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     action_values = self.online_qnet(obs_t)
                     q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
                 
@@ -345,7 +355,7 @@ class DQNAgent:
         batch_count = 0
         
         # OPTIMIZATION: Use mixed precision more efficiently with float16
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, idx)
@@ -624,6 +634,7 @@ def train_agents(num_episodes=10):
 
         # Initial state
         done = False
+        info = {}
         obs_current = env._get_observation(env.current_player)
         
         # OPTIMIZATION: Ensure obs_current is a numpy array
@@ -756,7 +767,7 @@ def train_agents(num_episodes=10):
                         # Get batch with optimal size
                         team0_obs_t, team0_actions_t, team0_rewards_t = team0_batch
                         
-                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                        with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                             # Process in larger batches to better use GPU
                             batch_size = min(512, len(team0_obs_t))
                             num_batches = (len(team0_obs_t) + batch_size - 1) // batch_size
@@ -833,7 +844,7 @@ def train_agents(num_episodes=10):
                         # Team 1 training
                         team1_obs_t, team1_actions_t, team1_rewards_t = team1_batch
                         
-                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                        with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                             batch_size = min(512, len(team1_obs_t))
                             num_batches = (len(team1_obs_t) + batch_size - 1) // batch_size
                             
