@@ -35,6 +35,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Regole di default per l'ambiente (modalità standard senza varianti)
+# Nota: la variante "asso_piglia_tutto" è disattivata e quindi ignorata in questo script di benchmark.
 DEFAULT_RULES = {
     'start_with_4_on_table': False,
     'asso_piglia_tutto': False,
@@ -79,6 +80,7 @@ def play_game(agent1, agent2, starting_player=0):
     env.current_player = starting_player
     
     done = False
+    info = {}
     
     # Track which agent is controlling the current player
     # In even positions (0, 2) of Team 0, agent1 plays. In odd positions (1, 3) of Team 1, agent2 plays.

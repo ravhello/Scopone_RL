@@ -3834,7 +3834,8 @@ class GameScreen(BaseScreen):
         self.series_tiebreak = rules.get("tiebreak", "single")
         self.series_scores = [0, 0]
         self.series_hands_played = 0
-        self.series_prev_starter = None
+        # Seed rotation from the first hand starter if already known
+        self.series_prev_starter = self.hand_starting_player if self.hand_starting_player is not None else None
         self.points_history = []
         self.hands_won = [0, 0]
         self.show_intermediate_recap = False
@@ -3898,6 +3899,8 @@ class GameScreen(BaseScreen):
             # Track starter and dealer for this hand
             self.hand_starting_player = random_starter
             self.current_dealer_id = (random_starter + 3) % 4
+            # Seed clockwise rotation from the first randomized starter
+            self.series_prev_starter = self.hand_starting_player
         
         # Set up AI controllers if needed
         if mode in ["single_player", "team_vs_ai"]:
@@ -5686,6 +5689,11 @@ class GameScreen(BaseScreen):
         
         # Includi esplicitamente informazioni sul giocatore corrente
         self.app.network.game_state['current_player'] = self.env.current_player
+        # Includi lo starting player della mano corrente per allineare il dealer su tutti i client
+        try:
+            self.app.network.game_state['starting_player'] = int(self.hand_starting_player) if self.hand_starting_player is not None else self.env.current_player
+        except Exception:
+            self.app.network.game_state['starting_player'] = self.env.current_player
         
         # Includi il mazzo di carte completo (con ordine casuale determinato dall'host)
         if hasattr(self.env, 'deck'):

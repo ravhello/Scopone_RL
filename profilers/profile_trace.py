@@ -24,6 +24,10 @@ from torch.profiler import profile, record_function, ProfilerActivity
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Autocast configuration
+autocast_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
+
 # Configurazione GPU avanzata
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
@@ -218,7 +222,13 @@ class DQNAgent:
         
         # Aggiunte per ottimizzazione GPU
         torch.backends.cudnn.benchmark = True
-        self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            try:
+                self.scaler = torch.amp.GradScaler('cuda')
+            except Exception:
+                self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
     
     def pick_action(self, obs, valid_actions, env):
         if not valid_actions:
@@ -264,7 +274,7 @@ class DQNAgent:
                     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     
                 # OTTIMIZZAZIONE: Usa mixed precision per accelerare l'inferenza
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     action_values = self.online_qnet(obs_t)
                     q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
                 

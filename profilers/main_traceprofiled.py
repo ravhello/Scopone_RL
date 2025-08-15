@@ -17,6 +17,10 @@ import torch.profiler
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Autocast configuration
+autocast_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
+
 # Configurazione GPU avanzata
 if torch.cuda.is_available():
     # Ottimizza per performance CUDA
@@ -235,7 +239,13 @@ class DQNAgent:
         
         # Aggiunte per ottimizzazione GPU
         torch.backends.cudnn.benchmark = True  # Ottimizzazione per dimensioni di input fisse
-        self.scaler = torch.amp.GradScaler('cuda')  # Per mixed precision training
+        if torch.cuda.is_available():
+            try:
+                self.scaler = torch.amp.GradScaler('cuda')
+            except Exception:
+                self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None  # Per mixed precision training
     
     #@profile
     def pick_action(self, obs, valid_actions, env):
@@ -283,7 +293,7 @@ class DQNAgent:
                     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     
                 # OTTIMIZZAZIONE: Usa mixed precision per accelerare l'inferenza
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     action_values = self.online_qnet(obs_t)
                     q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
                 
@@ -358,7 +368,7 @@ class DQNAgent:
         batch_count = 0
         
         # OTTIMIZZAZIONE: Usa mixed precision in modo più efficiente con float16
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, idx)
@@ -637,6 +647,7 @@ def train_agents(num_episodes=10):
 
             # Stato iniziale
             done = False
+            info = {}
             obs_current = env._get_observation(env.current_player)
             
             # OTTIMIZZAZIONE: Assicura che obs_current sia un array numpy
@@ -799,7 +810,7 @@ def train_agents(num_episodes=10):
                 # Ottiene batch con dimensione ottimale
                 team0_obs_t, team0_actions_t, team0_rewards_t = team0_batch
                 
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     # Processa in batch più grandi per sfruttare meglio la GPU
                     batch_size = min(512, len(team0_obs_t))
                     num_batches = (len(team0_obs_t) + batch_size - 1) // batch_size
@@ -842,7 +853,7 @@ def train_agents(num_episodes=10):
                 
                 team1_obs_t, team1_actions_t, team1_rewards_t = team1_batch
                 
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                     batch_size = min(512, len(team1_obs_t))
                     num_batches = (len(team1_obs_t) + batch_size - 1) // batch_size
                     
@@ -917,7 +928,7 @@ def train_agents(num_episodes=10):
                                     idx += 1
                     
                     # Training su mega-batch
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                         batch_size = min(512, idx)
                         num_batches = (idx + batch_size - 1) // batch_size
                         
@@ -977,7 +988,7 @@ def train_agents(num_episodes=10):
                                     team1_rewards_buffer[idx] = episode_reward
                                     idx += 1
                     
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
                         batch_size = min(512, idx)
                         num_batches = (idx + batch_size - 1) // batch_size
                         
