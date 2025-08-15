@@ -52,6 +52,21 @@ CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"
 PROFILE_DIR = "./profile_results"
 Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
 
+# Regole di default per l'ambiente (modalità standard senza varianti)
+DEFAULT_RULES = {
+    'start_with_4_on_table': False,
+    'asso_piglia_tutto': False,
+    'scopa_on_asso_piglia_tutto': False,
+    'asso_piglia_tutto_posabile': False,
+    'asso_piglia_tutto_posabile_only_empty': False,
+    'scopa_on_last_capture': False,
+    're_bello': False,
+    'napola': False,
+    'napola_scoring': 'fixed3',
+    'max_consecutive_scope': None,
+    'last_cards_to_dealer': True,
+}
+
 
 class EpisodicReplayBuffer:
     def __init__(self, capacity=20):
@@ -626,7 +641,7 @@ def profiled_train_agents(num_episodes=200):
         
         # Crea environment e inizializza
         with record_function("Environment_Setup"):
-            env = ScoponeEnvMA()
+            env = ScoponeEnvMA(rules=DEFAULT_RULES)
             env.current_player = first_player
 
         # Inizializza i buffer degli episodi

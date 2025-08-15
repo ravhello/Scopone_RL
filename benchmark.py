@@ -34,6 +34,21 @@ from main import DQNAgent
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Regole di default per l'ambiente (modalità standard senza varianti)
+DEFAULT_RULES = {
+    'start_with_4_on_table': False,
+    'asso_piglia_tutto': False,
+    'scopa_on_asso_piglia_tutto': False,
+    'asso_piglia_tutto_posabile': False,
+    'asso_piglia_tutto_posabile_only_empty': False,
+    'scopa_on_last_capture': False,
+    're_bello': False,
+    'napola': False,
+    'napola_scoring': 'fixed3',
+    'max_consecutive_scope': None,
+    'last_cards_to_dealer': True,
+}
+
 def load_agent_from_checkpoint(checkpoint_path):
     """Load a Team 0 agent from a checkpoint file."""
     if not os.path.exists(checkpoint_path):
@@ -60,7 +75,7 @@ def play_game(agent1, agent2, starting_player=0):
         team_scores: Scores for each agent [agent1_score, agent2_score]
         game_length: Number of moves in the game
     """
-    env = ScoponeEnvMA()
+    env = ScoponeEnvMA(rules=DEFAULT_RULES)
     env.current_player = starting_player
     
     done = False

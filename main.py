@@ -67,6 +67,21 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
     torch.cuda.memory_stats()
 
+# Regole di default per l'ambiente (modalità standard senza varianti)
+DEFAULT_RULES = {
+    'start_with_4_on_table': False,
+    'asso_piglia_tutto': False,
+    'scopa_on_asso_piglia_tutto': False,
+    'asso_piglia_tutto_posabile': False,
+    'asso_piglia_tutto_posabile_only_empty': False,
+    'scopa_on_last_capture': False,
+    're_bello': False,
+    'napola': False,
+    'napola_scoring': 'fixed3',
+    'max_consecutive_scope': None,
+    'last_cards_to_dealer': True,
+}
+
 ############################################################
 # 1) Definiamo una classe EpisodicReplayBuffer
 ############################################################
@@ -589,8 +604,8 @@ def train_agents(num_episodes=10):
         if ep == num_episodes - 1:
             pbar.close()
         
-        # Crea ambiente e inizializza
-        env = ScoponeEnvMA()
+        # Crea ambiente e inizializza (regole di default bloccate)
+        env = ScoponeEnvMA(rules=DEFAULT_RULES)
         env.current_player = first_player
 
         # Inizializza buffer episodici
