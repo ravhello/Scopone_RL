@@ -3693,6 +3693,8 @@ class GameScreen(BaseScreen):
         self.last_hand_breakdown = None
         self._pending_next_starter = None
         self.next_hand_button = None
+        # Defer overlay drawing until state sync/animations are handled (prevents overlay-before-sweep)
+        self.defer_overlays_until_state_sync = False
 
     def _play_next_queued_client_move(self):
         """Play the next queued client move, ensuring strict serialization.
@@ -4002,12 +4004,11 @@ class GameScreen(BaseScreen):
         if proceed_new_hand:
             # In modalità a punti o a mani mostra prima un recap dell'ultima mano
             if self.series_mode in ("points", "hands"):
-                # Delay to let players see the sweep before showing overlay (increased)
-                try:
-                    pygame.time.delay(4500)
-                except Exception:
-                    pass
+                # Do not block the loop here; overlays will be gated in draw() until animations finish
+                # Keeping a small optional grace handled by gating logic
                 self.show_intermediate_recap = True
+                # Gate overlays until any pending serialized client moves (like sweep) are consumed
+                self.defer_overlays_until_state_sync = True
                 self.last_hand_breakdown = final_breakdown
                 # Calcola in anticipo il prossimo starter ma non resettare ancora
                 next_starter = (self.series_prev_starter + 1) % 4 if self.series_prev_starter is not None else random.randint(0, 3)
@@ -4038,11 +4039,9 @@ class GameScreen(BaseScreen):
                 self.setup_layout()
         else:
             # Series ended; show final scoreboard by setting final_breakdown to last hand (already set)
-            # Delay to let players see the final sweep before showing final overlay (increased)
-            try:
-                pygame.time.delay(4500)
-            except Exception:
-                pass
+            # Do not block the loop; overlays will be gated in draw() until animations finish
+            self.defer_overlays_until_state_sync = True
+            pass
 
     
     def setup_ai_controllers(self):
@@ -6145,6 +6144,8 @@ class GameScreen(BaseScreen):
                         if bool(series_state.get('show_intermediate_recap', False)):
                             # Recap intermedio → mai game over ora
                             self.game_over = False
+                            # Defer overlays until we consume any pending sweep queued from state diff
+                            self.defer_overlays_until_state_sync = True
                     except Exception:
                         pass
                 
@@ -7877,11 +7878,40 @@ class GameScreen(BaseScreen):
             take_btn.draw(surface)
 
         # Intermediate recap overlay between hands (points mode) - draw on TOP of everything
-        if self.show_intermediate_recap and self.last_hand_breakdown:
+        # Ensure any pending sweep animation starts before overlays and delay overlays until animations/queue finish
+        try:
+            wants_overlay = self.show_intermediate_recap or (self.game_over and not self.show_intermediate_recap)
+            if wants_overlay:
+                # If a client-side move is queued (e.g., end-of-hand sweep) and no animation is active, start it now
+                if getattr(self, 'queued_client_moves', None) and not self.animations and not getattr(self, 'waiting_for_animation', False):
+                    # Only try to start if queue is non-empty
+                    try:
+                        has_queued = bool(self.queued_client_moves)
+                    except Exception:
+                        has_queued = False
+                    if has_queued:
+                        played = self._play_next_queued_client_move()
+                        if played:
+                            self.defer_overlays_until_state_sync = True
+                        # After triggering a sweep, keep overlays blocked this frame
+                        self.defer_overlays_until_state_sync = True
+        except Exception:
+            pass
+
+        try:
+            has_queued = bool(self.queued_client_moves) if getattr(self, 'queued_client_moves', None) is not None else False
+        except Exception:
+            has_queued = False
+        # If overlays are explicitly deferred until state sync (set at hand end), keep blocking until queue empty and no animations
+        if getattr(self, 'defer_overlays_until_state_sync', False) and not (has_queued or self.animations or getattr(self, 'waiting_for_animation', False)):
+            # Clear the deferral once safe
+            self.defer_overlays_until_state_sync = False
+        overlays_blocked = bool(self.animations) or has_queued or bool(getattr(self, 'waiting_for_animation', False)) or bool(getattr(self, 'defer_overlays_until_state_sync', False))
+        if self.show_intermediate_recap and self.last_hand_breakdown and not overlays_blocked:
             self.draw_intermediate_recap(surface)
 
         # Draw game over screen if game is over (but not during intermediate recap)
-        if self.game_over and self.final_breakdown and not self.show_intermediate_recap:
+        if self.game_over and self.final_breakdown and not self.show_intermediate_recap and not overlays_blocked:
             self.draw_game_over(surface)
     
     def draw_players(self, surface):
@@ -8805,7 +8835,10 @@ class GameScreen(BaseScreen):
         # trigger the next one immediately for snappier sequencing
         if getattr(self, 'queued_client_moves', None) is not None and not self.animations:
             try:
-                self._play_next_queued_client_move()
+                played = self._play_next_queued_client_move()
+                if played:
+                    # Ensure overlays remain blocked if we just started a queued animation (e.g., sweep)
+                    self.defer_overlays_until_state_sync = True
             except Exception:
                 pass
     
