@@ -790,7 +790,7 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
     # Ma se il codice di base non salva la final reward nel replay, Team1 non "impara".
 
     # Facciamo qualche step di training in più per consolidare l'apprendimento
-    for _ in range(5):
+    for _ in range(10):
         agent_team1.train_episodic_monte_carlo()
 
     ###############################################
