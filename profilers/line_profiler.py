@@ -1,5 +1,4 @@
 import functools
-import numpy as np
 from collections import defaultdict
 import pandas as pd
 import contextlib

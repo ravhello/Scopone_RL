@@ -73,6 +73,24 @@ SUIT_NAMES = {
     'bastoni': 'bastoni'
 }
 
+# ----- Card helpers: support IDs (0..39) or tuples (rank,suit) -----
+SUIT_BY_COL = {0: 'denari', 1: 'coppe', 2: 'spade', 3: 'bastoni'}
+
+def is_card_id(card):
+    return isinstance(card, int)
+
+def id_to_tuple(cid: int):
+    return (cid // 4 + 1, SUIT_BY_COL[cid % 4])
+
+def ensure_tuple(card):
+    return id_to_tuple(card) if isinstance(card, int) else card
+
+def ensure_tuple_list(cards):
+    return [ensure_tuple(c) for c in cards]
+
+def rank_of(card):
+    return (card // 4) + 1 if isinstance(card, int) else card[0]
+
 # Card mapping helper function
 def format_card(card):
     """
@@ -498,8 +516,8 @@ class ResourceManager:
             self.sound_enabled = False
     
     def get_card_image(self, card):
-        """Get the image for a specific card"""
-        return self.card_images.get(card)
+        """Get the image for a specific card (accepts ID or tuple)"""
+        return self.card_images.get(ensure_tuple(card))
     
     def get_card_back(self, team_id):
         """Get the card back image for a specific team"""
@@ -4973,7 +4991,7 @@ class GameScreen(BaseScreen):
                         table_cards = []
                         if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                             table_cards = list(self.env.game_state.get("table", []))
-                        same_rank = [c for c in table_cards if c and isinstance(c, (list, tuple)) and len(c) > 0 and c[0] == ace_card[0]]
+                        same_rank = [c for c in table_cards if rank_of(c) == rank_of(ace_card)]
 
                         if same_rank:
                             # Se c'è una sola carta di pari rank: auto-cattura quella
@@ -6515,9 +6533,9 @@ class GameScreen(BaseScreen):
             print(f"Queueing animations for detected play: Player {player_id} played {played_card} and captured {captured_cards}")
             self.queued_client_moves.append({
                 'player': player_id,
-                'card_played': played_card,
-                'cards_captured': captured_cards,
-                'table': list(old_table)
+                'card_played': ensure_tuple(played_card),
+                'cards_captured': ensure_tuple_list(captured_cards),
+                'table': ensure_tuple_list(list(old_table))
             })
         # If only captures detected, animate them
         elif captured_cards:
@@ -6532,9 +6550,9 @@ class GameScreen(BaseScreen):
                 print(f"Queueing animations for partial detection: Player {likely_player} played {played_card} and captured {captured_cards}")
                 self.queued_client_moves.append({
                     'player': likely_player,
-                    'card_played': played_card,
-                    'cards_captured': captured_cards,
-                    'table': list(old_table)
+                    'card_played': ensure_tuple(played_card),
+                    'cards_captured': ensure_tuple_list(captured_cards),
+                    'table': ensure_tuple_list(list(old_table))
                 })
             else:
                 print(f"Creating animations for captures only: {captured_cards}")
@@ -6893,7 +6911,7 @@ class GameScreen(BaseScreen):
             ap_enabled = bool(rules.get("asso_piglia_tutto", False))
             ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
             ap_only_empty = bool(rules.get("asso_piglia_tutto_posabile_only_empty", False))
-            if ap_enabled and self.selected_hand_card and self.selected_hand_card[0] == 1:
+            if ap_enabled and self.selected_hand_card and rank_of(self.selected_hand_card) == 1:
                 table_cards = []
                 if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                     table_cards = list(self.env.game_state.get("table", []))
@@ -6923,8 +6941,8 @@ class GameScreen(BaseScreen):
             # Regola speciale: se esistono carte di pari rank sul tavolo, permetti solo la cattura di UNA di esse
             # (non una combinazione). Quindi, se selected_table_cards contiene più carte dello stesso rank, invalida.
             try:
-                if self.selected_hand_card and self.selected_hand_card[0] == card[0]:
-                    table_same_rank = [c for c in (self.env.game_state.get("table", []) if self.env else []) if c[0] == card[0]]
+                if self.selected_hand_card and rank_of(self.selected_hand_card) == rank_of(card):
+                    table_same_rank = [c for c in (self.env.game_state.get("table", []) if self.env else []) if rank_of(c) == rank_of(card)]
                 else:
                     table_same_rank = []
             except Exception:
@@ -6945,7 +6963,7 @@ class GameScreen(BaseScreen):
                 table_cards = []
                 if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                     table_cards = list(self.env.game_state.get("table", []))
-                if ap_enabled and not ap_posabile and self.selected_hand_card and self.selected_hand_card[0] == 1 and len(table_cards) == 0:
+                if ap_enabled and not ap_posabile and self.selected_hand_card and rank_of(self.selected_hand_card) == 1 and len(table_cards) == 0:
                     forced_action = encode_action(self.selected_hand_card, [])
                     self.create_move_animations(self.selected_hand_card, [], source_player_id=self.current_player_id, force_self_capture=True)
                     self.app.resources.play_sound("card_play")
@@ -8650,7 +8668,7 @@ class GameScreen(BaseScreen):
             for move in team_moves[team_id]:
                 ctype = move.get("capture_type")
                 captured_cards = move.get("captured_cards") or []
-                played_card = move.get("played_card")
+                played_card = ensure_tuple(move.get("played_card"))
 
                 if ctype == "scopa":
                     # Base position at current top of pile; face-up will anchor to the covered card just below it
@@ -9106,7 +9124,7 @@ class GameScreen(BaseScreen):
             remaining_cards.extend(hands.get(pid, []))
         remaining_cards.extend(gs.get("table", []))
         rem_total = len(remaining_cards)
-        rem_den = sum(1 for r, s in remaining_cards if s == 'denari')
+        rem_den = sum(1 for c in remaining_cards if ensure_tuple(c)[1] == 'denari')
 
         # Scope counts
         scope0 = 0
@@ -9124,15 +9142,16 @@ class GameScreen(BaseScreen):
         lead_c0 = 1 if c0 > c1 else 0 if c0 == c1 else -1
 
         # Denari majority
-        den0 = sum(1 for r, s in team_cards_0 if s == 'denari')
-        den1 = sum(1 for r, s in team_cards_1 if s == 'denari')
+        den0 = sum(1 for c in team_cards_0 if ensure_tuple(c)[1] == 'denari')
+        den1 = sum(1 for c in team_cards_1 if ensure_tuple(c)[1] == 'denari')
         lead_d0 = 1 if den0 > den1 else 0 if den0 == den1 else -1
 
         # Primiera leader
         val_map = {1: 16, 2: 12, 3: 13, 4: 14, 5: 15, 6: 18, 7: 21, 8: 10, 9: 10, 10: 10}
         def prim_sum(cards):
             best = {"denari": 0, "coppe": 0, "spade": 0, "bastoni": 0}
-            for (rank, suit) in cards:
+            for c in cards:
+                rank, suit = ensure_tuple(c)
                 v = val_map.get(rank, 0)
                 if v > best.get(suit, 0):
                     best[suit] = v
@@ -9143,8 +9162,14 @@ class GameScreen(BaseScreen):
         lead_p0 = 1 if prim0 > prim1 else 0 if prim0 == prim1 else -1
 
         # Settebello possession
-        sb0 = (7, 'denari') in team_cards_0
-        sb1 = (7, 'denari') in team_cards_1
+        def _has_sette(seq):
+            for c in seq:
+                r, s = ensure_tuple(c)
+                if r == 7 and s == 'denari':
+                    return True
+            return False
+        sb0 = _has_sette(team_cards_0)
+        sb1 = _has_sette(team_cards_1)
 
         # Render two compact rows: team 0 and 1
         row_y = 6
@@ -9255,8 +9280,14 @@ class GameScreen(BaseScreen):
 
             # Re Bello (King of denari) indicator if active
             if rules.get("re_bello", False):
-                rb_team_has = (10, 'denari') in (team_cards_0 if team_id == 0 else team_cards_1)
-                rb_opp_has = (10, 'denari') in (team_cards_1 if team_id == 0 else team_cards_0)
+                def _has_re_bello(seq):
+                    for c in seq:
+                        r, s = ensure_tuple(c)
+                        if r == 10 and s == 'denari':
+                            return True
+                    return False
+                rb_team_has = _has_re_bello(team_cards_0 if team_id == 0 else team_cards_1)
+                rb_opp_has = _has_re_bello(team_cards_1 if team_id == 0 else team_cards_0)
                 rb_tie = (not rb_team_has) and (not rb_opp_has)
                 draw_dot("RB", dot_color(rb_team_has, rb_opp_has, rb_tie, 0))
 
@@ -9264,8 +9295,8 @@ class GameScreen(BaseScreen):
             if rules.get("napola", False):
                 team_cards = team_cards_0 if team_id == 0 else team_cards_1
                 opp_cards = team_cards_1 if team_id == 0 else team_cards_0
-                team_den_ranks = {r for (r, s) in team_cards if s == 'denari'}
-                opp_den_ranks = {r for (r, s) in opp_cards if s == 'denari'}
+                team_den_ranks = {ensure_tuple(c)[0] for c in team_cards if ensure_tuple(c)[1] == 'denari'}
+                opp_den_ranks = {ensure_tuple(c)[0] for c in opp_cards if ensure_tuple(c)[1] == 'denari'}
 
                 have_all3 = {1, 2, 3}.issubset(team_den_ranks)
                 opp_has_any_123 = len(opp_den_ranks.intersection({1, 2, 3})) > 0
@@ -9991,7 +10022,7 @@ class GameScreen(BaseScreen):
     def create_replay_animations(self, move):
         """Create animations for a replay move using the unified builder"""
         player = move.get("player")
-        played_card = move.get("played_card")
+        played_card = ensure_tuple(move.get("played_card"))
         captured_cards = move.get("captured_cards") or []
         capture_type = move.get('capture_type')
 

@@ -4,11 +4,16 @@ import random
 SUITS = ['denari', 'coppe', 'spade', 'bastoni']
 RANKS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
+def card_to_id(card):
+    rank, suit = card
+    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+    return (rank - 1) * 4 + suit_to_int[suit]
+
 def create_deck():
     """
-    Crea e restituisce un mazzo di 40 carte (rank, suit).
+    Crea e restituisce un mazzo di 40 carte come ID 0..39.
     """
-    deck = [(r, s) for s in SUITS for r in RANKS]
+    deck = list(range(40))
     return deck
 
 def initialize_game(rules=None):
@@ -36,7 +41,7 @@ def initialize_game(rules=None):
         while True:
             random.shuffle(deck)
             table_cards = deck[:4]
-            kings_on_table = sum(1 for (r, _) in table_cards if r == 10)
+            kings_on_table = sum(1 for cid in table_cards if (cid // 4 + 1) == 10)
             if kings_on_table < 3:
                 break
             attempts += 1
@@ -57,8 +62,8 @@ def initialize_game(rules=None):
         table = []
 
     state = {
-        "hands": hands,               # dict: {0: [...], 1: [...], 2: [...], 3: [...]}
-        "table": table,               # carte sul tavolo
+        "hands": hands,               # dict: {0: [ids], 1: [ids], 2: [ids], 3: [ids]}
+        "table": table,               # ids sul tavolo
         "captured_squads": {0:[], 1:[]}, 
         "history": []
     }

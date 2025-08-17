@@ -11,7 +11,7 @@ Usage:
 """
 
 import torch
-import numpy as np
+from tests.torch_np import np
 import argparse
 import os
 import time
@@ -28,10 +28,14 @@ import openpyxl
 
 # Import the required components from the existing code
 from environment import ScoponeEnvMA
+from algorithms.is_mcts import run_is_mcts
+from models.action_conditioned import ActionConditionedActor, CentralValueNet
+from belief.belief import BeliefState
+import torch
 from main import DQNAgent
 
-# Use CUDA if available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Use CUDA only
+device = torch.device("cuda")
 print(f"Using device: {device}")
 
 # Regole di default per l'ambiente (modalità standard senza varianti)
@@ -62,7 +66,7 @@ def load_agent_from_checkpoint(checkpoint_path):
     agent.epsilon = 0.0
     return agent
 
-def play_game(agent1, agent2, starting_player=0):
+def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=16):
     """
     Play a single game between two Team 0 agents.
     
@@ -107,12 +111,38 @@ def play_game(agent1, agent2, starting_player=0):
         # Get observation for current player
         obs = env._get_observation(current_player)
         
-        # Agent selects action
-        action = agent.pick_action(obs, valid_actions, env)
-        
+        # Agent selects action (with optional IS-MCTS if available)
+        if use_mcts:
+            try:
+                actor = ActionConditionedActor()
+                critic = CentralValueNet()
+                belief = BeliefState(env.game_state, observer_id=env.current_player, num_particles=256)
+                def policy_fn(o, leg):
+                    o_t = torch.tensor(o, dtype=torch.float32, device=device)
+                    if len(leg) > 0 and torch.is_tensor(leg[0]):
+                        leg_t = torch.stack(leg).to(device=device, dtype=torch.float32)
+                    else:
+                        leg_t = torch.stack([
+                            x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
+                        for x in leg], dim=0)
+                    with torch.no_grad():
+                        logits = actor(o_t.unsqueeze(0), leg_t)
+                    probs = torch.softmax(logits, dim=0)
+                    return probs
+                def value_fn(o):
+                    o_t = torch.tensor(o, dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        v = critic(o_t.unsqueeze(0)).item()
+                    return v
+                action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=1.0, belief=belief, num_determinization=dets)
+            except Exception:
+                action = agent.pick_action(obs, valid_actions, env)
+        else:
+            action = agent.pick_action(obs, valid_actions, env)
+
         # Take step in environment
         next_obs, reward, done, info = env.step(action)
-    
+
     # Extract final score information from team_rewards
     agent1_score = 0.0
     agent2_score = 0.0
@@ -125,6 +155,72 @@ def play_game(agent1, agent2, starting_player=0):
     winner = 0 if agent1_score > agent2_score else 1 if agent2_score > agent1_score else -1
     
     return winner, [agent1_score, agent2_score], len(env.game_state["history"])
+
+def load_actor_critic(ckpt_path: str):
+    actor = ActionConditionedActor()
+    critic = CentralValueNet()
+    try:
+        ckpt = torch.load(ckpt_path, map_location='cuda')
+        # se si usa algorithms/ppo_ac save
+        if 'actor' in ckpt and 'critic' in ckpt:
+            actor.load_state_dict(ckpt['actor'])
+            critic.load_state_dict(ckpt['critic'])
+        else:
+            # fallback: niente pesi
+            pass
+    except Exception:
+        pass
+    return actor, critic
+
+
+def main_cli():
+    import argparse
+    parser = argparse.ArgumentParser(description='Benchmark Scopone with optional IS-MCTS')
+    parser.add_argument('--mcts', action='store_true', help='Use IS-MCTS booster')
+    parser.add_argument('--sims', type=int, default=128, help='Number of MCTS simulations')
+    parser.add_argument('--dets', type=int, default=16, help='Number of belief determinisations per search')
+    parser.add_argument('--compact', action='store_true', help='Use compact observation')
+    parser.add_argument('--k-history', type=int, default=12, help='Recent moves for compact observation')
+    parser.add_argument('--ckpt', type=str, default='', help='Checkpoint path for actor/critic (optional)')
+    parser.add_argument('--games', type=int, default=10, help='Number of games to play')
+    args = parser.parse_args()
+    # Placeholder for agent loading and running a quick game
+    actor, critic = load_actor_critic(args.ckpt) if args.ckpt else (ActionConditionedActor(), CentralValueNet())
+    for g in range(args.games):
+        env = ScoponeEnvMA(use_compact_obs=args.compact, k_history=args.k_history)
+        done = False
+        while not done:
+            obs = env._get_observation(env.current_player)
+            legals = env.get_valid_actions()
+            if not legals:
+                break
+            if args.mcts:
+                belief = BeliefState(env.game_state, observer_id=env.current_player, num_particles=256)
+                def policy_fn(o, leg):
+                    o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
+                    leg_t = torch.stack([
+                        x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
+                    for x in leg], dim=0)
+                    with torch.no_grad():
+                        logits = actor(o_t.unsqueeze(0), leg_t)
+                    return torch.softmax(logits, dim=0)
+                def value_fn(o):
+                    o_t = torch.tensor(o, dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        return critic(o_t.unsqueeze(0)).item()
+                action = run_is_mcts(env, policy_fn, value_fn, num_simulations=args.sims, c_puct=1.0, belief=belief, num_determinization=args.dets)
+            else:
+                # pick best by actor scoring
+                with torch.no_grad():
+                    o_t = obs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(obs) else torch.tensor(obs, dtype=torch.float32, device=device)
+                    leg_t = torch.stack([
+                        x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
+                    for x in legals], dim=0)
+                    logits = actor(o_t.unsqueeze(0), leg_t)
+                    idx = torch.argmax(logits).item()
+                action = legals[idx]
+            _, _, done, _ = env.step(action)
+    print('Benchmark completed.')
 
 def find_checkpoints(checkpoint_dir, pattern="*team0*ep*.pth"):
     """Find Team 0 checkpoint files in the specified directory."""

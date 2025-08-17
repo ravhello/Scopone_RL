@@ -1,6 +1,6 @@
 # game_logic.py
 
-from actions import decode_action
+from actions import decode_action_ids
 from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
 
 def update_game_state(game_state, action_id, current_player, rules=None):
@@ -16,11 +16,30 @@ def update_game_state(game_state, action_id, current_player, rules=None):
         final_reward = compute_final_reward_from_breakdown(final_breakdown)
         return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
 
-    # Decodifica l'azione
-    try:
-        played_card, cards_to_capture = decode_action(action_id)
-    except ValueError as e:
-        raise ValueError(f"Azione non valida: {e}")
+    # Helpers per conversioni
+    COL_TO_SUIT = {0: 'denari', 1: 'coppe', 2: 'spade', 3: 'bastoni'}
+    def id_to_tuple(cid: int):
+        return (cid // 4 + 1, COL_TO_SUIT[cid % 4])
+    def ensure_same_mode(x, want_tuple: bool):
+        # x può essere int o (rank,suit)
+        if want_tuple:
+            return id_to_tuple(x) if isinstance(x, int) else x
+        else:
+            if isinstance(x, int):
+                return x
+            r, s = x
+            suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+            return (r - 1) * 4 + suit_to_col[s]
+
+    # Decodifica l'azione (sempre in ID)
+    played_id, captured_ids = decode_action_ids(action_id)
+    # Determina la modalità dello stato attuale (ID o tuple)
+    hand_is_id = (len(hand) > 0 and isinstance(hand[0], int))
+    table = game_state["table"]
+    table_is_id = (len(table) > 0 and isinstance(table[0], int))
+    # Allinea rappresentazioni
+    played_card = ensure_same_mode(played_id, want_tuple=not hand_is_id)
+    cards_to_capture = [ensure_same_mode(cid, want_tuple=not table_is_id) for cid in captured_ids]
     
     # Cerca la carta nella mano del giocatore corrente
     if played_card not in hand:
@@ -29,14 +48,11 @@ def update_game_state(game_state, action_id, current_player, rules=None):
     # Rimuovi la carta dalla mano
     hand.remove(played_card)
 
-    table = game_state["table"]
-    
     # Verifica che le carte da catturare siano sul tavolo
     for card in cards_to_capture:
         if card not in table:
             raise ValueError(f"La carta {card} non è sul tavolo")
-    
-    sum_chosen = sum(c[0] for c in cards_to_capture)
+
     capture_type = "no_capture"
     scopa_flag = False
 
@@ -45,8 +61,15 @@ def update_game_state(game_state, action_id, current_player, rules=None):
         for card in cards_to_capture:
             table.remove(card)
         
-        game_state["captured_squads"][squad_id].extend(cards_to_capture)
-        game_state["captured_squads"][squad_id].append(played_card)
+        # Mantieni coerenza di rappresentazione con captured_squads esistenti
+        cap_list = game_state["captured_squads"][squad_id]
+        if len(cap_list) > 0:
+            want_tuple = not isinstance(cap_list[0], int)
+        else:
+            want_tuple = not hand_is_id
+        to_add = [ensure_same_mode(c, want_tuple) for c in cards_to_capture]
+        to_add.append(ensure_same_mode(played_id, want_tuple))
+        game_state["captured_squads"][squad_id].extend(to_add)
         
         if len(table) == 0:
             scopa_flag = True

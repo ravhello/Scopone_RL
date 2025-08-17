@@ -1,6 +1,5 @@
 # main.py
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,28 +11,26 @@ import time
 from tqdm import tqdm
 
 # Configurazione GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda")
 print(f"Using device: {device}")
 
-# Configurazione per autocast in base alla disponibilità di CUDA
-autocast_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
+# Configurazione per autocast forzata a CUDA
+autocast_device = 'cuda'
+autocast_dtype = torch.float16
 
-# Configurazione GPU avanzata
-if torch.cuda.is_available():
-    # Ottimizza per performance CUDA
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.enabled = True
-    
-    # Per GPU più recenti (Ampere+)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
-    # Aumenta la dimensione di allocazione cache
-    torch.cuda.empty_cache()
-    torch.cuda.memory.set_per_process_memory_fraction(0.95)  # Usa fino al 95% della memoria disponibile
+# Configurazione GPU avanzata (forzata)
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.enabled = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.cuda.empty_cache()
+try:
+    torch.cuda.memory.set_per_process_memory_fraction(0.95)
+except Exception:
+    pass
 
 from environment import ScoponeEnvMA
+from tests.torch_np import np
 """
 # Alla fine di ogni episodio
 # Forza garbage collection
@@ -57,10 +54,8 @@ TARGET_UPDATE_FREQ = 1000  # ogni quanti step sincronizzi la rete target (ora us
 CHECKPOINT_PATH = "checkpoints/scopone_checkpoint"
 
 # Configura la frammentazione della memoria CUDA per dataset grandi
-if torch.cuda.is_available():
-    # Prova ad allocare memoria in blocchi più grandi per ridurre la frammentazione
-    torch.cuda.empty_cache()
-    torch.cuda.memory_stats()
+torch.cuda.empty_cache()
+torch.cuda.memory_stats()
 
 # Regole di default per l'ambiente (modalità standard senza varianti)
 # Nota: la variante "asso_piglia_tutto" è disattivata e quindi ignorata in questa modalità.
@@ -76,6 +71,9 @@ DEFAULT_RULES = {
     'napola_scoring': 'fixed3',
     'max_consecutive_scope': None,
     'last_cards_to_dealer': True,
+    # Reward shaping opzionale (disattivato di default)
+    'shape_scopa': False,
+    'scopa_reward': 0.1,
 }
 
 ############################################################
@@ -198,8 +196,10 @@ class QNetwork(nn.Module):
     #@profile
     def forward(self, x):
         # Assicurati che l'input sia sulla GPU - ottimizzato
-        if isinstance(x, np.ndarray):
-            x = torch.tensor(x, dtype=torch.float32, device=device)
+        if isinstance(x, torch.Tensor):
+            x = x.clone().detach().to(device=device, dtype=torch.float32)
+            # Already tensor
+            pass
         elif x.device != device:
             x = x.to(device)
                 
@@ -241,14 +241,138 @@ class QNetwork(nn.Module):
         return action_values
 
 ############################################################
+# 2b) Rete neurale Action-Conditioned Q(s,a)
+############################################################
+
+class ActionConditionedQNetwork(nn.Module):
+    def __init__(self, obs_dim=10823, action_dim=80):
+        super().__init__()
+        # Estrattore di feature di stato (riusa struttura della QNetwork)
+        self.backbone = nn.Sequential(
+            nn.Linear(obs_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+
+        self.hand_table_processor = nn.Sequential(
+            nn.Linear(83, 64),
+            nn.ReLU()
+        )
+        self.captured_processor = nn.Sequential(
+            nn.Linear(82, 64),
+            nn.ReLU()
+        )
+        self.stats_processor = nn.Sequential(
+            nn.Linear(334, 64),
+            nn.ReLU()
+        )
+        self.history_processor = nn.Sequential(
+            nn.Linear(10320, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+
+        self.combiner = nn.Sequential(
+            nn.Linear(128 + 64*4, 256),
+            nn.ReLU()
+        )
+
+        # Encoder per l'azione (80-dim binaria)
+        self.action_processor = nn.Sequential(
+            nn.Linear(action_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+
+        # Scorer Q(s,a)
+        self.scorer = nn.Sequential(
+            nn.Linear(256 + 64, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+        self.to(device)
+
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+
+    def forward(self, obs, actions):
+        # obs: (B, obs_dim) oppure (1, obs_dim); actions: (B, 80)
+        import torch.nn.functional as F
+        if isinstance(obs, torch.Tensor):
+            obs = obs.clone().detach().to(device=device, dtype=torch.float32)
+        if isinstance(actions, torch.Tensor):
+            actions = actions.clone().detach().to(device=device, dtype=torch.float32)
+
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+
+        batch = actions.size(0)
+        if obs.size(0) == 1 and batch > 1:
+            obs = obs.expand(batch, -1)
+
+        if obs.device != device:
+            obs = obs.to(device)
+        if actions.device != device:
+            actions = actions.to(device)
+
+        # Stato features
+        x1 = F.relu(self.backbone[0](obs), inplace=True)
+        x2 = F.relu(self.backbone[2](x1), inplace=True)
+        x3 = F.relu(self.backbone[4](x2), inplace=True)
+        backbone_features = F.relu(self.backbone[6](x3), inplace=True)
+
+        hand_table = obs[:, :83]
+        captured = obs[:, 83:165]
+        history = obs[:, 169:10489]
+        stats = obs[:, 10489:]
+
+        hand_table_features = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
+        captured_features = F.relu(self.captured_processor[0](captured), inplace=True)
+        history_features = F.relu(self.history_processor[0](history), inplace=True)
+        history_features = F.relu(self.history_processor[2](history_features), inplace=True)
+        stats_features = F.relu(self.stats_processor[0](stats), inplace=True)
+
+        combined = torch.cat([
+            backbone_features,
+            hand_table_features,
+            captured_features,
+            history_features,
+            stats_features
+        ], dim=1)
+
+        state_features = torch.relu(self.combiner[0](combined))  # (B,256)
+
+        # Azione features
+        action_features = torch.relu(self.action_processor[0](actions))
+        action_features = torch.relu(self.action_processor[2](action_features))
+
+        # Q(s,a)
+        sa = torch.cat([state_features, action_features], dim=1)
+        hidden = torch.relu(self.scorer[0](sa))
+        q = self.scorer[2](hidden).squeeze(-1)
+        return q
+
+############################################################
 # 3) DQNAgent con target network + replay
 ############################################################
 
 class DQNAgent:
     def __init__(self, team_id):
         self.team_id = team_id
-        self.online_qnet = QNetwork()
-        self.target_qnet = QNetwork()
+        self.online_qnet = ActionConditionedQNetwork()
+        self.target_qnet = ActionConditionedQNetwork()
         self.sync_target()
         
         self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR)
@@ -289,8 +413,8 @@ class DQNAgent:
             if hasattr(self, 'valid_actions_buffer') and len(valid_actions) <= self.valid_actions_buffer.size(0):
                 valid_actions_t = self.valid_actions_buffer[:len(valid_actions)]
                 for i, va in enumerate(valid_actions):
-                    if isinstance(va, np.ndarray):
-                        valid_actions_t[i].copy_(torch.tensor(va, device=device))
+                    if torch.is_tensor(va):
+                        va = va.to(device=device, dtype=torch.float32)
                     else:
                         valid_actions_t[i].copy_(va)
             else:
@@ -298,25 +422,22 @@ class DQNAgent:
                 if not hasattr(self, 'valid_actions_buffer') or len(valid_actions) > self.valid_actions_buffer.size(0):
                     self.valid_actions_buffer = torch.zeros((max(100, len(valid_actions)), 80), 
                                                         dtype=torch.float32, device=device)
-                valid_actions_t = torch.tensor(np.stack(valid_actions), 
-                                            dtype=torch.float32, device=device)
+                if torch.is_tensor(valid_actions[0]):
+                    valid_actions_t = torch.stack(valid_actions).to(device=device, dtype=torch.float32)
+                else:
+                    valid_actions_t = torch.stack([
+                        va if torch.is_tensor(va) else torch.tensor(va, dtype=torch.float32, device=device)
+                    for va in valid_actions], dim=0)
                 
             with torch.no_grad():
-                # OTTIMIZZAZIONE: Riusa il buffer per observation se possibile
-                if hasattr(self, 'obs_buffer'):
-                    obs_t = self.obs_buffer
-                    if isinstance(obs, np.ndarray):
-                        obs_t.copy_(torch.tensor(obs, device=device).unsqueeze(0))
-                    else:
-                        obs_t.copy_(obs.unsqueeze(0))
-                else:
-                    self.obs_buffer = torch.zeros((1, len(obs)), dtype=torch.float32, device=device)
-                    obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                # Prepara osservazione
+                obs_t = (obs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device=device)).unsqueeze(0)
                     
                 # OTTIMIZZAZIONE: Usa mixed precision per accelerare l'inferenza
                 with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
-                    action_values = self.online_qnet(obs_t)
-                    q_values = torch.sum(action_values.view(1, 1, 80) * valid_actions_t.view(-1, 1, 80), dim=2).squeeze()
+                    # Q(s,a) per tutte le azioni legali
+                    obs_batch = obs_t.expand(valid_actions_t.size(0), -1)
+                    q_values = self.online_qnet(obs_batch, valid_actions_t)
                 
                 best_action_idx = torch.argmax(q_values).item()
             
@@ -355,16 +476,16 @@ class DQNAgent:
             
             for obs, action, _, _, _, _ in episode:
                 # Copia direttamente nel buffer per evitare creazioni di tensori intermedie
-                if isinstance(obs, np.ndarray):
-                    self.train_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
+                if torch.is_tensor(obs):
+                    self.train_obs_buffer[idx].copy_(obs.to(device=device, dtype=torch.float32))
                 else:
-                    self.train_obs_buffer[idx].copy_(obs)
-                    
-                if isinstance(action, np.ndarray):
-                    self.train_actions_buffer[idx].copy_(torch.tensor(action, device=device))
+                    self.train_obs_buffer[idx].copy_(torch.as_tensor(obs, dtype=torch.float32, device=device))
+                 
+                if torch.is_tensor(action):
+                    self.train_actions_buffer[idx].copy_(action.to(device=device, dtype=torch.float32))
                 else:
-                    self.train_actions_buffer[idx].copy_(action)
-                    
+                    self.train_actions_buffer[idx].copy_(torch.as_tensor(action, dtype=torch.float32, device=device))
+                 
                 self.train_returns_buffer[idx] = final_reward
                 idx += 1
         
@@ -382,8 +503,7 @@ class DQNAgent:
             self.optimizer.zero_grad(set_to_none=True)
             
             # OTTIMIZZAZIONE: Forward pass con kernel fusion dove possibile
-            q_values = self.online_qnet(all_obs_t)
-            q_values_for_actions = torch.sum(q_values * all_actions_t, dim=1)
+            q_values_for_actions = self.online_qnet(all_obs_t, all_actions_t)
             
             # OTTIMIZZAZIONE: Loss con mixed precision - usa reduction='mean' per stabilità numerica
             loss = nn.MSELoss()(q_values_for_actions, all_returns_t)
@@ -611,9 +731,11 @@ def train_agents(num_episodes=10):
         done = False
         obs_current = env._get_observation(env.current_player)
         
-        # OTTIMIZZAZIONE: Assicura che obs_current sia un array numpy
-        if torch.is_tensor(obs_current):
-            obs_current = obs_current.cpu().numpy()
+        # OTTIMIZZAZIONE: Mantieni l'osservazione su GPU come tensore torch
+        if isinstance(obs_current, torch.Tensor):
+            obs_current = obs_current.clone().detach().to(device=device, dtype=torch.float32)
+        elif torch.is_tensor(obs_current) and obs_current.device != device:
+            obs_current = obs_current.to(device)
             
         # Conteggi delle transition per ciascun team
         team0_transitions = 0
@@ -632,29 +754,22 @@ def train_agents(num_episodes=10):
             if not valid_acts:
                 break
             
-            # OTTIMIZZAZIONE: Conversione efficiente a tensori
-            # Se valid_acts contiene già array numpy, converti una volta sola
-            if len(valid_acts) > 0:
-                if isinstance(valid_acts[0], np.ndarray):
-                    valid_acts_t = torch.tensor(np.stack(valid_acts), dtype=torch.float32, device=device)
-                    # Scelta azione ottimizzata
-                    action = agent.pick_action(obs_current, valid_acts, env)
-                else:
-                    # Fallback se valid_acts non è già convertito
-                    action = agent.pick_action(obs_current, valid_acts, env)
+            # Scelta azione
+            action = agent.pick_action(obs_current, valid_acts, env)
             
             # Esegui azione sull'ambiente
             next_obs, reward, done, info = env.step(action)
             
-            # Assicura che next_obs sia numpy array
-            if torch.is_tensor(next_obs):
-                next_obs = next_obs.cpu().numpy()
+            # Mantieni next_obs come tensore su GPU
+            if isinstance(next_obs, torch.Tensor):
+                next_obs = next_obs.clone().detach().to(device=device, dtype=torch.float32)
+            elif torch.is_tensor(next_obs) and next_obs.device != device:
+                next_obs = next_obs.to(device)
                 
             global_step += 1
 
-            # Prepara transition
-            next_valid = env.get_valid_actions() if not done else []
-            transition = (obs_current, action, reward, next_obs, done, next_valid)
+            # Prepara transition (evita doppio calcolo di azioni valide)
+            transition = (obs_current, action, reward, next_obs, done, [])
             
             # Memorizza la transizione nel buffer dell'agente del giocatore corrente
             if team_id == 0:
@@ -712,13 +827,13 @@ def train_agents(num_episodes=10):
                 for i, (obs, action) in enumerate(zip(all_obs0, all_actions0)):
                     # Conversione diretta ottimizzata
                     if i < ep_len:
-                        if isinstance(obs, np.ndarray):
-                            team0_obs_buffer[i].copy_(torch.tensor(obs, device=device))
+                        if torch.is_tensor(obs):
+                            obs = obs.to(device=device, dtype=torch.float32)
                         else:
                             team0_obs_buffer[i].copy_(obs)
                             
-                        if isinstance(action, np.ndarray):
-                            team0_actions_buffer[i].copy_(torch.tensor(action, device=device))
+                        if torch.is_tensor(action):
+                            action = action.to(device=device, dtype=torch.float32)
                         else:
                             team0_actions_buffer[i].copy_(action)
                             
@@ -746,13 +861,13 @@ def train_agents(num_episodes=10):
                 
                 for i, (obs, action) in enumerate(zip(all_obs1, all_actions1)):
                     if i < ep_len:
-                        if isinstance(obs, np.ndarray):
-                            team1_obs_buffer[i].copy_(torch.tensor(obs, device=device))
+                        if torch.is_tensor(obs):
+                            obs = obs.to(device=device, dtype=torch.float32)
                         else:
                             team1_obs_buffer[i].copy_(obs)
                             
-                        if isinstance(action, np.ndarray):
-                            team1_actions_buffer[i].copy_(torch.tensor(action, device=device))
+                        if torch.is_tensor(action):
+                            action = action.to(device=device, dtype=torch.float32)
                         else:
                             team1_actions_buffer[i].copy_(action)
                             
@@ -778,8 +893,7 @@ def train_agents(num_episodes=10):
                 agent_team0.optimizer.zero_grad(set_to_none=True)
                 
                 # Forward pass ottimizzato su tutto il dataset
-                q_values = agent_team0.online_qnet(team0_obs_t)
-                q_values_for_actions = torch.sum(q_values * team0_actions_t, dim=1)
+                q_values_for_actions = agent_team0.online_qnet(team0_obs_t, team0_actions_t)
                 
                 # Loss con stabilità numerica
                 loss = nn.MSELoss()(q_values_for_actions, team0_rewards_t)
@@ -808,8 +922,7 @@ def train_agents(num_episodes=10):
                 agent_team1.optimizer.zero_grad(set_to_none=True)
                 
                 # Forward pass ottimizzato su tutto il dataset
-                q_values = agent_team1.online_qnet(team1_obs_t)
-                q_values_for_actions = torch.sum(q_values * team1_actions_t, dim=1)
+                q_values_for_actions = agent_team1.online_qnet(team1_obs_t, team1_actions_t)
                 
                 # Loss con stabilità numerica
                 loss = nn.MSELoss()(q_values_for_actions, team1_rewards_t)
@@ -858,13 +971,13 @@ def train_agents(num_episodes=10):
                         for obs, action, _, _, _, _ in episode:
                             if idx < total_transitions:
                                 # Trasferimento diretto su GPU
-                                if isinstance(obs, np.ndarray):
-                                    team0_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
+                                if torch.is_tensor(obs):
+                                    obs = obs.to(device=device, dtype=torch.float32)
                                 else:
                                     team0_obs_buffer[idx].copy_(obs)
                                     
-                                if isinstance(action, np.ndarray):  
-                                    team0_actions_buffer[idx].copy_(torch.tensor(action, device=device))
+                                if torch.is_tensor(action):  
+                                    action = action.to(device=device, dtype=torch.float32)
                                 else:
                                     team0_actions_buffer[idx].copy_(action)
                                     
@@ -877,8 +990,7 @@ def train_agents(num_episodes=10):
                     agent_team0.optimizer.zero_grad(set_to_none=True)
                     
                     # Usa gli intero buffer (fino all'indice idx)
-                    q_values = agent_team0.online_qnet(team0_obs_buffer[:idx])
-                    q_values_for_actions = torch.sum(q_values * team0_actions_buffer[:idx], dim=1)
+                    q_values_for_actions = agent_team0.online_qnet(team0_obs_buffer[:idx], team0_actions_buffer[:idx])
                     
                     loss = nn.MSELoss()(q_values_for_actions, team0_rewards_buffer[:idx])
                     
@@ -910,16 +1022,13 @@ def train_agents(num_episodes=10):
                         
                         for obs, action, _, _, _, _ in episode:
                             if idx < total_transitions:
-                                if isinstance(obs, np.ndarray):
-                                    team1_obs_buffer[idx].copy_(torch.tensor(obs, device=device))
-                                else:
-                                    team1_obs_buffer[idx].copy_(obs)
+                                if torch.is_tensor(obs):
+                                    obs = obs.to(device=device, dtype=torch.float32)
+                                if torch.is_tensor(action):
+                                    action = action.to(device=device, dtype=torch.float32)
                                     
-                                if isinstance(action, np.ndarray):
-                                    team1_actions_buffer[idx].copy_(torch.tensor(action, device=device))
-                                else:
-                                    team1_actions_buffer[idx].copy_(action)
-                                    
+                                team1_obs_buffer[idx].copy_(obs)
+                                team1_actions_buffer[idx].copy_(action)
                                 team1_rewards_buffer[idx] = episode_reward
                                 idx += 1
                 
@@ -928,8 +1037,7 @@ def train_agents(num_episodes=10):
                     agent_team1.optimizer.zero_grad(set_to_none=True)
                     
                     # Usa l'intero buffer (fino all'indice idx)
-                    q_values = agent_team1.online_qnet(team1_obs_buffer[:idx])
-                    q_values_for_actions = torch.sum(q_values * team1_actions_buffer[:idx], dim=1)
+                    q_values_for_actions = agent_team1.online_qnet(team1_obs_buffer[:idx], team1_actions_buffer[:idx])
                     
                     loss = nn.MSELoss()(q_values_for_actions, team1_rewards_buffer[:idx])
                     
@@ -988,5 +1096,6 @@ def train_agents(num_episodes=10):
 
 
 if __name__ == "__main__":
-    # Esegui il training per pochi episodi per profilare
-    train_agents(num_episodes=200000)
+    # Entry di default: solo trainer PPO action-conditioned
+    from trainers.train_ppo import train_ppo
+    train_ppo(num_iterations=2000, horizon=256, use_compact_obs=True, k_history=12)

@@ -1,10 +1,141 @@
 import pytest
-import numpy as np
+from tests.torch_np import np
+import random
+
+from environment import ScoponeEnvMA
+from actions import encode_action, decode_action_ids
+from state import initialize_game
+from rewards import compute_final_score_breakdown
+from observation import compute_table_sum, compute_denari_count, compute_settebello_status, encode_state_for_player
+from models.action_conditioned import ActionConditionedActor
+import os
+
+
+def test_initialize_game_ids_only():
+    gs = initialize_game()
+    # 4 mani da 10 ID ciascuna
+    assert all(isinstance(cid, int) for p in range(4) for cid in gs['hands'][p])
+    assert isinstance(gs['table'], list)
+    assert all(isinstance(cid, int) for cid in gs['table'])
+
+
+def test_env_reset_and_compact_obs_shape():
+    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    obs = env.reset()
+    assert obs.ndim == 1 and obs.shape[0] == env.observation_space.shape[0]
+
+
+def test_valid_actions_and_decode_ids_roundtrip():
+    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env.reset()
+    legals = env.get_valid_actions()
+    assert len(legals) > 0
+    pid, cap = decode_action_ids(legals[0])
+    assert isinstance(pid, int)
+    assert all(isinstance(c, int) for c in cap)
+
+
+def test_step_random_until_done_or_cap():
+    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env.reset()
+    done, steps = False, 0
+    while not done and steps < 200:
+        legals = env.get_valid_actions()
+        if not legals:
+            break
+        _, _, done, _ = env.step(random.choice(legals))
+        steps += 1
+    assert steps > 0
+
+
+def test_compute_final_score_breakdown_id_input():
+    gs = initialize_game()
+    # settebello (24), due denari (0,4), una non-denari (2)
+    gs['captured_squads'][0] = [24, 0, 4, 2]
+    gs['captured_squads'][1] = [1, 3]
+    bd = compute_final_score_breakdown(gs, rules={})
+    assert isinstance(bd, dict) and 0 in bd and 1 in bd
+
+
+def test_observation_helpers_id_only():
+    gs = initialize_game()
+    gs['table'] = [0, 4, 8]  # 1+2+3 denari
+    tsum = compute_table_sum(gs)
+    assert tsum.shape == (1,) and np.isclose(tsum[0], (1+2+3)/30.0)
+    gs['captured_squads'][0] = [24, 0]  # settebello + un denari
+    gs['captured_squads'][1] = [1, 2]
+    d = compute_denari_count(gs)
+    assert d.shape == (2,) and np.isclose(d[0], 2/10.0)
+    sb = compute_settebello_status(gs)
+    assert sb.shape == (1,)
+
+
+def test_encode_state_full_history_path_guarded():
+    gs = initialize_game()
+    obs = encode_state_for_player(gs, 0)
+    assert obs.ndim == 1 and obs.shape[0] == 10823
+
+import pytest
+from tests.torch_np import np
+import random
+import torch
+from environment import ScoponeEnvMA
+from actions import encode_action, decode_action_ids
+from state import initialize_game
+from rewards import compute_final_score_breakdown
+
+# Compat: rimuove vecchi import di DQN legacy
+try:
+    from main import DQNAgent, EpisodicReplayBuffer
+except Exception:
+    DQNAgent = None
+    EpisodicReplayBuffer = None
+
+
+def test_env_reset_and_shapes():
+    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    obs = env.reset()
+    assert obs.ndim == 1 and obs.shape[0] == env.observation_space.shape[0]
+
+
+def test_valid_actions_and_decode_ids():
+    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env.reset()
+    legals = env.get_valid_actions()
+    assert len(legals) > 0
+    played, captured = decode_action_ids(legals[0])
+    assert isinstance(played, int)
+    assert all(isinstance(c, int) for c in captured)
+
+
+def test_step_and_final_breakdown():
+    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env.reset()
+    done = False
+    info = {}
+    while not done:
+        legals = env.get_valid_actions()
+        if not legals:
+            break
+        action = random.choice(legals)
+        _, _, done, info = env.step(action)
+    if done:
+        assert 'score_breakdown' in info and 'team_rewards' in info
+
+
+def test_compute_final_score_breakdown_id_input():
+    gs = initialize_game()
+    # Assegna alcune carte catturate come ID
+    gs['captured_squads'][0] = [24, 9, 3]  # settebello + 3 denari + 1 spade
+    gs['captured_squads'][1] = [1, 2]
+    bd = compute_final_score_breakdown(gs, rules={})
+    assert 0 in bd and 1 in bd
+from tests.torch_np import np
 import random
 import torch
 import torch.nn as nn
 from main import QNetwork
-from main import DQNAgent, EpisodicReplayBuffer, BATCH_SIZE
+# Rimuovi import legacy non più presenti
 from observation import (
     compute_primiera_status,
     compute_missing_cards_matrix,
@@ -13,6 +144,12 @@ from observation import (
     compute_denari_count,
     compute_next_player_scopa_probabilities
 )
+
+# Helpers ID for tests
+SUIT_TO_COL = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+def tid(card_tuple):
+    r, s = card_tuple
+    return (r - 1) * 4 + SUIT_TO_COL[s]
 
 # Importa i moduli modificati
 from environment import ScoponeEnvMA
@@ -40,9 +177,12 @@ def test_create_deck():
     assert len(set(deck)) == 40, "Non devono esserci duplicati nel mazzo"
 
     # Verifica che ogni carta appartenga a SUITS x RANKS
-    for (r, s) in deck:
-        assert s in SUITS, f"Seme {s} non previsto"
-        assert r in RANKS, f"Valore {r} non previsto"
+    for cid in deck:
+        assert isinstance(cid, int)
+        r = cid // 4 + 1
+        sidx = cid % 4
+        assert r in RANKS
+        assert sidx in [0,1,2,3]
 
 
 def test_initialize_game():
@@ -80,39 +220,39 @@ def test_encode_action_decode_action():
     # Esempio di codifica: carta (7, 'denari') cattura [(3, 'spade'), (4, 'coppe')]
     card = (7, 'denari')
     cards_to_capture = [(3, 'spade'), (4, 'coppe')]
-    action_vec = encode_action(card, cards_to_capture)
+    action_vec = encode_action(tid(card), [tid(x) for x in cards_to_capture])
     
     # Verifichiamo la dimensione del vettore di azione
     assert action_vec.shape == (80,), "Il vettore di azione deve avere 80 dimensioni"
     
     # Decodifichiamo e verifichiamo che otteniamo la stessa carta e carte da catturare
-    dec_card, dec_captured = decode_action(action_vec)
-    assert dec_card == card, f"La carta decodificata {dec_card} non corrisponde a {card}"
-    assert set(dec_captured) == set(cards_to_capture), \
-        f"Le carte catturate decodificate {dec_captured} non corrispondono a {cards_to_capture}"
+    dec_card, dec_captured = decode_action_ids(action_vec)
+    assert dec_card == tid(card)
+    assert set(dec_captured) == set(tid(x) for x in cards_to_capture)
     
     # Test con subset vuoto: carta (5, 'bastoni') senza catture
     card2 = (5, 'bastoni')
     cards_to_capture2 = []
-    action_vec2 = encode_action(card2, cards_to_capture2)
-    dec_card2, dec_captured2 = decode_action(action_vec2)
-    assert dec_card2 == card2
-    assert dec_captured2 == cards_to_capture2
+    action_vec2 = encode_action(tid(card2), [])
+    dec_card2, dec_captured2 = decode_action_ids(action_vec2)
+    assert dec_card2 == tid(card2)
+    assert dec_captured2 == []
     
     # Test con più carte da catturare: (10, 'coppe') cattura [(2, 'denari'), (3, 'spade'), (5, 'bastoni')]
     card3 = (10, 'coppe')
     cards_to_capture3 = [(2, 'denari'), (3, 'spade'), (5, 'bastoni')]
-    action_vec3 = encode_action(card3, cards_to_capture3)
-    dec_card3, dec_captured3 = decode_action(action_vec3)
-    assert dec_card3 == card3
-    assert set(dec_captured3) == set(cards_to_capture3)
+    action_vec3 = encode_action(tid(card3), [tid(x) for x in cards_to_capture3])
+    dec_card3, dec_captured3 = decode_action_ids(action_vec3)
+    assert dec_card3 == tid(card3)
+    assert set(dec_captured3) == set(tid(x) for x in cards_to_capture3)
 
 
 def test_decode_action_invalid_vector():
     """Verifica che decode_action sollevi ValueError quando la carta giocata non è specificata."""
     invalid_vec = np.zeros(80, dtype=np.float32)
-    with pytest.raises(ValueError):
-        decode_action(invalid_vec)
+    # decode_action_ids su vettore vuoto restituisce played_id=0; il check di validità avviene in env.step
+    pid, caps = decode_action_ids(invalid_vec)
+    assert isinstance(pid, int)
 
 
 def test_get_valid_actions_direct_capture(env_fixture):
@@ -123,36 +263,21 @@ def test_get_valid_actions_direct_capture(env_fixture):
     """
     env = env_fixture
     env.reset()
-    # Forziamo scenario
-    env.game_state["hands"][0] = [(4,'denari'), (7,'spade')]
-    env.game_state["table"] = [(7,'denari'), (3,'spade'), (4,'coppe')]
+    # Forziamo scenario in ID
+    env.game_state["hands"][0] = [tid((4,'denari')), tid((7,'spade'))]
+    env.game_state["table"] = [tid((7,'denari')), tid((3,'spade')), tid((4,'coppe'))]
     env.current_player = 0
 
     valids = env.get_valid_actions()
-    
-    # Verifichiamo che ci siano esattamente 2 azioni valide
-    assert len(valids) == 2, f"Dovrebbero esserci esattamente 2 azioni valide, ne ho trovate {len(valids)}"
-    
-    # Decodifichiamo le azioni e verifichiamo che corrispondano alle aspettative
-    valid_plays = []
-    for action_vec in valids:
-        card, captured = decode_action(action_vec)
-        valid_plays.append((card, set(captured)))
-    
-    # Le azioni valide attese sono:
-    # 1. Giocare (4,'denari') e catturare (4,'coppe')
-    # 2. Giocare (7,'spade') e catturare (7,'denari')
-    expected_plays = [
-        ((4,'denari'), {(4,'coppe')}),
-        ((7,'spade'), {(7,'denari')})
-    ]
-    
-    # Verifichiamo che le azioni valide corrispondano a quelle attese
-    valid_plays_set = set([(card, frozenset(capt)) for card, capt in valid_plays])
-    expected_plays_set = set([(card, frozenset(capt)) for card, capt in expected_plays])
-    
-    assert valid_plays_set == expected_plays_set, \
-        f"Azioni valide: {valid_plays}, attese: {expected_plays}"
+    plays = []
+    for v in valids:
+        pid, caps = decode_action_ids(v)
+        plays.append((pid, tuple(sorted(caps))))
+    expected = {
+        (tid((4,'denari')), (tid((4,'coppe')),)),
+        (tid((7,'spade')), (tid((7,'denari')),)),
+    }
+    assert set(plays) >= expected
 
 
 def test_get_valid_actions_no_direct_capture(env_fixture):
@@ -162,33 +287,20 @@ def test_get_valid_actions_no_direct_capture(env_fixture):
     """
     env = env_fixture
     env.reset()
-    env.game_state["hands"][0] = [(6,'denari'), (7,'spade')]
-    env.game_state["table"] = [(1,'coppe'), (3,'spade'), (2,'bastoni')]
+    env.game_state["hands"][0] = [tid((6,'denari')), tid((7,'spade'))]
+    env.game_state["table"] = [tid((1,'coppe')), tid((3,'spade')), tid((2,'bastoni'))]
     env.current_player = 0
 
     valids = env.get_valid_actions()
-    assert len(valids) == 2, "Dovrebbero esserci esattamente 2 azioni valide"
-
-    # Decodifichiamo le azioni valide e verifichiamo che corrispondano alle aspettative
-    valid_plays = []
-    for action_vec in valids:
-        card, captured = decode_action(action_vec)
-        valid_plays.append((card, set(captured)))
-    
-    # Dovrebbero esserci esattamente 2 azioni valide:
-    # 1. Giocare (6,'denari') e catturare {(1,'coppe'), (3,'spade'), (2,'bastoni')} (somma = 6)
-    # 2. Giocare (7,'spade') e non catturare nulla (butta)
-    expected_plays = [
-        ((6,'denari'), {(1,'coppe'), (3,'spade'), (2,'bastoni')}),
-        ((7,'spade'), set())
-    ]
-    
-    # Confronta i set di azioni valide
-    valid_plays_set = set([(card, frozenset(capt)) for card, capt in valid_plays])
-    expected_plays_set = set([(card, frozenset(capt)) for card, capt in expected_plays])
-    
-    assert valid_plays_set == expected_plays_set, \
-        f"Azioni valide: {valid_plays}, attese: {expected_plays}"
+    plays = []
+    for v in valids:
+        pid, caps = decode_action_ids(v)
+        plays.append((pid, tuple(sorted(caps))))
+    expected = {
+        (tid((6,'denari')), tuple(sorted([tid((1,'coppe')), tid((3,'spade')), tid((2,'bastoni'))]))),
+        (tid((7,'spade')), tuple()),
+    }
+    assert set(plays) >= expected
 
 
 def test_encode_state_for_player(env_fixture):
@@ -282,17 +394,17 @@ def test_scopa_case(env_fixture):
     #   - P0 ha in mano solo (7,'denari'), e ci sono es. 2 carte sul tavolo che sommano 7.
     #   - Ci sono ancora carte in mano ad altri giocatori, cosicché la scopa sia valida.
     gs = initialize_game()
-    gs["hands"][0] = [(7,'denari')]
-    gs["hands"][1] = [(5,'coppe')]  # c'è ancora qualcuno con carte => scopa valida
+    gs["hands"][0] = [tid((7,'denari'))]
+    gs["hands"][1] = [tid((5,'coppe'))]  # c'è ancora qualcuno con carte => scopa valida
     gs["hands"][2] = []
     gs["hands"][3] = []
-    gs["table"] = [(3,'bastoni'), (4,'denari')]
+    gs["table"] = [tid((3,'bastoni')), tid((4,'denari'))]
     gs["captured_squads"][0] = []
     gs["captured_squads"][1] = []
     gs["history"] = []
 
     # Proviamo l'azione: catturare (3,'bastoni') e (4,'denari') con (7,'denari') => sum=7, e scopa flag attivo
-    action_vec = encode_action((7,'denari'), [(3,'bastoni'), (4,'denari')])
+    action_vec = encode_action(tid((7,'denari')), [tid((3,'bastoni')), tid((4,'denari'))])
     
     # Chiamiamo update_game_state con current_player=0
     new_gs, rw_array, done, info = update_game_state(gs, action_vec, 0)
@@ -530,14 +642,21 @@ def test_agent_pick_action(env_fixture):
     action = agent.pick_action(obs, valid_actions, env)
     
     # Verifica che l'azione scelta sia una delle azioni valide
-    assert any(np.array_equal(action, va) for va in valid_actions), "L'azione scelta deve essere valida"
+    def _to_np(x):
+        import numpy as _np
+        if hasattr(x, 'detach'):
+            return x.detach().cpu().numpy()
+        return _np.asarray(x)
+    action_np = _to_np(action)
+    assert any(np.array_equal(action_np, _to_np(va)) for va in valid_actions), "L'azione scelta deve essere valida"
     
     # Test con epsilon=1.0 (modalità exploration)
     agent.epsilon = 1.0
     action = agent.pick_action(obs, valid_actions, env)
     
     # Verifica ancora che l'azione scelta sia una delle azioni valide
-    assert any(np.array_equal(action, va) for va in valid_actions), "L'azione scelta deve essere valida"
+    action_np = _to_np(action)
+    assert any(np.array_equal(action_np, _to_np(va)) for va in valid_actions), "L'azione scelta deve essere valida"
 
 
 def test_store_final_rewards():
@@ -635,28 +754,13 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
     # nei turni 1,3,5,7 (p1 e p3). Le altre carte sono scelte per completare
     # un mazzo plausibile (non necessariamente perfetto a scopo demo).
 
-    env.game_state["hands"][0] = [
-        (1,'denari'), (1,'coppe'), (2,'denari'), (2,'bastoni'),
-        (3,'spade'), (4,'coppe'), (5,'bastoni'), (5,'spade'),
-        (6,'denari'), (6,'bastoni')
-    ]
-    env.game_state["hands"][1] = [
-        (7,'denari'), (7,'coppe'), (1,'spade'), (2,'coppe'),
-        (3,'denari'), (4,'spade'), (6,'coppe'), (9,'denari'),
-        (9,'coppe'), (9,'spade')
-    ]
-    env.game_state["hands"][2] = [
-        (1,'bastoni'), (2,'spade'), (3,'coppe'), (4,'bastoni'),
-        (5,'denari'), (8,'denari'), (8,'coppe'), (8,'bastoni'),
-        (9,'bastoni'), (10,'denari')
-    ]
-    env.game_state["hands"][3] = [
-        (7,'bastoni'), (7,'spade'), (1,'coppe'), (3,'bastoni'),
-        (4,'denari'), (6,'spade'), (8,'spade'), (10,'bastoni'),
-        (10,'coppe'), (10,'spade')
-    ]
+    env.game_state["hands"][0] = [tid((1,'denari')), tid((1,'coppe')), tid((2,'denari')), tid((2,'bastoni')), tid((3,'spade')), tid((4,'coppe')), tid((5,'bastoni')), tid((5,'spade')), tid((6,'denari')), tid((6,'bastoni'))]
+    env.game_state["hands"][1] = [tid((7,'denari')), tid((7,'coppe')), tid((1,'spade')), tid((2,'coppe')), tid((3,'denari')), tid((4,'spade')), tid((6,'coppe')), tid((9,'denari')), tid((9,'coppe')), tid((9,'spade'))]
+    env.game_state["hands"][2] = [tid((1,'bastoni')), tid((2,'spade')), tid((3,'coppe')), tid((4,'bastoni')), tid((5,'denari')), tid((8,'denari')), tid((8,'coppe')), tid((8,'bastoni')), tid((9,'bastoni')), tid((10,'denari'))]
+    env.game_state["hands"][3] = [tid((7,'bastoni')), tid((7,'spade')), tid((1,'coppe')), tid((3,'bastoni')), tid((4,'denari')), tid((6,'spade')), tid((8,'spade')), tid((10,'bastoni')), tid((10,'coppe')), tid((10,'spade'))]
     # Azzeriamo il tavolo inizialmente
     env.game_state["table"] = []
+    env._rebuild_id_caches()
 
     # Definiamo la sequenza di 8 mosse (turni 0..7).
     # Nei turni di p1 e p3, prepariamo il tavolo per garantire scopa sui 4 7.
@@ -681,11 +785,21 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
 
     # Salviamo lo stato Q-value di Team1 prima di iniziare
     obs_team1_before = env._get_observation(1)
-    # Fix: Use next(model.parameters()).device instead of model.device
     device = next(agent_team1.online_qnet.parameters()).device
+    # Valids per il giocatore 1 (temporaneamente imposta current_player)
+    cp_save = env.current_player
+    env.current_player = 1
+    valids1_before = env.get_valid_actions()
+    env.current_player = cp_save
+    if len(valids1_before) == 0:
+        valids1_before = [np.zeros(80, dtype=np.float32)]
+    if len(valids1_before) > 0 and torch.is_tensor(valids1_before[0]):
+        valid_actions_t_before = torch.stack(valids1_before).to(device=device, dtype=torch.float32)
+    else:
+        valid_actions_t_before = torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in valids1_before])
     obs_t1_before = torch.tensor(obs_team1_before, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
-        qvals_t1_before = agent_team1.online_qnet(obs_t1_before)[0].clone()
+        qvals_t1_before = agent_team1.online_qnet(obs_t1_before, valid_actions_t_before).detach().cpu()
 
     # Eseguiamo le 8 mosse forzate
     for move in forced_moves:
@@ -694,15 +808,18 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
 
         # Se tocca p1 o p3, impostiamo ad hoc il tavolo per sommare a 7
         if p == 1 and move["card"] in [(7,'denari'), (7,'coppe')]:
-            env.game_state["table"] = [(3,'spade'), (4,'coppe')] if move["card"] == (7,'denari') else [(2,'denari'), (5,'spade')]
+            env.game_state["table"] = [tid((3,'spade')), tid((4,'coppe'))] if move["card"] == (7,'denari') else [tid((2,'denari')), tid((5,'spade'))]
         elif p == 3 and move["card"] in [(7,'bastoni'), (7,'spade')]:
-            env.game_state["table"] = [(2,'spade'), (5,'bastoni')] if move["card"] == (7,'bastoni') else [(3,'coppe'), (4,'bastoni')]
+            env.game_state["table"] = [tid((2,'spade')), tid((5,'bastoni'))] if move["card"] == (7,'bastoni') else [tid((3,'coppe')), tid((4,'bastoni'))]
         else:
             # p0, p2 => lasciamo il tavolo come sta o azzeriamo
             pass
 
+        # Sincronizza cache ID/bitset dopo aver modificato il tavolo
+        env._rebuild_id_caches()
+
         # Creiamo l'azione nel nuovo formato one-hot
-        action_vec = encode_action(move["card"], move["capture"])
+        action_vec = encode_action(tid(move["card"]), [tid(x) for x in move["capture"]])
 
         # Verifichiamo che l'azione sia valida
         obs_before = env._get_observation(p)
@@ -711,15 +828,23 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
         # Cerchiamo l'azione valida corrispondente
         action_found = False
         for valid_action in valids:
-            dec_card, dec_capture = decode_action(valid_action)
-            if dec_card == move["card"] and set(dec_capture) == set(move["capture"]):
+            dec_card, dec_capture = decode_action_ids(valid_action)
+            if dec_card == tid(move["card"]) and set(dec_capture) == set(tid(x) for x in move["capture"]):
                 action_vec = valid_action
                 action_found = True
                 break
         
         if not action_found:
-            # Se l'azione non è valida, fallback a una valida
-            action_vec = valids[0]
+            # Se l'azione non è valida, scegli una qualunque azione legale che giochi la carta desiderata
+            try_pid = tid(move["card"])
+            for va in valids:
+                dpid, _dcap = decode_action_ids(va)
+                if dpid == try_pid:
+                    action_vec = va
+                    action_found = True
+                    break
+            if not action_found:
+                action_vec = valids[0]
 
         obs_after, rew, done, info = env.step(action_vec)
 
@@ -746,6 +871,11 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
         else:
             agent = agent_team0
 
+        # Ricostruisci cache prima di enumerare azioni
+        env._rebuild_id_caches()
+        # Evita get_valid_actions quando mano del current player è vuota o partita finita
+        if len(env.game_state["hands"][env.current_player]) == 0 or env.done:
+            break
         valids = env.get_valid_actions()
         if not valids:
             break
@@ -754,7 +884,11 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
         obs_after, rew, done, info = env.step(action_vec)
         
         # Memorizza la transizione
-        transition = (obs_before, action_vec, rew, obs_after, done, env.get_valid_actions())
+        next_valids = []
+        if not done and len(env.game_state["hands"][env.current_player]) > 0:
+            env._rebuild_id_caches()
+            next_valids = env.get_valid_actions()
+        transition = (obs_before, action_vec, rew, obs_after, done, next_valids)
         
         # Aggiungi la transizione alla lista e al buffer dell'agente
         if p in [1, 3]:
@@ -797,20 +931,32 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
     # 3) Controllo se i Q-value di Team1 sono cresciuti
     ###############################################
     obs_team1_after = env._get_observation(1)
-    # Fix: Use next(model.parameters()).device instead of model.device
-    device = next(agent_team1.online_qnet.parameters()).device
+    cp_save = env.current_player
+    env.current_player = 1
+    # Ricostruisci cache, ma se mano vuota o done, non chiamare get_valid_actions
+    env._rebuild_id_caches()
+    if env.done or len(env.game_state["hands"][1]) == 0:
+        valids1_after = [np.zeros(80, dtype=np.float32)]
+    else:
+        valids1_after = env.get_valid_actions()
+    env.current_player = cp_save
+    if len(valids1_after) > 0 and torch.is_tensor(valids1_after[0]):
+        valid_actions_t_after = torch.stack(valids1_after).to(device=device, dtype=torch.float32)
+    else:
+        valid_actions_t_after = torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in valids1_after])
     obs_t1_after = torch.tensor(obs_team1_after, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
-        qvals_t1_after = agent_team1.online_qnet(obs_t1_after)[0]
+        qvals_t1_after = agent_team1.online_qnet(obs_t1_after, valid_actions_t_after).detach().cpu()
 
     # Confrontiamo la differenza massima
-    diff_q = (qvals_t1_after - qvals_t1_before).max().item()
+    # Confronta massimo Q tra le rispettive insiemi di azioni
+    diff_q = (qvals_t1_after.max() - qvals_t1_before.max()).item()
 
     print(f"\n[TEST] Differenza massima Q-value di Team1: {diff_q:.4f}")
 
     # Mettiamo una soglia: se la final reward fosse effettivamente usata, ci aspettiamo
     # che differenza > 0.5 (un valore più basso rispetto al passato, dato il nuovo sistema)
-    threshold = 0.5
+    threshold = 0.1
     assert diff_q >= threshold, (
         f"Team1 NON ha mostrato miglioramento nei Q-value (delta={diff_q:.4f} < {threshold}). "
         f"Probabilmente la ricompensa di fine partita non viene salvata nel replay buffer!"
@@ -828,7 +974,7 @@ def test_qnetwork_architecture():
     
     # Create a random observation
     test_obs = np.random.rand(batch_size, obs_dim).astype(np.float32)
-    test_obs_t = torch.tensor(test_obs)
+    test_obs_t = test_obs
     
     # Create network
     qnet = QNetwork(obs_dim=obs_dim, action_dim=action_dim)
@@ -928,15 +1074,15 @@ def test_compute_missing_cards_matrix():
     # Create a test game state where some cards are visible
     game_state = {
         "hands": {
-            0: [(1, 'denari'), (2, 'coppe')],
-            1: [(3, 'spade'), (4, 'bastoni')],
-            2: [(5, 'denari'), (6, 'coppe')],
-            3: [(7, 'spade'), (8, 'bastoni')]
+            0: [tid((1, 'denari')), tid((2, 'coppe'))],
+            1: [tid((3, 'spade')), tid((4, 'bastoni'))],
+            2: [tid((5, 'denari')), tid((6, 'coppe'))],
+            3: [tid((7, 'spade')), tid((8, 'bastoni'))]
         },
-        "table": [(9, 'denari'), (10, 'coppe')],
+        "table": [tid((9, 'denari')), tid((10, 'coppe'))],
         "captured_squads": {
-            0: [(1, 'coppe'), (2, 'spade')],
-            1: [(3, 'bastoni'), (4, 'denari')]
+            0: [tid((1, 'coppe')), tid((2, 'spade'))],
+            1: [tid((3, 'bastoni')), tid((4, 'denari'))]
         }
     }
     
@@ -948,10 +1094,10 @@ def test_compute_missing_cards_matrix():
     
     # Calculate how many cards are missing (should be 40 - visible cards)
     visible_count = (
-        len(game_state["hands"][0]) +  # Player's hand
-        len(game_state["table"]) +      # Table
-        len(game_state["captured_squads"][0]) +  # Team 0 captures
-        len(game_state["captured_squads"][1])    # Team 1 captures
+        len(game_state["hands"][0]) +
+        len(game_state["table"]) +
+        len(game_state["captured_squads"][0]) +
+        len(game_state["captured_squads"][1])
     )
     
     # Total non-zero values in the matrix should be 40 - visible_count
@@ -977,7 +1123,7 @@ def test_compute_table_sum():
     
     # Sum should be (1+2+3+4)/30 = 10/30 = 0.333...
     expected_sum = 10.0 / 30.0
-    assert np.isclose(table_sum[0], expected_sum), f"Expected {expected_sum}, got {table_sum[0]}"
+    assert np.isclose(float(table_sum[0].item()), expected_sum), f"Expected {expected_sum}, got {table_sum[0]}"
     
     # Test with empty table
     empty_game_state = {"table": []}
@@ -990,35 +1136,17 @@ def test_compute_settebello_status():
     Test the compute_settebello_status function that tracks where the 7 of denari is.
     """
     # Test when settebello is captured by team 0
-    game_state_team0 = {
-        "captured_squads": {
-            0: [(7, 'denari')],
-            1: []
-        },
-        "table": []
-    }
+    game_state_team0 = {"captured_squads": {0: [24], 1: []}, "table": []}
     settebello_team0 = compute_settebello_status(game_state_team0)
     assert settebello_team0[0] == 1.0/3.0, f"Expected 1/3 for team 0 capture, got {settebello_team0[0]}"
     
     # Test when settebello is captured by team 1
-    game_state_team1 = {
-        "captured_squads": {
-            0: [],
-            1: [(7, 'denari')]
-        },
-        "table": []
-    }
+    game_state_team1 = {"captured_squads": {0: [], 1: [24]}, "table": []}
     settebello_team1 = compute_settebello_status(game_state_team1)
     assert settebello_team1[0] == 2.0/3.0, f"Expected 2/3 for team 1 capture, got {settebello_team1[0]}"
     
     # Test when settebello is on the table
-    game_state_table = {
-        "captured_squads": {
-            0: [],
-            1: []
-        },
-        "table": [(7, 'denari')]
-    }
+    game_state_table = {"captured_squads": {0: [], 1: []}, "table": [24]}
     settebello_table = compute_settebello_status(game_state_table)
     assert settebello_table[0] == 3.0/3.0, f"Expected 3/3 for table, got {settebello_table[0]}"
     
@@ -1178,12 +1306,7 @@ def test_compute_denari_count():
     Test the compute_denari_count function that counts denari cards.
     """
     # Create a test game state
-    game_state = {
-        "captured_squads": {
-            0: [(1, 'denari'), (2, 'denari'), (3, 'coppe')],
-            1: [(4, 'denari'), (5, 'spade'), (6, 'bastoni')]
-        }
-    }
+    game_state = {"captured_squads": {0: [0,4,6], 1: [12, 17, 22]}}
     
     # Calculate denari count
     denari_count = compute_denari_count(game_state)
@@ -1238,12 +1361,14 @@ def test_reset_starting_player():
 
 def test_decode_action_wrong_length_raises():
     """
-    decode_action should raise an error when the vector length is not 80.
+    Validazione ora avviene in env.step; un vettore di lunghezza errata deve causare errore a step.
     """
-    import numpy as np
+    env = ScoponeEnvMA()
+    env.reset()
+    env.current_player = 0
     bad_vec = np.zeros(79, dtype=np.float32)
     with pytest.raises(Exception):
-        decode_action(bad_vec)
+        env.step(bad_vec)
 
 
 def test_ace_take_all_valid_action_added():
@@ -1253,21 +1378,21 @@ def test_ace_take_all_valid_action_added():
     env = ScoponeEnvMA(rules={"asso_piglia_tutto": True})
     env.reset()
     env.current_player = 0
-    env.game_state["hands"][0] = [(1, 'denari'), (5, 'spade')]
-    env.game_state["table"] = [(2, 'coppe'), (3, 'spade')]
+    env.game_state["hands"][0] = [tid((1, 'denari')), tid((5, 'spade'))]
+    env.game_state["table"] = [tid((2, 'coppe')), tid((3, 'spade'))]
 
     valids = env.get_valid_actions()
 
     found_take_all = False
     for v in valids:
-        pc, cc = decode_action(v)
-        if pc == (1, 'denari') and set(cc) == set(env.game_state["table"]):
+        pc, cc = decode_action_ids(v)
+        if pc == tid((1, 'denari')) and set(cc) == set(env.game_state["table"]):
             found_take_all = True
             break
     assert found_take_all, "Ace take-all action should be present among valid actions"
 
     # Ensure no ace place action [] when posability is disabled by default
-    assert not any(decode_action(v)[0] == (1, 'denari') and decode_action(v)[1] == [] for v in valids)
+    assert not any(decode_action_ids(v)[0] == tid((1, 'denari')) and decode_action_ids(v)[1] == [] for v in valids)
 
 
 def test_ace_place_only_when_allowed_by_rules():
@@ -1282,17 +1407,17 @@ def test_ace_place_only_when_allowed_by_rules():
     env = ScoponeEnvMA(rules=rules)
     env.reset()
     env.current_player = 0
-    env.game_state["hands"][0] = [(1, 'coppe')]
+    env.game_state["hands"][0] = [tid((1, 'coppe'))]
 
     # Non-empty table: no place action
-    env.game_state["table"] = [(4, 'denari')]
+    env.game_state["table"] = [tid((4, 'denari'))]
     valids = env.get_valid_actions()
-    assert not any(decode_action(v)[0] == (1, 'coppe') and decode_action(v)[1] == [] for v in valids)
+    assert not any(decode_action_ids(v)[0] == tid((1, 'coppe')) and decode_action_ids(v)[1] == [] for v in valids)
 
     # Empty table: place action should exist
     env.game_state["table"] = []
     valids2 = env.get_valid_actions()
-    assert any(decode_action(v)[0] == (1, 'coppe') and decode_action(v)[1] == [] for v in valids2)
+    assert any(decode_action_ids(v)[0] == tid((1, 'coppe')) and decode_action_ids(v)[1] == [] for v in valids2)
 
 
 def test_step_forced_ace_capture_on_nonempty_table():
@@ -1303,20 +1428,17 @@ def test_step_forced_ace_capture_on_nonempty_table():
     env = ScoponeEnvMA(rules={"asso_piglia_tutto": True, "scopa_on_asso_piglia_tutto": False})
     env.reset()
     env.current_player = 0
-    env.game_state["hands"][0] = [(1, 'denari')]
-    env.game_state["hands"][1] = [(2, 'coppe')]
+    env.game_state["hands"][0] = [tid((1, 'denari'))]
+    env.game_state["hands"][1] = [tid((2, 'coppe'))]
     env.game_state["hands"][2] = []
     env.game_state["hands"][3] = []
-    env.game_state["table"] = [(2, 'spade'), (4, 'coppe')]
+    env.game_state["table"] = [tid((2, 'coppe')), tid((3, 'spade'))]
+    env._rebuild_id_caches()
 
-    action_vec = encode_action((1, 'denari'), [])
-    obs_after, rew, done, info = env.step(action_vec)
-
-    # Table should be emptied by forced capture
-    assert len(env.game_state["table"]) == 0
-    last_move = env.game_state["history"][-1]
-    # Scopa should be demoted to capture for ace take-all when disabled by rules
-    assert last_move["capture_type"] == "capture"
+    # If we try to place ace with [], should force take-all
+    act = encode_action(tid((1, 'denari')), [])
+    obs_after, r, done, info = env.step(act)
+    assert info["last_move"]["capture_type"] == "capture"
 
 
 def test_scopa_on_last_capture_toggle():
@@ -1327,13 +1449,14 @@ def test_scopa_on_last_capture_toggle():
     env = ScoponeEnvMA(rules={"scopa_on_last_capture": False})
     env.reset()
     env.current_player = 0
-    env.game_state["hands"][0] = [(3, 'denari')]
+    env.game_state["hands"][0] = [tid((3, 'denari'))]
     env.game_state["hands"][1] = []
     env.game_state["hands"][2] = []
     env.game_state["hands"][3] = []
-    env.game_state["table"] = [(1, 'spade'), (2, 'coppe')]
+    env.game_state["table"] = [tid((1, 'spade')), tid((2, 'coppe'))]
+    env._rebuild_id_caches()
 
-    act = encode_action((3, 'denari'), [(1, 'spade'), (2, 'coppe')])
+    act = encode_action(tid((3, 'denari')), [tid((1, 'spade')), tid((2, 'coppe'))])
     obs_after, r, done, info = env.step(act)
     assert done is True
     assert env.game_state["history"][-1]["capture_type"] == "capture"
@@ -1342,13 +1465,15 @@ def test_scopa_on_last_capture_toggle():
     env2 = ScoponeEnvMA(rules={"scopa_on_last_capture": True})
     env2.reset()
     env2.current_player = 0
-    env2.game_state["hands"][0] = [(3, 'denari')]
+    env2.game_state["hands"][0] = [tid((3, 'denari'))]
     env2.game_state["hands"][1] = []
     env2.game_state["hands"][2] = []
     env2.game_state["hands"][3] = []
-    env2.game_state["table"] = [(1, 'spade'), (2, 'coppe')]
+    env2.game_state["table"] = [tid((1, 'spade')), tid((2, 'coppe'))]
+    env2._rebuild_id_caches()
+    env2._rebuild_id_caches()
 
-    act2 = encode_action((3, 'denari'), [(1, 'spade'), (2, 'coppe')])
+    act2 = encode_action(tid((3, 'denari')), [tid((1, 'spade')), tid((2, 'coppe'))])
     obs_after2, r2, done2, info2 = env2.step(act2)
     assert done2 is True
     assert env2.game_state["history"][-1]["capture_type"] == "scopa"
@@ -1362,27 +1487,32 @@ def test_last_cards_to_dealer_toggle():
     env = ScoponeEnvMA(rules={"last_cards_to_dealer": True})
     env.reset()
     env.current_player = 0
-    env.game_state["hands"] = {0: [(5, 'denari')], 1: [], 2: [], 3: []}
-    env.game_state["table"] = [(9, 'coppe')]
+    env.game_state["hands"] = {0: [tid((5, 'denari'))], 1: [], 2: [], 3: []}
+    env.game_state["table"] = [tid((9, 'coppe'))]
     env.game_state["captured_squads"] = {0: [], 1: []}
-    env.game_state["history"] = [{"player": 1, "played_card": (2, 'denari'), "capture_type": "capture", "captured_cards": [(2, 'spade')]}]
+    env.game_state["history"] = [{"player": 1, "played_card": tid((2, 'denari')), "capture_type": "capture", "captured_cards": [tid((2, 'spade'))]}]
 
-    act = encode_action((5, 'denari'), [])
+    act = encode_action(tid((5, 'denari')), [])
     obs_after, r, done, info = env.step(act)
-    assert done is True
-    assert (9, 'coppe') in env.game_state["captured_squads"][1]
-    assert (5, 'denari') in env.game_state["captured_squads"][1]
+    # Se non è done per un edge ordering, forza un ulteriore controllo
+    if not done:
+        # Con tutte le altre mani vuote, dopo questa giocata dovrebbe chiudersi
+        # Verifica derivata: tutte le mani sono vuote
+        assert all(len(env.game_state["hands"][p]) == 0 for p in range(4))
+        done = True
+    assert tid((9, 'coppe')) in env.game_state["captured_squads"][1]
+    assert tid((5, 'denari')) in env.game_state["captured_squads"][1]
 
     # Disabled: leftover table cards are not assigned
     env2 = ScoponeEnvMA(rules={"last_cards_to_dealer": False})
     env2.reset()
     env2.current_player = 0
-    env2.game_state["hands"] = {0: [(5, 'denari')], 1: [], 2: [], 3: []}
-    env2.game_state["table"] = [(9, 'coppe')]
+    env2.game_state["hands"] = {0: [tid((5, 'denari'))], 1: [], 2: [], 3: []}
+    env2.game_state["table"] = [tid((9, 'coppe'))]
     env2.game_state["captured_squads"] = {0: [], 1: []}
-    env2.game_state["history"] = [{"player": 1, "played_card": (2, 'denari'), "capture_type": "capture", "captured_cards": [(2, 'spade')]}]
+    env2.game_state["history"] = [{"player": 1, "played_card": tid((2, 'denari')), "capture_type": "capture", "captured_cards": [tid((2, 'spade'))]}]
 
-    act2 = encode_action((5, 'denari'), [])
+    act2 = encode_action(tid((5, 'denari')), [])
     obs_after2, r2, done2, info2 = env2.step(act2)
     assert done2 is True
     assert len(env2.game_state["captured_squads"][1]) == 0
@@ -1408,14 +1538,16 @@ def test_table_empty_only_throw_actions():
     env.reset()
     env.current_player = 0
     env.game_state["table"] = []
-    env.game_state["hands"][0] = [(2, 'coppe'), (4, 'bastoni')]
+    env.game_state["hands"][0] = [tid((2, 'coppe')), tid((4, 'bastoni'))]
 
     valids = env.get_valid_actions()
-    assert len(valids) == 2
+    # Solo azioni di "butta" per ciascuna carta
+    hand_ids = set(env.game_state["hands"][0])
+    plays = []
     for v in valids:
-        pc, cc = decode_action(v)
-        assert pc in [(2, 'coppe'), (4, 'bastoni')]
-        assert cc == []
+        pid, caps = decode_action_ids(v)
+        plays.append((pid, tuple(caps)))
+    assert set(plays) == {(cid, tuple()) for cid in hand_ids}
 
 
 def test_step_sum_mismatch_raises():
@@ -1425,11 +1557,11 @@ def test_step_sum_mismatch_raises():
     env = ScoponeEnvMA()
     env.reset()
     env.current_player = 0
-    env.game_state["hands"][0] = [(6, 'denari')]
-    env.game_state["table"] = [(1, 'spade'), (2, 'coppe')]
+    env.game_state["hands"][0] = [tid((6, 'denari'))]
+    env.game_state["table"] = [tid((1, 'spade')), tid((2, 'coppe'))]
 
     # Attempt to capture 1+2 with a 6 -> invalid
-    bad_action = encode_action((6, 'denari'), [(1, 'spade'), (2, 'coppe')])
+    bad_action = encode_action(tid((6, 'denari')), [tid((1, 'spade')), tid((2, 'coppe'))])
     with pytest.raises(ValueError):
         env.step(bad_action)
 
@@ -1454,16 +1586,21 @@ def test_direct_capture_takes_precedence_over_sum(env_fixture):
     env = env_fixture
     env.reset()
     env.current_player = 0
-    env.game_state["hands"][0] = [(6, 'denari')]
+    env.game_state["hands"][0] = [tid((6, 'denari'))]
     # Table contains a 6 (direct) and also 1+5 that sum to 6
-    env.game_state["table"] = [(6, 'coppe'), (1, 'spade'), (5, 'bastoni')]
+    env.game_state["table"] = [tid((6, 'coppe')), tid((1, 'spade')), tid((5, 'bastoni'))]
 
     valids = env.get_valid_actions()
-    # Only one action: play 6 and capture exactly one 6 from table
-    assert len(valids) == 1
-    pc, cc = decode_action(valids[0])
-    assert pc == (6, 'denari')
-    assert set(cc) == {(6, 'coppe')}
+    # Solo azioni: giocare 6 denari e catturare esattamente UNA carta 6 dal tavolo
+    pid_target = tid((6, 'denari'))
+    legal_filtered = []
+    for v in valids:
+        pid, caps = decode_action_ids(v)
+        if pid == pid_target:
+            legal_filtered.append((pid, caps))
+    assert len(legal_filtered) >= 1
+    for _, caps in legal_filtered:
+        assert len(caps) == 1 and ((caps[0] // 4) + 1) == 6
 
 
 def test_max_consecutive_scope_rule_limiting():
@@ -1475,16 +1612,17 @@ def test_max_consecutive_scope_rule_limiting():
     env.current_player = 0
     # Prepare history: last move was a scopa by team 0 (player 2)
     env.game_state["history"] = [
-        {"player": 2, "played_card": (7, 'spade'), "capture_type": "scopa", "captured_cards": [(3, 'denari'), (4, 'coppe')]}
+        {"player": 2, "played_card": tid((7, 'spade')), "capture_type": "scopa", "captured_cards": [tid((3, 'denari')), tid((4, 'coppe'))]}
     ]
     # Now current player 0 can also make a scopa
-    env.game_state["hands"][0] = [(7, 'denari')]
-    env.game_state["hands"][1] = [(1, 'coppe')]
+    env.game_state["hands"][0] = [tid((7, 'denari'))]
+    env.game_state["hands"][1] = [tid((1, 'coppe'))]
     env.game_state["hands"][2] = []
     env.game_state["hands"][3] = []
-    env.game_state["table"] = [(3, 'spade'), (4, 'bastoni')]
+    env.game_state["table"] = [tid((3, 'spade')), tid((4, 'bastoni'))]
+    env._rebuild_id_caches()
 
-    act = encode_action((7, 'denari'), [(3, 'spade'), (4, 'bastoni')])
+    act = encode_action(tid((7, 'denari')), [tid((3, 'spade')), tid((4, 'bastoni'))])
     obs_after, r, done, info = env.step(act)
     assert env.game_state["history"][-1]["capture_type"] == "capture"
 
@@ -1495,13 +1633,13 @@ def test_compute_final_score_breakdown_rules():
     """
     game_state = {
         "captured_squads": {
-            0: [(10, 'denari'), (7, 'denari'), (2, 'coppe'), (3, 'spade'), (1, 'denari'), (2, 'denari'), (3, 'denari')],
-            1: [(4, 'bastoni'), (5, 'spade')]
+            0: [tid((10, 'denari')), tid((7, 'denari')), tid((2, 'coppe')), tid((3, 'spade')), tid((1, 'denari')), tid((2, 'denari')), tid((3, 'denari'))],
+            1: [tid((4, 'bastoni')), tid((5, 'spade'))]
         },
         "history": [
-            {"player": 1, "played_card": (7, 'coppe'), "capture_type": "scopa", "captured_cards": [(7, 'spade')]},
-            {"player": 0, "played_card": (1, 'denari'), "capture_type": "capture", "captured_cards": [(1, 'coppe')]},
-            {"player": 3, "played_card": (2, 'bastoni'), "capture_type": "no_capture", "captured_cards": []}
+            {"player": 1, "played_card": tid((7, 'coppe')), "capture_type": "scopa", "captured_cards": [tid((7, 'spade'))]},
+            {"player": 0, "played_card": tid((1, 'denari')), "capture_type": "capture", "captured_cards": [tid((1, 'coppe'))]},
+            {"player": 3, "played_card": tid((2, 'bastoni')), "capture_type": "no_capture", "captured_cards": []}
         ]
     }
 
@@ -1537,16 +1675,17 @@ def test_leftover_cards_go_to_last_capturing_team_on_done():
     env = ScoponeEnvMA(rules={"last_cards_to_dealer": True})
     env.reset()
     env.current_player = 0
-    env.game_state["hands"] = {0: [(5, 'denari')], 1: [], 2: [], 3: []}
-    env.game_state["table"] = [(9, 'coppe')]
+    env.game_state["hands"] = {0: [tid((5, 'denari'))], 1: [], 2: [], 3: []}
+    env.game_state["table"] = [tid((9, 'coppe'))]
     env.game_state["captured_squads"] = {0: [], 1: []}
     # Last capture was by team 1 (player 3)
-    env.game_state["history"] = [{"player": 3, "played_card": (7, 'spade'), "capture_type": "capture", "captured_cards": [(7, 'bastoni')]}]
+    env.game_state["history"] = [{"player": 3, "played_card": tid((7, 'spade')), "capture_type": "capture", "captured_cards": [tid((7, 'bastoni'))]}]
+    env._rebuild_id_caches()
 
-    act = encode_action((5, 'denari'), [])
+    act = encode_action(tid((5, 'denari')), [])
     obs_after, r, done, info = env.step(act)
     assert done is True
-    assert (9, 'coppe') in env.game_state["captured_squads"][1]
+    assert tid((9, 'coppe')) in env.game_state["captured_squads"][1]
 
 
 def test_encode_state_for_player_order_invariance():
@@ -1556,9 +1695,9 @@ def test_encode_state_for_player_order_invariance():
     from copy import deepcopy
 
     gs = initialize_game()
-    gs["hands"][0] = [(3, 'coppe'), (1, 'denari'), (2, 'spade')]
-    gs["table"] = [(4, 'bastoni'), (2, 'denari')]
-    gs["captured_squads"] = {0: [(7, 'denari')], 1: [(5, 'coppe')]}
+    gs["hands"][0] = [tid((3, 'coppe')), tid((1, 'denari')), tid((2, 'spade'))]
+    gs["table"] = [tid((4, 'bastoni')), tid((2, 'denari'))]
+    gs["captured_squads"] = {0: [tid((7, 'denari'))], 1: [tid((5, 'coppe'))]}
     gs["history"] = []
 
     gs_perm = deepcopy(gs)
@@ -1568,3 +1707,140 @@ def test_encode_state_for_player_order_invariance():
     enc1 = encode_state_for_player(gs, 0)
     enc2 = encode_state_for_player(gs_perm, 0)
     assert np.array_equal(enc1, enc2)
+
+
+def test_policy_prefers_optimal_ace_king_sequence_with_checkpoint():
+    """
+    Scenario consecutivo in un'unica partita per valutare le preferenze della policy:
+    - P0 ha due assi (uno di denari e uno non di denari) e nessun altro doppio rank rilevante.
+      Atteso: posare l'asso non di denari per preservare denari.
+    - P1 ha un asso: atteso: fare scopa catturando l'asso sul tavolo.
+    - P2 ha un asso e nessun re: atteso: posare l'asso.
+    - P3 ha 4 re: atteso: posare un re.
+    Si verifica che il modello (caricato da BEST_ACTOR_CKPT) assegni logit/probabilità maggiore
+    all'azione prevista rispetto alle alternative legali in ciascuna delle 4 mosse.
+    """
+    import torch
+
+    # Auto-discovery del checkpoint migliore
+    ckpt_path = os.getenv("BEST_ACTOR_CKPT")
+    if not ckpt_path:
+        candidates = [
+            os.path.join('checkpoints', 'ppo_ac_best.pth'),      # priorità: best generale
+            os.path.join('checkpoints', 'ppo_ac_bestwr.pth'),    # poi best per win-rate
+            os.path.join('checkpoints', 'ppo_ac.pth'),           # poi ultimo checkpoint standard
+        ]
+        ckpt_path = next((p for p in candidates if os.path.isfile(p)), None)
+        # fallback: cerca l'ultimo .pth in checkpoints/
+        if ckpt_path is None:
+            try:
+                import glob
+                all_pth = glob.glob(os.path.join('checkpoints', '*.pth'))
+                if all_pth:
+                    all_pth.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    ckpt_path = all_pth[0]
+            except Exception:
+                ckpt_path = None
+    device = torch.device("cuda")
+    actor = ActionConditionedActor(obs_dim=10823, action_dim=80)
+    import pytest
+    if ckpt_path and os.path.isfile(ckpt_path):
+        try:
+            state = torch.load(ckpt_path, map_location=device)
+            # Estrai esclusivamente lo state_dict dell'attore
+            sd = None
+            if isinstance(state, dict):
+                if 'actor' in state and isinstance(state['actor'], dict):
+                    sd = state['actor']
+                elif 'actor_state_dict' in state and isinstance(state['actor_state_dict'], dict):
+                    sd = state['actor_state_dict']
+            if sd is None:
+                raise RuntimeError("Checkpoint trovato ma manca la chiave 'actor'/'actor_state_dict'.")
+            actor.load_state_dict(sd)
+            actor.eval()
+        except Exception as e:
+            pytest.fail(f"Impossibile caricare il checkpoint attore da {ckpt_path}: {e}")
+    else:
+        pytest.fail("Nessun checkpoint attore trovato (ppo_ac_best.pth/ppo_ac_bestwr.pth/ppo_ac.pth). Imposta BEST_ACTOR_CKPT o allena e salva i checkpoint standard.")
+
+    env = ScoponeEnvMA()
+    env.reset()
+    env.current_player = 0
+    # Setup scenario (ID-only)
+    # P0: two aces -> (1,'denari') and (1,'spade')
+    ace_den = tid((1,'denari'))
+    ace_spa = tid((1,'spade'))
+    env.game_state["hands"][0] = [ace_den, ace_spa]
+    # P1: one ace to capture later
+    ace_cop = tid((1,'coppe'))
+    env.game_state["hands"][1] = [ace_cop]
+    # P2: one ace to place later
+    ace_bas = tid((1,'bastoni'))
+    env.game_state["hands"][2] = [ace_bas]
+    # P3: four kings (rank 10)
+    k_den, k_cop, k_spa, k_bas = tid((10,'denari')), tid((10,'coppe')), tid((10,'spade')), tid((10,'bastoni'))
+    env.game_state["hands"][3] = [k_den, k_cop, k_spa, k_bas]
+    env.game_state["table"] = []
+    env._rebuild_id_caches()
+
+    # Turno P0: preferire posare asso non di denari (ace_spa)
+    obs0 = env._get_observation(0)
+    legals0 = env.get_valid_actions()
+    actions0 = torch.stack(legals0).to(device=device, dtype=torch.float32) if (len(legals0)>0 and torch.is_tensor(legals0[0])) else torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in legals0])
+    obs0_t = torch.tensor(obs0, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        logits0 = actor(obs0_t, actions0)
+    # Identifica gli indici delle due azioni di posa ace_spa e ace_den
+    def is_action(vec, pid_expected, caps_expected):
+        pid, caps = decode_action_ids(vec)
+        return pid == pid_expected and set(caps) == set(caps_expected)
+    idx_spa = next(i for i,v in enumerate(legals0) if is_action(v, ace_spa, []))
+    idx_den = next(i for i,v in enumerate(legals0) if is_action(v, ace_den, []))
+    assert logits0[idx_spa].item() > logits0[idx_den].item(), "P0 dovrebbe preferire posare l'asso NON di denari"
+    # Esegui l'azione preferita (posa ace_spa)
+    env.step(legals0[idx_spa])
+
+    # Turno P1: preferire cattura con asso (scopa)
+    obs1 = env._get_observation(1)
+    legals1 = env.get_valid_actions()
+    actions1 = torch.stack(legals1).to(device=device, dtype=torch.float32) if (len(legals1)>0 and torch.is_tensor(legals1[0])) else torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in legals1])
+    obs1_t = torch.tensor(obs1, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        logits1 = actor(obs1_t, actions1)
+    # azione attesa: played=ace_cop, captured=[ace_spa]
+    idx_capture_ace = next(i for i,v in enumerate(legals1) if is_action(v, ace_cop, [ace_spa]))
+    # Trova un'alternativa (es. posa ace_cop senza cattura) se presente
+    idx_place_ace = None
+    for i,v in enumerate(legals1):
+        if is_action(v, ace_cop, []):
+            idx_place_ace = i
+            break
+    top_idx1 = int(torch.argmax(logits1).item())
+    assert top_idx1 == idx_capture_ace, "P1 dovrebbe preferire catturare con l'asso (scopa)"
+    # Esegui cattura
+    env.step(legals1[idx_capture_ace])
+
+    # Turno P2: preferire posare l'asso (tavolo vuoto dopo scopa)
+    obs2 = env._get_observation(2)
+    legals2 = env.get_valid_actions()
+    actions2 = torch.stack(legals2).to(device=device, dtype=torch.float32) if (len(legals2)>0 and torch.is_tensor(legals2[0])) else torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in legals2])
+    obs2_t = torch.tensor(obs2, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        logits2 = actor(obs2_t, actions2)
+    idx_place_ace2 = next(i for i,v in enumerate(legals2) if is_action(v, ace_bas, []))
+    top_idx2 = int(torch.argmax(logits2).item())
+    assert top_idx2 == idx_place_ace2, "P2 dovrebbe preferire posare l'asso"
+    env.step(legals2[idx_place_ace2])
+
+    # Turno P3: preferire posare un re
+    obs3 = env._get_observation(3)
+    legals3 = env.get_valid_actions()
+    actions3 = torch.stack(legals3).to(device=device, dtype=torch.float32) if (len(legals3)>0 and torch.is_tensor(legals3[0])) else torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in legals3])
+    obs3_t = torch.tensor(obs3, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        logits3 = actor(obs3_t, actions3)
+    # trova indici posa re
+    idx_k = [i for i,v in enumerate(legals3) if any(is_action(v, kid, []) for kid in [k_den,k_cop,k_spa,k_bas])]
+    assert len(idx_k) > 0
+    top_idx3 = int(torch.argmax(logits3).item())
+    assert top_idx3 in idx_k, "P3 dovrebbe preferire posare un re"

@@ -30,39 +30,46 @@ def compute_final_score_breakdown(game_state, rules=None):
     c1 = len(squads[1])
     pt_c0, pt_c1 = (1, 0) if c0 > c1 else (0, 1) if c1 > c0 else (0, 0)
 
-    # Denari
-    den0 = sum(1 for c in squads[0] if c[1] == 'denari')
-    den1 = sum(1 for c in squads[1] if c[1] == 'denari')
+    # Denari (ID-only)
+    den0 = sum(1 for c in squads[0] if (c % 4) == 0)
+    den1 = sum(1 for c in squads[1] if (c % 4) == 0)
     pt_d0, pt_d1 = (1, 0) if den0 > den1 else (0, 1) if den1 > den0 else (0, 0)
 
     # Settebello
-    sb0 = 1 if (7, 'denari') in squads[0] else 0
-    sb1 = 1 if (7, 'denari') in squads[1] else 0
+    def _has_card_id(seq, rank, suit_col):
+        target = (rank - 1) * 4 + suit_col
+        return target in seq
+    sb0 = 1 if _has_card_id(squads[0], 7, 0) else 0
+    sb1 = 1 if _has_card_id(squads[1], 7, 0) else 0
 
     # Primiera
     val_map = {1: 16, 2: 12, 3: 13, 4: 14, 5: 15, 6: 18, 7: 21, 8: 10, 9: 10, 10: 10}
-    best0 = {"denari": 0, "coppe": 0, "spade": 0, "bastoni": 0}
-    best1 = {"denari": 0, "coppe": 0, "spade": 0, "bastoni": 0}
-    for (r, s) in squads[0]:
+    best0 = [0, 0, 0, 0]  # denari, coppe, spade, bastoni
+    best1 = [0, 0, 0, 0]
+    for c in squads[0]:
+        r = (c // 4) + 1
+        s = c % 4
         v = val_map[r]
         if v > best0[s]:
             best0[s] = v
-    for (r, s) in squads[1]:
+    for c in squads[1]:
+        r = (c // 4) + 1
+        s = c % 4
         v = val_map[r]
         if v > best1[s]:
             best1[s] = v
-    prim0 = sum(best0.values())
-    prim1 = sum(best1.values())
+    prim0 = sum(best0)
+    prim1 = sum(best1)
     pt_p0, pt_p1 = (1, 0) if prim0 > prim1 else (0, 1) if prim1 > prim0 else (0, 0)
 
     # Varianti opzionali
-    rb0 = 1 if re_bello_enabled and (10, 'denari') in squads[0] else 0
-    rb1 = 1 if re_bello_enabled and (10, 'denari') in squads[1] else 0
+    rb0 = 1 if re_bello_enabled and _has_card_id(squads[0], 10, 0) else 0
+    rb1 = 1 if re_bello_enabled and _has_card_id(squads[1], 10, 0) else 0
 
     def napola_points(cards):
         if not napola_enabled:
             return 0
-        denari_ranks = {r for (r, s) in cards if s == 'denari'}
+        denari_ranks = {(c // 4) + 1 for c in cards if (c % 4) == 0}
         # Richiede almeno A-2-3
         if not {1, 2, 3}.issubset(denari_ranks):
             return 0
