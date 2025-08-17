@@ -53,27 +53,34 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
     approx_kl = torch.zeros(obs.size(0), dtype=torch.float32, device=device)
     entropy = torch.zeros(obs.size(0), dtype=torch.float32, device=device)
     with torch.no_grad():
-        for i in range(obs.size(0)):
-            start = int(offs[i])
-            end = start + int(cnts[i])
-            legal_i = legals[start:end]
-            logits_i = agent.actor(obs[i], legal_i, seat[i])
-            logp_i = torch.log_softmax(logits_i, dim=0)
-            probs_i = torch.softmax(logits_i, dim=0)
-            entropy[i] = -(probs_i * logp_i).sum()
-            approx_kl[i] = (old_logp[i] - logp_i[int(chosen_idx[i])]).abs()
+        B = obs.size(0)
+        raw_logits = agent.actor(obs, None, seat)  # (B, 80) or (80,)
+        if raw_logits.dim() == 1:
+            raw_logits = raw_logits.unsqueeze(0)
+        max_cnt = int(cnts.max().item()) if B > 0 else 0
+        if max_cnt > 0:
+            pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+            rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
+            mask = rel_pos_2d < cnts.unsqueeze(1)
+            rel_pos = rel_pos_2d[mask]
+            sample_idx_per_legal = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+            abs_idx_2d = offs.unsqueeze(1) + rel_pos_2d
+            abs_idx = abs_idx_2d[mask]
+            legals_mb = legals[abs_idx].contiguous()
+            legal_scores = (legals_mb * raw_logits[sample_idx_per_legal]).sum(dim=1)
+            padded = torch.full((B, max_cnt), -float('inf'), device=device, dtype=legal_scores.dtype)
+            padded[mask] = legal_scores
+        else:
+            padded = torch.full((B, 0), -float('inf'), device=device, dtype=raw_logits.dtype)
+        logp_group = torch.log_softmax(padded, dim=1)
+        probs_group = torch.softmax(padded, dim=1)
+        entropy[:] = (-(probs_group * logp_group).sum(dim=1))
+        chosen_clamped = torch.minimum(chosen_idx, (cnts - 1).clamp_min(0)) if max_cnt > 0 else chosen_idx
+        new_logp_chosen = logp_group[torch.arange(B, device=device), chosen_clamped]
+        approx_kl[:] = (old_logp - new_logp_chosen).abs()
     # clip fraction per-sample sul chosen
     ratio = torch.exp(-approx_kl)  # solo se old_logp - new_logp = KL approx, ma usiamo direttamente logp chosen
     # ricalcoliamo ratio in modo corretto: new_logp_chosen - old_logp
-    new_logp_chosen = torch.zeros_like(old_logp)
-    with torch.no_grad():
-        for i in range(obs.size(0)):
-            start = int(offs[i])
-            end = start + int(cnts[i])
-            legal_i = legals[start:end]
-            logits_i = agent.actor(obs[i], legal_i, seat[i])
-            logp_i = torch.log_softmax(logits_i, dim=0)
-            new_logp_chosen[i] = logp_i[int(chosen_idx[i])]
     ratio = torch.exp(new_logp_chosen - old_logp)
     clip_low = 1.0 - agent.clip_ratio
     clip_high = 1.0 + agent.clip_ratio
@@ -150,14 +157,14 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 s_t = seat_vec.unsqueeze(0)
                 b_t = bsum.unsqueeze(0)
                 v = float(agent.critic(o_t, s_t, b_t))
-            act, logp, idx = agent.select_action(obs, legal, seat_vec, bsum)
-            next_obs, rew, done, info = env.step(act)
+            chosen_act, logp, idx_t = agent.select_action(obs, legal, seat_vec, bsum)
+            next_obs, rew, done, info = env.step(chosen_act)
             routing_log.append((cp, 'main'))
 
             obs_list.append(obs)
             next_obs_list.append(next_obs)
-            act_list.append(act)
-            logp_list.append(logp)
+            act_list.append(chosen_act)
+            logp_list.append(float(logp))
             rew_list.append(rew)
             done_list.append(done)
             val_list.append(v)
@@ -165,7 +172,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             belief_sum_list.append(bsum)
             legals_offset.append(len(legals_list))
             legals_count.append(len(legal))
-            chosen_index.append(idx)
+            chosen_index.append(int(idx_t))
             legals_list.extend(legal)
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
@@ -197,27 +204,31 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
 
         steps += 1
 
-    # CTDE: valuta V(next) con seat_team e belief_summary
-    next_val_list = []
+    # CTDE: stima V(next) vettorizzata su GPU
+    next_val_t = None
     if len(next_obs_list) > 0:
         with torch.no_grad():
-            for i in range(len(next_obs_list)):
-                if done_list[i]:
-                    next_val_list.append(0.0)
-                else:
-                    no = next_obs_list[i]
-                    o_t = no.clone().detach().to(device=device, dtype=torch.float32).unsqueeze(0) if torch.is_tensor(no) else torch.as_tensor(no, dtype=torch.float32, device=device).unsqueeze(0)
-                    s_t = seat_team_list[i].unsqueeze(0)
-                    b_t = belief_sum_list[i].unsqueeze(0)
-                    nv = float(agent.critic(o_t, s_t, b_t))
-                    next_val_list.append(float(nv))
+            next_obs_t = torch.stack([no if torch.is_tensor(no) else torch.as_tensor(no, dtype=torch.float32) for no in next_obs_list], dim=0).to(device=device, dtype=torch.float32)
+            s_all = torch.stack(seat_team_list, dim=0).to(device=device)
+            b_all = torch.stack(belief_sum_list, dim=0).to(device=device)
+            done_mask_bool = torch.as_tensor([bool(d) for d in done_list], dtype=torch.bool, device=device)
+            next_val_t = agent.critic(next_obs_t, s_all, b_all)
+            next_val_t = torch.where(done_mask_bool, torch.zeros_like(next_val_t), next_val_t)
 
-    # Compute GAE on GPU
+    # Compute V(obs) in batch su GPU e GAE
     T = len(rew_list)
     rew_t = torch.as_tensor(rew_list, dtype=torch.float32, device=device) if T>0 else torch.zeros((0,), dtype=torch.float32, device=device)
     done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if T>0 else torch.zeros((0,), dtype=torch.float32, device=device)
-    val_t = torch.as_tensor(val_list, dtype=torch.float32, device=device) if T>0 else torch.zeros((0,), dtype=torch.float32, device=device)
-    nval_t = torch.as_tensor(next_val_list, dtype=torch.float32, device=device) if T>0 else torch.zeros((0,), dtype=torch.float32, device=device)
+    if T > 0:
+        with torch.no_grad():
+            o_all = torch.stack([o if torch.is_tensor(o) else torch.as_tensor(o, dtype=torch.float32) for o in obs_list], dim=0).to(device=device, dtype=torch.float32)
+            s_all = torch.stack(seat_team_list, dim=0).to(device=device)
+            b_all = torch.stack(belief_sum_list, dim=0).to(device=device)
+            val_t = agent.critic(o_all, s_all, b_all)
+            nval_t = next_val_t if next_val_t is not None else torch.zeros_like(val_t)
+    else:
+        val_t = torch.zeros((0,), dtype=torch.float32, device=device)
+        nval_t = torch.zeros((0,), dtype=torch.float32, device=device)
     adv_vec = torch.zeros_like(rew_t)
     gae = torch.tensor(0.0, dtype=torch.float32, device=device)
     for t in reversed(range(T)):
@@ -240,10 +251,36 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     rew_t = rew_t
     done_t = torch.as_tensor(done_list, dtype=torch.bool, device=device) if len(done_list)>0 else torch.zeros((0,), dtype=torch.bool, device=device)
 
+    # Calcola old_logp in batch per evitare sincronizzazioni step-by-step
+    if obs_t.size(0) > 0:
+        with torch.no_grad():
+            raw_logits = agent.actor(obs_t, None, seat_team_t)
+            if raw_logits.dim() == 1:
+                raw_logits = raw_logits.unsqueeze(0)
+            B = obs_t.size(0)
+            max_cnt = int(legals_count_t.max().item()) if B > 0 else 0
+            if max_cnt > 0:
+                pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+                rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
+                mask = rel_pos_2d < legals_count_t.unsqueeze(1)
+                sample_idx_per_legal = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+                abs_idx = (legals_offset_t.unsqueeze(1) + rel_pos_2d)[mask]
+                legals_mb = legals_t[abs_idx].contiguous()
+                legal_scores = (legals_mb * raw_logits[sample_idx_per_legal]).sum(dim=1)
+                padded = torch.full((B, max_cnt), -float('inf'), device=device, dtype=legal_scores.dtype)
+                padded[mask] = legal_scores
+                logp_group = torch.log_softmax(padded, dim=1)
+                chosen_clamped = torch.minimum(chosen_index_t, (legals_count_t - 1).clamp_min(0))
+                old_logp_t = logp_group[torch.arange(B, device=device), chosen_clamped]
+            else:
+                old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
+    else:
+        old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
+
     batch = {
         'obs': obs_t,
         'act': act_t,
-        'old_logp': torch.as_tensor(logp_list, dtype=torch.float32, device=device) if len(logp_list)>0 else torch.zeros((0,), dtype=torch.float32, device=device),
+        'old_logp': old_logp_t,
         'ret': ret_t,
         'adv': adv_t,
         'rew': rew_t,

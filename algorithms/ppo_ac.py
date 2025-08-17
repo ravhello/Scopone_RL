@@ -28,8 +28,15 @@ class ActionConditionedPPO:
         self.actor = ActionConditionedActor(obs_dim, action_dim)
         self.critic = CentralValueNet(obs_dim)
 
-        self.opt_actor = optim.Adam(self.actor.parameters(), lr=lr)
-        self.opt_critic = optim.Adam(self.critic.parameters(), lr=lr)
+        # Optimizers with fused/foreach when available to reduce kernel launches
+        try:
+            self.opt_actor = optim.Adam(self.actor.parameters(), lr=lr, fused=True)
+        except TypeError:
+            self.opt_actor = optim.Adam(self.actor.parameters(), lr=lr, foreach=True)
+        try:
+            self.opt_critic = optim.Adam(self.critic.parameters(), lr=lr, fused=True)
+        except TypeError:
+            self.opt_critic = optim.Adam(self.critic.parameters(), lr=lr, foreach=True)
         self.clip_ratio = clip_ratio
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
@@ -71,7 +78,7 @@ class ActionConditionedPPO:
             self.scaler = torch.cuda.amp.GradScaler()
 
     @torch.inference_mode()
-    def select_action(self, obs, legal_actions: List, seat_team_vec = None, belief_summary = None) -> Tuple[torch.Tensor, float, int]:
+    def select_action(self, obs, legal_actions: List, seat_team_vec = None, belief_summary = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
         # Avoid warning: if obs already tensor, use clone().detach().to(device)
@@ -94,8 +101,9 @@ class ActionConditionedPPO:
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = self.actor(obs_t, actions_t, st)
         logp = torch.log_softmax(logits, dim=0)
-        idx = int(torch.multinomial(torch.exp(logp), num_samples=1).item())
-        return legal_actions[idx], logp[idx], idx
+        idx_t = torch.multinomial(torch.exp(logp), num_samples=1).squeeze(0)
+        chosen_act = actions_t[idx_t]
+        return chosen_act, logp[idx_t], idx_t
 
     def compute_loss(self, batch):
         """
@@ -125,22 +133,62 @@ class ActionConditionedPPO:
         cnts = to_long(batch['legals_count'])
         chosen_idx = to_long(batch['chosen_index'])
 
-        # Ricalcola logp sulle sole azioni legali per ciascun sample (ragged via loop)
-        new_logp_list = []
-        entropy_list = []
-        for i in range(obs.size(0)):
-            start = offs[i].item()
-            end = start + cnts[i].item()
-            legal_i = legals[start:end]
-            logits_i = self.actor(obs[i], legal_i, seat[i])
-            logp_i = torch.log_softmax(logits_i, dim=0)
-            new_logp_list.append(logp_i[chosen_idx[i]])
-            # entropia media per diagnosi
-            probs_i = torch.softmax(logits_i, dim=0)
-            entropy_list.append(-(probs_i * logp_i).sum())
-
-        logp_new = torch.stack(new_logp_list)
-        entropy = torch.stack(entropy_list).mean()
+        # Filtra eventuali sample senza azioni legali per evitare NaN
+        valid_mask = cnts > 0
+        if not bool(valid_mask.all()):
+            if not bool(valid_mask.any()):
+                zero = torch.tensor(0.0, device=device)
+                return zero, {'loss_pi': 0.0, 'loss_v': 0.0, 'entropy': 0.0, 'approx_kl': 0.0, 'clip_frac': 0.0}
+            obs = obs[valid_mask]
+            seat = seat[valid_mask]
+            belief = belief[valid_mask]
+            act = act[valid_mask]
+            old_logp = old_logp[valid_mask]
+            ret = ret[valid_mask]
+            adv = adv[valid_mask]
+            offs = offs[valid_mask]
+            cnts = cnts[valid_mask]
+            chosen_idx = chosen_idx[valid_mask]
+        B = obs.size(0)
+        # Forward actor una sola volta sul batch intero (logits pieni)
+        raw_logits = self.actor(obs, None, seat)  # (B, action_dim) or (action_dim,)
+        if raw_logits.dim() == 1:
+            raw_logits = raw_logits.unsqueeze(0)
+        # Prepara indici legal per minibatch usando offs/cnts contro legals globali
+        max_cnt = int(cnts.max().item()) if B > 0 else 0
+        if max_cnt > 0:
+            pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+            rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)                    # (B, max_cnt)
+            mask = rel_pos_2d < cnts.unsqueeze(1)                               # (B, max_cnt)
+            rel_pos = rel_pos_2d[mask]                                          # (M_mb)
+            sample_idx_per_legal = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+            abs_idx_2d = offs.unsqueeze(1) + rel_pos_2d                         # (B, max_cnt)
+            abs_idx = abs_idx_2d[mask]                                          # (M_mb)
+            legals_mb = legals[abs_idx].contiguous()                            # (M_mb, 80)
+            # Score legali per le rispettive osservazioni: dot product per riga
+            legal_scores = (legals_mb * raw_logits[sample_idx_per_legal]).sum(dim=1)  # (M_mb)
+            # Costruisci tensore padded (B, max_cnt) per softmax per-gruppo senza loop Python
+            padded = torch.full((B, max_cnt), fill_value=-float('inf'), device=device, dtype=legal_scores.dtype)
+            padded[mask] = legal_scores
+        else:
+            padded = torch.full((B, 0), fill_value=-float('inf'), device=device, dtype=raw_logits.dtype)
+        # log-softmax per gruppo
+        logp_group = torch.log_softmax(padded, dim=1)
+        # estrai logp scelti
+        row_idx = torch.arange(B, device=device, dtype=torch.long)
+        # clamp chosen_idx to valid range per-row
+        if max_cnt > 0:
+            chosen_clamped = torch.minimum(chosen_idx, (cnts - 1).clamp_min(0))
+            logp_new = logp_group[row_idx, chosen_clamped]
+        else:
+            logp_new = torch.zeros((B,), device=device, dtype=padded.dtype)
+        # entropia media per gruppo: evita 0 * -inf applicando mask
+        probs_group = torch.softmax(padded, dim=1)
+        if max_cnt > 0:
+            logp_group_masked = logp_group.masked_fill(~mask, 0)
+            entropy = (-(probs_group * logp_group_masked).sum(dim=1)).mean()
+        else:
+            entropy = torch.tensor(0.0, device=device)
 
         ratio = torch.exp(logp_new - old_logp)
         clipped = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv

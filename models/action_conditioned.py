@@ -190,14 +190,16 @@ class ActionConditionedActor(torch.nn.Module):
         # Raw action logits for full action space
         raw_logits = self.net(x)  # (B, action_dim)
         if legals is None:
-            return raw_logits.squeeze(0)
+            # Keep batch if B>1, otherwise return vector
+            return raw_logits if raw_logits.size(0) > 1 else raw_logits.squeeze(0)
         # legals: (A, 80) one-hot-like masks per legal action. Score each by dot product
         if not torch.is_tensor(legals):
             legals_t = torch.as_tensor(legals, dtype=torch.float32, device=torch.device('cuda'))
         else:
             legals_t = legals.to(torch.device('cuda'), dtype=torch.float32)
-        # Ensure shapes
-        legal_scores = torch.matmul(legals_t, raw_logits.squeeze(0).reshape(-1, 1)).squeeze(-1)  # (A)
+        # B is expected to be 1 in this path
+        logits_vec = raw_logits.squeeze(0)
+        legal_scores = torch.matmul(legals_t, logits_vec.reshape(-1, 1)).squeeze(-1)  # (A)
         return legal_scores
 
     # Accept legacy checkpoints by loading non-strictly
