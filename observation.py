@@ -17,6 +17,9 @@ RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, de
 SUITCOL_OF_ID = torch.tensor([i % 4 for i in range(40)], dtype=torch.int16, device=torch.device('cuda'))
 MASK_RANK = [(sum(1 << j for j in range(40) if (j // 4 + 1) == r)) for r in range(1, 11)]
 PRIMIERA_VAL_T = torch.tensor([0, 16, 12, 13, 14, 15, 18, 21, 10, 10, 10], dtype=torch.float32, device=torch.device('cuda'))
+IDS_CUDA = torch.arange(40, device=torch.device('cuda'), dtype=torch.int64)
+IS_DENARI_MASK_40 = (SUITCOL_OF_ID.to(torch.long) == 0)
+PRIMIERA_PER_ID = PRIMIERA_VAL_T[RANK_OF_ID.to(torch.long)]  # (40,)
 
 def bitset_popcount(x: int) -> int:
     return int(x.bit_count()) if hasattr(int, 'bit_count') else bin(x).count('1')
@@ -402,11 +405,18 @@ def compute_inferred_probabilities(game_state, player_id):
     if cache_key in inferred_probs_cache:
         return inferred_probs_cache[cache_key].clone()
     
-    # GPU implementation
-    vis = torch.zeros(40, dtype=torch.bool, device=torch.device('cuda'))
-    for lst in (game_state["hands"][player_id], game_state["table"], game_state["captured_squads"][0], game_state["captured_squads"][1]):
-        if lst:
-            vis[torch.as_tensor(lst, dtype=torch.long, device=torch.device('cuda'))] = True
+    # GPU implementation (use bitset mirrors if available)
+    hands_bits_t = game_state.get('_hands_bits_t', None)
+    table_bits_t = game_state.get('_table_bits_t', None)
+    captured_bits_t = game_state.get('_captured_bits_t', None)
+    if hands_bits_t is not None and table_bits_t is not None and captured_bits_t is not None:
+        visible_bits = hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
+        vis = (((visible_bits >> IDS_CUDA) & 1).to(torch.bool))
+    else:
+        vis = torch.zeros(40, dtype=torch.bool, device=torch.device('cuda'))
+        for lst in (game_state["hands"][player_id], game_state["table"], game_state["captured_squads"][0], game_state["captured_squads"][1]):
+            if lst:
+                vis[torch.as_tensor(lst, dtype=torch.long, device=torch.device('cuda'))] = True
     invisible = ~vis
     total_unknown = int(invisible.sum().item())
     probs = []
@@ -803,19 +813,32 @@ def compute_rank_probabilities_by_player(game_state, player_id):
     # GPU-based computation
     all_probs = torch.zeros((3, 5, 10), dtype=torch.float32, device=torch.device('cuda'))
     other_players = [p for p in range(4) if p != player_id]
-    # Visible rank counts
+    # Visible rank counts (use bitsets if available)
+    hands_bits_t = game_state.get('_hands_bits_t', None)
+    table_bits_t = game_state.get('_table_bits_t', None)
+    captured_bits_t = game_state.get('_captured_bits_t', None)
     visible_rank_counts = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
-    def _acc_counts(lst):
-        if lst:
-            ids = torch.as_tensor(lst, dtype=torch.long, device=torch.device('cuda'))
-            ranks = (RANK_OF_ID[ids].to(torch.long) - 1)
+    if hands_bits_t is not None and table_bits_t is not None and captured_bits_t is not None:
+        visible_bits = hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
+        mask = (((visible_bits >> IDS_CUDA) & 1).to(torch.bool))
+        idx = torch.nonzero(mask, as_tuple=False).flatten()
+        if idx.numel() > 0:
+            ranks = (RANK_OF_ID[idx].to(torch.long) - 1).clamp_(0, 9)
             add = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
             add.index_add_(0, ranks, torch.ones_like(ranks, dtype=torch.float32))
-            return add
-        return torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
-    visible_rank_counts += _acc_counts(game_state["table"]) + _acc_counts(game_state["hands"][player_id])
-    for team_cards in game_state["captured_squads"].values():
-        visible_rank_counts += _acc_counts(team_cards)
+            visible_rank_counts += add
+    else:
+        def _acc_counts(lst):
+            if lst:
+                ids = torch.as_tensor(lst, dtype=torch.long, device=torch.device('cuda'))
+                ranks = (RANK_OF_ID[ids].to(torch.long) - 1)
+                add = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
+                add.index_add_(0, ranks, torch.ones_like(ranks, dtype=torch.float32))
+                return add
+            return torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
+        visible_rank_counts += _acc_counts(game_state["table"]) + _acc_counts(game_state["hands"][player_id])
+        for team_cards in game_state["captured_squads"].values():
+            visible_rank_counts += _acc_counts(team_cards)
     total_invisible = 40 - int(visible_rank_counts.sum().item())
     for i, p in enumerate(other_players):
         played_rank_counts = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
@@ -1104,3 +1127,106 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     if len(state_compact_cache) < 50:
         state_compact_cache[cache_key] = result.clone()
     return result
+
+def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
+    """
+    Variante interamente GPU-driven che usa i bitset mirror già residenti su CUDA
+    (inseriti dall'ambiente come _hands_bits_t, _table_bits_t, _captured_bits_t)
+    per minimizzare i trasferimenti H2D. Richiede che tali chiavi siano presenti.
+    """
+    device = torch.device('cuda')
+    hands_bits_t = game_state.get('_hands_bits_t', None)
+    table_bits_t = game_state.get('_table_bits_t', None)
+    captured_bits_t = game_state.get('_captured_bits_t', None)
+    if hands_bits_t is None or table_bits_t is None or captured_bits_t is None:
+        # fallback
+        return encode_state_compact_for_player(game_state, player_id, k_history=k_history)
+
+    # 1) Mani (43): 40 one-hot + 3 conteggi altri giocatori
+    hand_vec = (((hands_bits_t[player_id] >> IDS_CUDA) & 1).to(torch.float32))  # (40,)
+    other_counts = []
+    for p in range(4):
+        if p == player_id:
+            continue
+        cnt = (((hands_bits_t[p] >> IDS_CUDA) & 1).to(torch.float32).sum() / 10.0)
+        other_counts.append(cnt)
+    other_counts_t = torch.stack(other_counts) if other_counts else torch.zeros(3, dtype=torch.float32, device=device)
+    hands_enc = torch.cat([hand_vec.reshape(-1), other_counts_t.reshape(-1)], dim=0)
+
+    # 2) Tavolo (40)
+    table_enc = (((table_bits_t >> IDS_CUDA) & 1).to(torch.float32))
+
+    # 3) Catture squadre (82): 40 + 40 + 2
+    team0_vec = (((captured_bits_t[0] >> IDS_CUDA) & 1).to(torch.float32))
+    team1_vec = (((captured_bits_t[1] >> IDS_CUDA) & 1).to(torch.float32))
+    team0_count = torch.tensor([team0_vec.sum() / 40.0], dtype=torch.float32, device=device)
+    team1_count = torch.tensor([team1_vec.sum() / 40.0], dtype=torch.float32, device=device)
+    captured_enc = torch.cat([team0_vec, team1_vec, team0_count, team1_count], dim=0)
+
+    # 4) History compatta (61*k)
+    hist_k = encode_recent_history_k(game_state, k=k_history)
+
+    # 5) Missing cards (40): inverti visibilità (mano osservatore + tavolo + captured)
+    visible_bits = hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
+    missing_vec = (1 - (((visible_bits >> IDS_CUDA) & 1).to(torch.float32)))
+
+    # 6) Inferred probs (120) - fallback GPU funzione esistente
+    inferred_probs = compute_inferred_probabilities(game_state, player_id)
+
+    # 7) Primiera status (8) via bitset
+    def _primiera_from_bits(bits_t):
+        present = (((bits_t >> IDS_CUDA) & 1).to(torch.bool))
+        vals = PRIMIERA_PER_ID.to(torch.float32)
+        prim = torch.zeros(4, dtype=torch.float32, device=device)
+        for s in range(4):
+            mask_s = (SUITCOL_OF_ID.to(torch.long) == s)
+            v = vals.where(mask_s & present, torch.zeros((), device=device))
+            prim[s] = v.max() if bool((mask_s & present).any().item()) else 0.0
+        return prim / 21.0
+    primiera_status = torch.cat([_primiera_from_bits(captured_bits_t[0]), _primiera_from_bits(captured_bits_t[1])])
+
+    # 8) Denari count (2)
+    den0 = (present := (((captured_bits_t[0] >> IDS_CUDA) & 1).to(torch.bool)))
+    den1 = (((captured_bits_t[1] >> IDS_CUDA) & 1).to(torch.bool))
+    denari_count = torch.stack([
+        (den0 & IS_DENARI_MASK_40).to(torch.float32).sum() / 10.0,
+        (den1 & IS_DENARI_MASK_40).to(torch.float32).sum() / 10.0,
+    ])
+
+    # 9) Settebello (1)
+    settebello_id = 24
+    settebello_status = torch.tensor([
+        1.0 if bool(((captured_bits_t[0] >> settebello_id) & 1).item()) else
+        (2.0 if bool(((captured_bits_t[1] >> settebello_id) & 1).item()) else
+         (3.0 if bool(((table_bits_t >> settebello_id) & 1).item()) else 0.0))
+    ], dtype=torch.float32, device=device) / 3.0
+
+    # 10) Score estimate (2) - fallback
+    score_estimate = compute_current_score_estimate(game_state)
+
+    # 11) Table sum (1) via bitset
+    table_sum = torch.tensor([
+        (RANK_OF_ID.to(torch.int64)[IDS_CUDA].to(torch.float32) * (((table_bits_t >> IDS_CUDA) & 1).to(torch.float32))).sum() / 30.0
+    ], dtype=torch.float32, device=device)
+
+    # 12) Scopa probs next (10) - fallback
+    scopa_probs = compute_next_player_scopa_probabilities(game_state, player_id)
+
+    # 13) Rank probs by player (150) - fallback
+    rank_probs_by_player = compute_rank_probabilities_by_player(game_state, player_id).flatten()
+
+    return torch.cat([
+        hands_enc,
+        table_enc,
+        captured_enc,
+        hist_k,
+        missing_vec,
+        inferred_probs,
+        primiera_status,
+        denari_count,
+        settebello_status,
+        score_estimate,
+        table_sum,
+        scopa_probs,
+        rank_probs_by_player
+    ])

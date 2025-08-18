@@ -7,6 +7,11 @@ from tests.torch_np import np
 from models.action_conditioned import ActionConditionedActor, CentralValueNet
 
 device = torch.device("cuda")
+# Ensure CUDA is default for new tensors
+try:
+    torch.set_default_device('cuda')
+except Exception:
+    pass
 autocast_device = 'cuda'
 autocast_dtype = torch.float16
 
@@ -232,22 +237,27 @@ class ActionConditionedPPO:
                     total_sq = total_sq + p.grad.data.norm(2).pow(2)
             return total_sq.sqrt()
 
-        for _ in range(epochs):
-            perm = torch.randperm(num_samples).tolist()
+        check_every = 4  # reduce CPU syncs for early-stop
+        for ep in range(epochs):
+            # keep indices on CUDA to avoid H2D copies during advanced indexing
+            perm = torch.randperm(num_samples, device=device)
             for start in range(0, num_samples, minibatch_size):
-                idx = perm[start:start+minibatch_size]
+                idx_t = perm[start:start+minibatch_size]
+                # Use index_select to slice tensors by CUDA indices
+                def sel(x):
+                    return torch.index_select(x, 0, idx_t)
                 mini = {
-                    'obs': batch['obs'][idx],
-                    'act': batch['act'][idx],
-                    'old_logp': batch['old_logp'][idx],
-                    'ret': batch['ret'][idx],
-                    'adv': batch['adv'][idx],
+                    'obs': sel(batch['obs']),
+                    'act': sel(batch['act']),
+                    'old_logp': sel(batch['old_logp']),
+                    'ret': sel(batch['ret']),
+                    'adv': sel(batch['adv']),
                     'legals': batch['legals'],  # globale
-                    'legals_offset': batch['legals_offset'][idx],
-                    'legals_count': batch['legals_count'][idx],
-                    'chosen_index': batch['chosen_index'][idx],
-                    'seat_team': batch.get('seat_team', None)[idx] if batch.get('seat_team', None) is not None else None,
-                    'belief_summary': batch.get('belief_summary', None)[idx] if batch.get('belief_summary', None) is not None else None,
+                    'legals_offset': sel(batch['legals_offset']),
+                    'legals_count': sel(batch['legals_count']),
+                    'chosen_index': sel(batch['chosen_index']),
+                    'seat_team': sel(batch['seat_team']) if batch.get('seat_team', None) is not None else None,
+                    'belief_summary': sel(batch['belief_summary']) if batch.get('belief_summary', None) is not None else None,
                 }
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
@@ -285,17 +295,15 @@ class ActionConditionedPPO:
                 last_info['grad_norm_critic'] = gn_critic.detach()
                 last_info['lr_actor'] = self.opt_actor.param_groups[0]['lr']
                 last_info['lr_critic'] = self.opt_critic.param_groups[0]['lr']
-                # early stop per target KL
-                try:
-                    _kl = float(info.get('approx_kl', torch.tensor(0.0, device=device)).detach().cpu().item())
-                except Exception:
-                    _kl = 0.0
-                if _kl > self.target_kl:
-                    self._high_kl_count += 1
-                    early_stop = True
-                    break
-                else:
-                    self._high_kl_count = max(0, self._high_kl_count - 1)
+                # early stop per target KL (controlla meno spesso per ridurre sync CPU)
+                if (count_mb % check_every) == 0:
+                    _kl = info.get('approx_kl', torch.tensor(0.0, device=device)).detach()
+                    if bool((_kl > self.target_kl).item()):
+                        self._high_kl_count += 1
+                        early_stop = True
+                        break
+                    else:
+                        self._high_kl_count = max(0, self._high_kl_count - 1)
             # Step any schedulers
             for sch in self._lr_schedulers:
                 sch.step()

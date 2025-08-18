@@ -35,7 +35,7 @@ def main():
         #experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         # Short run for signal; adjust if needed
-        train_ppo(num_iterations=2, horizon=256, use_compact_obs=True, k_history=12)
+        train_ppo(num_iterations=20, horizon=256, use_compact_obs=True, k_history=12)
 
     # Export chrome trace
     #prof.export_chrome_trace(trace_path)
@@ -123,15 +123,18 @@ def main():
             cuda_us = cuda_us or 0.0
             stack = getattr(evt, 'stack', None)
             file_rel, line_no = find_user_file(stack)
+            # Attribute external ops (no project stack) to a synthetic bucket
             if not file_rel:
-                continue
+                file_rel = '<external/CUDA or Library>'
+                line_no = -1
             stats = per_file[file_rel]
             stats['cpu_ms'] += to_ms(cpu_us)
             stats['cuda_ms'] += to_ms(cuda_us)
             stats['count'] += 1
 
             lname = name.lower()
-            is_memcpy = ('memcpy' in lname) or ('memcpy' in name) or ('memcpy' in lname.replace(' ', ''))
+            lname = lname.replace(' ', '')
+            is_memcpy = ('memcpy' in lname) or ('memcpyasync' in lname) or ('dtoh' in lname) or ('htod' in lname)
             if is_memcpy:
                 memcpy_ms = to_ms(cuda_us if cuda_us else cpu_us)
                 stats['memcpy_ms'] += memcpy_ms

@@ -154,7 +154,7 @@ class ScoponeEnvMA(gym.Env):
         """Calcola azioni valide interamente su GPU usando i mirror a bitset CUDA."""
         start_time = time.time()
         from observation import RANK_OF_ID as _RANK_OF_ID
-        from actions import encode_action
+        from actions import encode_action_from_ids_gpu
 
         # Estrai ID in mano e sul tavolo da bitset tensor
         ids = torch.arange(40, device=device, dtype=torch.int64)
@@ -170,20 +170,20 @@ class ScoponeEnvMA(gym.Env):
             return valid_actions
 
         for pid_t in hand_ids_t:
-            pid = int(pid_t.item())
-            prank = int(_RANK_OF_ID[pid].item())
+            # resta su GPU
+            prank_t = _RANK_OF_ID[pid_t].to(torch.int64)
 
             # Pari-rank sul tavolo
             if table_ids_t.numel() > 0:
                 table_ranks = _RANK_OF_ID[table_ids_t].to(torch.int64)
-                direct_sel = (table_ranks == prank)
+                direct_sel = (table_ranks == prank_t)
                 direct_ids_t = table_ids_t[direct_sel]
             else:
                 direct_ids_t = torch.empty(0, dtype=torch.int64, device=device)
 
             if direct_ids_t.numel() > 0:
                 for did_t in direct_ids_t:
-                    valid_actions.append(encode_action(pid, [int(did_t.item())]))
+                    valid_actions.append(encode_action_from_ids_gpu(pid_t, did_t.view(1)))
             else:
                 # Somma: trova tutti i subset con somma prank (GPU)
                 n = int(table_ids_t.numel())
@@ -193,26 +193,26 @@ class ScoponeEnvMA(gym.Env):
                     masks = torch.arange(1, 1 << n, device=device, dtype=torch.int64)
                     sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.int64)
                     sums = (sel * ranks_k.unsqueeze(0)).sum(dim=1)
-                    good = (sums == prank).nonzero(as_tuple=False).flatten()
+                    good = (sums == prank_t).nonzero(as_tuple=False).flatten()
                     if good.numel() > 0:
                         for gi in good:
-                            subset_ids = table_ids_t[((masks[gi].unsqueeze(0) >> pos) & 1).bool()].tolist()
-                            valid_actions.append(encode_action(pid, subset_ids))
+                            cap_ids_t = table_ids_t[((masks[gi].unsqueeze(0) >> pos) & 1).bool()]
+                            valid_actions.append(encode_action_from_ids_gpu(pid_t, cap_ids_t))
                     else:
                         # Scarto
-                        valid_actions.append(encode_action(pid, []))
+                        valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
                 else:
                     # Tavolo vuoto: solo scarto
-                    valid_actions.append(encode_action(pid, []))
+                    valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
             # Variante: Asso piglia tutto (aggiungi cattura completa)
-            if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and prank == 1:
-                valid_actions.append(encode_action(pid, table_ids_t.tolist()))
+            if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and int(prank_t.item()) == 1:
+                valid_actions.append(encode_action_from_ids_gpu(pid_t, table_ids_t))
             # Ace place action if allowed
             ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
             ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-            if prank == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
-                valid_actions.append(encode_action(pid, []))
+            if int(prank_t.item()) == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
+                valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
         # Post-filtri AP: rimuovi posa asso non consentita se richiesto
         ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
@@ -564,7 +564,15 @@ class ScoponeEnvMA(gym.Env):
         else:
             # Calcola l'osservazione
             if self.use_compact_obs:
-                result = encode_state_compact_for_player(self.game_state, player_id, k_history=self.k_history)
+                from observation import encode_state_compact_for_player_fast
+                try:
+                    # esponi mirrors per fast-path GPU
+                    self.game_state['_hands_bits_t'] = self._hands_bits_t
+                    self.game_state['_table_bits_t'] = self._table_bits_t
+                    self.game_state['_captured_bits_t'] = self._captured_bits_t
+                except Exception:
+                    pass
+                result = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
             else:
                 result = encode_state_for_player(self.game_state, player_id)
             

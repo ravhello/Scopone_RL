@@ -96,6 +96,32 @@ def encode_action(card, cards_to_capture):
     # Appiattisci le matrici e concatenale
     return torch.cat([played_card_matrix.reshape(-1), captured_cards_matrix.reshape(-1)], dim=0)
 
+def encode_action_from_ids_gpu(played_id_t: torch.Tensor, captured_ids_t: torch.Tensor) -> torch.Tensor:
+    """
+    GPU-native variant: build the 80-d action vector directly from CUDA int tensors
+    without converting to Python ints. Inputs can be scalar int64 tensor for played_id
+    and 1-D int64 tensor for captured_ids (possibly empty).
+    """
+    # Ensure tensors are on CUDA and correct dtypes/shapes
+    pid = played_id_t.to(device=device, dtype=torch.long).reshape(())
+    cap = captured_ids_t.to(device=device, dtype=torch.long).reshape(-1)
+
+    played_card_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
+    captured_cards_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
+
+    # Set played bit
+    prow = pid // 4
+    pcol = pid % 4
+    played_card_matrix[prow, pcol] = 1.0
+
+    # Set captured bits if any
+    if cap.numel() > 0:
+        rows = (cap // 4).clamp_(0, 9)
+        cols = (cap % 4).clamp_(0, 3)
+        captured_cards_matrix[rows, cols] = 1.0
+
+    return torch.cat([played_card_matrix.reshape(-1), captured_cards_matrix.reshape(-1)], dim=0)
+
 def decode_action(action_vec):
     """
     Decodifica un vettore azione 80-dim in (played_id, [captured_ids]).
