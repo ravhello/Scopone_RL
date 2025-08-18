@@ -21,9 +21,10 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs:
     Gioca N partite e ritorna win-rate team0 e breakdown medio dei punteggi.
     agent_fn_*: callable(env) -> action (usa env.get_valid_actions())
     """
+    device = torch.device('cuda')
     wins = 0
-    breakdown_sum = {0: {'carte': 0, 'denari': 0, 'settebello': 0, 'primiera': 0, 'scope': 0, 'total': 0},
-                     1: {'carte': 0, 'denari': 0, 'settebello': 0, 'primiera': 0, 'scope': 0, 'total': 0}}
+    breakdown_sum = {0: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0},
+                     1: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0}}
     for _ in tqdm(range(games), desc='Eval matches'):
         env = ScoponeEnvMA(use_compact_obs=use_compact_obs, k_history=k_history)
         done = False
@@ -41,7 +42,7 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs:
             bd = info['score_breakdown']
             for t in [0, 1]:
                 for k in breakdown_sum[t].keys():
-                    breakdown_sum[t][k] += bd[t].get(k, 0)
+                    breakdown_sum[t][k] += float(bd[t].get(k, 0))
             if bd[0]['total'] > bd[1]['total']:
                 wins += 1
         elif 'team_rewards' in info:

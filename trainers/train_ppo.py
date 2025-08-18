@@ -1,6 +1,6 @@
 import torch
 from tqdm import tqdm
-from typing import Dict, List
+from typing import Dict, List, Callable, Optional
 import os
 import time
 import sys
@@ -36,8 +36,11 @@ try:
     torch.set_float32_matmul_precision('high')
 except Exception:
     pass
-def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> Dict[str, float]:
-    """Calcola approx_kl ed entropia per gruppo seat 0/2 vs 1/3 sul batch corrente."""
+def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> Dict[str, torch.Tensor]:
+    """Calcola approx_kl, entropia e clip_frac per gruppi seat 0/2 vs 1/3.
+
+    Tutte le operazioni restano su GPU; ritorna tensori 0-D su device.
+    """
     obs = batch['obs'] if torch.is_tensor(batch['obs']) else torch.as_tensor(batch['obs'], dtype=torch.float32, device=device)
     seat = batch.get('seat_team', None)
     if seat is None:
@@ -79,8 +82,7 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
         new_logp_chosen = logp_group[torch.arange(B, device=device), chosen_clamped]
         approx_kl[:] = (old_logp - new_logp_chosen).abs()
     # clip fraction per-sample sul chosen
-    ratio = torch.exp(-approx_kl)  # solo se old_logp - new_logp = KL approx, ma usiamo direttamente logp chosen
-    # ricalcoliamo ratio in modo corretto: new_logp_chosen - old_logp
+    # ricalcolo ratio corretto: new_logp_chosen - old_logp
     ratio = torch.exp(new_logp_chosen - old_logp)
     clip_low = 1.0 - agent.clip_ratio
     clip_high = 1.0 + agent.clip_ratio
@@ -89,15 +91,29 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
     seats = torch.argmax(seat[:, :4], dim=1)
     mask_02 = (seats == 0) | (seats == 2)
     mask_13 = (seats == 1) | (seats == 3)
-    out = {}
-    if mask_02.any():
-        out['by_seat/kl_02'] = float(approx_kl[mask_02].mean().item())
-        out['by_seat/entropy_02'] = float(entropy[mask_02].mean().item())
-        out['by_seat/clip_frac_02'] = float(clipped_mask[mask_02].float().mean().item())
-    if mask_13.any():
-        out['by_seat/kl_13'] = float(approx_kl[mask_13].mean().item())
-        out['by_seat/entropy_13'] = float(entropy[mask_13].mean().item())
-        out['by_seat/clip_frac_13'] = float(clipped_mask[mask_13].float().mean().item())
+    out: Dict[str, torch.Tensor] = {}
+    # Evita branching su CPU: usa conteggi e where per gestire gruppi vuoti
+    one = torch.tensor(1.0, device=device, dtype=torch.float32)
+    count_02 = mask_02.float().sum()
+    count_13 = mask_13.float().sum()
+    sum_kl_02 = (approx_kl * mask_02.float()).sum()
+    sum_kl_13 = (approx_kl * mask_13.float()).sum()
+    sum_en_02 = (entropy * mask_02.float()).sum()
+    sum_en_13 = (entropy * mask_13.float()).sum()
+    sum_cf_02 = (clipped_mask.float() * mask_02.float()).sum()
+    sum_cf_13 = (clipped_mask.float() * mask_13.float()).sum()
+    mean_kl_02 = torch.where(count_02 > 0, sum_kl_02 / count_02, torch.zeros((), device=device, dtype=torch.float32))
+    mean_kl_13 = torch.where(count_13 > 0, sum_kl_13 / count_13, torch.zeros((), device=device, dtype=torch.float32))
+    mean_en_02 = torch.where(count_02 > 0, sum_en_02 / count_02, torch.zeros((), device=device, dtype=torch.float32))
+    mean_en_13 = torch.where(count_13 > 0, sum_en_13 / count_13, torch.zeros((), device=device, dtype=torch.float32))
+    mean_cf_02 = torch.where(count_02 > 0, sum_cf_02 / count_02, torch.zeros((), device=device, dtype=torch.float32))
+    mean_cf_13 = torch.where(count_13 > 0, sum_cf_13 / count_13, torch.zeros((), device=device, dtype=torch.float32))
+    out['by_seat/kl_02'] = mean_kl_02
+    out['by_seat/kl_13'] = mean_kl_13
+    out['by_seat/entropy_02'] = mean_en_02
+    out['by_seat/entropy_13'] = mean_en_13
+    out['by_seat/clip_frac_02'] = mean_cf_02
+    out['by_seat/clip_frac_13'] = mean_cf_13
     return out
 
 
@@ -121,10 +137,10 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                        main_seats: List[int] = None,
                        belief_particles: int = 256, belief_ess_frac: float = 0.5) -> Dict:
     obs_list, next_obs_list = [], []
-    act_list, logp_list = [], []
+    act_list = []
     rew_list, done_list = [], []
-    val_list, next_val_list = [], []
-    legals_list, legals_offset, legals_count, chosen_index = [], [], [], []
+    legals_list, legals_offset, legals_count = [], [], []
+    chosen_index_t_list = []
     seat_team_list = []
     belief_sum_list = []
 
@@ -153,26 +169,25 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         is_main = (main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats)
         if is_main:
             with torch.no_grad():
+                # Keep tensors on device; avoid GPU->CPU syncs
                 o_t = obs.clone().detach().to(device=device, dtype=torch.float32).unsqueeze(0) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 s_t = seat_vec.unsqueeze(0)
                 b_t = bsum.unsqueeze(0)
-                v = float(agent.critic(o_t, s_t, b_t))
-            chosen_act, logp, idx_t = agent.select_action(obs, legal, seat_vec, bsum)
+                _ = agent.critic(o_t, s_t, b_t)
+            chosen_act, _logp, idx_t = agent.select_action(obs, legal, seat_vec, bsum)
             next_obs, rew, done, info = env.step(chosen_act)
             routing_log.append((cp, 'main'))
 
             obs_list.append(obs)
             next_obs_list.append(next_obs)
             act_list.append(chosen_act)
-            logp_list.append(float(logp))
             rew_list.append(rew)
             done_list.append(done)
-            val_list.append(v)
             seat_team_list.append(seat_vec)
             belief_sum_list.append(bsum)
             legals_offset.append(len(legals_list))
             legals_count.append(len(legal))
-            chosen_index.append(int(idx_t))
+            chosen_index_t_list.append(idx_t)
             legals_list.extend(legal)
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
@@ -188,11 +203,15 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                             x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
                         for x in legal], dim=0)
                     logits = frozen(o_t.unsqueeze(0), leg_t)
-                    idx = int(torch.argmax(logits).item())
-                act = legal[idx]
+                    idx_t = torch.argmax(logits)
+                    act = leg_t[idx_t]
             else:
-                idx = int(torch.randint(len(legal), (1,), device=device).item())
-                act = legal[idx]
+                idx_t = torch.randint(len(legal), (1,), device=device).squeeze(0)
+                # Build tensor batch of legals to pick without CPU sync
+                leg_t = torch.stack([
+                    x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
+                for x in legal], dim=0)
+                act = leg_t[idx_t]
             next_obs, rew, done, info = env.step(act)
             routing_log.append((cp, 'partner' if is_partner_seat else 'opponent'))
 
@@ -245,7 +264,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     belief_sum_t = torch.stack(belief_sum_list, dim=0) if len(belief_sum_list)>0 else torch.zeros((0,120), dtype=torch.float32, device=device)
     legals_offset_t = torch.as_tensor(legals_offset, dtype=torch.long, device=device) if len(legals_offset)>0 else torch.zeros((0,), dtype=torch.long, device=device)
     legals_count_t = torch.as_tensor(legals_count, dtype=torch.long, device=device) if len(legals_count)>0 else torch.zeros((0,), dtype=torch.long, device=device)
-    chosen_index_t = torch.as_tensor(chosen_index, dtype=torch.long, device=device) if len(chosen_index)>0 else torch.zeros((0,), dtype=torch.long, device=device)
+    chosen_index_t = (torch.stack(chosen_index_t_list, dim=0).to(device=device, dtype=torch.long) if len(chosen_index_t_list)>0 else torch.zeros((0,), dtype=torch.long, device=device))
     ret_t = ret_vec
     adv_t = adv_vec
     rew_t = rew_t
@@ -299,7 +318,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
 def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 200, ckpt_path: str = 'checkpoints/ppo_ac.pth', use_compact_obs: bool = True, k_history: int = 12, seed: int = 0,
               entropy_schedule_type: str = 'linear', eval_every: int = 0, eval_games: int = 10, belief_particles: int = 256, belief_ess_frac: float = 0.5,
               mcts_in_eval: bool = False, mcts_sims: int = 128, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
-              mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25):
+              mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25,
+              on_iter_end: Optional[Callable[[int], None]] = None):
     set_global_seeds(seed)
     env = ScoponeEnvMA(use_compact_obs=use_compact_obs, k_history=k_history)
     obs_dim = env.observation_space.shape[0]
@@ -379,15 +399,22 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                    belief_particles=belief_particles, belief_ess_frac=belief_ess_frac)
         if len(batch['obs']) == 0:
             continue
-        # normalizza vantaggi
+        # normalizza vantaggi completamente su GPU (no sync)
         adv = batch['adv']
-        if adv.std() > 1e-8:
-            batch['adv'] = (adv - adv.mean()) / (adv.std() + 1e-8)
+        if adv.numel() > 0:
+            mean = adv.mean()
+            std = adv.std()
+            std = torch.clamp(std, min=1e-8)
+            batch['adv'] = (adv - mean) / std
         info = agent.update(batch, epochs=4, minibatch_size=256)
         dt = time.time() - t0
 
         # proxy per best: media return del batch
-        avg_return = float(np.mean(batch['ret'])) if len(batch['ret']) else 0.0
+        # All device tensors; compute small stats without moving large arrays
+        if len(batch['ret']):
+            avg_return = float(batch['ret'].mean().detach().cpu().item())
+        else:
+            avg_return = 0.0
         if avg_return > best_return:
             best_return = avg_return
             try:
@@ -449,27 +476,52 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     agent.save(best_wr_ckpt_path)
 
         if it % 50 == 0:
-            print({k: round(v, 4) for k, v in info.items()})
+            def _to_float(x):
+                return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
+            pretty = {k: round(_to_float(v), 4) for k, v in info.items()}
+            print(pretty)
         if writer is not None:
+            def _to_float(x):
+                return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
             for k, v in info.items():
-                writer.add_scalar(f'train/{k}', v, it)
+                writer.add_scalar(f'train/{k}', _to_float(v), it)
             writer.add_scalar('train/episode_time_s', dt, it)
             writer.add_scalar('train/avg_return', avg_return, it)
             writer.add_text('train/main_seats', str(main_seats), it)
-            # Log by seat group (0/2 vs 1/3) using batch returns as proxy
+            # Log by seat completamente su GPU; singola sync per tutto il blocco
             try:
-                seats = np.argmax(batch['seat_team'][:, :4], axis=1)
-                ret_arr = batch['ret']
-                mask_02 = np.isin(seats, [0, 2])
-                mask_13 = np.isin(seats, [1, 3])
-                if mask_02.any():
-                    writer.add_scalar('by_seat/ret_02', float(ret_arr[mask_02].mean()), it)
-                if mask_13.any():
-                    writer.add_scalar('by_seat/ret_13', float(ret_arr[mask_13].mean()), it)
-                # diagnostica per-seat: KL/entropy
+                seats_t = torch.argmax(batch['seat_team'][:, :4], dim=1)
+                ret_t = batch['ret']
+                mask_02_t = (seats_t == 0) | (seats_t == 2)
+                mask_13_t = (seats_t == 1) | (seats_t == 3)
+                cnt_02 = mask_02_t.float().sum()
+                cnt_13 = mask_13_t.float().sum()
+                sum_ret_02 = (ret_t * mask_02_t.float()).sum()
+                sum_ret_13 = (ret_t * mask_13_t.float()).sum()
+                mean_ret_02 = torch.where(cnt_02 > 0, sum_ret_02 / cnt_02, torch.zeros((), device=device, dtype=torch.float32))
+                mean_ret_13 = torch.where(cnt_13 > 0, sum_ret_13 / cnt_13, torch.zeros((), device=device, dtype=torch.float32))
                 diag = _compute_per_seat_diagnostics(agent, batch)
-                for k, v in diag.items():
-                    writer.add_scalar(k, v, it)
+                # Prepara chiavi e valori da sincronizzare in una volta
+                keys = [
+                    'by_seat/ret_02', 'by_seat/ret_13',
+                    'by_seat/kl_02', 'by_seat/kl_13',
+                    'by_seat/entropy_02', 'by_seat/entropy_13',
+                    'by_seat/clip_frac_02', 'by_seat/clip_frac_13'
+                ]
+                vals = [
+                    mean_ret_02.to(torch.float32),
+                    mean_ret_13.to(torch.float32),
+                    diag['by_seat/kl_02'].to(torch.float32),
+                    diag['by_seat/kl_13'].to(torch.float32),
+                    diag['by_seat/entropy_02'].to(torch.float32),
+                    diag['by_seat/entropy_13'].to(torch.float32),
+                    diag['by_seat/clip_frac_02'].to(torch.float32),
+                    diag['by_seat/clip_frac_13'].to(torch.float32),
+                ]
+                stacked = torch.stack(vals)
+                numbers = stacked.detach().cpu().tolist()  # unica sincronizzazione CPU
+                for key, num in zip(keys, numbers):
+                    writer.add_scalar(key, float(num), it)
             except Exception:
                 pass
         if (it + 1) % save_every == 0:
@@ -480,6 +532,12 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             agent.save(ckpt_path)
             try:
                 league.register(ckpt_path)
+            except Exception:
+                pass
+        # Optional profiler or external hook per-iteration
+        if on_iter_end is not None:
+            try:
+                on_iter_end(it)
             except Exception:
                 pass
     if writer is not None:

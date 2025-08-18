@@ -24,14 +24,13 @@ def _suit_to_int(suit):
     return 3  # 'bastoni'
 
 def _card_to_id(card):
-    # Accetta sia tuple (rank, suit) sia ID int
     if isinstance(card, int):
         return int(card)
     rank, suit = card
     return (rank - 1) * 4 + _suit_to_int(suit)
 
 def _id_to_card(cid):
-    # Legacy helper (evitare nuovo uso): mantieni per compat GUI
+    # Legacy helper (evitare nuovo uso)
     rank = cid // 4 + 1
     suit = ['denari', 'coppe', 'spade', 'bastoni'][cid % 4]
     return (rank, suit)
@@ -82,6 +81,11 @@ class ScoponeEnvMA(gym.Env):
         self._table_ids = []
         self._hands_bits = {p: 0 for p in range(4)}
         self._table_bits = 0
+        # GPU mirrors: int64 bitsets on CUDA to keep state resident on device
+        self._hands_bits_t = torch.zeros(4, dtype=torch.int64, device=device)
+        self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
+        self._captured_bits_t = torch.zeros(2, dtype=torch.int64, device=device)
+        self._one_i64 = torch.tensor(1, dtype=torch.int64, device=device)
         
         # Regole/varianti opzionali della partita
         # Nota: negli script con modalità di default, "asso_piglia_tutto" è disattivato
@@ -110,9 +114,26 @@ class ScoponeEnvMA(gym.Env):
             ids = [_card_to_id(c) for c in self.game_state['hands'][p]]
             self._hands_ids[p] = ids
             self._hands_bits[p] = _ids_to_bitset(ids) if self._use_bitset else 0
+            # sync CUDA mirror
+            try:
+                self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
+            except Exception:
+                self._hands_bits_t[p] = torch.tensor(int(self._hands_bits[p]), dtype=torch.int64, device=device)
         tids = [_card_to_id(c) for c in self.game_state['table']]
         self._table_ids = tids
         self._table_bits = _ids_to_bitset(tids) if self._use_bitset else 0
+        try:
+            self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
+        except Exception:
+            self._table_bits_t = torch.tensor(int(self._table_bits), dtype=torch.int64, device=device)
+        # captured squads mirror
+        try:
+            bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
+            bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
+        except Exception:
+            bits0, bits1 = 0, 0
+        self._captured_bits_t[0] = torch.as_tensor(bits0, dtype=torch.int64, device=device)
+        self._captured_bits_t[1] = torch.as_tensor(bits1, dtype=torch.int64, device=device)
 
     
     def clone(self):
@@ -130,166 +151,88 @@ class ScoponeEnvMA(gym.Env):
         return cloned
     #@profile
     def get_valid_actions(self):
-        """Versione ad alte prestazioni con cache efficiente"""
+        """Calcola azioni valide interamente su GPU usando i mirror a bitset CUDA."""
         start_time = time.time()
-        
-        # OTTIMIZZAZIONE: Calcola una chiave cache efficiente basata su ID numerici
-        # usa cache ID se disponibile
-        if isinstance(self.game_state["hands"][self.current_player][0], int):
-            hand_ids = tuple(sorted(self.game_state["hands"][self.current_player]))
-            table_ids = tuple(sorted(self.game_state["table"]))
-        else:
-            if self._use_id_cache and self._hands_ids[self.current_player] is not None:
-                hand_ids = tuple(sorted(self._hands_ids[self.current_player]))
-                table_ids = tuple(sorted(self._table_ids))
+        from observation import RANK_OF_ID as _RANK_OF_ID
+        from actions import encode_action
+
+        # Estrai ID in mano e sul tavolo da bitset tensor
+        ids = torch.arange(40, device=device, dtype=torch.int64)
+        hand_mask = ((self._hands_bits_t[self.current_player] >> ids) & 1).bool()
+        table_mask = ((self._table_bits_t >> ids) & 1).bool()
+        hand_ids_t = ids[hand_mask]
+        table_ids_t = ids[table_mask]
+
+        valid_actions = []
+
+        if hand_ids_t.numel() == 0:
+            self._get_valid_actions_time += time.time() - start_time
+            return valid_actions
+
+        for pid_t in hand_ids_t:
+            pid = int(pid_t.item())
+            prank = int(_RANK_OF_ID[pid].item())
+
+            # Pari-rank sul tavolo
+            if table_ids_t.numel() > 0:
+                table_ranks = _RANK_OF_ID[table_ids_t].to(torch.int64)
+                direct_sel = (table_ranks == prank)
+                direct_ids_t = table_ids_t[direct_sel]
             else:
-                hand_ids = tuple(sorted(_card_to_id(c) for c in self.game_state["hands"][self.current_player]))
-                table_ids = tuple(sorted(_card_to_id(c) for c in self.game_state["table"]))
-        current_hash = (hand_ids, table_ids)
-        
-        # Verifica cache
-        if current_hash == self._last_state_hash and current_hash in self._valid_actions_cache:
-            self._cache_hits += 1
-            valid_actions = self._valid_actions_cache[current_hash]
-            # LRU refresh
-            self._valid_actions_cache.move_to_end(current_hash)
-        else:
-            # Cache miss
-            self._cache_misses += 1
-            
-            # Calcola le azioni valide (fast path con ID/bitset)
-            try:
-                valid_actions = []
-                table_ids_list = list(table_ids)
+                direct_ids_t = torch.empty(0, dtype=torch.int64, device=device)
 
-                # helper: trova subset che sommano a target
-                from actions import find_sum_subsets_ids, encode_action
-
-                for pid in hand_ids:
-                    prank = pid // 4 + 1
-                    # pari-rank sul tavolo
-                    direct_ids = [cid for cid in table_ids_list if (cid // 4 + 1) == prank]
-                    if direct_ids:
-                        for did in direct_ids:
-                            valid_actions.append(encode_action(pid, [did]))
+            if direct_ids_t.numel() > 0:
+                for did_t in direct_ids_t:
+                    valid_actions.append(encode_action(pid, [int(did_t.item())]))
+            else:
+                # Somma: trova tutti i subset con somma prank (GPU)
+                n = int(table_ids_t.numel())
+                if n > 0:
+                    pos = torch.arange(n, device=device, dtype=torch.int64)
+                    ranks_k = _RANK_OF_ID[table_ids_t].to(torch.int64)
+                    masks = torch.arange(1, 1 << n, device=device, dtype=torch.int64)
+                    sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.int64)
+                    sums = (sel * ranks_k.unsqueeze(0)).sum(dim=1)
+                    good = (sums == prank).nonzero(as_tuple=False).flatten()
+                    if good.numel() > 0:
+                        for gi in good:
+                            subset_ids = table_ids_t[((masks[gi].unsqueeze(0) >> pos) & 1).bool()].tolist()
+                            valid_actions.append(encode_action(pid, subset_ids))
                     else:
-                        # somma
-                        subs = find_sum_subsets_ids(table_ids_list, prank)
-                        if subs:
-                            for sub in subs:
-                                valid_actions.append(encode_action(pid, list(sub)))
-                        else:
-                            # scarto
-                            valid_actions.append(encode_action(pid, []))
+                        # Scarto
+                        valid_actions.append(encode_action(pid, []))
+                else:
+                    # Tavolo vuoto: solo scarto
+                    valid_actions.append(encode_action(pid, []))
 
-                # Variante: Asso piglia tutto
-                if self.rules.get("asso_piglia_tutto", False) and len(table_ids_list) > 0:
-                    for pid in hand_ids:
-                        if (pid // 4 + 1) == 1:
-                            extra = encode_action(pid, list(table_ids_list))
-                            valid_actions.append(extra)
-            except Exception:
-                # Fallback alla versione originale
-                valid_actions = get_valid_actions(
-                    game_state=self.game_state,
-                    current_player=self.current_player
-                )
+            # Variante: Asso piglia tutto (aggiungi cattura completa)
+            if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and prank == 1:
+                valid_actions.append(encode_action(pid, table_ids_t.tolist()))
+            # Ace place action if allowed
+            ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
+            ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
+            if prank == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
+                valid_actions.append(encode_action(pid, []))
 
-            # Variante: Asso piglia tutto → aggiungi azioni extra (asso cattura tutto il tavolo)
-            try:
-                if self.rules.get("asso_piglia_tutto", False):
-                    # Chiavi compatte per deduplicare in O(1) evitando decode per confronto
-                    def _action_key(vec):
-                        try:
-                            import torch as _torch
-                            if _torch.is_tensor(vec):
-                                nz = _torch.nonzero(vec > 0, as_tuple=False).flatten().tolist()
-                                return tuple(int(i) for i in nz)
-                            else:
-                                nz = torch.nonzero(torch.as_tensor(vec, dtype=torch.float32), as_tuple=False).flatten()
-                                return tuple(int(i.item()) for i in nz)
-                        except Exception:
-                            return None
-                    existing_keys = set()
-                    for v in valid_actions:
-                        k = _action_key(v)
-                        if k is not None:
-                            existing_keys.add(k)
+        # Post-filtri AP: rimuovi posa asso non consentita se richiesto
+        ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
+        ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
+        if not (ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0)) and table_ids_t.numel() > 0:
+            filtered = []
+            for v in valid_actions:
+                try:
+                    played = v[:40].reshape(10, 4)
+                    captured = v[40:]
+                    is_ace_play = bool(played[0, :].any().item())
+                    is_no_capture = not bool(captured.any().item())
+                    if is_ace_play and is_no_capture:
+                        continue
+                except Exception:
+                    pass
+                filtered.append(v)
+            valid_actions = filtered
 
-                    hand_cards = self.game_state["hands"].get(self.current_player, [])
-                    table_cards = self.game_state.get("table", [])
-                    if table_cards:
-                        for card in hand_cards:
-                            cid = _card_to_id(card)
-                            if ((cid // 4) + 1) == 1:  # Asso
-                                extra = encode_action(cid, list(map(_card_to_id, table_cards)))
-                                # Evita duplicati con chiave rapida
-                                extra_key = _action_key(extra)
-                                if extra_key is None or extra_key not in existing_keys:
-                                    valid_actions.append(extra)
-                                    if extra_key is not None:
-                                        existing_keys.add(extra_key)
-
-                    # Nuova regola: posabilità dell'asso piglia tutto
-                    # Se posabile è consentito, aggiungi anche l'azione di "posa" (nessuna presa)
-                    ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
-                    ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-                    if ap_posabile:
-                        for card in hand_cards:
-                            cid = _card_to_id(card)
-                            if ((cid // 4) + 1) == 1:
-                                can_place_now = True if not ap_only_empty else (len(table_cards) == 0)
-                                if can_place_now:
-                                    # Verifica se esiste già l'azione di posa (cattura vuota)
-                                    place_vec = encode_action(cid, [])
-                                    place_key = _action_key(place_vec)
-                                    if place_key is None or place_key not in existing_keys:
-                                        valid_actions.append(place_vec)
-                                        if place_key is not None:
-                                            existing_keys.add(place_key)
-
-                    # Se AP è attivo ma la posa non è consentita nelle condizioni attuali,
-                    # rimuovi eventuali azioni di "posa" dell'asso (no-capture).
-                    # Eccezione importante: a tavolo vuoto manteniamo l'azione "asso + []"
-                    # per rappresentare (lato UI) la presa forzata su tavolo vuoto.
-                    allow_place_now = ap_posabile and (not ap_only_empty or (len(table_cards) == 0))
-                    if not allow_place_now and len(table_cards) > 0:
-                        filtered = []
-                        for v in valid_actions:
-                            try:
-                                import torch as _torch
-                                if _torch.is_tensor(v):
-                                    played = v[:40].reshape(10, 4)
-                                    captured = v[40:]
-                                    is_ace_play = bool(played[0, :].any().item())
-                                    is_no_capture = not bool(captured.any().item())
-                                else:
-                                    played = v[:40].reshape(10, 4)
-                                    captured = v[40:]
-                                    is_ace_play = played[0, :].any()
-                                    is_no_capture = not torch.any(captured)
-                                if is_ace_play and is_no_capture:
-                                    continue
-                            except Exception:
-                                # Non scartare se non interpretabile
-                                pass
-                            filtered.append(v)
-                        valid_actions = filtered
-            except Exception:
-                # In caso di qualunque errore, non interrompere il flusso
-                pass
-            
-            # Aggiorna la cache
-            # LRU insert
-            self._valid_actions_cache[current_hash] = valid_actions
-            self._valid_actions_cache.move_to_end(current_hash)
-            while len(self._valid_actions_cache) > self._cache_capacity:
-                self._valid_actions_cache.popitem(last=False)
-            self._last_state_hash = current_hash
-        
-        # Aggiorna il tempo di esecuzione
         self._get_valid_actions_time += time.time() - start_time
-        
         return valid_actions
     
     def step(self, action_vec):
@@ -326,16 +269,11 @@ class ScoponeEnvMA(gym.Env):
         if pid not in [_card_to_id(c) for c in hand] and pid not in hand:
             raise ValueError(f"La carta {pid} non è nella mano del giocatore {current_player}.")
         
-        # Verifica carte da catturare (ID)
-        if self._use_bitset and self._use_id_cache:
-            for cid in cap_ids:
-                if (self._table_bits >> cid) & 1 == 0:
-                    raise ValueError(f"La carta {cid} non si trova sul tavolo; cattura non valida.")
-        else:
-            table_set = set(table)
-            for cid in cap_ids:
-                if cid not in table_set:
-                    raise ValueError(f"La carta {cid} non si trova sul tavolo; cattura non valida.")
+        # Verifica carte da catturare (ID) interamente via bitset CUDA mirror
+        for cid in cap_ids:
+            present = int(((self._table_bits_t >> int(cid)) & self._one_i64).item())
+            if present == 0:
+                raise ValueError(f"La carta {cid} non si trova sul tavolo; cattura non valida.")
 
         # Applicazione nuova regola AP posabilità: forza presa totale se non è consentito posare
         rank = pid // 4 + 1
@@ -361,14 +299,16 @@ class ScoponeEnvMA(gym.Env):
                     except Exception:
                         pass
         
-        # Verifica regole di cattura
-        # Calcoli su ID per coerenza
-        table_ids_current = list(self._table_ids) if self._use_id_cache else [_card_to_id(c) for c in table]
-        same_rank_ids = [cid for cid in table_ids_current if ((cid // 4) + 1) == rank]
+        # Verifica regole di cattura su GPU
+        ids = torch.arange(40, device=device, dtype=torch.int64)
+        table_ids_t = ids[((self._table_bits_t >> ids) & 1).bool()]
+        from observation import RANK_OF_ID as _RANK_OF_ID
+        same_rank_ids_t = table_ids_t[(_RANK_OF_ID[table_ids_t].to(torch.int64) == int(rank))]
+        same_rank_ids = same_rank_ids_t.tolist()
         if same_rank_ids:
             # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta
             ace_take_all = (rank == 1 and self.rules.get("asso_piglia_tutto", False)
-                            and set(cap_ids) == set(table_ids_current))
+                            and set(cap_ids) == set(table_ids_t.tolist()))
             if not ace_take_all:
                 # Devi catturare UNA carta di pari rank
                 if not (len(cap_ids) == 1 and (cap_ids[0] in same_rank_ids)):
@@ -376,7 +316,7 @@ class ScoponeEnvMA(gym.Env):
         elif cap_ids:
             # Verifica somma
             # Eccezione: Asso piglia tutto
-            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False) and set(cap_ids) == set(table_ids_current)):
+            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False) and set(cap_ids) == set(table_ids_t.tolist())):
                 sum_chosen = sum(((cid // 4) + 1) for cid in cap_ids)
                 if sum_chosen != rank:
                     raise ValueError(f"La somma delle carte catturate ({sum_chosen}) deve essere uguale al rank ({rank}).")
@@ -397,11 +337,21 @@ class ScoponeEnvMA(gym.Env):
                 pass
             if self._use_bitset:
                 self._hands_bits[current_player] &= ~(1 << pid)
+                # tensor mirror
+                try:
+                    mask = (self._one_i64 << int(pid))
+                    self._hands_bits_t[current_player] = self._hands_bits_t[current_player] & (~mask)
+                except Exception:
+                    pass
         
         if forced_ace_capture_on_empty:
             # Cattura forzata su tavolo vuoto: conta come scopa (o cattura se disabilitata via opzione)
             squad_id = 0 if current_player in [0, 2] else 1
             self.game_state["captured_squads"][squad_id].append(pid)
+            try:
+                self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | (self._one_i64 << int(pid))
+            except Exception:
+                pass
             # Scopa se non è l'ultima carta giocata
             cards_left = sum(len(self.game_state["hands"][p]) for p in range(4))
             if cards_left > 0:
@@ -425,11 +375,22 @@ class ScoponeEnvMA(gym.Env):
                         pass
                     if self._use_bitset:
                         self._table_bits &= ~(1 << cid)
+                        try:
+                            self._table_bits_t = self._table_bits_t & (~(self._one_i64 << int(cid)))
+                        except Exception:
+                            pass
             
             # Aggiungi le carte catturate e la carta giocata alla squadra
             squad_id = 0 if current_player in [0, 2] else 1
             self.game_state["captured_squads"][squad_id].extend(cap_ids)
             self.game_state["captured_squads"][squad_id].append(pid)
+            try:
+                take_mask = (self._one_i64 << int(pid))
+                for cid in cap_ids:
+                    take_mask = take_mask | (self._one_i64 << int(cid))
+                self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | take_mask
+            except Exception:
+                pass
             
             # Verifica scopa
             if len(table) == 0:
@@ -449,6 +410,10 @@ class ScoponeEnvMA(gym.Env):
                 self._table_ids.append(pid)
                 if self._use_bitset:
                     self._table_bits |= (1 << pid)
+                    try:
+                        self._table_bits_t = self._table_bits_t | (self._one_i64 << int(pid))
+                    except Exception:
+                        pass
         
         # Calcola reward shaping opzionale
         shaped_reward = 0.0
@@ -518,12 +483,23 @@ class ScoponeEnvMA(gym.Env):
                     
                     if last_capturing_team is not None:
                         self.game_state["captured_squads"][last_capturing_team].extend(self.game_state["table"])
+                        try:
+                            add_mask = torch.zeros((), dtype=torch.int64, device=device)
+                            for cid in self.game_state["table"]:
+                                add_mask = add_mask | (self._one_i64 << int(_card_to_id(cid) if not isinstance(cid, int) else int(cid)))
+                            self._captured_bits_t[last_capturing_team] = self._captured_bits_t[last_capturing_team] | add_mask
+                        except Exception:
+                            pass
                 # In ogni caso svuota il tavolo a fine mano
                 self.game_state["table"].clear()
                 # reset cache table
                 if self._use_id_cache:
                     self._table_ids.clear()
                     self._table_bits = 0
+                    try:
+                        self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
+                    except Exception:
+                        pass
             
             # Calcolo punteggio finale
             from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
@@ -624,12 +600,28 @@ class ScoponeEnvMA(gym.Env):
                 for p in range(4):
                     self._hands_ids[p] = list(self.game_state['hands'][p])
                     self._hands_bits[p] = _ids_to_bitset(self._hands_ids[p]) if self._use_bitset else 0
+                    try:
+                        self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
+                    except Exception:
+                        self._hands_bits_t[p] = torch.tensor(int(self._hands_bits[p]), dtype=torch.int64, device=device)
                 self._table_ids = list(self.game_state['table'])
                 self._table_bits = _ids_to_bitset(self._table_ids) if self._use_bitset else 0
+                try:
+                    self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
+                except Exception:
+                    self._table_bits_t = torch.tensor(int(self._table_bits), dtype=torch.int64, device=device)
             else:
                 self._rebuild_id_caches()
         except Exception:
             self._rebuild_id_caches()
+        # reset captured bits tensors
+        try:
+            bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
+            bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
+        except Exception:
+            bits0, bits1 = 0, 0
+        self._captured_bits_t[0] = torch.as_tensor(bits0, dtype=torch.int64, device=device)
+        self._captured_bits_t[1] = torch.as_tensor(bits1, dtype=torch.int64, device=device)
         
         # Ottieni l'osservazione iniziale
         return self._get_observation(self.current_player)

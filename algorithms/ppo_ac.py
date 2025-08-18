@@ -103,6 +103,7 @@ class ActionConditionedPPO:
         logp = torch.log_softmax(logits, dim=0)
         idx_t = torch.multinomial(torch.exp(logp), num_samples=1).squeeze(0)
         chosen_act = actions_t[idx_t]
+        # Return GPU tensors; caller will keep them on device
         return chosen_act, logp[idx_t], idx_t
 
     def compute_loss(self, batch):
@@ -205,12 +206,13 @@ class ActionConditionedPPO:
         approx_kl = (old_logp - logp_new).mean().abs()
         # clip frac non calcolata su tutte le azioni: metti 0 per logging (puoi rimpiazzare con stima migliore)
         clip_frac = torch.tensor(0.0, device=device)
+        # Restituisci TENSORS su device; conversione a float avverrà nel trainer in un'unica sync
         return loss, {
-            'loss_pi': loss_pi.item(),
-            'loss_v': loss_v.item(),
-            'entropy': entropy.item(),
-            'approx_kl': float(approx_kl.item()),
-            'clip_frac': float(clip_frac.item())
+            'loss_pi': loss_pi.detach(),
+            'loss_v': loss_v.detach(),
+            'entropy': entropy.detach(),
+            'approx_kl': approx_kl.detach(),
+            'clip_frac': clip_frac.detach()
         }
 
     def update(self, batch, epochs: int = 4, minibatch_size: int = 256):
@@ -228,7 +230,7 @@ class ActionConditionedPPO:
             for p in params:
                 if p.grad is not None:
                     total_sq = total_sq + p.grad.data.norm(2).pow(2)
-            return float(total_sq.sqrt().item())
+            return total_sq.sqrt()
 
         for _ in range(epochs):
             perm = torch.randperm(num_samples).tolist()
@@ -276,15 +278,19 @@ class ActionConditionedPPO:
                     self.opt_critic.step()
                 last_info = info
                 self.update_steps += 1
-                avg_kl_acc += info.get('approx_kl', 0.0)
-                avg_clip_acc += info.get('clip_frac', 0.0)
+                avg_kl_acc += info.get('approx_kl', torch.tensor(0.0, device=device))
+                avg_clip_acc += info.get('clip_frac', torch.tensor(0.0, device=device))
                 count_mb += 1
-                last_info['grad_norm_actor'] = gn_actor
-                last_info['grad_norm_critic'] = gn_critic
+                last_info['grad_norm_actor'] = gn_actor.detach()
+                last_info['grad_norm_critic'] = gn_critic.detach()
                 last_info['lr_actor'] = self.opt_actor.param_groups[0]['lr']
                 last_info['lr_critic'] = self.opt_critic.param_groups[0]['lr']
                 # early stop per target KL
-                if info.get('approx_kl', 0.0) > self.target_kl:
+                try:
+                    _kl = float(info.get('approx_kl', torch.tensor(0.0, device=device)).detach().cpu().item())
+                except Exception:
+                    _kl = 0.0
+                if _kl > self.target_kl:
                     self._high_kl_count += 1
                     early_stop = True
                     break
@@ -310,9 +316,9 @@ class ActionConditionedPPO:
             last_info['lr_reduced'] = True
         # medie su minibatch
         if count_mb > 0:
-            last_info['avg_kl'] = avg_kl_acc / count_mb
-            last_info['avg_clip_frac'] = avg_clip_acc / count_mb
-            last_info['early_stop'] = early_stop
+            last_info['avg_kl'] = (avg_kl_acc / count_mb).detach()
+            last_info['avg_clip_frac'] = (avg_clip_acc / count_mb).detach()
+            last_info['early_stop'] = torch.tensor(1.0 if early_stop else 0.0, device=device)
         return last_info
 
     def add_lr_schedulers(self, actor_scheduler, critic_scheduler):

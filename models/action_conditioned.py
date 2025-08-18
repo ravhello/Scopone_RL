@@ -202,10 +202,6 @@ class ActionConditionedActor(torch.nn.Module):
         legal_scores = torch.matmul(legals_t, logits_vec.reshape(-1, 1)).squeeze(-1)  # (A)
         return legal_scores
 
-    # Accept legacy checkpoints by loading non-strictly
-    def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
-        return super().load_state_dict(state_dict, strict=False)
-
 
 class CentralValueNet(torch.nn.Module):
     def __init__(self, obs_dim=10823):

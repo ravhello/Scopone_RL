@@ -267,6 +267,8 @@ def test_get_valid_actions_direct_capture(env_fixture):
     env.game_state["hands"][0] = [tid((4,'denari')), tid((7,'spade'))]
     env.game_state["table"] = [tid((7,'denari')), tid((3,'spade')), tid((4,'coppe'))]
     env.current_player = 0
+    # Sync mirrors for GPU-only environment after manual mutation
+    env._rebuild_id_caches()
 
     valids = env.get_valid_actions()
     plays = []
@@ -290,6 +292,7 @@ def test_get_valid_actions_no_direct_capture(env_fixture):
     env.game_state["hands"][0] = [tid((6,'denari')), tid((7,'spade'))]
     env.game_state["table"] = [tid((1,'coppe')), tid((3,'spade')), tid((2,'bastoni'))]
     env.current_player = 0
+    env._rebuild_id_caches()
 
     valids = env.get_valid_actions()
     plays = []
@@ -1380,6 +1383,7 @@ def test_ace_take_all_valid_action_added():
     env.current_player = 0
     env.game_state["hands"][0] = [tid((1, 'denari')), tid((5, 'spade'))]
     env.game_state["table"] = [tid((2, 'coppe')), tid((3, 'spade'))]
+    env._rebuild_id_caches()
 
     valids = env.get_valid_actions()
 

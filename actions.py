@@ -70,30 +70,27 @@ def encode_action(card, cards_to_capture):
     played_card_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
     captured_cards_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
     
-    # Mappatura dei semi agli indici di colonna
-    suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-    
-    # Codifica la carta giocata (accetta ID o tuple)
+    # Codifica la carta giocata (forza ID)
     if isinstance(card, int):
         cid = int(card)
-        row = (cid // 4)
-        col = (cid % 4)
     else:
         rank, suit = card
-        row = rank - 1
-        col = suit_to_col[suit]
+        suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+        cid = (rank - 1) * 4 + suit_to_col[suit]
+    row = (cid // 4)
+    col = (cid % 4)
     played_card_matrix[row, col] = 1.0
     
     # Codifica le carte catturate
     for capt_card in cards_to_capture:
         if isinstance(capt_card, int):
             cid = int(capt_card)
-            capt_row = (cid // 4)
-            capt_col = (cid % 4)
         else:
             capt_rank, capt_suit = capt_card
-            capt_row = capt_rank - 1
-            capt_col = suit_to_col[capt_suit]
+            suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+            cid = (capt_rank - 1) * 4 + suit_to_col[capt_suit]
+        capt_row = (cid // 4)
+        capt_col = (cid % 4)
         captured_cards_matrix[capt_row, capt_col] = 1.0
     
     # Appiattisci le matrici e concatenale
@@ -120,9 +117,12 @@ def _idx_to_id(row: int, col: int) -> int:
 def _decode_ids(vec_t: torch.Tensor):
     if vec_t.dim() != 1 or vec_t.numel() != 80:
         raise ValueError("decode_action_ids richiede un vettore 80-dim")
-    played_idx = int(torch.argmax(vec_t[:40]).item())
+    # Avoid per-element .item(); move once to CPU for indexing scalars
+    played_idx = torch.argmax(vec_t[:40])
     captured_ids = torch.nonzero(vec_t[40:] > 0, as_tuple=False).flatten()
-    return played_idx, [int(i.item()) for i in captured_ids]
+    played_idx_cpu = int(played_idx.item())
+    captured_cpu = captured_ids.tolist()
+    return played_idx_cpu, captured_cpu
 
 def decode_action_ids(action_vec):
     """
@@ -146,111 +146,60 @@ def find_sum_subsets_ids(table_ids, target_rank: int):
     """
     if not table_ids:
         return []
-    # Usa puro Python per evitare CPU array ops; le liste restano leggere
-    ids = [int(x) for x in table_ids]
-    ranks = [(cid // 4) + 1 for cid in ids]
-    if False:
-        masks = _subset_masks_with_sum(torch.tensor(ranks, dtype=torch.int64), int(target_rank))
-        n = len(ids)
-        results = []
-        for mask in masks:
-            sub = []
-            for i in range(n):
-                if (mask >> i) & 1:
-                    sub.append(int(ids[i]))
-            results.append(sub)
-        return results
-    # Python path: bitmask
-    n = len(ids)
+    ids = torch.as_tensor([int(x) for x in table_ids], dtype=torch.long, device=device)
+    ranks = (ids // 4) + 1
+    n = int(ids.numel())
+    if n <= 0:
+        return []
+    pos = torch.arange(n, device=device, dtype=torch.long)
+    masks = torch.arange(1, 1 << n, device=device, dtype=torch.long)
+    sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
+    sums = (sel * ranks.unsqueeze(0)).sum(dim=1)
+    good = (sums == int(target_rank)).nonzero(as_tuple=False).flatten()
     results = []
-    for mask in range(1, 1 << n):
-        s = 0
-        sub = []
-        for i in range(n):
-            if (mask >> i) & 1:
-                cid = ids[i]
-                s += (cid // 4) + 1
-                sub.append(cid)
-        if s == target_rank:
-            results.append(sub)
+    for gi in good:
+        subset = ids[((masks[gi].unsqueeze(0) >> pos) & 1).bool()].tolist()
+        results.append([int(x) for x in subset])
     return results
 
 def get_valid_actions(game_state, current_player):
-    """
-    Restituisce una lista di azioni valide nel formato matrice per il giocatore corrente.
-    
-    Args:
-        game_state: Stato del gioco
-        current_player: ID del giocatore corrente
-    
-    Returns:
-        Lista di azioni valide nel formato matrice (80 bit)
-    """
+    """Azioni valide compute interamente su CUDA. Richiede stato in ID (0..39)."""
     cp = current_player
     hand = game_state["hands"][cp]
     table = game_state["table"]
-
     valid_actions = []
-
-    # Se lo stato è in ID (int), usa path ottimizzato con bitmask/numba
-    if len(hand) > 0 and isinstance(hand[0], int):
-        # Helpers: ID <-> tuple
-        def _id_to_tuple(cid: int):
-            rank = cid // 4 + 1
-            suit = _COL_TO_SUIT[cid % 4]
-            return (rank, suit)
-
-        from actions import find_sum_subsets_ids
-
-        table_ids = list(table)
-        # Per ogni carta in mano
-        for pid in hand:
-            prank = pid // 4 + 1
-            # pari-rank
-            direct_ids = [tid for tid in table_ids if (tid // 4 + 1) == prank]
-            if direct_ids:
-                for did in direct_ids:
-                    action_vec = encode_action(_id_to_tuple(pid), [_id_to_tuple(did)])
-                    valid_actions.append(action_vec)
-            else:
-                subs = find_sum_subsets_ids(table_ids, prank)
-                if subs:
-                    for sub in subs:
-                        action_vec = encode_action(_id_to_tuple(pid), [_id_to_tuple(x) for x in sub])
-                        valid_actions.append(action_vec)
-                else:
-                    valid_actions.append(encode_action(_id_to_tuple(pid), []))
+    if not hand:
         return valid_actions
-
-    # Altrimenti, percorso legacy su tuple con acceleratori locali
-    def _find_sum_subsets(table_cards, target_rank):
-        # Usa accelerazione numba/bitmask se possibile, altrimenti DP
-        if len(table_cards) <= 15:
-            return _find_sum_subsets_fast(table_cards, target_rank)
-        dp = defaultdict(list)
-        dp[0] = [tuple()]
-        for card in table_cards:
-            r, _ = card
-            for s in sorted(list(dp.keys()), reverse=True):
-                new_sum = s + r
-                if new_sum > target_rank:
-                    continue
-                for subset in dp[s]:
-                    dp[new_sum].append(subset + (card,))
-        return [list(subset) for subset in dp.get(target_rank, [])]
-
-    for card in hand:
-        rank, suit = card
-        same_rank_cards = [t_c for t_c in table if t_c[0] == rank]
-        if same_rank_cards:
-            for direct_card in same_rank_cards:
-                valid_actions.append(encode_action(card, [direct_card]))
+    if not isinstance(hand[0], int) or (len(table) > 0 and not isinstance(table[0], int)):
+        raise TypeError("get_valid_actions richiede game_state in ID (int)")
+    from observation import RANK_OF_ID as _RANK_OF_ID
+    hand_ids_t = torch.as_tensor(hand, dtype=torch.long, device=device)
+    table_ids_t = torch.as_tensor(table or [], dtype=torch.long, device=device)
+    for pid_t in hand_ids_t:
+        pid = int(pid_t.item())
+        prank = int(_RANK_OF_ID[pid].item())
+        if table_ids_t.numel() > 0:
+            table_ranks = _RANK_OF_ID[table_ids_t].to(torch.long)
+            direct_ids_t = table_ids_t[table_ranks == prank]
         else:
-            sum_subsets = _find_sum_subsets(table, rank)
-            if sum_subsets:
-                for subset in sum_subsets:
-                    valid_actions.append(encode_action(card, subset))
+            direct_ids_t = torch.empty(0, dtype=torch.long, device=device)
+        if direct_ids_t.numel() > 0:
+            for did_t in direct_ids_t:
+                valid_actions.append(encode_action(pid, [int(did_t.item())]))
+        else:
+            n = int(table_ids_t.numel())
+            if n > 0:
+                pos = torch.arange(n, device=device, dtype=torch.long)
+                masks = torch.arange(1, 1 << n, device=device, dtype=torch.long)
+                sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
+                sums = (sel * (table_ranks.unsqueeze(0))).sum(dim=1)
+                good = (sums == prank).nonzero(as_tuple=False).flatten()
+                if good.numel() > 0:
+                    for gi in good:
+                        subset_ids = table_ids_t[((masks[gi].unsqueeze(0) >> pos) & 1).bool()].tolist()
+                        valid_actions.append(encode_action(pid, subset_ids))
+                else:
+                    valid_actions.append(encode_action(pid, []))
             else:
-                valid_actions.append(encode_action(card, []))
-
+                valid_actions.append(encode_action(pid, []))
     return valid_actions

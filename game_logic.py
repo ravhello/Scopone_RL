@@ -1,5 +1,6 @@
 # game_logic.py
 
+import torch
 from actions import decode_action_ids
 from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
 
@@ -16,42 +17,47 @@ def update_game_state(game_state, action_id, current_player, rules=None):
         final_reward = compute_final_reward_from_breakdown(final_breakdown)
         return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
 
-    # Helpers per conversioni
-    COL_TO_SUIT = {0: 'denari', 1: 'coppe', 2: 'spade', 3: 'bastoni'}
-    def id_to_tuple(cid: int):
-        return (cid // 4 + 1, COL_TO_SUIT[cid % 4])
-    def ensure_same_mode(x, want_tuple: bool):
-        # x può essere int o (rank,suit)
-        if want_tuple:
-            return id_to_tuple(x) if isinstance(x, int) else x
-        else:
-            if isinstance(x, int):
-                return x
-            r, s = x
-            suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-            return (r - 1) * 4 + suit_to_col[s]
+    # Helpers per conversioni (ID/tuple) e operazioni su CUDA
+    device = torch.device('cuda')
+    def to_id(x):
+        if isinstance(x, int):
+            return int(x)
+        r, s = x
+        suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+        return (r - 1) * 4 + suit_to_col[s]
 
     # Decodifica l'azione (sempre in ID)
     played_id, captured_ids = decode_action_ids(action_id)
-    # Determina la modalità dello stato attuale (ID o tuple)
-    hand_is_id = (len(hand) > 0 and isinstance(hand[0], int))
+    # Enforce ID-only
     table = game_state["table"]
-    table_is_id = (len(table) > 0 and isinstance(table[0], int))
-    # Allinea rappresentazioni
-    played_card = ensure_same_mode(played_id, want_tuple=not hand_is_id)
-    cards_to_capture = [ensure_same_mode(cid, want_tuple=not table_is_id) for cid in captured_ids]
+    if len(hand) > 0 and not isinstance(hand[0], int):
+        game_state["hands"][current_player] = [to_id(c) for c in hand]
+        hand = game_state["hands"][current_player]
+    if len(table) > 0 and not isinstance(table[0], int):
+        game_state["table"] = [to_id(c) for c in table]
+        table = game_state["table"]
+    game_state["captured_squads"][0] = [to_id(c) for c in game_state["captured_squads"][0]]
+    game_state["captured_squads"][1] = [to_id(c) for c in game_state["captured_squads"][1]]
+    played_card = int(played_id)
+    cards_to_capture = [int(cid) for cid in captured_ids]
     
-    # Cerca la carta nella mano del giocatore corrente
-    if played_card not in hand:
+    # Verifica presenza carta nella mano usando mask su CUDA
+    hand_ids_t = torch.as_tensor([to_id(c) for c in hand], dtype=torch.long, device=device)
+    if hand_ids_t.numel() == 0 or int((hand_ids_t == int(played_id)).any().item()) == 0:
         raise ValueError(f"La carta {played_card} non è nella mano del giocatore {current_player}")
     
     # Rimuovi la carta dalla mano
-    hand.remove(played_card)
+    try:
+        hand.remove(played_card)
+    except ValueError:
+        pass
 
-    # Verifica che le carte da catturare siano sul tavolo
-    for card in cards_to_capture:
-        if card not in table:
-            raise ValueError(f"La carta {card} non è sul tavolo")
+    # Verifica che le carte da catturare siano sul tavolo (mask su CUDA)
+    table_ids_t = torch.as_tensor([to_id(c) for c in table], dtype=torch.long, device=device)
+    if len(cards_to_capture) > 0:
+        caps_t = torch.as_tensor([to_id(c) for c in cards_to_capture], dtype=torch.long, device=device)
+        if table_ids_t.numel() == 0 or int((caps_t.unsqueeze(1) == table_ids_t.unsqueeze(0)).all(dim=1).sum().item()) != len(cards_to_capture):
+            raise ValueError("Una o più carte da catturare non sono sul tavolo")
 
     capture_type = "no_capture"
     scopa_flag = False
@@ -61,14 +67,9 @@ def update_game_state(game_state, action_id, current_player, rules=None):
         for card in cards_to_capture:
             table.remove(card)
         
-        # Mantieni coerenza di rappresentazione con captured_squads esistenti
-        cap_list = game_state["captured_squads"][squad_id]
-        if len(cap_list) > 0:
-            want_tuple = not isinstance(cap_list[0], int)
-        else:
-            want_tuple = not hand_is_id
-        to_add = [ensure_same_mode(c, want_tuple) for c in cards_to_capture]
-        to_add.append(ensure_same_mode(played_id, want_tuple))
+        # Stato ID-only
+        to_add = list(cards_to_capture)
+        to_add.append(int(played_id))
         game_state["captured_squads"][squad_id].extend(to_add)
         
         if len(table) == 0:
@@ -77,11 +78,11 @@ def update_game_state(game_state, action_id, current_player, rules=None):
         capture_type = "capture"
     else:
         # Nessuna cattura: la carta viene messa sul tavolo
-        table.append(played_card)
+        table.append(int(played_card))
         capture_type = "no_capture"
 
     # Verifica se scopa è valida (se scopa_flag e ci sono ancora carte nelle mani degli altri)
-    cards_left = sum(len(game_state["hands"][p]) for p in range(4))
+    cards_left = int(torch.as_tensor([len(game_state["hands"][p]) for p in range(4)], dtype=torch.long, device=device).sum().item())
     if scopa_flag and cards_left > 0:
         capture_type = "scopa"
     # se scopa_flag e cards_left==0, era l'ultima giocata => scopa annullata

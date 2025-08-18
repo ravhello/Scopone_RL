@@ -12,63 +12,46 @@ PRIMIERA_VAL = {1:16, 2:12, 3:13, 4:14, 5:15, 6:18, 7:21, 8:10, 9:10, 10:10}
 # Mappa condivisa per conversione suit → index
 suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
 
-# ===== ID/Bitset helpers =====
+# ===== ID/Bitset helpers (CUDA) =====
 RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=torch.device('cuda'))
 SUITCOL_OF_ID = torch.tensor([i % 4 for i in range(40)], dtype=torch.int16, device=torch.device('cuda'))
 MASK_RANK = [(sum(1 << j for j in range(40) if (j // 4 + 1) == r)) for r in range(1, 11)]
+PRIMIERA_VAL_T = torch.tensor([0, 16, 12, 13, 14, 15, 18, 21, 10, 10, 10], dtype=torch.float32, device=torch.device('cuda'))
 
 def bitset_popcount(x: int) -> int:
     return int(x.bit_count()) if hasattr(int, 'bit_count') else bin(x).count('1')
 
 def bitset_rank_counts(bits: int) -> torch.Tensor:
-    counts = torch.zeros(10, dtype=torch.int32, device=torch.device('cuda'))
-    for r in range(10):
-        counts[r] = bitset_popcount(bits & MASK_RANK[r])
-    return counts
+    # GPU-based rank counts via bit manip over CUDA tensor
+    ids = torch.arange(40, device=torch.device('cuda'), dtype=torch.int64)
+    bits_t = torch.tensor(int(bits), dtype=torch.int64, device=torch.device('cuda'))
+    active = ((bits_t >> ids) & 1).to(torch.float32)
+    ranks = RANK_OF_ID.to(torch.int64) - 1
+    counts = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
+    counts.index_add_(0, ranks, active)
+    return counts.to(torch.int32)
 
 def bitset_table_sum(bits: int) -> int:
-    # sum of ranks on table
-    return int(sum((r+1) * bitset_popcount(bits & MASK_RANK[r]) for r in range(10)))
+    # Sum of ranks via CUDA vectorization
+    ids = torch.arange(40, device=torch.device('cuda'), dtype=torch.int64)
+    bits_t = torch.tensor(int(bits), dtype=torch.int64, device=torch.device('cuda'))
+    active = ((bits_t >> ids) & 1).to(torch.float32)
+    ranks = RANK_OF_ID.to(torch.float32)
+    return int(torch.sum(active * ranks).item())
 
 # ----- OTTIMIZZAZIONE: CACHE PER FUNZIONI COSTOSE -----
 # Cache per risultati costosi
 cards_matrix_cache = {}
-# Cache alternativa basata su bitset per vettori 40-d (più stabile e senza sort)
-cards_matrix_cache_bits = {}
-
-def _vector_from_bitset(bits: int) -> torch.Tensor:
-    """Crea un vettore 40-d (float32, CUDA) dai bit attivi in bits (ID 0..39). Usa cache."""
-    cached = cards_matrix_cache_bits.get(bits)
-    if cached is not None:
-        return cached
-    vec = torch.zeros(40, dtype=torch.float32, device=torch.device('cuda'))
-    mb = bits
-    while mb:
-        lsb = mb & -mb
-        idx = (lsb.bit_length() - 1)
-        vec[idx] = 1.0
-        mb ^= lsb
-    cards_matrix_cache_bits[bits] = vec
-    # mantieni cache entro ~2000 entry
-    if len(cards_matrix_cache_bits) > 2000:
-        import random
-        for k in random.sample(list(cards_matrix_cache_bits.keys()), 400):
-            del cards_matrix_cache_bits[k]
-    return vec
 
 def encode_cards_as_matrix(cards):
-    """
-    Codifica un insieme di carte come vettore 40-d. Richiede ID (0..39).
-    """
+    """Codifica un insieme di carte come vettore 40-d su CUDA usando scatter, ID-only."""
     if not cards:
         return torch.zeros(40, dtype=torch.float32, device=torch.device('cuda'))
     if not isinstance(cards[0], int):
-        # Enforce ID-only usage
         raise TypeError("encode_cards_as_matrix expects card IDs (int)")
-    bits = 0
-    for cid in cards:
-        bits |= (1 << int(cid))
-    vec = _vector_from_bitset(bits)
+    idx = torch.as_tensor(cards, dtype=torch.long, device=torch.device('cuda')).clamp_(0, 39)
+    vec = torch.zeros(40, dtype=torch.float32, device=torch.device('cuda'))
+    vec[idx] = 1.0
     return vec
 
 def encode_hands(hands, player_id):
@@ -78,13 +61,9 @@ def encode_hands(hands, player_id):
     """
     # Accetta sia liste di ID sia liste di tuple; usa bitset se ID
     ph = hands[player_id]
-    if ph and isinstance(ph[0], int):
-        bits = 0
-        for cid in ph:
-            bits |= (1 << int(cid))
-        player_hand = _vector_from_bitset(bits)
-    else:
-        player_hand = encode_cards_as_matrix(ph)
+    if ph and not isinstance(ph[0], int):
+        raise TypeError("encode_hands expects ID lists")
+    player_hand = encode_cards_as_matrix(ph)
     
     other_counts = torch.zeros(3, dtype=torch.float32, device=torch.device('cuda'))
     count_idx = 0
@@ -100,11 +79,8 @@ def encode_table(table):
     Codifica il tavolo come matrice rank x suit.
     Versione cachizzata con risultati identici.
     """
-    if table and isinstance(table[0], int):
-        bits = 0
-        for cid in table:
-            bits |= (1 << int(cid))
-        return _vector_from_bitset(bits)
+    if table and not isinstance(table[0], int):
+        raise TypeError("encode_table expects ID list")
     return encode_cards_as_matrix(table)  # 40 dim
 
 def encode_captured_squads(captured_squads):
@@ -114,20 +90,8 @@ def encode_captured_squads(captured_squads):
     """
     t0 = captured_squads[0]
     t1 = captured_squads[1]
-    if t0 and isinstance(t0[0], int):
-        bits0 = 0
-        for c in t0:
-            bits0 |= (1 << int(c))
-        v0 = _vector_from_bitset(bits0)
-    else:
-        v0 = encode_cards_as_matrix(t0)
-    if t1 and isinstance(t1[0], int):
-        bits1 = 0
-        for c in t1:
-            bits1 |= (1 << int(c))
-        v1 = _vector_from_bitset(bits1)
-    else:
-        v1 = encode_cards_as_matrix(t1)
+    v0 = encode_cards_as_matrix(t0)
+    v1 = encode_cards_as_matrix(t1)
     team0_count = torch.tensor([len(t0) / 40.0], dtype=torch.float32, device=torch.device('cuda'))
     team1_count = torch.tensor([len(t1) / 40.0], dtype=torch.float32, device=torch.device('cuda'))
     return torch.cat([v0.reshape(-1), v1.reshape(-1), team0_count, team1_count], dim=0)
@@ -391,36 +355,14 @@ def compute_missing_cards_matrix(game_state, player_id):
     if cache_key in missing_cards_cache:
         return missing_cards_cache[cache_key].clone()
     
-    # Calcolo con bitset se possibile
-    h = game_state["hands"][player_id]
-    t = game_state["table"]
-    c0 = game_state["captured_squads"][0]
-    c1 = game_state["captured_squads"][1]
-    if (h and isinstance(h[0], int)) or (t and isinstance(t[0], int)):
-        visible_bits = 0
-        for lst in (h, t, c0, c1):
-            for cid in lst:
-                if isinstance(cid, int):
-                    visible_bits |= (1 << int(cid))
-        all_bits = (1 << 40) - 1
-        missing_bits = all_bits & (~visible_bits)
-        vec = torch.zeros(40, dtype=torch.float32, device=torch.device('cuda'))
-        mb = missing_bits
-        while mb:
-            lsb = mb & -mb
-            idx = (lsb.bit_length() - 1)
-            vec[idx] = 1.0
-            mb ^= lsb
-        result = vec
-    else:
-        all_cards = list(range(40))
-        visible_cards = set()
-        visible_cards.update(h)
-        visible_cards.update(t)
-        visible_cards.update(c0)
-        visible_cards.update(c1)
-        missing_cards = [card for card in all_cards if card not in set(visible_cards)]
-        result = encode_cards_as_matrix(missing_cards)
+    # GPU mask-based computation
+    vis = torch.zeros(40, dtype=torch.bool, device=torch.device('cuda'))
+    for lst in (game_state["hands"][player_id], game_state["table"], game_state["captured_squads"][0], game_state["captured_squads"][1]):
+        if lst:
+            idx = torch.as_tensor(lst, dtype=torch.long, device=torch.device('cuda'))
+            vis[idx] = True
+    missing = (~vis).to(torch.float32)
+    result = missing
     
     # Salva in cache e ritorna tensore
     missing_cards_cache[cache_key] = result.clone()
@@ -460,62 +402,36 @@ def compute_inferred_probabilities(game_state, player_id):
     if cache_key in inferred_probs_cache:
         return inferred_probs_cache[cache_key].clone()
     
-    # Calcolo originale se non in cache
-    # Tutte le carte nel mazzo
-    # ID set
-    all_ids = set(range(40))
-    
-    # Carte visibili (mano propria, tavolo, catturate)
-    visible_cards = set()
-    visible_cards.update(game_state["hands"][player_id])
-    visible_cards.update(game_state["table"])
-    visible_cards.update(game_state["captured_squads"][0])
-    visible_cards.update(game_state["captured_squads"][1])
-    
-    # Carte invisibili
-    invisible_cards = all_ids - visible_cards
-    
-    # Risultato finale
+    # GPU implementation
+    vis = torch.zeros(40, dtype=torch.bool, device=torch.device('cuda'))
+    for lst in (game_state["hands"][player_id], game_state["table"], game_state["captured_squads"][0], game_state["captured_squads"][1]):
+        if lst:
+            vis[torch.as_tensor(lst, dtype=torch.long, device=torch.device('cuda'))] = True
+    invisible = ~vis
+    total_unknown = int(invisible.sum().item())
     probs = []
     other_players = [p for p in range(4) if p != player_id]
-    
     for p in other_players:
-        played_cards = set()
+        hand_size = len(game_state["hands"].get(p, []))
+        pm = torch.zeros((10, 4), dtype=torch.float32, device=torch.device('cuda'))
+        if hand_size == 0 or total_unknown == 0:
+            probs.append(pm.reshape(-1))
+            continue
+        played_mask = torch.zeros(40, dtype=torch.bool, device=torch.device('cuda'))
         for mv in game_state["history"]:
             if mv["player"] == p:
                 pc = mv["played_card"]
-                if isinstance(pc, int):
-                    played_cards.add(pc)
-                else:
-                    # tuple → id
-                    r, s = pc
-                    pid = (r - 1) * 4 + suit_to_col[s]
-                    played_cards.add(pid)
-        
-        # Dimensione mano attuale
-        hand_size = len(game_state["hands"].get(p, []))
-        
-        # Matrice probabilità (10x4)
-        prob_matrix = torch.zeros((10, 4), dtype=torch.float32, device=torch.device('cuda'))
-        
-        if hand_size == 0 or len(invisible_cards) == 0:
-            probs.append(prob_matrix.reshape(-1))
-            continue
-        
-        # Carte possibili per questo giocatore (invisibili e non già giocate)
-        possible_cards = invisible_cards - played_cards
-        
-        # Totale carte rimaste nel gioco non visibili al giocatore corrente
-        total_unknown_cards = len(invisible_cards)
-        
-        # Per ogni carta possibile
-        for cid in possible_cards:
-            row = int(RANK_OF_ID[cid].item()) - 1
-            col = int(SUITCOL_OF_ID[cid].item())
-            prob_matrix[row, col] = float(hand_size / total_unknown_cards)
-        
-        probs.append(prob_matrix.reshape(-1))
-    result = torch.cat(probs)  # 120 dim
+                cid = int(pc if isinstance(pc, int) else (pc[0] - 1) * 4 + suit_to_col[pc[1]])
+                if 0 <= cid < 40:
+                    played_mask[cid] = True
+        possible_mask = invisible & (~played_mask)
+        idx = torch.nonzero(possible_mask, as_tuple=False).flatten()
+        if idx.numel() > 0:
+            rows = (RANK_OF_ID[idx].to(torch.long) - 1).clamp_(0, 9)
+            cols = SUITCOL_OF_ID[idx].to(torch.long).clamp_(0, 3)
+            pm[rows, cols] = float(hand_size / total_unknown)
+        probs.append(pm.reshape(-1))
+    result = torch.cat(probs)
     
     # Salva in cache
     inferred_probs_cache[cache_key] = result.clone()
@@ -545,39 +461,32 @@ def compute_primiera_status(game_state):
     if cache_key in primiera_cache:
         return primiera_cache[cache_key].clone()
     
-    # Calcolo originale se non in cache
-    # Inizializza gli array per i valori primiera
-    team0_primiera = torch.zeros(4, dtype=torch.float32, device=torch.device('cuda'))
-    team1_primiera = torch.zeros(4, dtype=torch.float32, device=torch.device('cuda'))
-    
-    suit_to_idx = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-    
-    # Calcola i valori primiera per Team 0
-    for c in game_state["captured_squads"][0]:
-        if isinstance(c, int):
-            rank = int(RANK_OF_ID[c])
-            suit_idx = int(SUITCOL_OF_ID[c])
+    # Calcolo GPU vectorized
+    def _max_per_suit(ids_list):
+        if not ids_list:
+            return torch.zeros(4, dtype=torch.float32, device=torch.device('cuda'))
+        # Accept tuple cards; convert to IDs if needed
+        if isinstance(ids_list[0], int):
+            ids = torch.as_tensor(ids_list, dtype=torch.long, device=torch.device('cuda'))
         else:
-            rank, suit = c
-            suit_idx = suit_to_idx[suit]
-        primiera_val = PRIMIERA_VAL[rank]
-        team0_primiera[suit_idx] = max(team0_primiera[suit_idx], primiera_val)
-    
-    # Calcola i valori primiera per Team 1
-    for c in game_state["captured_squads"][1]:
-        if isinstance(c, int):
-            rank = int(RANK_OF_ID[c])
-            suit_idx = int(SUITCOL_OF_ID[c])
-        else:
-            rank, suit = c
-            suit_idx = suit_to_idx[suit]
-        primiera_val = PRIMIERA_VAL[rank]
-        team1_primiera[suit_idx] = max(team1_primiera[suit_idx], primiera_val)
-    
-    # Normalizza
-    team0_primiera = team0_primiera / 21.0  # 21 è il valore massimo (7)
-    team1_primiera = team1_primiera / 21.0
-    
+            suit_to_idx = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+            ids_py = [int((r - 1) * 4 + suit_to_idx[s]) for (r, s) in ids_list]
+            ids = torch.as_tensor(ids_py, dtype=torch.long, device=torch.device('cuda'))
+        ranks = RANK_OF_ID[ids].to(torch.long)
+        suits = SUITCOL_OF_ID[ids].to(torch.long)
+        vals = PRIMIERA_VAL_T[ranks]
+        out = torch.zeros(4, dtype=torch.float32, device=torch.device('cuda'))
+        # scatter_reduce for max if available
+        try:
+            out.scatter_reduce_(0, suits, vals, reduce='amax', include_self=True)
+        except Exception:
+            for s in range(4):
+                mask = (suits == s)
+                if mask.any():
+                    out[s] = torch.max(vals[mask])
+        return out / 21.0
+    team0_primiera = _max_per_suit(game_state["captured_squads"][0])
+    team1_primiera = _max_per_suit(game_state["captured_squads"][1])
     result = torch.cat([team0_primiera, team1_primiera]).to(dtype=torch.float32)
     
     # Salva in cache
@@ -608,14 +517,11 @@ def compute_denari_count(game_state):
     if cache_key in denari_cache:
         return denari_cache[cache_key].clone()
     
-    # Calcolo ID-only
-    cs0 = game_state["captured_squads"][0]
-    cs1 = game_state["captured_squads"][1]
-    team0_denari = sum(1 for c in cs0 if (c % 4) == 0)
-    team1_denari = sum(1 for c in cs1 if (c % 4) == 0)
-    
-    # Normalizza
-    result = torch.tensor([team0_denari / 10.0, team1_denari / 10.0], dtype=torch.float32, device=torch.device('cuda'))
+    cs0 = torch.as_tensor(game_state["captured_squads"][0] or [], dtype=torch.long, device=torch.device('cuda'))
+    cs1 = torch.as_tensor(game_state["captured_squads"][1] or [], dtype=torch.long, device=torch.device('cuda'))
+    den0 = (cs0.numel() > 0) and (SUITCOL_OF_ID[cs0] == 0).sum().item() or 0
+    den1 = (cs1.numel() > 0) and (SUITCOL_OF_ID[cs1] == 0).sum().item() or 0
+    result = torch.tensor([den0 / 10.0, den1 / 10.0], dtype=torch.float32, device=torch.device('cuda'))
     
     # Salva in cache
     denari_cache[cache_key] = result.clone()
@@ -750,13 +656,16 @@ def compute_table_sum(game_state):
     table_key = tuple(sorted(tbl))
     if table_key in table_sum_cache:
         return table_sum_cache[table_key].clone()
-    if len(tbl) > 0 and isinstance(tbl[0], int):
-        bits = 0
-        for cid in tbl:
-            bits |= (1 << int(cid))
-        table_sum = bitset_table_sum(bits)
+    if len(tbl) > 0:
+        if isinstance(tbl[0], int):
+            ids = torch.as_tensor(tbl, dtype=torch.long, device=torch.device('cuda'))
+        else:
+            suit_to_idx = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+            ids_py = [int((r - 1) * 4 + suit_to_idx[s]) for (r, s) in tbl]
+            ids = torch.as_tensor(ids_py, dtype=torch.long, device=torch.device('cuda'))
+        table_sum = int(RANK_OF_ID[ids].to(torch.int64).sum().item())
     else:
-        table_sum = sum(card[0] for card in tbl)
+        table_sum = 0
     result = torch.tensor([table_sum / 30.0], dtype=torch.float32, device=torch.device('cuda'))
     table_sum_cache[table_key] = result.clone()
     
@@ -788,107 +697,60 @@ def compute_next_player_scopa_probabilities(game_state, player_id, rank_probabil
     if cache_key in scopa_probs_cache:
         return scopa_probs_cache[cache_key].clone()
     
-    # Calcolo originale se non in cache
+    # GPU-based computation
     next_player_idx = [i for i, p in enumerate([p for p in range(4) if p != player_id]) if p == next_player][0]
     scopa_probs = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
-    
-    # Se non vengono fornite le probabilità di rank, le calcoliamo
     if rank_probabilities is None:
         rank_probabilities = compute_rank_probabilities_by_player(game_state, player_id)
-    
-    # Dimensione mano del prossimo giocatore
     hand_size = len(game_state["hands"].get(next_player, []))
     if hand_size == 0:
         return scopa_probs
-    
-    # Precompute mani ID bitset per rank presenti (se ID)
-    hand_list = game_state["hands"][player_id]
-    hand_bits = 0
-    if hand_list and isinstance(hand_list[0], int):
-        for cid in hand_list:
-            hand_bits |= (1 << int(cid))
-        hand_rank_counts = bitset_rank_counts(hand_bits)
-    else:
-        hand_rank_counts = None
-
-    # Helper per ottenere rank da carta ID/tuple
-    def _rank_of(x):
-        return (x // 4) + 1 if isinstance(x, int) else x[0]
-
-    # Per ogni rank che il giocatore corrente potrebbe giocare
+    table = game_state["table"]
+    if table and not isinstance(table[0], int):
+        suit_to_idx = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+        table = [int((r - 1) * 4 + suit_to_idx[s]) for (r, s) in table]
+    table_ids = torch.as_tensor(table or [], dtype=torch.long, device=torch.device('cuda'))
+    table_ranks = RANK_OF_ID[table_ids].to(torch.long) if table_ids.numel() > 0 else torch.empty(0, dtype=torch.long, device=torch.device('cuda'))
+    # For each current_rank 1..10
     for current_rank in range(1, 11):
-        # Verifica se il giocatore ha in mano una carta di questo rank
-        if hand_rank_counts is not None:
-            has_rank = hand_rank_counts[current_rank-1] > 0
-        else:
-            has_rank = any(card[0] == current_rank for card in hand_list)
-        if not has_rank:
-            continue
-        
-        # Simula cosa accadrebbe al tavolo dopo aver giocato questa carta (in spazio di rank)
-        simulated_ranks = [_rank_of(c) for c in game_state["table"]]
-        # Regola 1: Cattura diretta di tutte le carte con stesso rank
-        if any(r == current_rank for r in simulated_ranks):
-            simulated_ranks = [r for r in simulated_ranks if r != current_rank]
-        else:
-            # Regola 2: Cerca combinazioni che sommano al rank
-            captured = None
-            n = len(simulated_ranks)
-            for subset_size in range(1, min(4, n) + 1):
-                for idxs in itertools.combinations(range(n), subset_size):
-                    if sum(simulated_ranks[i] for i in idxs) == current_rank:
-                        captured = set(idxs)
-                        break
-                if captured is not None:
-                    break
-            if captured is not None:
-                simulated_ranks = [r for i, r in enumerate(simulated_ranks) if i not in captured]
+        # Direct capture removes all of that rank
+        if table_ranks.numel() > 0:
+            if (table_ranks == current_rank).any():
+                remaining = table_ranks[table_ranks != current_rank]
             else:
-                # Nessuna cattura: la carta va sul tavolo (considera solo il rank)
-                simulated_ranks.append(current_rank)
-        
-        # Caso 1: Se il tavolo è vuoto, qualsiasi carta porterebbe a scopa
-        if not simulated_ranks:
-            # Probabilità che il giocatore abbia almeno una carta = 1 - P(avere 0 carte)
-            # Possiamo calcolare questa probabilità sommando tutte le probabilità che
-            # il giocatore abbia almeno una carta di qualsiasi rank
-            p_has_at_least_one_card = 0.0
-            for rank_idx in range(10):
-                # Probabilità di avere 0 carte di questo rank
-                p_zero = rank_probabilities[next_player_idx, 0, rank_idx]
-                # Probabilità di avere almeno una carta di questo rank
-                p_at_least_one = 1.0 - p_zero
-                p_has_at_least_one_card += p_at_least_one
-            
-            # Normalizza per evitare probabilità > 1.0
-            p_has_at_least_one_card = min(1.0, p_has_at_least_one_card)
-            scopa_probs[current_rank-1] = p_has_at_least_one_card
+                n = int(table_ranks.numel())
+                if n > 0:
+                    pos = torch.arange(n, device=torch.device('cuda'), dtype=torch.long)
+                    masks = torch.arange(1, 1 << n, device=torch.device('cuda'), dtype=torch.long)
+                    sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
+                    sums = (sel * table_ranks.unsqueeze(0)).sum(dim=1)
+                    good = (sums == current_rank)
+                    if bool(good.any().item()):
+                        # if a subset sums, simulate remove that subset
+                        gi = int(torch.nonzero(good, as_tuple=False)[0].item())
+                        remaining = table_ranks[((masks[gi].unsqueeze(0) >> pos) & 1) == 0]
+                    else:
+                        remaining = torch.cat([table_ranks, torch.tensor([current_rank], device=torch.device('cuda'))])
+                else:
+                    remaining = table_ranks
+        else:
+            remaining = table_ranks
+        if remaining.numel() == 0:
+            p_has = (1.0 - rank_probabilities[next_player_idx, 0, :].sum()).clamp_(0.0, 1.0)
+            scopa_probs[current_rank-1] = p_has
             continue
-        
-        # Caso 2: Il tavolo non è vuoto, serve una carta specifica
+        total_sum = int(remaining.sum().item()) if remaining.numel() > 0 else 0
         for next_rank in range(1, 11):
-            # Verifica se questo rank può catturare tutto il tavolo
             can_capture_all = False
-            
-            # Cattura diretta
-            if simulated_ranks and all(r == next_rank for r in simulated_ranks):
-                can_capture_all = True
-            # Cattura per somma
-            elif simulated_ranks and sum(simulated_ranks) == next_rank:
-                can_capture_all = True
-            
+            if remaining.numel() > 0:
+                if bool((remaining == next_rank).all().item()):
+                    can_capture_all = True
+                elif total_sum == next_rank:
+                    can_capture_all = True
             if can_capture_all:
-                # Utilizziamo direttamente le probabilità calcolate da compute_rank_probabilities_by_player
-                # Probabilità di avere 0 carte di questo rank
                 p_zero = rank_probabilities[next_player_idx, 0, next_rank-1]
-                # Probabilità di avere almeno una carta di questo rank
-                p_at_least_one = 1.0 - p_zero
-                
-                # Aggiungi alla probabilità totale per questo rank
-                scopa_probs[current_rank-1] += p_at_least_one
-        
-        # Normalizza a 1.0 se necessario
-        scopa_probs[current_rank-1] = min(1.0, scopa_probs[current_rank-1])
+                scopa_probs[current_rank-1] += (1.0 - p_zero)
+        scopa_probs[current_rank-1] = min(1.0, float(scopa_probs[current_rank-1].item()))
     
     # Salva in cache
     scopa_probs_cache[cache_key] = scopa_probs.clone()
@@ -938,106 +800,58 @@ def compute_rank_probabilities_by_player(game_state, player_id):
     if cache_key in rank_prob_cache:
         return rank_prob_cache[cache_key].clone()
     
-    # Calcolo originale se non in cache
+    # GPU-based computation
     all_probs = torch.zeros((3, 5, 10), dtype=torch.float32, device=torch.device('cuda'))
     other_players = [p for p in range(4) if p != player_id]
-    
-    # Carte visibili per rank
-    visible_rank_counts = [0] * 10
-    
-    # Conta carte visibili: usa bitset_rank_counts quando in ID
-    def _accumulate_counts_from_list(lst):
-        if lst and isinstance(lst[0], int):
-            bits = 0
-            for cid in lst:
-                bits |= (1 << int(cid))
-            cnt = bitset_rank_counts(bits)
-            for i in range(10):
-                visible_rank_counts[i] += int(cnt[i])
-        else:
-            for card in lst:
-                r, _ = card
-                visible_rank_counts[r-1] += 1
-    _accumulate_counts_from_list(game_state["table"])
-    _accumulate_counts_from_list(game_state["hands"][player_id])
+    # Visible rank counts
+    visible_rank_counts = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
+    def _acc_counts(lst):
+        if lst:
+            ids = torch.as_tensor(lst, dtype=torch.long, device=torch.device('cuda'))
+            ranks = (RANK_OF_ID[ids].to(torch.long) - 1)
+            add = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
+            add.index_add_(0, ranks, torch.ones_like(ranks, dtype=torch.float32))
+            return add
+        return torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
+    visible_rank_counts += _acc_counts(game_state["table"]) + _acc_counts(game_state["hands"][player_id])
     for team_cards in game_state["captured_squads"].values():
-        _accumulate_counts_from_list(team_cards)
-    
-    # Totale carte visibili e invisibili
-    total_invisible = 40 - sum(visible_rank_counts)
-    
+        visible_rank_counts += _acc_counts(team_cards)
+    total_invisible = 40 - int(visible_rank_counts.sum().item())
     for i, p in enumerate(other_players):
-        # Carte già giocate da questo giocatore (per rank)
-        played_rank_counts = [0] * 10
+        played_rank_counts = torch.zeros(10, dtype=torch.float32, device=torch.device('cuda'))
         for move in game_state.get("history", []):
             if move.get("player") == p:
                 pc = move.get("played_card")
                 rank = (pc // 4) + 1 if isinstance(pc, int) else pc[0]
                 if 1 <= rank <= 10:
                     played_rank_counts[rank-1] += 1
-        
-        # Carte in mano attualmente
         hand_size = len(game_state["hands"].get(p, []))
         if hand_size == 0:
-            # Tutti i rank hanno probabilità 1.0 di avere 0 carte
-            for rank_idx in range(10):
-                all_probs[i, 0, rank_idx] = 1.0
+            all_probs[i, 0, :] = 1.0
             continue
-        
+        total_rank = 4
         for rank in range(1, 11):
             rank_idx = rank - 1
-            
-            # Carte totali di questo rank
-            total_rank = 4
-            
-            # Carte invisibili di questo rank
-            invisible_rank = total_rank - visible_rank_counts[rank_idx]
-            
-            # Carte già giocate di questo rank dal giocatore
-            played_rank = played_rank_counts[rank_idx]
-            
-            # Carte potenzialmente rimaste di questo rank
+            invisible_rank = total_rank - int(visible_rank_counts[rank_idx].item())
+            played_rank = int(played_rank_counts[rank_idx].item())
             remaining_rank = total_rank - played_rank
-            
-            # Carte possibili per questo giocatore
-            possible_rank = min(remaining_rank, invisible_rank)
-            
+            possible_rank = min(max(remaining_rank, 0), max(invisible_rank, 0))
             if possible_rank < 0:
-                # Impossibile avere carte di questo rank
-                all_probs[i, 0, rank_idx] = 1.0  # Probabilità 1.0 di avere 0 carte
+                all_probs[i, 0, rank_idx] = 1.0
                 continue
-            
-            try:
-                from scipy.special import comb
-                
-                # Per ogni possibile numero di carte (0-4)
-                for k in range(min(possible_rank + 1, hand_size + 1, 5)):
-                    # Probabilità ipergeometrica di avere esattamente k carte di questo rank
-                    # P(X=k) = [C(K,k) × C(N-K,n-k)] / C(N,n)
-                    
-                    numerator = comb(invisible_rank, k, exact=True) * comb(total_invisible - invisible_rank, hand_size - k, exact=True)
-                    denominator = comb(total_invisible, hand_size, exact=True)
-                    
-                    if denominator > 0:
-                        prob = numerator / denominator
-                        all_probs[i, k, rank_idx] = prob
-            except:
-                # Approssimazione se scipy non è disponibile
-                for k in range(min(possible_rank + 1, hand_size + 1, 5)):
-                    from math import comb as math_comb
-                    try:
-                        numerator = math_comb(invisible_rank, k) * math_comb(total_invisible - invisible_rank, hand_size - k)
-                        denominator = math_comb(total_invisible, hand_size)
-                        prob = numerator / denominator if denominator > 0 else 0
-                    except:
-                        # Fallback ancora più semplice
-                        prob = 0
-                        if k == 0:
-                            prob = ((total_invisible - invisible_rank) / total_invisible) ** hand_size
-                        else:
-                            prob = (invisible_rank / total_invisible) ** k * ((total_invisible - invisible_rank) / total_invisible) ** (hand_size - k)
-                    
-                    all_probs[i, k, rank_idx] = prob
+            # k from 0..min(4, hand_size)
+            k_max = min(possible_rank, hand_size, 4)
+            k = torch.arange(k_max + 1, device=torch.device('cuda'), dtype=torch.float32)
+            N = torch.tensor(float(total_invisible), device=torch.device('cuda'))
+            K = torch.tensor(float(invisible_rank), device=torch.device('cuda'))
+            n = torch.tensor(float(hand_size), device=torch.device('cuda'))
+            # log comb using lgamma
+            def log_comb(a, b):
+                return torch.lgamma(a + 1.0) - torch.lgamma(b + 1.0) - torch.lgamma(a - b + 1.0)
+            log_num = log_comb(K, k) + log_comb(N - K, n - k)
+            log_den = log_comb(N, n)
+            probs_k = torch.exp(log_num - log_den)
+            all_probs[i, :k.numel(), rank_idx] = probs_k
     
     # Salva in cache
     rank_prob_cache[cache_key] = all_probs.clone()

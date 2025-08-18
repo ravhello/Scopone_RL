@@ -198,21 +198,41 @@ def run_is_mcts(env: ScoponeEnvMA,
                 node.Q = node.W / node.N
                 node = node.parent
 
-    # Scelta finale: robust child o soft a seconda di temperature
-    if root_temperature and root_temperature > 1e-6:
-        visits = _np.array([ch.N for ch in root.children], dtype=_np.float64)
-        logits = _np.power(visits + 1e-9, 1.0 / root_temperature)
-        probs = logits / logits.sum()
-        idx = _np.random.choice(len(root.children), p=probs)
-        if return_stats:
-            return root.children[idx].action, probs
-        return root.children[idx].action
-    else:
-        best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
-        if return_stats:
+    # Scelta finale: robust child o soft a seconda di temperature (preferisci torch su CUDA)
+    try:
+        import torch
+        device = torch.device('cuda')
+        if root_temperature and root_temperature > 1e-6:
+            visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
+            logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))
+            probs_t = logits / torch.clamp_min(logits.sum(), 1e-9)
+            idx = int(torch.multinomial(probs_t, num_samples=1).item())
+            if return_stats:
+                return root.children[idx].action, probs_t.detach().cpu().numpy()
+            return root.children[idx].action
+        else:
+            best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
+            if return_stats:
+                visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
+                probs_t = visits_t / torch.clamp_min(visits_t.sum(), 1e-9)
+                return best.action, probs_t.detach().cpu().numpy()
+            return best.action
+    except Exception:
+        # Fallback CPU/numpy
+        if root_temperature and root_temperature > 1e-6:
             visits = _np.array([ch.N for ch in root.children], dtype=_np.float64)
-            probs = visits / max(1.0, visits.sum())
-            return best.action, probs
-        return best.action
+            logits = _np.power(visits + 1e-9, 1.0 / root_temperature)
+            probs = logits / logits.sum()
+            idx = _np.random.choice(len(root.children), p=probs)
+            if return_stats:
+                return root.children[idx].action, probs
+            return root.children[idx].action
+        else:
+            best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
+            if return_stats:
+                visits = _np.array([ch.N for ch in root.children], dtype=_np.float64)
+                probs = visits / max(1.0, visits.sum())
+                return best.action, probs
+            return best.action
 
 

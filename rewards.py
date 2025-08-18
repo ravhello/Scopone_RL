@@ -1,13 +1,11 @@
+import torch
+from observation import RANK_OF_ID, SUITCOL_OF_ID, PRIMIERA_VAL_T
+
 def compute_final_score_breakdown(game_state, rules=None):
     """
-    Come compute_final_score, ma restituisce un breakdown dettagliato 
-    e un "total" per ciascuna squadra (0 e 1).
-
-    Parametri opzionali tramite "rules":
-      - re_bello: bool
-      - napola: bool
-      - napola_scoring: "fixed3" | "length"
+    Breakdown finale calcolato su CUDA; i valori restituiti sono scalari Python.
     """
+    device = torch.device('cuda')
     squads = game_state["captured_squads"]
 
     rules = rules or {}
@@ -15,7 +13,7 @@ def compute_final_score_breakdown(game_state, rules=None):
     napola_enabled = bool(rules.get("napola", False))
     napola_scoring = rules.get("napola_scoring", "fixed3")
 
-    # Conteggio scope
+    # Scope per team (conteggio su CPU per estrazione, ma computo è banale)
     scope0 = 0
     scope1 = 0
     for move in game_state["history"]:
@@ -28,63 +26,68 @@ def compute_final_score_breakdown(game_state, rules=None):
     # Carte totali
     c0 = len(squads[0])
     c1 = len(squads[1])
-    pt_c0, pt_c1 = (1, 0) if c0 > c1 else (0, 1) if c1 > c0 else (0, 0)
+    pt_c0, pt_c1 = ((1, 0) if c0 > c1 else (0, 1) if c1 > c0 else (0, 0))
 
-    # Denari (ID-only)
-    den0 = sum(1 for c in squads[0] if (c % 4) == 0)
-    den1 = sum(1 for c in squads[1] if (c % 4) == 0)
-    pt_d0, pt_d1 = (1, 0) if den0 > den1 else (0, 1) if den1 > den0 else (0, 0)
+    # Denari (suit==0)
+    ids0 = torch.as_tensor(squads[0] or [], dtype=torch.long, device=device)
+    ids1 = torch.as_tensor(squads[1] or [], dtype=torch.long, device=device)
+    den0 = int(((ids0.numel() > 0) and (SUITCOL_OF_ID[ids0] == 0).sum().item()) or 0)
+    den1 = int(((ids1.numel() > 0) and (SUITCOL_OF_ID[ids1] == 0).sum().item()) or 0)
+    pt_d0, pt_d1 = ((1, 0) if den0 > den1 else (0, 1) if den1 > den0 else (0, 0))
 
-    # Settebello
-    def _has_card_id(seq, rank, suit_col):
+    # Settebello (ID=24)
+    sb0 = int((ids0 == 24).any().item())
+    sb1 = int((ids1 == 24).any().item())
+
+    # Primiera: max per seme
+    def _primiera_points(ids_t: torch.Tensor) -> float:
+        if ids_t.numel() == 0:
+            return 0.0
+        ranks = RANK_OF_ID[ids_t].to(torch.long)
+        suits = SUITCOL_OF_ID[ids_t].to(torch.long)
+        vals = PRIMIERA_VAL_T[ranks]
+        out = torch.zeros(4, dtype=torch.float32, device=device)
+        try:
+            out.scatter_reduce_(0, suits, vals, reduce='amax', include_self=True)
+        except Exception:
+            for s in range(4):
+                mask = (suits == s)
+                if mask.any():
+                    out[s] = torch.max(vals[mask])
+        return float(out.sum().item())
+    prim0 = _primiera_points(ids0)
+    prim1 = _primiera_points(ids1)
+    pt_p0, pt_p1 = ((1, 0) if prim0 > prim1 else (0, 1) if prim1 > prim0 else (0, 0))
+
+    # re_bello
+    def _has_card_id_tensor(ids_t: torch.Tensor, rank: int, suit_col: int) -> int:
         target = (rank - 1) * 4 + suit_col
-        return target in seq
-    sb0 = 1 if _has_card_id(squads[0], 7, 0) else 0
-    sb1 = 1 if _has_card_id(squads[1], 7, 0) else 0
+        return int((ids_t == target).any().item())
+    rb0 = _has_card_id_tensor(ids0, 10, 0) if re_bello_enabled else 0
+    rb1 = _has_card_id_tensor(ids1, 10, 0) if re_bello_enabled else 0
 
-    # Primiera
-    val_map = {1: 16, 2: 12, 3: 13, 4: 14, 5: 15, 6: 18, 7: 21, 8: 10, 9: 10, 10: 10}
-    best0 = [0, 0, 0, 0]  # denari, coppe, spade, bastoni
-    best1 = [0, 0, 0, 0]
-    for c in squads[0]:
-        r = (c // 4) + 1
-        s = c % 4
-        v = val_map[r]
-        if v > best0[s]:
-            best0[s] = v
-    for c in squads[1]:
-        r = (c // 4) + 1
-        s = c % 4
-        v = val_map[r]
-        if v > best1[s]:
-            best1[s] = v
-    prim0 = sum(best0)
-    prim1 = sum(best1)
-    pt_p0, pt_p1 = (1, 0) if prim0 > prim1 else (0, 1) if prim1 > prim0 else (0, 0)
-
-    # Varianti opzionali
-    rb0 = 1 if re_bello_enabled and _has_card_id(squads[0], 10, 0) else 0
-    rb1 = 1 if re_bello_enabled and _has_card_id(squads[1], 10, 0) else 0
-
-    def napola_points(cards):
+    # Napola
+    def _napola_points(ids_t: torch.Tensor) -> int:
         if not napola_enabled:
             return 0
-        denari_ranks = {(c // 4) + 1 for c in cards if (c % 4) == 0}
-        # Richiede almeno A-2-3
-        if not {1, 2, 3}.issubset(denari_ranks):
+        if ids_t.numel() == 0:
+            return 0
+        ranks = RANK_OF_ID[ids_t].to(torch.long)
+        suits = SUITCOL_OF_ID[ids_t].to(torch.long)
+        denari_ranks = ranks[suits == 0]
+        if denari_ranks.numel() == 0:
+            return 0
+        present = torch.zeros(11, dtype=torch.float32, device=device)
+        present[denari_ranks.clamp(1, 10)] = 1.0
+        # Richiede 1,2,3
+        if float(present[1:4].sum().item()) < 3.0:
             return 0
         if napola_scoring == "length":
-            length = 0
-            r = 1
-            while r in denari_ranks:
-                length += 1
-                r += 1
-            return length
-        # default: fixed3
+            cprod = present[1:].cumprod(dim=0)
+            return int(cprod.sum().item())
         return 3
-
-    np0 = napola_points(squads[0])
-    np1 = napola_points(squads[1])
+    np0 = _napola_points(ids0)
+    np1 = _napola_points(ids1)
 
     total0 = pt_c0 + pt_d0 + sb0 + pt_p0 + scope0 + rb0 + np0
     total1 = pt_c1 + pt_d1 + sb1 + pt_p1 + scope1 + rb1 + np1
@@ -115,10 +118,10 @@ def compute_final_score_breakdown(game_state, rules=None):
 
 def compute_final_reward_from_breakdown(breakdown):
     """
-    Calcola (breakdown[0]['total'] - breakdown[1]['total']) * 10 restituendo le ricompense per i due team.
+    Calcolo su CUDA della ricompensa finale (ritorna scalari Python).
     """
-    diff = breakdown[0]["total"] - breakdown[1]["total"]
-    return {
-        0: diff*10,
-        1: -diff*10
-    }
+    device = torch.device('cuda')
+    diff = torch.tensor(breakdown[0]["total"] - breakdown[1]["total"], dtype=torch.float32, device=device)
+    pos = int((diff * 10.0).item())
+    neg = -pos
+    return {0: pos, 1: neg}
