@@ -34,7 +34,7 @@ def main():
         with_stack=True,
     ) as prof:
         # Short run for signal; adjust if needed
-        train_ppo(num_iterations=2, horizon=32, use_compact_obs=True, k_history=12)
+        train_ppo(num_iterations=12, horizon=256, use_compact_obs=True, k_history=12)
 
     # Export chrome trace
     prof.export_chrome_trace(trace_path)
