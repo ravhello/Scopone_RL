@@ -10,3 +10,4 @@ scopone_checkpoint_team1.pth
 profiling_report.txt
 .vscode/settings.json
 .gitignore
+profile_trace.json
