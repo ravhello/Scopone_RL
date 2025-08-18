@@ -258,8 +258,14 @@ class ScoponeEnvMA(gym.Env):
         if act_len != 80:
             raise ValueError(f"Formato vettore azione non valido: atteso 80, ricevuto {act_len}")
 
-        # Decodifica l'azione in ID
-        pid, cap_ids = decode_action_ids(action_vec)
+        # Decodifica l'azione in ID (GPU-native, nessuna sync)
+        try:
+            from actions import decode_action_ids_torch as _decode_ids_torch
+            pid_t, cap_ids_t = _decode_ids_torch(action_vec)
+            pid = int(pid_t.item())
+            cap_ids = cap_ids_t.tolist()
+        except Exception:
+            pid, cap_ids = decode_action_ids(action_vec)
         
         # Verifica validità (come prima)
         current_player = self.current_player
@@ -269,11 +275,12 @@ class ScoponeEnvMA(gym.Env):
         if pid not in [_card_to_id(c) for c in hand] and pid not in hand:
             raise ValueError(f"La carta {pid} non è nella mano del giocatore {current_player}.")
         
-        # Verifica carte da catturare (ID) interamente via bitset CUDA mirror
-        for cid in cap_ids:
-            present = int(((self._table_bits_t >> int(cid)) & self._one_i64).item())
-            if present == 0:
-                raise ValueError(f"La carta {cid} non si trova sul tavolo; cattura non valida.")
+        # Verifica carte da catturare (ID) interamente via bitset CUDA mirror (vectorized)
+        if len(cap_ids) > 0:
+            cap_ids_t = torch.as_tensor(cap_ids, dtype=torch.long, device=device)
+            present_mask = (((self._table_bits_t >> cap_ids_t) & self._one_i64) != 0)
+            if not present_mask.all():
+                raise ValueError("Cattura non valida: alcune carte non sono sul tavolo.")
 
         # Applicazione nuova regola AP posabilità: forza presa totale se non è consentito posare
         rank = pid // 4 + 1
@@ -303,21 +310,24 @@ class ScoponeEnvMA(gym.Env):
         ids = torch.arange(40, device=device, dtype=torch.int64)
         table_ids_t = ids[((self._table_bits_t >> ids) & 1).bool()]
         from observation import RANK_OF_ID as _RANK_OF_ID
-        same_rank_ids_t = table_ids_t[(_RANK_OF_ID[table_ids_t].to(torch.int64) == int(rank))]
-        same_rank_ids = same_rank_ids_t.tolist()
-        if same_rank_ids:
+        same_rank_mask = (_RANK_OF_ID[table_ids_t].to(torch.int64) == int(rank))
+        same_rank_ids_t = table_ids_t[same_rank_mask]
+        if same_rank_ids_t.numel() > 0:
             # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta
-            ace_take_all = (rank == 1 and self.rules.get("asso_piglia_tutto", False)
-                            and set(cap_ids) == set(table_ids_t.tolist()))
-            if not ace_take_all:
+            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False)
+                    and len(cap_ids) == int(table_ids_t.numel())
+                    and torch.equal(torch.sort(torch.as_tensor(cap_ids, device=device).to(torch.long))[0], torch.sort(table_ids_t)[0])):
                 # Devi catturare UNA carta di pari rank
-                if not (len(cap_ids) == 1 and (cap_ids[0] in same_rank_ids)):
+                if not (len(cap_ids) == 1 and int(torch.as_tensor(cap_ids[0], device=device)) in set(same_rank_ids_t.tolist())):
                     raise ValueError("Quando esistono carte di rank uguale, devi catturarne una (non una combinazione).")
-        elif cap_ids:
+        elif len(cap_ids) > 0:
             # Verifica somma
             # Eccezione: Asso piglia tutto
-            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False) and set(cap_ids) == set(table_ids_t.tolist())):
-                sum_chosen = sum(((cid // 4) + 1) for cid in cap_ids)
+            cap_ids_t = torch.as_tensor(cap_ids, dtype=torch.long, device=device)
+            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False)
+                    and cap_ids_t.numel() == table_ids_t.numel()
+                    and torch.equal(torch.sort(cap_ids_t)[0], torch.sort(table_ids_t)[0])):
+                sum_chosen = int(((cap_ids_t // 4) + 1).sum().item())
                 if sum_chosen != rank:
                     raise ValueError(f"La somma delle carte catturate ({sum_chosen}) deve essere uguale al rank ({rank}).")
         

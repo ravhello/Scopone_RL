@@ -164,6 +164,25 @@ def decode_action_ids(action_vec):
             vec_t = torch.tensor(list(action_vec), dtype=torch.float32, device=device).reshape(-1)
     return _decode_ids(vec_t)
 
+def _decode_ids_torch(vec_t: torch.Tensor):
+    if vec_t.dim() != 1 or vec_t.numel() != 80:
+        raise ValueError("decode_action_ids_torch richiede un vettore 80-dim")
+    played_idx = torch.argmax(vec_t[:40]).to(dtype=torch.long)
+    captured_ids = torch.nonzero(vec_t[40:] > 0, as_tuple=False).flatten().to(dtype=torch.long)
+    # map 0..39 for captured since indices 40..79 map directly 0..39
+    return played_idx, captured_ids
+
+def decode_action_ids_torch(action_vec: torch.Tensor):
+    """
+    GPU-native: ritorna (played_id_t, captured_ids_t) come tensori CUDA (long).
+    Non effettua conversioni a Python e non sincronizza la GPU.
+    """
+    if torch.is_tensor(action_vec):
+        vec_t = action_vec.to(device=device, dtype=torch.float32).reshape(-1)
+    else:
+        vec_t = torch.as_tensor(action_vec, dtype=torch.float32, device=device).reshape(-1)
+    return _decode_ids_torch(vec_t)
+
 # ----- FAST PATH: subset-sum su ID con numba -----
 def find_sum_subsets_ids(table_ids, target_rank: int):
     """

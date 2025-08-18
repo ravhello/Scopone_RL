@@ -1,4 +1,5 @@
 import torch
+import os
 from tqdm import tqdm
 from typing import Dict, List, Callable, Optional
 import os
@@ -28,6 +29,12 @@ from evaluation.eval import evaluate_pair_actors
 import torch.optim as optim
 
 device = torch.device("cuda")
+# GPU-only mode: set default device to CUDA to avoid implicit H2D copies
+try:
+    if os.environ.get('GPU_ONLY', '1') == '1':
+        torch.set_default_device('cuda')
+except Exception:
+    pass
 # Global perf flags
 try:
     torch.backends.cudnn.benchmark = True
@@ -411,17 +418,33 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
 
         # proxy per best: media return del batch
         # All device tensors; compute small stats without moving large arrays
-        if len(batch['ret']):
-            avg_return = float(batch['ret'].mean().detach().cpu().item())
+        # Avoid CPU syncs in GPU-only mode
+        if os.environ.get('GPU_ONLY', '1') == '1':
+            if batch['ret'].numel() > 0:
+                avg_return_t = batch['ret'].mean()
+                # Compare as tensors to avoid .item(); maintain best on GPU
+                if 'best_return_t' not in locals():
+                    best_return_t = torch.tensor(-1e9, device=device)
+                if (avg_return_t > best_return_t).item():
+                    best_return_t = avg_return_t
+                    try:
+                        os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+                    except Exception:
+                        pass
+                    agent.save(best_ckpt_path)
+            avg_return = 0.0  # skip CPU logging
         else:
-            avg_return = 0.0
-        if avg_return > best_return:
-            best_return = avg_return
-            try:
-                os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-            except Exception:
-                pass
-            agent.save(best_ckpt_path)
+            if len(batch['ret']):
+                avg_return = float(batch['ret'].mean().detach().cpu().item())
+            else:
+                avg_return = 0.0
+            if avg_return > best_return:
+                best_return = avg_return
+                try:
+                    os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+                except Exception:
+                    pass
+                agent.save(best_ckpt_path)
 
         # mini-eval periodica e Elo update
         if eval_every and (it + 1) % eval_every == 0 and len(league.history) >= 1:
@@ -475,12 +498,12 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         pass
                     agent.save(best_wr_ckpt_path)
 
-        if it % 50 == 0:
+        if it % 50 == 0 and os.environ.get('GPU_ONLY', '1') != '1':
             def _to_float(x):
                 return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
             pretty = {k: round(_to_float(v), 4) for k, v in info.items()}
             print(pretty)
-        if writer is not None:
+        if writer is not None and os.environ.get('GPU_ONLY', '1') != '1':
             def _to_float(x):
                 return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
             for k, v in info.items():
