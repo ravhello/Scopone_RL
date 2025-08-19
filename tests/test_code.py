@@ -5,7 +5,7 @@ import random
 from environment import ScoponeEnvMA
 from actions import encode_action, decode_action_ids
 from state import initialize_game
-from rewards import compute_final_score_breakdown
+from rewards import compute_final_score_breakdown_torch as compute_final_score_breakdown
 from observation import compute_table_sum, compute_denari_count, compute_settebello_status, encode_state_for_player
 from models.action_conditioned import ActionConditionedActor
 import os
@@ -82,7 +82,7 @@ import torch
 from environment import ScoponeEnvMA
 from actions import encode_action, decode_action_ids
 from state import initialize_game
-from rewards import compute_final_score_breakdown
+from rewards import compute_final_score_breakdown_torch as compute_final_score_breakdown
 
 # Compat: rimuove vecchi import di DQN legacy
 try:
@@ -120,7 +120,7 @@ def test_step_and_final_breakdown():
         action = random.choice(legals)
         _, _, done, info = env.step(action)
     if done:
-        assert 'score_breakdown' in info and 'team_rewards' in info
+        assert ('score_breakdown_t' in info and 'team_rewards_t' in info) or ('score_breakdown' in info and 'team_rewards' in info)
 
 
 def test_compute_final_score_breakdown_id_input():
@@ -338,7 +338,7 @@ def test_step_basic(env_fixture):
     assert next_obs.shape == (10823,), f"Dimensione osservazione errata: {next_obs.shape} invece di (10823,)"
     assert reward == 0.0
     assert done == False
-    assert "team_rewards" not in info
+    assert "team_rewards_t" not in info
 
 
 def test_step_invalid_action(env_fixture):
@@ -370,7 +370,7 @@ def test_step_invalid_action(env_fixture):
 def test_done_and_final_reward(env_fixture):
     """
     Esegue step finché la partita non finisce. A fine partita (done=True),
-    controlla che in info ci sia "team_rewards" e che la lunghezza sia 2.
+    controlla che in info ci sia "team_rewards_t" e che la lunghezza sia 2.
     """
     env = env_fixture
     env.reset()
@@ -384,8 +384,8 @@ def test_done_and_final_reward(env_fixture):
         obs, r, done, info = env.step(action)
 
     assert done is True, "La partita dovrebbe risultare finita."
-    assert "team_rewards" in info, "L'info finale dovrebbe contenere team_rewards."
-    assert len(info["team_rewards"]) == 2, "team_rewards dev'essere un array di 2 (team0, team1)."
+    assert "team_rewards_t" in info, "L'info finale dovrebbe contenere team_rewards_t."
+    assert len(info["team_rewards_t"]) == 2, "team_rewards_t dev'essere un array di 2 (team0, team1)."
 
 
 def test_scopa_case(env_fixture):
@@ -438,8 +438,9 @@ def test_scopa_case(env_fixture):
     new_gs2, rw_array2, done2, info2 = update_game_state(new_gs, dummy_action, 1)
     assert done2 is True
     # Adesso se la scopa era valida, nel breakdown finale vedremo scope=1 per team0
-    final_scope_team0 = info2["score_breakdown"][0]["scope"]
-    final_scope_team1 = info2["score_breakdown"][1]["scope"]
+    bd_t = info2.get("score_breakdown_t")
+    final_scope_team0 = int(bd_t[0]["scope"].detach().to('cpu').item())
+    final_scope_team1 = int(bd_t[1]["scope"].detach().to('cpu').item())
     assert final_scope_team0 == 1, f"Team0 dovrebbe avere scope=1, invece {final_scope_team0}"
     assert final_scope_team1 == 0, f"Team1 deve avere scope=0, invece {final_scope_team1}"
 
@@ -456,7 +457,7 @@ def test_full_match_random(env_fixture):
     """
     Test finale in cui giochiamo una partita random completa con l'Env:
     a) Controlliamo che si arrivi a done=True senza errori.
-    b) Controlliamo che info['team_rewards'] abbia valori coerenti.
+    b) Controlliamo che info['team_rewards_t'] abbia valori coerenti.
     """
     env = env_fixture
     obs = env.reset()
@@ -475,8 +476,10 @@ def test_full_match_random(env_fixture):
         obs, rew, done, info = env.step(a)
 
     if done:
-        assert "team_rewards" in info
-        r0, r1 = info["team_rewards"]
+        assert "team_rewards_t" in info
+        r0, r1 = info["team_rewards_t"]
+        r0 = float(r0.detach().to('cpu').item())
+        r1 = float(r1.detach().to('cpu').item())
         print("Partita terminata. Ricompense finali:", r0, r1)
 
         # Se r0>0 => Team0 vince, se <0 => Team1 vince, se =0 => pareggio
@@ -903,8 +906,8 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
             
     if done:
         # Fine partita
-        team_rewards = info["team_rewards"]
-        print(f"Team Rewards finali: {team_rewards}")
+        tr_t = info["team_rewards_t"]
+        print(f"Team Rewards finali: {[float(tr_t[0].detach().to('cpu').item()), float(tr_t[1].detach().to('cpu').item())]}")
         
         # Termina gli episodi 
         agent_team0.end_episode()
@@ -922,7 +925,7 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
                 (obs_, act_, rew_, next_obs_, done_, valids_) = trans
                 print(f" Team1 transizione {idx} -> reward={rew_} done={done_}")
 
-    # Se la partita è finita, in info["team_rewards"] ci saranno i punteggi finali
+    # Se la partita è finita, in info["team_rewards_t"] ci saranno i punteggi finali
     # (Team1 avrà un grande vantaggio grazie alle 4 scope + denari + 7bello + primiera).
     # Ma se il codice di base non salva la final reward nel replay, Team1 non "impara".
 

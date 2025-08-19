@@ -422,10 +422,9 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         if os.environ.get('GPU_ONLY', '1') == '1':
             if batch['ret'].numel() > 0:
                 avg_return_t = batch['ret'].mean()
-                # Compare as tensors to avoid .item(); maintain best on GPU
                 if 'best_return_t' not in locals():
                     best_return_t = torch.tensor(-1e9, device=device)
-                if (avg_return_t > best_return_t).item():
+                if (avg_return_t > best_return_t):
                     best_return_t = avg_return_t
                     try:
                         os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)

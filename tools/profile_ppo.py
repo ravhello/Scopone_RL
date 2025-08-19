@@ -32,6 +32,7 @@ def main():
         record_shapes=True,
         profile_memory=True,
         with_stack=True,
+        with_modules=True,
         #experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         # Short run for signal; adjust if needed
@@ -59,6 +60,8 @@ def main():
     try:
         from collections import defaultdict
 
+        import re
+
         project_root = ROOT
         events = prof.events()
 
@@ -68,39 +71,69 @@ def main():
             except Exception:
                 return 0.0
 
-        def frame_filename(frame):
+        def frame_filename_and_line(frame_like):
+            """Return (filename, line) from a frame-like object or string."""
             try:
-                fn = getattr(frame, 'filename', None)
-                if fn is None:
-                    s = str(frame)
-                    # Heuristic: extract path before ':' if present
-                    return s.split(':', 1)[0]
-                return fn
-            except Exception:
-                return None
-
-        def find_user_file(stack_frames):
-            if not stack_frames:
+                # Kineto Python frame
+                fn = getattr(frame_like, 'filename', None)
+                ln = getattr(frame_like, 'line', None)
+                if fn:
+                    return fn, ln if isinstance(ln, int) else None
+                s = str(frame_like)
+                # Common formats: '/path/file.py:123 (func)' or '.../file.py(123): ...'
+                m = re.search(r"(.*?\.py):(\d+)", s)
+                if not m:
+                    m = re.search(r"(.*?\.py)\((\d+)\)", s)
+                if m:
+                    fn = m.group(1)
+                    ln = int(m.group(2))
+                    return fn, ln
+                # Fallback: up to first ':' may still be a path
+                if '.py' in s:
+                    pre = s.split('.py', 1)[0] + '.py'
+                    # Try extract trailing :line
+                    ln_m = re.search(r":(\d+)", s)
+                    ln = int(ln_m.group(1)) if ln_m else None
+                    return pre, ln
                 return None, None
-            for fr in stack_frames:
-                fn = frame_filename(fr)
+            except Exception:
+                return None, None
+
+        def iter_stack_frames(stack_obj):
+            """Yield frame-like entries from various torch profiler stack formats."""
+            if not stack_obj:
+                return
+            # KinetoStackTrace(frames=[...])
+            frames_attr = getattr(stack_obj, 'frames', None)
+            if isinstance(frames_attr, (list, tuple)):
+                for fr in frames_attr:
+                    yield fr
+                return
+            # A list/tuple of frames or strings
+            if isinstance(stack_obj, (list, tuple)):
+                for fr in stack_obj:
+                    yield fr
+                return
+            # A single string containing newline-separated frames
+            if isinstance(stack_obj, str):
+                for line in stack_obj.splitlines():
+                    yield line
+                return
+            # Fallback: yield the object itself
+            yield stack_obj
+
+        def find_user_file(stack_obj):
+            for fr in iter_stack_frames(stack_obj):
+                fn, ln = frame_filename_and_line(fr)
                 if not fn:
                     continue
-                # Normalize and keep only frames from project
                 abs_fn = os.path.abspath(fn)
-                if abs_fn.startswith(project_root):
+                # Some stacks may contain site-packages paths; only keep in-project
+                if project_root in abs_fn:
+                    # Normalize root anchor to avoid symlink/path casing issues
+                    # Use substring search rather than startswith to be robust
                     rel = os.path.relpath(abs_fn, project_root)
-                    # Line number (best-effort)
-                    ln = getattr(fr, 'line', None)
-                    if ln is None:
-                        try:
-                            s = str(fr)
-                            parts = s.split(':')
-                            if len(parts) >= 3 and parts[1].isdigit():
-                                ln = int(parts[1])
-                        except Exception:
-                            ln = None
-                    return rel, ln
+                    return rel, (ln if isinstance(ln, int) else None)
             return None, None
 
         per_file = defaultdict(lambda: {
@@ -158,6 +191,38 @@ def main():
         ranked = sorted(per_file.items(), key=lambda kv: (kv[1]['cuda_ms'] + kv[1]['cpu_ms']), reverse=True)
         for i, (file_rel, s) in enumerate(ranked[:30], 1):
             print(fmt_row(i, file_rel, s))
+
+        # If nothing attributed to user files, try a fallback using aggregated stacks
+        only_external = all(k == '<external/CUDA or Library>' for k, _ in per_file.items()) or len(per_file) == 0
+        if only_external:
+            try:
+                per_file_agg = defaultdict(lambda: {
+                    'cpu_ms': 0.0,
+                    'cuda_ms': 0.0,
+                    'count': 0,
+                    'memcpy_h2d_count': 0,
+                    'memcpy_d2h_count': 0,
+                    'memcpy_ms': 0.0,
+                })
+                for avg in prof.key_averages(group_by_stack_n=20):
+                    stack_obj = getattr(avg, 'stack', None)
+                    file_rel, _ = find_user_file(stack_obj)
+                    if not file_rel:
+                        file_rel = '<external/CUDA or Library>'
+                    cuda_us = getattr(avg, 'self_device_time_total', None)
+                    if cuda_us is None:
+                        cuda_us = getattr(avg, 'self_cuda_time_total', 0.0)
+                    cpu_us = getattr(avg, 'self_cpu_time_total', 0.0) or 0.0
+                    s = per_file_agg[file_rel]
+                    s['cpu_ms'] += to_ms(cpu_us)
+                    s['cuda_ms'] += to_ms(cuda_us or 0.0)
+                    s['count'] += getattr(avg, 'count', 1) or 1
+                print("\n===== Fallback (aggregated stacks) — Time by source file =====")
+                ranked2 = sorted(per_file_agg.items(), key=lambda kv: (kv[1]['cuda_ms'] + kv[1]['cpu_ms']), reverse=True)
+                for i, (file_rel, s) in enumerate(ranked2[:30], 1):
+                    print(fmt_row(i, file_rel, s))
+            except Exception:
+                pass
 
         if memcpy_sites:
             print("\n===== Top memcpy sites (by time) =====")

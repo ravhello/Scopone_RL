@@ -38,7 +38,18 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs:
             else:
                 action = agent_fn_team1(env)
             _, _, done, info = env.step(action)
-        if 'score_breakdown' in info:
+        if 'score_breakdown_t' in info:
+            bd_t = info['score_breakdown_t']
+            for t in [0, 1]:
+                for k in breakdown_sum[t].keys():
+                    breakdown_sum[t][k] += float(bd_t[t].get(k, torch.zeros((), device=torch.device('cuda'))).detach().to('cpu').item())
+            if float(bd_t[0]['total'].detach().to('cpu').item()) > float(bd_t[1]['total'].detach().to('cpu').item()):
+                wins += 1
+        elif 'team_rewards_t' in info:
+            tr_t = info['team_rewards_t']
+            if float(tr_t[0].detach().to('cpu').item()) > float(tr_t[1].detach().to('cpu').item()):
+                wins += 1
+        elif 'score_breakdown' in info:
             bd = info['score_breakdown']
             for t in [0, 1]:
                 for k in breakdown_sum[t].keys():

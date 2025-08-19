@@ -122,12 +122,8 @@ def run_is_mcts(env: ScoponeEnvMA,
             # Determinizzazione dal belief (se presente): assegna mani agli altri giocatori
             if belief is not None:
                 try:
-                    det = belief.sample_determinization(1)[0]
-                    for pid, ids in det.items():
-                        if pid == belief.observer:
-                            continue
-                        # assegna direttamente ID
-                        sim_env.game_state['hands'][pid] = list(ids)
+                    masks = belief.sample_determinization_gpu(1)[0]  # (3,40) bool CUDA
+                    sim_env.apply_determinization_gpu(masks, belief.observer)
                 except Exception:
                     pass
             # Selection (ensure chosen child action is legal under current determinization)
@@ -190,7 +186,11 @@ def run_is_mcts(env: ScoponeEnvMA,
                 v = 0.0
             else:
                 obs_v = sim_env._get_observation(sim_env.current_player)
-                v = float(value_fn(obs_v))
+                # value_fn deve restituire tensor CUDA 0-D
+                import torch
+                v_t = value_fn(obs_v)
+                # Keep GPU sync minimal; convert to Python float once
+                v = float(v_t.detach().to('cpu').item())
             # Backup
             while node is not None:
                 node.N += 1
@@ -206,16 +206,23 @@ def run_is_mcts(env: ScoponeEnvMA,
             visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
             logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))
             probs_t = logits / torch.clamp_min(logits.sum(), 1e-9)
-            idx = int(torch.multinomial(probs_t, num_samples=1).item())
+            idx_t = torch.multinomial(probs_t, num_samples=1).to(dtype=torch.long).squeeze(0)
+            # Evita conversioni CPU: mantieni idx_t tensor e usa direttamente
+            idx = int(idx_t)
             if return_stats:
-                return root.children[idx].action, probs_t.detach().cpu().numpy()
+                # Ritorna anche le probabilità come tensore su CUDA in modalità GPU-only
+                if __import__('os').environ.get('GPU_ONLY', '1') == '1':
+                    return root.children[idx].action, probs_t
+                return root.children[idx].action, probs_t.detach().to('cpu').numpy()
             return root.children[idx].action
         else:
             best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
             if return_stats:
                 visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
                 probs_t = visits_t / torch.clamp_min(visits_t.sum(), 1e-9)
-                return best.action, probs_t.detach().cpu().numpy()
+                if __import__('os').environ.get('GPU_ONLY', '1') == '1':
+                    return best.action, probs_t
+                return best.action, probs_t.detach().to('cpu').numpy()
             return best.action
     except Exception:
         # Fallback CPU/numpy

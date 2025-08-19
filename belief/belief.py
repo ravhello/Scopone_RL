@@ -1,4 +1,3 @@
-from tests.torch_np import np
 import torch
 from typing import List, Dict, Tuple
 import random
@@ -29,8 +28,10 @@ class BeliefState:
         self.observer = observer_id
         self.num_particles = num_particles
         self.ess_frac = float(ess_frac)
-        self.particles: List[Dict[int, List[int]]] = []  # ogni particella: {player_id: [card_ids, ...]}
-        self.weights = np.ones(num_particles, dtype=np.float32) / num_particles
+        # Particelle su GPU: owner[p, i, cid] = True se nella particella p la carta cid (0..39)
+        # è assegnata al giocatore others[i] (i=0..2 rispetto all'osservatore)
+        self.owner = torch.zeros((num_particles, 3, 40), dtype=torch.bool, device=torch.device('cuda'))
+        self.weights = torch.ones(num_particles, dtype=torch.float32, device=torch.device('cuda')) / float(num_particles)
         # vincoli permanenti derivati dalla history: rank che un player non può avere
         self._forbidden_ranks_by_pid = {pid: set() for pid in range(4)}
         # conteggi per suit/rank giocati per-player
@@ -56,37 +57,40 @@ class BeliefState:
         return visible, counts
 
     def _init_from_state(self, game_state: Dict):
+        device = self.weights.device
         visible, counts = self._visible_ids(game_state)
-        all_cards = set(range(40))
-        unknown = list(all_cards - visible)
-        # Vincoli storici: carte già giocate per player
-        played_by_pid = {pid: set() for pid in range(4)}
+        vis_mask = torch.zeros(40, dtype=torch.bool, device=device)
+        for cid in visible:
+            vis_mask[cid] = True
+        unknown_ids = torch.nonzero(~vis_mask, as_tuple=False).flatten()
+        # aggiorna storico giocate
         try:
             for mv in game_state.get('history', []):
                 pid = int(mv.get('player'))
                 cid = card_to_id(mv.get('played_card'))
-                played_by_pid[pid].add(cid)
                 self._played_ids_by_pid[pid].add(cid)
+            
         except Exception:
             pass
-        for _ in range(self.num_particles):
-            pool = list(unknown)
-            self.rng.shuffle(pool)
-            assignment = {}
-            for pid in counts:
-                k = counts[pid]
-                forb_ids = played_by_pid.get(pid, set())
-                # applica anche vincoli su rank vietati (se già presenti da update incrementali)
-                forb_ranks = self._forbidden_ranks_by_pid.get(pid, set())
-                allowed = [c for c in pool if (c not in forb_ids) and ((c // 4 + 1) not in forb_ranks)]
-                take = allowed[:k]
-                if len(take) < k:
-                    rest = [c for c in pool if c not in take]
-                    take += rest[:(k - len(take))]
-                assignment[pid] = list(take)
-                pool = [c for c in pool if c not in take]
-            self.particles.append(assignment)
-        self.weights[:] = 1.0 / self.num_particles
+        others = [(self.observer + 1) % 4, (self.observer + 2) % 4, (self.observer + 3) % 4]
+        counts_3 = [counts.get(pid, 0) for pid in others]
+        # reset owner
+        self.owner.zero_()
+        if unknown_ids.numel() > 0:
+            for p in range(self.num_particles):
+                perm = torch.randperm(int(unknown_ids.numel()), device=device)
+                start = 0
+                for i in range(3):
+                    k = int(counts_3[i])
+                    if k <= 0:
+                        continue
+                    end = min(start + k, int(unknown_ids.numel()))
+                    if end <= start:
+                        break
+                    take = unknown_ids[perm[start:end]]
+                    self.owner[p, i, take] = True
+                    start = end
+        self.weights.fill_(1.0 / float(self.num_particles))
 
     def _unknown_ids_and_counts(self, game_state: Dict):
         visible, counts = self._visible_ids(game_state)
@@ -141,17 +145,19 @@ class BeliefState:
             per_pid[pid] = exhausted
         return per_pid
 
-    def effective_sample_size(self) -> float:
+    def effective_sample_size(self) -> torch.Tensor:
         w = self.weights
-        return 1.0 / np.sum(np.square(w))
+        return 1.0 / (w.pow(2).sum())
 
     def resample_if_needed(self, ess_threshold: float = None):
         if ess_threshold is None:
             ess_threshold = max(1.0, self.ess_frac * self.num_particles)
-        if self.effective_sample_size() < ess_threshold:
-            idx = np.random.choice(self.num_particles, size=self.num_particles, replace=True, p=self.weights)
-            self.particles = [self.particles[i].copy() for i in idx]
-            self.weights[:] = 1.0 / self.num_particles
+        ess = self.effective_sample_size()
+        thr = torch.tensor(float(ess_threshold), device=self.weights.device, dtype=self.weights.dtype)
+        if bool((ess < thr).item()):
+            idx = torch.multinomial(self.weights, num_samples=self.num_particles, replacement=True)
+            self.owner = self.owner.index_select(0, idx)
+            self.weights.fill_(1.0 / float(self.num_particles))
 
     def update_with_move(self, move: Dict, game_state: Dict, rules: Dict = None, ess_threshold: float = None):
         """
@@ -189,7 +195,7 @@ class BeliefState:
             # mossa illegale rispetto a regole: non aggiorniamo (evita distruzione del belief)
             return
 
-        new_weights = np.zeros_like(self.weights)
+        new_weights = torch.zeros_like(self.weights)
         # ricostruisci tavolo pre-mossa
         table_after = [card_to_id(c) for c in game_state.get('table', [])]
         if captured_ids:
@@ -215,94 +221,22 @@ class BeliefState:
         # deduzione di semi esauriti per-player
         exhausted_by_pid = self._per_player_exhausted_suits(game_state)
 
-        for i, part in enumerate(self.particles):
-            ok = True
-            if player != self.observer:
-                hand_ids = list(part.get(player, []))
-                if played not in hand_ids:
-                    ok = False
-                else:
-                    # simula rimozione dalla mano
-                    hand_ids.remove(played)
-                    part[player] = hand_ids
-            # vincoli di legalità aggiuntivi sulla tavolo pre-mossa
-            if ok and direct_same_rank and not (ap_enabled and rank_played == 1 and set(captured_ids) == set(table_before)):
-                if not (len(captured_ids) == 1 and captured_ids[0] in direct_same_rank):
-                    ok = False
-            if ok and (not direct_same_rank) and captured_ids:
-                # subset-sum rigoroso
-                if not set(captured_ids).issubset(set(table_before)):
-                    ok = False
-                elif sum(((cid // 4) + 1) for cid in captured_ids) != rank_played and not (ap_enabled and rank_played == 1 and set(captured_ids) == set(table_before)):
-                    ok = False
-            # coerenza con public state
-            if ok:
-                public_ids = set(card_to_id(c) for c in game_state.get('table', []))
-                cs = game_state.get('captured_squads', None)
-                try:
-                    public_ids |= set(card_to_id(c) for c in cs[0] + cs[1])
-                except Exception:
-                    try:
-                        public_ids |= set(card_to_id(c) for c in cs.get(0, []) + cs.get(1, []))
-                    except Exception:
-                        pass
-                for pid, h in part.items():
-                    if any(cid in public_ids for cid in h):
-                        ok = False
-                        break
-            # vincoli storici per player
-            if ok:
-                try:
-                    hist_by_pid = {pid: set() for pid in range(4)}
-                    for mv in game_state.get('history', []):
-                        pid0 = int(mv.get('player'))
-                        hist_by_pid[pid0].add(card_to_id(mv.get('played_card')))
-                    for pid, h in part.items():
-                        if pid == self.observer:
-                            continue
-                        forb = hist_by_pid.get(pid, set())
-                        if any(cid in forb for cid in h):
-                            ok = False
-                            break
-                except Exception:
-                    pass
-            # vincolo persistente su rank proibiti emersi dalla history
-            if ok and self._forbidden_ranks_by_pid.get(player):
-                forb_ranks = self._forbidden_ranks_by_pid.get(player, set())
-                if any(((cid // 4) + 1) in forb_ranks for cid in part.get(player, [])):
-                    ok = False
-            # vincoli addizionali: conteggi residui per suit/rank per-player e suit/rank impossibili
-            if ok:
-                for pid, h in part.items():
-                    if pid == self.observer:
-                        continue
-                    suit_counts = [0, 0, 0, 0]
-                    rank_counts = [0] * 10
-                    for cid in h:
-                        suit_counts[cid % 4] += 1
-                        rank_counts[cid // 4] += 1
-                    # impossibili globali
-                    if any((not suit_possible[s] and suit_counts[s] > 0) for s in range(4)):
-                        ok = False
-                        break
-                    if any((not rank_possible[r] and rank_counts[r] > 0) for r in range(10)):
-                        ok = False
-                        break
-                    # per-player suits esauriti
-                    exhausted = exhausted_by_pid.get(pid, [False, False, False, False])
-                    if any(exhausted[s] and suit_counts[s] > 0 for s in range(4)):
-                        ok = False
-                        break
-                    # cap su residui
-                    if any(suit_counts[s] > suit_cap[s] for s in range(4)):
-                        ok = False
-                        break
-                    if any(rank_counts[r] > rank_cap[r] for r in range(10)):
-                        ok = False
-                        break
-            new_weights[i] = 1.0 if ok else 0.0
+        # update pesi con controllo presenza carta giocata
+        if player != self.observer:
+            others = [(self.observer + 1) % 4, (self.observer + 2) % 4, (self.observer + 3) % 4]
+            m = others.index(player) if player in others else -1
+            if m >= 0:
+                present = self.owner[:, m, played]
+                new_weights = torch.where(present, self.weights, torch.zeros_like(self.weights))
+                # rimuovi la carta dalla mano assegnata in tutte le particelle
+                self.owner[:, m, played] = False
+            else:
+                new_weights = self.weights.clone()
+        else:
+            new_weights = self.weights.clone()
+        # (vincoli aggiuntivi complessi omessi per ora; pesi già filtrati dalla presenza della carta)
         s = new_weights.sum()
-        if s > 0:
+        if bool((s > 0).item()):
             self.weights = new_weights / s
         # aggiorna vincoli persistenti: se esiste almeno una carta dello stesso rank sul tavolo prima della mossa
         # e il player non ha effettuato presa diretta (e non AP taking-all), allora quel rank è vietato per il player
@@ -323,31 +257,41 @@ class BeliefState:
             vis, _ = self._visible_ids(game_state)
             unknown_frac = max(0.0, (40 - len(vis)) / 40.0)
             dyn = self.num_particles * max(0.3, min(0.8, unknown_frac))
-            self.resample_if_needed(ess_threshold=dyn)
+            self.resample_if_needed(ess_threshold=float(dyn))
         else:
-            self.resample_if_needed(ess_threshold=ess_threshold)
+            self.resample_if_needed(ess_threshold=float(ess_threshold))
 
     def sample_determinization(self, num: int) -> List[Dict[int, List[int]]]:
         """Estrae 'num' assegnazioni (mani avversarie) in base ai pesi attuali."""
-        idx = np.random.choice(self.num_particles, size=num, replace=True, p=self.weights)
-        return [self.particles[i] for i in idx]
+        idx = torch.multinomial(self.weights, num_samples=int(num), replacement=True)
+        others = [(self.observer + 1) % 4, (self.observer + 2) % 4, (self.observer + 3) % 4]
+        out = []
+        for i in idx.detach().to('cpu').tolist():
+            p = int(i)
+            assign = {}
+            for j, pid in enumerate(others):
+                ids = torch.nonzero(self.owner[p, j, :], as_tuple=False).flatten().detach().to('cpu').tolist()
+                assign[pid] = ids
+            out.append(assign)
+        return out
+
+    def sample_determinization_gpu(self, num: int) -> torch.Tensor:
+        """
+        GPU-native: ritorna maschere boolean (num, 3, 40) su CUDA per le determinizzazioni campionate.
+        L'ordine dei 3 giocatori è others = [(observer+1)%4, (observer+2)%4, (observer+3)%4].
+        """
+        idx = torch.multinomial(self.weights, num_samples=int(num), replacement=True)
+        return self.owner.index_select(0, idx)
 
     def belief_summary(self, game_state: Dict, player_id: int):
         """
         Ritorna un vettore 120-dim (3 * 40) di marginali per carta∈{partner, opp1, opp2}.
         Ordine giocatori: cicla su pid!=player_id in ordine [ (player_id+1)%4, (player_id+2)%4, (player_id+3)%4 ].
         """
-        others = [(player_id + 1) % 4, (player_id + 2) % 4, (player_id + 3) % 4]
-        marg = np.zeros((3, 40), dtype=np.float32)
-        # Le carte visibili hanno marginale 0 per tutti (sono già assegnate a osservatore/tavolo/captured)
-        # Conta fra le particelle la presenza di ciascuna carta nelle mani di ciascun altro giocatore
-        for i, pid in enumerate(others):
-            counts = np.zeros(40, dtype=np.float32)
-            for w, part in zip(self.weights, self.particles):
-                for cid in part.get(pid, []):
-                    counts[cid] += w
-            marg[i] = counts.astype(np.float32)
-        return torch.as_tensor(marg.reshape(-1), dtype=torch.float32, device=torch.device('cuda'))  # 120
+        # Somma pesata delle particelle su GPU
+        w = self.weights.view(-1, 1, 1).to(dtype=torch.float32)
+        marg = (self.owner.float() * w).sum(dim=0)  # (3,40)
+        return marg.reshape(-1)
 
 
 

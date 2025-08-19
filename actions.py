@@ -128,12 +128,7 @@ def decode_action(action_vec):
     """
     return decode_action_ids(action_vec)
 
-# ----- FAST PATH: decode to card IDs (0..39) -----
-try:
-    from numba import njit
-    NUMBA_JIT = True
-except Exception:
-    NUMBA_JIT = False
+# (Removed numba path; tensor-only paths used elsewhere)
 
 _COL_TO_SUIT = {0: 'denari', 1: 'coppe', 2: 'spade', 3: 'bastoni'}
 
@@ -146,8 +141,9 @@ def _decode_ids(vec_t: torch.Tensor):
     # Avoid per-element .item(); move once to CPU for indexing scalars
     played_idx = torch.argmax(vec_t[:40])
     captured_ids = torch.nonzero(vec_t[40:] > 0, as_tuple=False).flatten()
-    played_idx_cpu = int(played_idx.item())
-    captured_cpu = captured_ids.tolist()
+    # keep GPU path by returning Python only at the very end
+    played_idx_cpu = int(played_idx.to(dtype=torch.long).item())
+    captured_cpu = captured_ids.detach().to('cpu').tolist()
     return played_idx_cpu, captured_cpu
 
 def decode_action_ids(action_vec):
@@ -183,54 +179,29 @@ def decode_action_ids_torch(action_vec: torch.Tensor):
         vec_t = torch.as_tensor(action_vec, dtype=torch.float32, device=device).reshape(-1)
     return _decode_ids_torch(vec_t)
 
-# ----- FAST PATH: subset-sum su ID con numba -----
-def find_sum_subsets_ids(table_ids, target_rank: int):
-    """
-    Restituisce liste di ID dal tavolo la cui somma dei rank è target_rank.
-    Usa numba se disponibile per enumerare i sottoinsiemi via bitmask sulle rank.
-    """
-    if not table_ids:
-        return []
-    ids = torch.as_tensor([int(x) for x in table_ids], dtype=torch.long, device=device)
-    ranks = (ids // 4) + 1
-    n = int(ids.numel())
-    if n <= 0:
-        return []
-    pos = torch.arange(n, device=device, dtype=torch.long)
-    masks = torch.arange(1, 1 << n, device=device, dtype=torch.long)
-    sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
-    sums = (sel * ranks.unsqueeze(0)).sum(dim=1)
-    good = (sums == int(target_rank)).nonzero(as_tuple=False).flatten()
-    results = []
-    for gi in good:
-        subset = ids[((masks[gi].unsqueeze(0) >> pos) & 1).bool()].tolist()
-        results.append([int(x) for x in subset])
-    return results
-
 def get_valid_actions(game_state, current_player):
-    """Azioni valide compute interamente su CUDA. Richiede stato in ID (0..39)."""
+    """Azioni valide compute interamente su CUDA. Restituisce tensori 80-D su CUDA."""
     cp = current_player
     hand = game_state["hands"][cp]
     table = game_state["table"]
-    valid_actions = []
+    actions = []
     if not hand:
-        return valid_actions
+        return actions
     if not isinstance(hand[0], int) or (len(table) > 0 and not isinstance(table[0], int)):
         raise TypeError("get_valid_actions richiede game_state in ID (int)")
     from observation import RANK_OF_ID as _RANK_OF_ID
     hand_ids_t = torch.as_tensor(hand, dtype=torch.long, device=device)
     table_ids_t = torch.as_tensor(table or [], dtype=torch.long, device=device)
     for pid_t in hand_ids_t:
-        pid = int(pid_t.item())
-        prank = int(_RANK_OF_ID[pid].item())
+        prank_t = _RANK_OF_ID[pid_t].to(torch.long)
         if table_ids_t.numel() > 0:
             table_ranks = _RANK_OF_ID[table_ids_t].to(torch.long)
-            direct_ids_t = table_ids_t[table_ranks == prank]
+            direct_ids_t = table_ids_t[table_ranks == prank_t]
         else:
             direct_ids_t = torch.empty(0, dtype=torch.long, device=device)
         if direct_ids_t.numel() > 0:
             for did_t in direct_ids_t:
-                valid_actions.append(encode_action(pid, [int(did_t.item())]))
+                actions.append(encode_action_from_ids_gpu(pid_t, did_t.view(1)))
         else:
             n = int(table_ids_t.numel())
             if n > 0:
@@ -238,13 +209,13 @@ def get_valid_actions(game_state, current_player):
                 masks = torch.arange(1, 1 << n, device=device, dtype=torch.long)
                 sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
                 sums = (sel * (table_ranks.unsqueeze(0))).sum(dim=1)
-                good = (sums == prank).nonzero(as_tuple=False).flatten()
+                good = (sums == prank_t).nonzero(as_tuple=False).flatten()
                 if good.numel() > 0:
                     for gi in good:
-                        subset_ids = table_ids_t[((masks[gi].unsqueeze(0) >> pos) & 1).bool()].tolist()
-                        valid_actions.append(encode_action(pid, subset_ids))
+                        subset_ids = table_ids_t[((masks[gi].unsqueeze(0) >> pos) & 1).bool()]
+                        actions.append(encode_action_from_ids_gpu(pid_t, subset_ids))
                 else:
-                    valid_actions.append(encode_action(pid, []))
+                    actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
             else:
-                valid_actions.append(encode_action(pid, []))
-    return valid_actions
+                actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+    return actions

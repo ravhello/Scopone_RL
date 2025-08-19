@@ -149,6 +149,22 @@ class ScoponeEnvMA(gym.Env):
         cloned._observation_cache = OrderedDict()
         cloned._last_state_hash = None
         return cloned
+
+    def apply_determinization_gpu(self, owner_masks: torch.Tensor, observer_id: int):
+        """
+        Applica una determinizzazione usando maschere GPU (3,40) booleane per i tre giocatori non osservatori
+        nell'ordine others=[(obs+1)%4,(obs+2)%4,(obs+3)%4]. Aggiorna solo i mirror GPU (_hands_bits_t) e cache ID.
+        """
+        device_local = self._hands_bits_t.device
+        masks = owner_masks.to(device_local, dtype=torch.bool)
+        ids = torch.arange(40, device=device_local, dtype=torch.int64)
+        others = [(observer_id + 1) % 4, (observer_id + 2) % 4, (observer_id + 3) % 4]
+        for i, pid in enumerate(others):
+            # ricostruisci bitset via somma delle potenze di due selezionate
+            shifts = (self._one_i64 << ids)
+            bitset = shifts[masks[i]].sum()
+            self._hands_bits_t[pid] = bitset
+            # Niente mirror/Sync su CPU in modalità GPU-only
     #@profile
     def get_valid_actions(self):
         """Calcola azioni valide interamente su GPU usando i mirror a bitset CUDA."""
@@ -206,31 +222,31 @@ class ScoponeEnvMA(gym.Env):
                     valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
             # Variante: Asso piglia tutto (aggiungi cattura completa)
-            if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and int(prank_t.item()) == 1:
+            if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and (prank_t == 1):
                 valid_actions.append(encode_action_from_ids_gpu(pid_t, table_ids_t))
             # Ace place action if allowed
             ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
             ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-            if int(prank_t.item()) == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
+            if (prank_t == 1) and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
                 valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
-        # Post-filtri AP: rimuovi posa asso non consentita se richiesto
+        # Post-filtri AP: rimuovi posa asso non consentita se richiesto (GPU-vectorized)
         ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
         ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-        if not (ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0)) and table_ids_t.numel() > 0:
-            filtered = []
-            for v in valid_actions:
-                try:
-                    played = v[:40].reshape(10, 4)
-                    captured = v[40:]
-                    is_ace_play = bool(played[0, :].any().item())
-                    is_no_capture = not bool(captured.any().item())
-                    if is_ace_play and is_no_capture:
-                        continue
-                except Exception:
+        if not (ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0)) and table_ids_t.numel() > 0 and len(valid_actions) > 0:
+            try:
+                stack = torch.stack(valid_actions).to(device=device, dtype=torch.float32)
+                played_all = stack[:, :40].reshape(-1, 10, 4)
+                captured_all = stack[:, 40:]
+                ace_play = played_all[:, 0, :].any(dim=1)
+                no_capture = ~captured_all.any(dim=1)
+                keep_mask = ~(ace_play & no_capture)
+                if bool(keep_mask.all().item()):
                     pass
-                filtered.append(v)
-            valid_actions = filtered
+                else:
+                    valid_actions = [va for va, km in zip(valid_actions, keep_mask) if bool(km.item())]
+            except Exception:
+                pass
 
         self._get_valid_actions_time += time.time() - start_time
         return valid_actions
@@ -263,9 +279,10 @@ class ScoponeEnvMA(gym.Env):
             from actions import decode_action_ids_torch as _decode_ids_torch
             pid_t, cap_ids_t = _decode_ids_torch(action_vec)
             pid = int(pid_t.item())
-            cap_ids = cap_ids_t.tolist()
+            cap_ids = cap_ids_t.detach().to('cpu').tolist()
         except Exception:
             pid, cap_ids = decode_action_ids(action_vec)
+            cap_ids_t = torch.as_tensor(cap_ids, dtype=torch.long, device=device)
         
         # Verifica validità (come prima)
         current_player = self.current_player
@@ -318,7 +335,7 @@ class ScoponeEnvMA(gym.Env):
                     and len(cap_ids) == int(table_ids_t.numel())
                     and torch.equal(torch.sort(torch.as_tensor(cap_ids, device=device).to(torch.long))[0], torch.sort(table_ids_t)[0])):
                 # Devi catturare UNA carta di pari rank
-                if not (len(cap_ids) == 1 and int(torch.as_tensor(cap_ids[0], device=device)) in set(same_rank_ids_t.tolist())):
+                if not (len(cap_ids) == 1 and torch.isin(torch.as_tensor(cap_ids[0], device=device).view(1), same_rank_ids_t).any()):
                     raise ValueError("Quando esistono carte di rank uguale, devi catturarne una (non una combinazione).")
         elif len(cap_ids) > 0:
             # Verifica somma
@@ -511,14 +528,13 @@ class ScoponeEnvMA(gym.Env):
                     except Exception:
                         pass
             
-            # Calcolo punteggio finale
-            from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
-            final_breakdown = compute_final_score_breakdown(self.game_state, rules=self.rules)
-            final_reward = compute_final_reward_from_breakdown(final_breakdown)
-            
+            # Calcolo punteggio finale completamente su GPU
+            from rewards import compute_final_score_breakdown_torch, compute_final_team_rewards_torch
+            final_breakdown_t = compute_final_score_breakdown_torch(self.game_state, rules=self.rules)
+            team_rewards_t = compute_final_team_rewards_torch(self.game_state, rules=self.rules)  # (2,) CUDA
             info = {
-                "score_breakdown": final_breakdown,
-                "team_rewards": [final_reward[0], final_reward[1]]
+                "score_breakdown_t": final_breakdown_t,
+                "team_rewards_t": team_rewards_t,
             }
             
             # OTTIMIZZAZIONE: Crea uno stato finale di zeri senza ricalcolo (rimane tensor su CUDA)
@@ -529,7 +545,7 @@ class ScoponeEnvMA(gym.Env):
             
             # Restituisci la ricompensa finale per il team del giocatore corrente
             current_team = 0 if current_player in [0, 2] else 1
-            return obs_final, final_reward[current_team], True, info
+            return obs_final, float(team_rewards_t[current_team].to('cpu').item()), True, info
         else:
             # Passa al prossimo giocatore
             self.current_player = (self.current_player + 1) % 4
@@ -656,3 +672,7 @@ class ScoponeEnvMA(gym.Env):
             if total_cache > 0:
                 hit_rate = self._cache_hits / total_cache * 100
                 print(f"  Action cache hit rate: {hit_rate:.1f}% ({self._cache_hits}/{total_cache})")
+
+
+
+

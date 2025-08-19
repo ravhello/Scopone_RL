@@ -18,6 +18,13 @@ print(f"Using device: {device}")
 autocast_device = 'cuda'
 autocast_dtype = torch.float16
 
+# Imposta il device di default a CUDA in modalità GPU_ONLY per prevenire H2D impliciti
+try:
+    if os.environ.get('GPU_ONLY', '1') == '1':
+        torch.set_default_device('cuda')
+except Exception:
+    pass
+
 # Configurazione GPU avanzata (forzata)
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
@@ -375,7 +382,11 @@ class DQNAgent:
         self.target_qnet = ActionConditionedQNetwork()
         self.sync_target()
         
-        self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR)
+        try:
+            self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR, fused=True)
+        except TypeError:
+            # Fallback per versioni PyTorch che non supportano fused
+            self.optimizer = optim.Adam(self.online_qnet.parameters(), lr=LR, foreach=True)
         self.epsilon = EPSILON_START
         self.train_steps = 0
         self.episodic_buffer = EpisodicReplayBuffer()
@@ -394,7 +405,7 @@ class DQNAgent:
     
     #@profile
     def pick_action(self, obs, valid_actions, env):
-        """Epsilon-greedy ottimizzato per GPU"""
+        """Epsilon-greedy completamente GPU: restituisce un tensore CUDA 80-D."""
         if not valid_actions:
             print("\n[DEBUG] Nessuna azione valida! Stato attuale:")
             print("  Current player:", env.current_player)
@@ -403,45 +414,27 @@ class DQNAgent:
                 print(f"  Mano p{p}:", env.game_state["hands"][p])
             print("  History:", env.game_state["history"])
             raise ValueError("Nessuna azione valida (valid_actions=[]).")
-        
-        # Epsilon-greedy: scegli un'azione casuale con probabilità epsilon
-        if random.random() < self.epsilon:
-            return random.choice(valid_actions)
+
+        # Costruisci batch di azioni legali su GPU
+        if torch.is_tensor(valid_actions[0]):
+            valid_actions_t = torch.stack([va.to(device=device, dtype=torch.float32) for va in valid_actions], dim=0)
         else:
-            # OTTIMIZZAZIONE: Converti tutti gli input in tensori GPU in un'unica operazione
-            # e riusa il buffer pre-allocato se disponibile
-            if hasattr(self, 'valid_actions_buffer') and len(valid_actions) <= self.valid_actions_buffer.size(0):
-                valid_actions_t = self.valid_actions_buffer[:len(valid_actions)]
-                for i, va in enumerate(valid_actions):
-                    if torch.is_tensor(va):
-                        va = va.to(device=device, dtype=torch.float32)
-                    else:
-                        valid_actions_t[i].copy_(va)
-            else:
-                # Creazione del buffer se non esiste
-                if not hasattr(self, 'valid_actions_buffer') or len(valid_actions) > self.valid_actions_buffer.size(0):
-                    self.valid_actions_buffer = torch.zeros((max(100, len(valid_actions)), 80), 
-                                                        dtype=torch.float32, device=device)
-                if torch.is_tensor(valid_actions[0]):
-                    valid_actions_t = torch.stack(valid_actions).to(device=device, dtype=torch.float32)
-                else:
-                    valid_actions_t = torch.stack([
-                        va if torch.is_tensor(va) else torch.tensor(va, dtype=torch.float32, device=device)
-                    for va in valid_actions], dim=0)
-                
-            with torch.no_grad():
-                # Prepara osservazione
-                obs_t = (obs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device=device)).unsqueeze(0)
-                    
-                # OTTIMIZZAZIONE: Usa mixed precision per accelerare l'inferenza
-                with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
-                    # Q(s,a) per tutte le azioni legali
-                    obs_batch = obs_t.expand(valid_actions_t.size(0), -1)
-                    q_values = self.online_qnet(obs_batch, valid_actions_t)
-                
-                best_action_idx = torch.argmax(q_values).item()
-            
-            return valid_actions[best_action_idx]
+            valid_actions_t = torch.stack([
+                torch.as_tensor(va, dtype=torch.float32, device=device) for va in valid_actions
+            ], dim=0)
+
+        # Epsilon-greedy su GPU
+        if random.random() < self.epsilon:
+            idx_t = torch.randint(valid_actions_t.size(0), (1,), device=device, dtype=torch.long).squeeze(0)
+            return valid_actions_t[idx_t]
+
+        with torch.no_grad():
+            obs_t = (obs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device=device)).unsqueeze(0)
+            with torch.amp.autocast(device_type=autocast_device, dtype=autocast_dtype):
+                obs_batch = obs_t.expand(valid_actions_t.size(0), -1)
+                q_values = self.online_qnet(obs_batch, valid_actions_t)
+            best_idx_t = torch.argmax(q_values).to(dtype=torch.long)
+            return valid_actions_t[best_idx_t]
     
     #@profile
     def train_episodic_monte_carlo(self, specific_episode=None):
@@ -793,13 +786,19 @@ def train_agents(num_episodes=10):
         agent_team0.end_episode()
         agent_team1.end_episode()
         
-        # Ottieni le reward finali
-        team0_reward = 0.0
-        team1_reward = 0.0
-        if "team_rewards" in info:
+        # Ottieni le reward finali (GPU-first)
+        team0_reward_t = torch.tensor(0.0, device=device)
+        team1_reward_t = torch.tensor(0.0, device=device)
+        if "team_rewards_t" in info:
+            try:
+                team0_reward_t = info["team_rewards_t"][0].to(device=device, dtype=torch.float32)
+                team1_reward_t = info["team_rewards_t"][1].to(device=device, dtype=torch.float32)
+            except Exception:
+                pass
+        elif "team_rewards" in info:
             team_rewards = info["team_rewards"]
-            team0_reward = team_rewards[0]
-            team1_reward = team_rewards[1]
+            team0_reward_t = torch.as_tensor(team_rewards[0], dtype=torch.float32, device=device)
+            team1_reward_t = torch.as_tensor(team_rewards[1], dtype=torch.float32, device=device)
             #print(f"  Team Rewards finali: {team_rewards}")
         
         # TRAINING ALLA FINE DELL'EPISODIO - Completamente ottimizzato per GPU
@@ -828,16 +827,16 @@ def train_agents(num_episodes=10):
                     # Conversione diretta ottimizzata
                     if i < ep_len:
                         if torch.is_tensor(obs):
-                            obs = obs.to(device=device, dtype=torch.float32)
+                            team0_obs_buffer[i].copy_(obs.to(device=device, dtype=torch.float32))
                         else:
-                            team0_obs_buffer[i].copy_(obs)
-                            
+                            team0_obs_buffer[i].copy_(torch.as_tensor(obs, dtype=torch.float32, device=device))
+
                         if torch.is_tensor(action):
-                            action = action.to(device=device, dtype=torch.float32)
+                            team0_actions_buffer[i].copy_(action.to(device=device, dtype=torch.float32))
                         else:
-                            team0_actions_buffer[i].copy_(action)
-                            
-                        team0_rewards_buffer[i] = team0_reward
+                            team0_actions_buffer[i].copy_(torch.as_tensor(action, dtype=torch.float32, device=device))
+
+                        team0_rewards_buffer[i] = team0_reward_t
                 
                 # Batch finale con slicing
                 team0_batch = (
@@ -862,16 +861,16 @@ def train_agents(num_episodes=10):
                 for i, (obs, action) in enumerate(zip(all_obs1, all_actions1)):
                     if i < ep_len:
                         if torch.is_tensor(obs):
-                            obs = obs.to(device=device, dtype=torch.float32)
+                            team1_obs_buffer[i].copy_(obs.to(device=device, dtype=torch.float32))
                         else:
-                            team1_obs_buffer[i].copy_(obs)
-                            
+                            team1_obs_buffer[i].copy_(torch.as_tensor(obs, dtype=torch.float32, device=device))
+
                         if torch.is_tensor(action):
-                            action = action.to(device=device, dtype=torch.float32)
+                            team1_actions_buffer[i].copy_(action.to(device=device, dtype=torch.float32))
                         else:
-                            team1_actions_buffer[i].copy_(action)
-                            
-                        team1_rewards_buffer[i] = team1_reward
+                            team1_actions_buffer[i].copy_(torch.as_tensor(action, dtype=torch.float32, device=device))
+
+                        team1_rewards_buffer[i] = team1_reward_t
                 
                 team1_batch = (
                     team1_obs_buffer[:ep_len], 
@@ -972,15 +971,15 @@ def train_agents(num_episodes=10):
                             if idx < total_transitions:
                                 # Trasferimento diretto su GPU
                                 if torch.is_tensor(obs):
-                                    obs = obs.to(device=device, dtype=torch.float32)
+                                    team0_obs_buffer[idx].copy_(obs.to(device=device, dtype=torch.float32))
                                 else:
-                                    team0_obs_buffer[idx].copy_(obs)
-                                    
+                                    team0_obs_buffer[idx].copy_(torch.as_tensor(obs, dtype=torch.float32, device=device))
+
                                 if torch.is_tensor(action):  
-                                    action = action.to(device=device, dtype=torch.float32)
+                                    team0_actions_buffer[idx].copy_(action.to(device=device, dtype=torch.float32))
                                 else:
-                                    team0_actions_buffer[idx].copy_(action)
-                                    
+                                    team0_actions_buffer[idx].copy_(torch.as_tensor(action, dtype=torch.float32, device=device))
+
                                 team0_rewards_buffer[idx] = episode_reward
                                 idx += 1
                 
@@ -1023,12 +1022,13 @@ def train_agents(num_episodes=10):
                         for obs, action, _, _, _, _ in episode:
                             if idx < total_transitions:
                                 if torch.is_tensor(obs):
-                                    obs = obs.to(device=device, dtype=torch.float32)
+                                    team1_obs_buffer[idx].copy_(obs.to(device=device, dtype=torch.float32))
+                                else:
+                                    team1_obs_buffer[idx].copy_(torch.as_tensor(obs, dtype=torch.float32, device=device))
                                 if torch.is_tensor(action):
-                                    action = action.to(device=device, dtype=torch.float32)
-                                    
-                                team1_obs_buffer[idx].copy_(obs)
-                                team1_actions_buffer[idx].copy_(action)
+                                    team1_actions_buffer[idx].copy_(action.to(device=device, dtype=torch.float32))
+                                else:
+                                    team1_actions_buffer[idx].copy_(torch.as_tensor(action, dtype=torch.float32, device=device))
                                 team1_rewards_buffer[idx] = episode_reward
                                 idx += 1
                 

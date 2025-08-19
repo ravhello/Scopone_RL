@@ -2,7 +2,7 @@
 
 import torch
 from actions import decode_action_ids
-from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
+from rewards import compute_final_score_breakdown_torch, compute_final_team_rewards_torch
 
 def update_game_state(game_state, action_id, current_player, rules=None):
     """
@@ -13,9 +13,9 @@ def update_game_state(game_state, action_id, current_player, rules=None):
 
     hand = game_state["hands"][current_player]
     if not hand:
-        final_breakdown = compute_final_score_breakdown(game_state, rules=rules)
-        final_reward = compute_final_reward_from_breakdown(final_breakdown)
-        return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
+        final_breakdown_t = compute_final_score_breakdown_torch(game_state, rules=rules)
+        final_reward_t = compute_final_team_rewards_torch(game_state, rules=rules)
+        return game_state, [float(final_reward_t[0].detach().to('cpu').item()), float(final_reward_t[1].detach().to('cpu').item())], True, {"final_score_t": {0: final_breakdown_t[0]["total"], 1: final_breakdown_t[1]["total"]}, "score_breakdown_t": final_breakdown_t}
 
     # Helpers per conversioni (ID/tuple) e operazioni su CUDA
     device = torch.device('cuda')
@@ -43,7 +43,7 @@ def update_game_state(game_state, action_id, current_player, rules=None):
     
     # Verifica presenza carta nella mano usando mask su CUDA
     hand_ids_t = torch.as_tensor([to_id(c) for c in hand], dtype=torch.long, device=device)
-    if hand_ids_t.numel() == 0 or int((hand_ids_t == int(played_id)).any().item()) == 0:
+    if hand_ids_t.numel() == 0 or not bool((hand_ids_t == int(played_id)).any().item()):
         raise ValueError(f"La carta {played_card} non è nella mano del giocatore {current_player}")
     
     # Rimuovi la carta dalla mano
@@ -109,8 +109,8 @@ def update_game_state(game_state, action_id, current_player, rules=None):
                 game_state["captured_squads"][last_capturing_team].extend(game_state["table"])
                 game_state["table"].clear()
 
-        final_breakdown = compute_final_score_breakdown(game_state, rules=rules)
-        final_reward = compute_final_reward_from_breakdown(final_breakdown)
-        return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
+        final_breakdown_t = compute_final_score_breakdown_torch(game_state, rules=rules)
+        final_reward_t = compute_final_team_rewards_torch(game_state, rules=rules)
+        return game_state, [float(final_reward_t[0].detach().to('cpu').item()), float(final_reward_t[1].detach().to('cpu').item())], True, {"final_score_t": {0: final_breakdown_t[0]["total"], 1: final_breakdown_t[1]["total"]}, "score_breakdown_t": final_breakdown_t}
     else:
         return game_state, [0.0, 0.0], False, {"last_move": move}

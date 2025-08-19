@@ -113,7 +113,18 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
             _, _, done, info = env.step(action)
         # per-game record
         entry = {'game': g}
-        if 'score_breakdown' in info:
+        if 'score_breakdown_t' in info:
+            bd_t = info['score_breakdown_t']
+            for t in [0, 1]:
+                for k in ['carte', 'denari', 'settebello', 'primiera', 'scope', 'total']:
+                    entry[f'team{t}_{k}'] = float(bd_t[t].get(k, torch.zeros((), device=torch.device('cuda'))).detach().to('cpu').item())
+            entry['win_team0'] = 1 if float(bd_t[0]['total'].detach().to('cpu').item()) > float(bd_t[1]['total'].detach().to('cpu').item()) else 0
+        elif 'team_rewards_t' in info:
+            tr_t = info['team_rewards_t']
+            entry['team0_total'] = float(tr_t[0].detach().to('cpu').item())
+            entry['team1_total'] = float(tr_t[1].detach().to('cpu').item())
+            entry['win_team0'] = 1 if entry['team0_total'] > entry['team1_total'] else 0
+        elif 'score_breakdown' in info:
             bd = info['score_breakdown']
             for t in [0, 1]:
                 for k in ['carte', 'denari', 'settebello', 'primiera', 'scope', 'total']:

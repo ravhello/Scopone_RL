@@ -143,13 +143,17 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
         # Take step in environment
         next_obs, reward, done, info = env.step(action)
 
-    # Extract final score information from team_rewards
+    # Extract final score information (GPU-first)
     agent1_score = 0.0
     agent2_score = 0.0
-    if "team_rewards" in info:
+    if "team_rewards_t" in info:
+        tr_t = info["team_rewards_t"]
+        agent1_score = float(tr_t[0].detach().to('cpu').item())
+        agent2_score = float(tr_t[1].detach().to('cpu').item())
+    elif "team_rewards" in info:
         team_rewards = info["team_rewards"]
-        agent1_score = team_rewards[0]  # Team 0 score for agent1
-        agent2_score = team_rewards[1]  # Team 1 score for agent2
+        agent1_score = team_rewards[0]
+        agent2_score = team_rewards[1]
     
     # Determine winner based on team scores
     winner = 0 if agent1_score > agent2_score else 1 if agent2_score > agent1_score else -1

@@ -5339,7 +5339,13 @@ class GameScreen(BaseScreen):
                         # If game is finished, set final state
                         if done:
                             self.game_over = True
-                            if "score_breakdown" in info:
+                            if "score_breakdown_t" in info:
+                                bd_t = info["score_breakdown_t"]
+                                self.final_breakdown = {
+                                    0: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[0].items()},
+                                    1: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[1].items()},
+                                }
+                            elif "score_breakdown" in info:
                                 self.final_breakdown = info["score_breakdown"]
                                 # If last move did NOT capture and rules assign remaining cards to last taker,
                                 # animate a sweep of remaining cards (table before step + played card)
@@ -5417,12 +5423,12 @@ class GameScreen(BaseScreen):
                         if self.app.game_config.get("mode") == "online_multiplayer":
                             # Host gestisce la serie e la sincronizza
                             if self.app.game_config.get("is_host"):
-                                self._handle_hand_end(info.get("score_breakdown"))
+                                self._handle_hand_end(info.get("score_breakdown_t") or info.get("score_breakdown"))
                                 # Broadcast stato serie/recap
                                 if hasattr(self, 'app') and hasattr(self.app, 'network') and self.app.network:
                                     self._broadcast_series_state()
                         else:
-                            self._handle_hand_end(info.get("score_breakdown"))
+                            self._handle_hand_end(info.get("score_breakdown_t") or info.get("score_breakdown"))
                 
                 # Client-side: after an animation cycle completes, play next queued move (serialized)
                 try:
@@ -6390,8 +6396,12 @@ class GameScreen(BaseScreen):
                                         })
                                 # Calcola il breakdown finale per recap/game over
                                 try:
-                                    from rewards import compute_final_score_breakdown
-                                    self.final_breakdown = compute_final_score_breakdown(new_state, rules=self.app.game_config.get("rules", {}))
+                                    from rewards import compute_final_score_breakdown_torch
+                                    bd_t = compute_final_score_breakdown_torch(new_state, rules=self.app.game_config.get("rules", {}))
+                                    self.final_breakdown = {
+                                        0: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[0].items()},
+                                        1: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[1].items()},
+                                    }
                                 except Exception:
                                     pass
                                 is_online = self.app.game_config.get("mode") == "online_multiplayer"
@@ -6735,9 +6745,13 @@ class GameScreen(BaseScreen):
             is_host = self.app.game_config.get("is_host", False)
 
             # Calcola comunque il breakdown, utile sia per recap intermedio che per game over
-            from rewards import compute_final_score_breakdown
+            from rewards import compute_final_score_breakdown_torch
             try:
-                self.final_breakdown = compute_final_score_breakdown(gs, rules=self.app.game_config.get("rules", {}))
+                bd_t = compute_final_score_breakdown_torch(gs, rules=self.app.game_config.get("rules", {}))
+                self.final_breakdown = {
+                    0: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[0].items()},
+                    1: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[1].items()},
+                }
             except Exception:
                 pass
 
