@@ -17,15 +17,25 @@ def compute_final_score_breakdown_torch(game_state, rules=None):
     scope0 = sum(1 for m in game_state["history"] if m.get("capture_type") == "scopa" and (m.get("player") in [0, 2]))
     scope1 = sum(1 for m in game_state["history"] if m.get("capture_type") == "scopa" and (m.get("player") in [1, 3]))
 
-    # Carte totali (confronto su GPU)
-    c0_t = torch.tensor(len(squads[0]), dtype=torch.long, device=device)
-    c1_t = torch.tensor(len(squads[1]), dtype=torch.long, device=device)
+    # Carte totali (confronto su GPU) e ID catturati: preferisci mirror bitset se disponibili
+    from observation import IDS_CUDA
+    captured_bits_t = game_state.get('_captured_bits_t', None)
+    if captured_bits_t is not None:
+        mask0 = (((captured_bits_t[0] >> IDS_CUDA) & 1).to(torch.bool))
+        mask1 = (((captured_bits_t[1] >> IDS_CUDA) & 1).to(torch.bool))
+        ids0 = IDS_CUDA[mask0]
+        ids1 = IDS_CUDA[mask1]
+        c0_t = ids0.numel().to(torch.long)
+        c1_t = ids1.numel().to(torch.long)
+    else:
+        ids0 = torch.as_tensor(squads[0] or [], dtype=torch.long, device=device)
+        ids1 = torch.as_tensor(squads[1] or [], dtype=torch.long, device=device)
+        c0_t = torch.tensor(len(squads[0]), dtype=torch.long, device=device)
+        c1_t = torch.tensor(len(squads[1]), dtype=torch.long, device=device)
     pt_c0_t = (c0_t > c1_t).to(dtype=torch.long)
     pt_c1_t = (c1_t > c0_t).to(dtype=torch.long)
 
     # Denari (suit==0)
-    ids0 = torch.as_tensor(squads[0] or [], dtype=torch.long, device=device)
-    ids1 = torch.as_tensor(squads[1] or [], dtype=torch.long, device=device)
     den0_t = (SUITCOL_OF_ID[ids0] == 0).sum() if ids0.numel() > 0 else torch.zeros((), dtype=torch.long, device=device)
     den1_t = (SUITCOL_OF_ID[ids1] == 0).sum() if ids1.numel() > 0 else torch.zeros((), dtype=torch.long, device=device)
     pt_d0_t = (den0_t > den1_t).to(dtype=torch.long)

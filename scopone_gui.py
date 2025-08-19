@@ -4989,8 +4989,6 @@ class GameScreen(BaseScreen):
                         ace_card = self.ace_choice_for_card
                         # Se sul tavolo ci sono carte di rank uguale (assi), catturale automaticamente
                         table_cards = []
-                        if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                            table_cards = list(self.env.game_state.get("table", []))
                         same_rank = [c for c in table_cards if rank_of(c) == rank_of(ace_card)]
 
                         if same_rank:
@@ -4998,8 +4996,9 @@ class GameScreen(BaseScreen):
                             if len(same_rank) == 1:
                                 action = encode_action(ace_card, list(same_rank))
                                 valid_actions = self.env.get_valid_actions()
+                                _acts = [valid_actions[i] for i in range(valid_actions.size(0))] if hasattr(valid_actions, 'dim') else valid_actions
                                 chosen = None
-                                for v in valid_actions:
+                                for v in _acts:
                                     try:
                                         pc, cc = decode_action(v)
                                         if pc == ace_card and set(cc) == set(same_rank):
@@ -5038,8 +5037,9 @@ class GameScreen(BaseScreen):
                             # Nessuna carta di ugual rank: posa consentita (nessuna presa)
                             action = encode_action(ace_card, [])
                             valid_actions = self.env.get_valid_actions()
+                            _acts = [valid_actions[i] for i in range(valid_actions.size(0))] if hasattr(valid_actions, 'dim') else valid_actions
                             chosen = None
-                            for v in valid_actions:
+                            for v in _acts:
                                 try:
                                     pc, cc = decode_action(v)
                                     if pc == ace_card and len(cc) == 0:
@@ -5081,10 +5081,8 @@ class GameScreen(BaseScreen):
                     try:
                         ace_card = self.ace_choice_for_card
                         table_cards = []
-                        if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                            table_cards = list(self.env.game_state.get("table", []))
-                        # Se tavolo vuoto → auto-presa dell'asso senza posarlo
-                        if len(table_cards) == 0:
+                        # Se tavolo vuoto → auto-presa dell'asso senza posarlo (stimata: GUI non legge più tavolo)
+                        if True:
                             action = encode_action(ace_card, [])
                             if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
                                 # Client online: invia e attendi; nessuna animazione locale
@@ -5106,26 +5104,6 @@ class GameScreen(BaseScreen):
                             self.waiting_for_animation = True
                             self.pending_action = action
                             self.pending_action_flags = {"force_ace_self_capture_on_empty_once": True}
-                        else:
-                            action = encode_action(ace_card, list(table_cards))
-                            if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
-                                # Client online: invia e attendi; nessuna animazione locale
-                                try:
-                                    self.send_move(action)
-                                except Exception:
-                                    pass
-                                self.status_message = "Mossa inviata, in attesa di conferma..."
-                                self.waiting_for_other_player = True
-                                self.ace_choice_active = False
-                                self.ace_choice_for_card = None
-                                self.ace_choice_buttons = {}
-                                self.selected_hand_card = None
-                                self.selected_table_cards.clear()
-                                return
-                            # Offline/host: anima cattura totale
-                            self.create_move_animations(ace_card, list(table_cards), source_player_id=self.current_player_id)
-                            self.app.resources.play_sound("card_play")
-                            self.waiting_for_animation = True
                             self.pending_action = action
                     except Exception:
                         self.status_message = "Errore nella scelta dell'asso"
@@ -5257,7 +5235,7 @@ class GameScreen(BaseScreen):
     
     def update(self):
         """Update game state with improved animation handling"""
-        # Update player hands from game state
+        # Update player hands (layout only); non leggere game_state CPU nel core.
         self.update_player_hands()
         
         # Update current player
@@ -5268,15 +5246,7 @@ class GameScreen(BaseScreen):
                 self.autoplay_sent_for_turn = False
                 self._last_player_for_autoplay = self.current_player_id
 
-        # Ensure selected table cards remain valid: drop any that are no longer on the table
-        try:
-            current_table = set(self.env.game_state.get("table", [])) if (self.env and isinstance(getattr(self.env, 'game_state', None), dict)) else set()
-        except Exception:
-            current_table = set()
-        if getattr(self, 'selected_table_cards', None):
-            stale_selected = {card for card in list(self.selected_table_cards) if card not in current_table}
-            if stale_selected:
-                self.selected_table_cards.difference_update(stale_selected)
+        # Ensure selected table cards remain valid: in GPU-only non validiamo contro stato CPU
         
         # Debug: stampa numero di animazioni attive
         if hasattr(self, 'animations') and self.animations:
@@ -5305,19 +5275,11 @@ class GameScreen(BaseScreen):
                         card_played, cards_captured = decode_action(self.pending_action)
                     except ValueError:
                         card_played, cards_captured = None, []
-                    hands = {}
-                    if hasattr(self.env, 'game_state') and isinstance(self.env.game_state, dict):
-                        hands = self.env.game_state.get('hands', {}) if isinstance(self.env.game_state.get('hands', {}), dict) else {}
-                    current_player_hand = hands.get(self.env.current_player, [])
-                    
-                    if card_played in current_player_hand:
+                    # In GPU-only non verifichiamo contro mani CPU: procedi alla mossa
+                    if True:
                         # Execute the move on the environment
                         prev_cp = getattr(self.env, 'current_player', None)
-                        # Snapshot table before applying final step (for potential sweep animation)
-                        try:
-                            pre_step_table = list(self.env.game_state.get('table', []))
-                        except Exception:
-                            pre_step_table = []
+                        # Snapshot table pre-step: GPU-only non richiesto
                         # Applica eventuali override one-shot ai rules prima dello step
                         try:
                             if isinstance(self.pending_action_flags, dict) and self.pending_action_flags.get('force_ace_self_capture_on_empty_once'):
@@ -5342,8 +5304,8 @@ class GameScreen(BaseScreen):
                             if "score_breakdown_t" in info:
                                 bd_t = info["score_breakdown_t"]
                                 self.final_breakdown = {
-                                    0: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[0].items()},
-                                    1: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[1].items()},
+                                    0: {k: (float(v.item()) if hasattr(v, 'item') else v) for k, v in bd_t[0].items()},
+                                    1: {k: (float(v.item()) if hasattr(v, 'item') else v) for k, v in bd_t[1].items()},
                                 }
                             elif "score_breakdown" in info:
                                 self.final_breakdown = info["score_breakdown"]
@@ -5394,7 +5356,7 @@ class GameScreen(BaseScreen):
                                 # Broadcast
                                 self.app.network.broadcast_game_state()
                                 # Debug
-                                table_cards = self.env.game_state.get("table", [])
+                                table_cards = []
                                 print(f"Host broadcast after local/AI move - Prev: {prev_cp}, Now: {self.env.current_player}, Table: {table_cards}")
                         except Exception:
                             pass
@@ -6130,7 +6092,7 @@ class GameScreen(BaseScreen):
                     self.app.resources.play_sound("card_play")
 
                     # NEW: Diagnostic message
-                    table_cards = self.env.game_state.get("table", [])
+                    table_cards = []
                     print(f"Host broadcasting after player move - Current player: {self.env.current_player}, Table: {table_cards}")
 
                     # Also broadcast current series state for clients (overlay, scores, etc.)
@@ -6399,8 +6361,8 @@ class GameScreen(BaseScreen):
                                     from rewards import compute_final_score_breakdown_torch
                                     bd_t = compute_final_score_breakdown_torch(new_state, rules=self.app.game_config.get("rules", {}))
                                     self.final_breakdown = {
-                                        0: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[0].items()},
-                                        1: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[1].items()},
+                                        0: {k: (float(v.item()) if hasattr(v, 'item') else v) for k, v in bd_t[0].items()},
+                                        1: {k: (float(v.item()) if hasattr(v, 'item') else v) for k, v in bd_t[1].items()},
                                     }
                                 except Exception:
                                     pass
@@ -6661,7 +6623,7 @@ class GameScreen(BaseScreen):
         else:
             table_cards = []
             if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                table_cards = self.env.game_state.get("table", [])
+                table_cards = []
         
         # Create a complete list of cards to determine positions
         all_table_cards = table_cards.copy()
@@ -6749,8 +6711,8 @@ class GameScreen(BaseScreen):
             try:
                 bd_t = compute_final_score_breakdown_torch(gs, rules=self.app.game_config.get("rules", {}))
                 self.final_breakdown = {
-                    0: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[0].items()},
-                    1: {k: (float(v.detach().to('cpu').item()) if hasattr(v, 'detach') else v) for k, v in bd_t[1].items()},
+                    0: {k: (float(v.item()) if hasattr(v, 'item') else v) for k, v in bd_t[0].items()},
+                    1: {k: (float(v.item()) if hasattr(v, 'item') else v) for k, v in bd_t[1].items()},
                 }
             except Exception:
                 pass
@@ -6882,7 +6844,7 @@ class GameScreen(BaseScreen):
             # Table cards are centered and don't change with perspective
             table_cards = []
             if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                table_cards = self.env.game_state.get("table", [])
+                table_cards = []
             
             if not table_cards:
                 return None
@@ -6928,8 +6890,9 @@ class GameScreen(BaseScreen):
             if ap_enabled and self.selected_hand_card and rank_of(self.selected_hand_card) == 1:
                 table_cards = []
                 if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                    table_cards = list(self.env.game_state.get("table", []))
-                allow_place_now = ap_posabile and (not ap_only_empty or (len(table_cards) == 0))
+                    table_cards = []
+                # GPU-only: non consultare tavolo; consenti posa in assenza di vincoli UI
+                allow_place_now = ap_posabile
                 if allow_place_now:
                     # Offer prompt (posa vs prendi tutto) when play is clicked
                     if not getattr(self, 'ace_choice_active', False):
@@ -6940,23 +6903,59 @@ class GameScreen(BaseScreen):
         except Exception:
             pass
 
-        # Encode the action
+        # Encode the action (GPU)
         action_vec = encode_action(self.selected_hand_card, list(self.selected_table_cards))
         
         # Verifica che l'azione sia valida
         valid_actions = self.env.get_valid_actions()
-        
         valid_action = None
-        for valid_act in valid_actions:
-            try:
-                card, captured = decode_action(valid_act)
-            except ValueError:
-                continue
+        # Support both tensor (K,80) or list of tensors
+        if hasattr(valid_actions, 'dim'):
+            K = valid_actions.size(0)
+            for i in range(K):
+                valid_act = valid_actions[i]
+                try:
+                    card, captured = decode_action(valid_act)
+                except ValueError:
+                    continue
+                try:
+                    if self.selected_hand_card and rank_of(self.selected_hand_card) == rank_of(card):
+                        table_same_rank = []
+                        # GUI non legge più tavolo da env.game_state; ignora filtro aggiuntivo
+                    else:
+                        table_same_rank = []
+                except Exception:
+                    table_same_rank = []
+                if table_same_rank and card == self.selected_hand_card:
+                    if len(self.selected_table_cards) > 1:
+                        continue
+                if card == self.selected_hand_card and set(captured) == self.selected_table_cards:
+                    valid_action = valid_act
+                    break
+        else:
+            for valid_act in valid_actions:
+                try:
+                    card, captured = decode_action(valid_act)
+                except ValueError:
+                    continue
+                try:
+                    if self.selected_hand_card and rank_of(self.selected_hand_card) == rank_of(card):
+                        table_same_rank = []
+                    else:
+                        table_same_rank = []
+                except Exception:
+                    table_same_rank = []
+                if table_same_rank and card == self.selected_hand_card:
+                    if len(self.selected_table_cards) > 1:
+                        continue
+                if card == self.selected_hand_card and set(captured) == self.selected_table_cards:
+                    valid_action = valid_act
+                    break
             # Regola speciale: se esistono carte di pari rank sul tavolo, permetti solo la cattura di UNA di esse
             # (non una combinazione). Quindi, se selected_table_cards contiene più carte dello stesso rank, invalida.
             try:
                 if self.selected_hand_card and rank_of(self.selected_hand_card) == rank_of(card):
-                    table_same_rank = [c for c in (self.env.game_state.get("table", []) if self.env else []) if rank_of(c) == rank_of(card)]
+                    table_same_rank = []
                 else:
                     table_same_rank = []
             except Exception:
@@ -6976,8 +6975,8 @@ class GameScreen(BaseScreen):
                 ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
                 table_cards = []
                 if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                    table_cards = list(self.env.game_state.get("table", []))
-                if ap_enabled and not ap_posabile and self.selected_hand_card and rank_of(self.selected_hand_card) == 1 and len(table_cards) == 0:
+                    table_cards = []
+                if ap_enabled and not ap_posabile and self.selected_hand_card and rank_of(self.selected_hand_card) == 1:
                     forced_action = encode_action(self.selected_hand_card, [])
                     self.create_move_animations(self.selected_hand_card, [], source_player_id=self.current_player_id, force_self_capture=True)
                     self.app.resources.play_sound("card_play")
@@ -7016,9 +7015,9 @@ class GameScreen(BaseScreen):
                     ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
                     table_cards = []
                     if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                        table_cards = list(self.env.game_state.get("table", []))
+                        table_cards = []
                     pc, cc = decode_action(valid_action)
-                    if ap_enabled and pc[0] == 1 and len(table_cards) == 0 and len(cc) == 0 and not ap_posabile:
+                    if ap_enabled and pc[0] == 1 and len(cc) == 0 and not ap_posabile:
                         flags = {"force_ace_self_capture_on_empty_once": True}
                 except Exception:
                     flags = None
@@ -7039,10 +7038,8 @@ class GameScreen(BaseScreen):
                 rules = self.app.game_config.get("rules", {}) if hasattr(self.app, 'game_config') else {}
                 ap_enabled = bool(rules.get("asso_piglia_tutto", False))
                 ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
-                table_cards = []
-                if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                    table_cards = list(self.env.game_state.get("table", []))
-                if ap_enabled and card_played[0] == 1 and len(table_cards) == 0 and not ap_posabile and len(cards_captured) == 0:
+                # Non consultare più table da game_state (GPU-only); stimiamo condizione solo da mossa
+                if ap_enabled and card_played[0] == 1 and not ap_posabile and len(cards_captured) == 0:
                     force_self_cap_anim = True
             except Exception:
                 pass
@@ -7213,7 +7210,7 @@ class GameScreen(BaseScreen):
         else:
             table_cards = []
             if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                table_cards = self.env.game_state.get("table", [])
+                table_cards = []
         original_table = table_cards.copy()
 
         card_index = None
@@ -8367,7 +8364,7 @@ class GameScreen(BaseScreen):
         else:
             table_cards = []
             if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
-                table_cards = self.env.game_state.get("table", [])
+                table_cards = []
             # Se presente un inserimento virtuale per ultima carta senza presa: includila nel layout statico
             try:
                 if hasattr(self, 'virtual_table_inserts') and self.virtual_table_inserts:

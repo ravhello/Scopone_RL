@@ -38,80 +38,51 @@ class BeliefState:
         self._played_ids_by_pid = {pid: set() for pid in range(4)}
         self._init_from_state(game_state)
 
-    def _visible_ids(self, game_state: Dict) -> Tuple[set, Dict[int, int]]:
-        """Restituisce insieme di carte visibili e conteggi richiesti per ogni giocatore restante."""
-        visible = set()
-        counts = {}
-        # carte visibili: mano osservatore, tavolo, captured di entrambi
-        for c in game_state['hands'][self.observer]:
-            visible.add(card_to_id(c))
-        for c in game_state['table']:
-            visible.add(card_to_id(c))
-        for c in game_state['captured_squads'][0] + game_state['captured_squads'][1]:
-            visible.add(card_to_id(c))
-        # conteggio per ogni altro player = len(mano corrente)
+    def _visible_mask_and_counts(self, game_state: Dict):
+        device = self.weights.device
+        hands_bits_t = game_state['_hands_bits_t']
+        table_bits_t = game_state['_table_bits_t']
+        captured_bits_t = game_state['_captured_bits_t']
+        ids = torch.arange(40, device=device, dtype=torch.int64)
+        visible_bits = hands_bits_t[self.observer] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
+        vis_mask = (((visible_bits >> ids) & 1).to(torch.bool))
+        counts = torch.zeros(4, dtype=torch.long, device=device)
         for pid in range(4):
-            if pid == self.observer:
-                continue
-            counts[pid] = len(game_state['hands'][pid])
-        return visible, counts
+            counts[pid] = (((hands_bits_t[pid] >> ids) & 1).to(torch.float32).sum()).to(torch.long)
+        return vis_mask, counts
 
     def _init_from_state(self, game_state: Dict):
         device = self.weights.device
-        visible, counts = self._visible_ids(game_state)
-        vis_mask = torch.zeros(40, dtype=torch.bool, device=device)
-        for cid in visible:
-            vis_mask[cid] = True
+        vis_mask, counts_all = self._visible_mask_and_counts(game_state)
         unknown_ids = torch.nonzero(~vis_mask, as_tuple=False).flatten()
-        # aggiorna storico giocate
-        try:
-            for mv in game_state.get('history', []):
-                pid = int(mv.get('player'))
-                cid = card_to_id(mv.get('played_card'))
-                self._played_ids_by_pid[pid].add(cid)
-            
-        except Exception:
-            pass
-        others = [(self.observer + 1) % 4, (self.observer + 2) % 4, (self.observer + 3) % 4]
-        counts_3 = [counts.get(pid, 0) for pid in others]
+        others = torch.tensor([(self.observer + 1) % 4, (self.observer + 2) % 4, (self.observer + 3) % 4], device=device, dtype=torch.long)
+        counts_3_t = counts_all.index_select(0, others).clamp_min(0)
         # reset owner
         self.owner.zero_()
-        if unknown_ids.numel() > 0:
+        U = unknown_ids.numel()
+        if U > 0:
+            pos = torch.arange(U, device=device, dtype=torch.long)
+            cum = torch.cumsum(counts_3_t, dim=0)
+            cum = torch.minimum(cum, torch.tensor(U, device=device, dtype=cum.dtype))
             for p in range(self.num_particles):
-                perm = torch.randperm(int(unknown_ids.numel()), device=device)
-                start = 0
-                for i in range(3):
-                    k = int(counts_3[i])
-                    if k <= 0:
-                        continue
-                    end = min(start + k, int(unknown_ids.numel()))
-                    if end <= start:
-                        break
-                    take = unknown_ids[perm[start:end]]
-                    self.owner[p, i, take] = True
-                    start = end
+                perm = torch.randperm(U, device=device)
+                g0 = pos < cum[0]
+                g1 = (pos >= cum[0]) & (pos < cum[1])
+                g2 = (pos >= cum[1]) & (pos < cum[2])
+                if g0.any():
+                    self.owner[p, 0, unknown_ids[perm[g0]]] = True
+                if g1.any():
+                    self.owner[p, 1, unknown_ids[perm[g1]]] = True
+                if g2.any():
+                    self.owner[p, 2, unknown_ids[perm[g2]]] = True
         self.weights.fill_(1.0 / float(self.num_particles))
 
     def _unknown_ids_and_counts(self, game_state: Dict):
-        visible, counts = self._visible_ids(game_state)
-        unknown = [cid for cid in range(40) if cid not in visible]
-        # residui per suit e rank tra le carte sconosciute
-        suit_rem = [0, 0, 0, 0]
-        rank_rem = [0] * 10
-        for cid in unknown:
-            suit_rem[cid % 4] += 1
-            rank_rem[cid // 4] += 1
-        # numero di giocatori non osservatori con carte in mano
-        active_unknown = sum(1 for pid in range(4) if pid != self.observer and counts.get(pid, 0) > 0)
-        # progresso della mano: ~ carte giocate / 40
-        try:
-            progress = min(1.0, max(0.0, len(game_state.get('history', [])) / 40.0))
-        except Exception:
-            progress = 0.0
-        # rende impossibili suit/rank completamente esauriti
-        suit_possible = [suit_rem[s] > 0 for s in range(4)]
-        rank_possible = [rank_rem[r] > 0 for r in range(10)]
-        return unknown, suit_rem, rank_rem, max(1, active_unknown), progress, suit_possible, rank_possible
+        vis_mask, counts_all = self._visible_mask_and_counts(game_state)
+        unknown_ids = torch.nonzero(~vis_mask, as_tuple=False).flatten()
+        others = torch.tensor([(self.observer + 1) % 4, (self.observer + 2) % 4, (self.observer + 3) % 4], device=self.weights.device)
+        active_unknown = (counts_all.index_select(0, others) > 0).to(torch.float32).sum()
+        return unknown_ids, None, None, active_unknown, torch.tensor(0.0, device=self.weights.device), None, None
 
     def _per_player_exhausted_suits(self, game_state: Dict) -> Dict[int, List[bool]]:
         """Deduce per-player i semi impossibili considerando history e pubblico (grezzo, conservativo)."""
@@ -154,7 +125,7 @@ class BeliefState:
             ess_threshold = max(1.0, self.ess_frac * self.num_particles)
         ess = self.effective_sample_size()
         thr = torch.tensor(float(ess_threshold), device=self.weights.device, dtype=self.weights.dtype)
-        if bool((ess < thr).item()):
+        if (ess < thr):
             idx = torch.multinomial(self.weights, num_samples=self.num_particles, replacement=True)
             self.owner = self.owner.index_select(0, idx)
             self.weights.fill_(1.0 / float(self.num_particles))
@@ -196,17 +167,7 @@ class BeliefState:
             return
 
         new_weights = torch.zeros_like(self.weights)
-        # ricostruisci tavolo pre-mossa
-        table_after = [card_to_id(c) for c in game_state.get('table', [])]
-        if captured_ids:
-            table_before = table_after + captured_ids
-        else:
-            # no-capture: played è stato aggiunto al tavolo -> rimuovilo
-            tmp = list(table_after)
-            if played in tmp:
-                tmp.remove(played)
-            table_before = tmp
-        direct_same_rank = [cid for cid in table_before if ((cid // 4) + 1) == rank_played]
+        # no table reconstruction in GPU-only mode
 
         # calcola cap e impossibilità globali
         _, suit_rem, rank_rem, active_unknown, progress, suit_possible, rank_possible = self._unknown_ids_and_counts(game_state)
@@ -218,8 +179,7 @@ class BeliefState:
             suit_cap.append(0 if c <= 0 else int(math.ceil(c / active_unknown)) + extra_margin)
         for c in rank_rem:
             rank_cap.append(0 if c <= 0 else int(math.ceil(c / active_unknown)) + extra_margin)
-        # deduzione di semi esauriti per-player
-        exhausted_by_pid = self._per_player_exhausted_suits(game_state)
+        # skip complex constraints in GPU-only
 
         # update pesi con controllo presenza carta giocata
         if player != self.observer:
@@ -236,44 +196,24 @@ class BeliefState:
             new_weights = self.weights.clone()
         # (vincoli aggiuntivi complessi omessi per ora; pesi già filtrati dalla presenza della carta)
         s = new_weights.sum()
-        if bool((s > 0).item()):
+        if (s > 0):
             self.weights = new_weights / s
         # aggiorna vincoli persistenti: se esiste almeno una carta dello stesso rank sul tavolo prima della mossa
         # e il player non ha effettuato presa diretta (e non AP taking-all), allora quel rank è vietato per il player
-        try:
-            if direct_same_rank and not (ap_enabled and rank_played == 1 and set(captured_ids) == set(table_before)):
-                took_direct = (len(captured_ids) == 1 and captured_ids[0] in direct_same_rank)
-                if not took_direct:
-                    self._forbidden_ranks_by_pid[player].add(rank_played)
-        except Exception:
-            pass
+        # skip forbidden rank deductions in GPU-only
         # aggiorna storico carte giocate per-player
         try:
             self._played_ids_by_pid[player].add(played)
         except Exception:
             pass
         # resampling adattivo
-        if ess_threshold is None:
-            vis, _ = self._visible_ids(game_state)
-            unknown_frac = max(0.0, (40 - len(vis)) / 40.0)
-            dyn = self.num_particles * max(0.3, min(0.8, unknown_frac))
-            self.resample_if_needed(ess_threshold=float(dyn))
-        else:
-            self.resample_if_needed(ess_threshold=float(ess_threshold))
+        # simple resample every update (GPU-only)
+        idx = torch.multinomial(self.weights, num_samples=self.num_particles, replacement=True)
+        self.owner = self.owner.index_select(0, idx)
+        self.weights.fill_(1.0 / float(self.num_particles))
 
-    def sample_determinization(self, num: int) -> List[Dict[int, List[int]]]:
-        """Estrae 'num' assegnazioni (mani avversarie) in base ai pesi attuali."""
-        idx = torch.multinomial(self.weights, num_samples=int(num), replacement=True)
-        others = [(self.observer + 1) % 4, (self.observer + 2) % 4, (self.observer + 3) % 4]
-        out = []
-        for i in idx.detach().to('cpu').tolist():
-            p = int(i)
-            assign = {}
-            for j, pid in enumerate(others):
-                ids = torch.nonzero(self.owner[p, j, :], as_tuple=False).flatten().detach().to('cpu').tolist()
-                assign[pid] = ids
-            out.append(assign)
-        return out
+    def sample_determinization(self, num: int):
+        raise NotImplementedError("Use sample_determinization_gpu in GPU-only mode")
 
     def sample_determinization_gpu(self, num: int) -> torch.Tensor:
         """

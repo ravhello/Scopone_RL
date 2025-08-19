@@ -31,7 +31,7 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs:
         info = {}
         while not done:
             legals = env.get_valid_actions()
-            if not legals:
+            if (torch.is_tensor(legals) and legals.size(0) == 0) or (not torch.is_tensor(legals) and not legals):
                 break
             if env.current_player in [0, 2]:
                 action = agent_fn_team0(env)
@@ -42,12 +42,12 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs:
             bd_t = info['score_breakdown_t']
             for t in [0, 1]:
                 for k in breakdown_sum[t].keys():
-                    breakdown_sum[t][k] += float(bd_t[t].get(k, torch.zeros((), device=torch.device('cuda'))).detach().to('cpu').item())
-            if float(bd_t[0]['total'].detach().to('cpu').item()) > float(bd_t[1]['total'].detach().to('cpu').item()):
+                    breakdown_sum[t][k] += float(bd_t[t].get(k, torch.zeros((), device=torch.device('cuda'))).item())
+            if float(bd_t[0]['total'].item()) > float(bd_t[1]['total'].item()):
                 wins += 1
         elif 'team_rewards_t' in info:
             tr_t = info['team_rewards_t']
-            if float(tr_t[0].detach().to('cpu').item()) > float(tr_t[1].detach().to('cpu').item()):
+            if float(tr_t[0].item()) > float(tr_t[1].item()):
                 wins += 1
         elif 'score_breakdown' in info:
             bd = info['score_breakdown']

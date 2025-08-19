@@ -43,12 +43,11 @@ from tests.torch_np import np
 # Forza garbage collection
 import gc
 gc.collect()
-if torch.cuda.is_available():
-    # Più aggressivo nel liberare la memoria
-    torch.cuda.empty_cache()
-    # Stampa statistiche memoria
-    print(f"  GPU memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
-    print(f"  GPU memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB")
+# Più aggressivo nel liberare la memoria
+torch.cuda.empty_cache()
+# Stampa statistiche memoria
+print(f"  GPU memory allocated: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+print(f"  GPU memory reserved: {torch.cuda.memory_reserved()/1024**2:.1f}MB")
 """
 
 # Parametri di rete e training
@@ -192,13 +191,12 @@ class QNetwork(nn.Module):
         # Sposta tutto il modello su GPU all'inizializzazione
         self.to(device)
         
-        # Imposta opzioni CUDA per performance
-        if torch.cuda.is_available():
-            # Abilita TF32 su Ampere GPUs per migliori performance
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            # Ottimizzazione per dimensioni di input fisse
-            torch.backends.cudnn.benchmark = True
+        # Imposta opzioni CUDA per performance (GPU-only)
+        # Abilita TF32 su Ampere GPUs per migliori performance
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Ottimizzazione per dimensioni di input fisse
+        torch.backends.cudnn.benchmark = True
     
     #@profile
     def forward(self, x):
@@ -307,10 +305,9 @@ class ActionConditionedQNetwork(nn.Module):
 
         self.to(device)
 
-        if torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     def forward(self, obs, actions):
         # obs: (B, obs_dim) oppure (1, obs_dim); actions: (B, 80)
@@ -393,15 +390,12 @@ class DQNAgent:
 
         # Aggiunte per ottimizzazione GPU
         torch.backends.cudnn.benchmark = True  # Ottimizzazione per dimensioni di input fisse
-        # Usa GradScaler solo se CUDA è disponibile (API moderna torch.amp)
-        if torch.cuda.is_available():
-            try:
-                self.scaler = torch.amp.GradScaler('cuda')
-            except Exception:
-                # Fallback per versioni PyTorch più vecchie
-                self.scaler = torch.cuda.amp.GradScaler()
-        else:
-            self.scaler = None
+        # Mixed precision scaler (GPU-only)
+        try:
+            self.scaler = torch.amp.GradScaler('cuda')
+        except Exception:
+            # Fallback per versioni PyTorch più vecchie (comunque su CUDA)
+            self.scaler = torch.cuda.amp.GradScaler()
     
     #@profile
     def pick_action(self, obs, valid_actions, env):
@@ -595,21 +589,20 @@ def train_agents(num_episodes=10):
     Il training avviene alla fine di ogni episodio, con reward flat per tutte le mosse.
     Implementa ottimizzazioni per ridurre drasticamente i trasferimenti CPU-GPU.
     """
-    # Configurazione ottimale GPU
-    if torch.cuda.is_available():
-        # Impostazioni per massimizzare throughput
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.enabled = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        # Gestione aggressiva della memoria
-        torch.cuda.empty_cache()
-        if hasattr(torch.cuda, 'memory'):
-            torch.cuda.memory.set_per_process_memory_fraction(0.95)
-        
-        # Imposta allocator per ridurre frammentazione
-        torch.cuda.memory_stats()
+    # Configurazione ottimale GPU (GPU-only)
+    # Impostazioni per massimizzare throughput
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # Gestione aggressiva della memoria
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, 'memory'):
+        torch.cuda.memory.set_per_process_memory_fraction(0.95)
+
+    # Imposta allocator per ridurre frammentazione
+    torch.cuda.memory_stats()
 
     # Crea la directory dei checkpoint se non esiste
     checkpoint_dir = os.path.dirname(CHECKPOINT_PATH)
@@ -779,7 +772,7 @@ def train_agents(num_episodes=10):
         inference_times.append(inference_time)
         
         # Memoria usata dopo inferenza
-        #if torch.cuda.is_available():
+        # GPU-only mode
             #print(f"  Memoria GPU dopo inferenza: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocata")
 
         # Termina episodi e prepara per training

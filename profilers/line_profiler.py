@@ -5,13 +5,9 @@ import contextlib
 import sys
 import time
 
-# Try to import torch for GPU profiling
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    print("Warning: PyTorch not available. GPU profiling will be disabled.")
+# Import torch for GPU profiling (GPU-only)
+import torch
+TORCH_AVAILABLE = True
 
 class LineProfiler:
     """
@@ -19,6 +15,8 @@ class LineProfiler:
     """
     def __init__(self):
         self.functions = {}  # Functions to profile
+        self.code_to_func = {}
+        self.code_to_name = {}
         # Stats structure: {func_name: {line_no: [hits, cpu_time, gpu_time, transfer_time]}}
         self.results = defaultdict(lambda: defaultdict(lambda: [0, 0, 0, 0]))
         self.current_stack = []  # Stack of currently executing functions
@@ -28,7 +26,7 @@ class LineProfiler:
         self.import_times = {}   # Import statement execution times
         
         # GPU monitoring
-        self.use_cuda = TORCH_AVAILABLE and torch.cuda.is_available()
+        self.use_cuda = True
         if self.use_cuda:
             # Initialize GPU stats
             torch.cuda.reset_peak_memory_stats()
@@ -39,10 +37,33 @@ class LineProfiler:
         """Adds a function to profile with line-by-line instrumentation."""
         code = func.__code__
         self.functions[func.__name__] = func
+        self.code_to_func[code] = func
+        self.code_to_name[code] = func.__name__
         self.line_timings[id(code)] = {}
         
         # Create a tracing function for this code object
         def tracefunc(frame, event, arg):
+            # Only handle events for frames we care about
+            fcode = frame.f_code
+            if event == 'call':
+                # If this is a call into a profiled function, initialize timing for this frame
+                if fcode in self.code_to_name:
+                    # Track start time for the function call
+                    func_start_time = time.time()
+                    gpu_start_time = 0
+                    if self.use_cuda:
+                        torch.cuda.synchronize()
+                        gpu_start_time = time.time()
+                    self.start_times[id(frame)] = {
+                        'cpu_time': func_start_time,
+                        'gpu_time': gpu_start_time if self.use_cuda else 0,
+                        'line_start_time': func_start_time,
+                        'gpu_line_start': gpu_start_time if self.use_cuda else 0,
+                        'last_line': None
+                    }
+                    # Ensure we keep tracing inside this function
+                    frame.f_trace = tracefunc
+                return tracefunc
             if event == 'line':
                 self._trace_line(frame)
             elif event == 'return':
@@ -100,12 +121,11 @@ class LineProfiler:
         """Trace a line execution within a profiled function."""
         frame_id = id(frame)
         code = frame.f_code
-        func_name = code.co_name
-        line_no = frame.f_lineno
-        
-        # Verify this is a function we're profiling
-        if func_name not in self.functions:
+        # Only track functions that were registered
+        if code not in self.code_to_name:
             return
+        func_name = self.code_to_name[code]
+        line_no = frame.f_lineno
         
         # Get timing info for this frame
         if frame_id not in self.start_times:
@@ -153,11 +173,9 @@ class LineProfiler:
         """Handle function return while profiling."""
         frame_id = id(frame)
         code = frame.f_code
-        func_name = code.co_name
-        
-        # Verify this is a function we're profiling
-        if func_name not in self.functions:
+        if code not in self.code_to_name:
             return
+        func_name = self.code_to_name[code]
         
         # Get timing info for this frame
         if frame_id not in self.start_times:

@@ -11,7 +11,7 @@ except Exception:
 def set_global_seeds(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    # GPU-only: always seed CUDA
+    torch.cuda.manual_seed_all(seed)
 
 

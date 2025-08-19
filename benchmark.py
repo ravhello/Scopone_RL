@@ -148,8 +148,8 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
     agent2_score = 0.0
     if "team_rewards_t" in info:
         tr_t = info["team_rewards_t"]
-        agent1_score = float(tr_t[0].detach().to('cpu').item())
-        agent2_score = float(tr_t[1].detach().to('cpu').item())
+        agent1_score = float(tr_t[0].item())
+        agent2_score = float(tr_t[1].item())
     elif "team_rewards" in info:
         team_rewards = info["team_rewards"]
         agent1_score = team_rewards[0]
@@ -764,14 +764,13 @@ def main():
     for i, cp in enumerate(checkpoint_paths):
         print(f"{i+1}. {cp}")
     
-    # Configure GPU if available
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.enabled = True
-        if hasattr(torch.backends.cuda, 'matmul'):
-            torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.cuda.empty_cache()
+    # Configure GPU (GPU-only)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    if hasattr(torch.backends.cuda, 'matmul'):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.cuda.empty_cache()
     
     # Save results to file
     timestamp = time.strftime("%Y%m%d-%H%M%S")

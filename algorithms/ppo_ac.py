@@ -83,16 +83,17 @@ class ActionConditionedPPO:
             self.scaler = torch.cuda.amp.GradScaler()
 
     @torch.inference_mode()
-    def select_action(self, obs, legal_actions: List, seat_team_vec = None, belief_summary = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if len(legal_actions) == 0:
+    def select_action(self, obs, legal_actions, seat_team_vec = None, belief_summary = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # legal_actions può essere tensore (K,80) o lista di tensori
+        if (torch.is_tensor(legal_actions) and legal_actions.size(0) == 0) or (not torch.is_tensor(legal_actions) and len(legal_actions) == 0):
             raise ValueError("No legal actions")
         # Avoid warning: if obs already tensor, use clone().detach().to(device)
         if torch.is_tensor(obs):
             obs_t = obs.clone().detach().to(device=device, dtype=torch.float32).unsqueeze(0)
         else:
             obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        if len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]):
-            actions_t = torch.stack(legal_actions).to(device=device, dtype=torch.float32)
+        if torch.is_tensor(legal_actions):
+            actions_t = legal_actions.to(device=device, dtype=torch.float32)
         else:
             actions_t = torch.stack([
                 x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
@@ -161,7 +162,7 @@ class ActionConditionedPPO:
         if raw_logits.dim() == 1:
             raw_logits = raw_logits.unsqueeze(0)
         # Prepara indici legal per minibatch usando offs/cnts contro legals globali
-        max_cnt = int(cnts.max().item()) if B > 0 else 0
+        max_cnt = cnts.max().long() if B > 0 else 0
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)                    # (B, max_cnt)
@@ -298,7 +299,7 @@ class ActionConditionedPPO:
                 # early stop per target KL (controlla meno spesso per ridurre sync CPU)
                 if (count_mb % check_every) == 0:
                     _kl = info.get('approx_kl', torch.tensor(0.0, device=device)).detach()
-                    if bool((_kl > self.target_kl).item()):
+                    if (_kl > self.target_kl):
                         self._high_kl_count += 1
                         early_stop = True
                         break

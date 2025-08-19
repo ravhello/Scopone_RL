@@ -3,6 +3,7 @@ import random
 from typing import List, Tuple
 
 from environment import ScoponeEnvMA
+import torch
 from belief.belief import BeliefState
 
 
@@ -45,18 +46,18 @@ def run_is_mcts(env: ScoponeEnvMA,
     root_env = env.clone()
     obs = root_env._get_observation(root_env.current_player)
     legals = root_env.get_valid_actions()
-    if not legals:
+    if (torch.is_tensor(legals) and legals.size(0) == 0) or (not torch.is_tensor(legals) and not legals):
         raise ValueError("No legal actions for IS-MCTS")
 
     # Helpers per chiavi
     def action_key(vec):
         try:
-            import torch as _torch
-            import numpy as _np
-            if _torch.is_tensor(vec):
-                nz = _torch.nonzero(vec > 0, as_tuple=False).flatten().tolist()
-                return tuple(int(i) for i in nz)
+            if torch.is_tensor(vec):
+                nz = torch.nonzero(vec > 0, as_tuple=False).flatten()
+                # map indices to Python only for dict keys (UI/tests path)
+                return tuple([int(i) for i in nz.detach().tolist()])
             else:
+                import numpy as _np
                 return tuple(_np.flatnonzero(vec).tolist())
         except Exception:
             return tuple()
@@ -72,48 +73,54 @@ def run_is_mcts(env: ScoponeEnvMA,
     try:
         priors = policy_fn(obs, legals)
     except NameError:
-        # Fallback: prior uniforme (compat con test che definisce policy_fn con np non risolto)
-        import numpy as _np
-        priors = _np.ones(len(legals), dtype=_np.float32) / max(1, len(legals))
-    import numpy as _np
-    if isinstance(priors, _np.ndarray):
-        priors_len = len(priors)
-        if prior_smooth_eps > 0 and priors_len > 1:
-            priors = (1 - prior_smooth_eps) * priors + prior_smooth_eps * (1.0 / priors_len)
-        if root_dirichlet_eps > 0 and priors_len > 1 and root_dirichlet_alpha > 0:
-            noise = _np.random.dirichlet([root_dirichlet_alpha] * priors_len)
-            priors = (1 - root_dirichlet_eps) * priors + root_dirichlet_eps * noise
-    else:
-        # Assume torch.Tensor su CUDA
-        import torch
-        if not torch.is_tensor(priors):
-            priors = torch.as_tensor(priors, dtype=torch.float32, device=torch.device('cuda'))
-        device = priors.device
-        priors_len = int(priors.numel())
-        if prior_smooth_eps > 0 and priors_len > 1:
-            priors = (1.0 - prior_smooth_eps) * priors + prior_smooth_eps * (1.0 / priors_len)
-        if root_dirichlet_eps > 0 and priors_len > 1 and root_dirichlet_alpha > 0:
-            alpha = torch.full((priors_len,), float(root_dirichlet_alpha), device=device, dtype=priors.dtype)
-            noise = torch.distributions.Dirichlet(alpha).sample()
-            priors = (1.0 - root_dirichlet_eps) * priors + root_dirichlet_eps * noise
+        K = (legals.size(0) if torch.is_tensor(legals) else len(legals))
+        priors = torch.ones(K, dtype=torch.float32, device=torch.device('cuda')) / max(1, K)
+    if not torch.is_tensor(priors):
+        priors = torch.as_tensor(priors, dtype=torch.float32, device=torch.device('cuda'))
+    device = priors.device
+    priors_len = int(priors.numel())
+    if prior_smooth_eps > 0 and priors_len > 1:
+        priors = (1.0 - prior_smooth_eps) * priors + prior_smooth_eps * (1.0 / priors_len)
+    if root_dirichlet_eps > 0 and priors_len > 1 and root_dirichlet_alpha > 0:
+        alpha = torch.full((priors_len,), float(root_dirichlet_alpha), device=device, dtype=priors.dtype)
+        noise = torch.distributions.Dirichlet(alpha).sample()
+        priors = (1.0 - root_dirichlet_eps) * priors + root_dirichlet_eps * noise
     root = ISMCTSNode(parent=None, action=None)
     root.N = 0
     node_cache = {}
     pk_root = public_key(root_env)
-    prior_list = priors.tolist() if hasattr(priors, 'tolist') else list(priors)
-    for a, p in zip(legals, prior_list):
-        ak = action_key(a)
-        key = (pk_root, ak)
-        if key in node_cache:
-            child = node_cache[key]
-            child.P = float(p)
-            if child not in root.children:
+    if torch.is_tensor(legals):
+        K = legals.size(0)
+        for i in range(K):
+            a = legals[i]
+            p = float(priors[i])
+            ak = action_key(a)
+            key = (pk_root, ak)
+            if key in node_cache:
+                child = node_cache[key]
+                child.P = p
+                if child not in root.children:
+                    root.children.append(child)
+            else:
+                child = ISMCTSNode(parent=root, action=a)
+                child.P = p
                 root.children.append(child)
-        else:
-            child = ISMCTSNode(parent=root, action=a)
-            child.P = float(p)
-            root.children.append(child)
-            node_cache[key] = child
+                node_cache[key] = child
+    else:
+        prior_list = priors.tolist() if hasattr(priors, 'tolist') else list(priors)
+        for a, p in zip(legals, prior_list):
+            ak = action_key(a)
+            key = (pk_root, ak)
+            if key in node_cache:
+                child = node_cache[key]
+                child.P = float(p)
+                if child not in root.children:
+                    root.children.append(child)
+            else:
+                child = ISMCTSNode(parent=root, action=a)
+                child.P = float(p)
+                root.children.append(child)
+                node_cache[key] = child
 
     for _ in range(num_simulations):
         # Esegui una o più determinizzazioni
@@ -133,7 +140,10 @@ def run_is_mcts(env: ScoponeEnvMA,
                     break
                 # Get current legals and legal keys
                 legals_cur = sim_env.get_valid_actions()
-                legal_keys = set(action_key(a) for a in legals_cur)
+                if torch.is_tensor(legals_cur):
+                    legal_keys = set(action_key(legals_cur[i]) for i in range(legals_cur.size(0)))
+                else:
+                    legal_keys = set(action_key(a) for a in legals_cur)
                 # Filter children to only those legal in this determinization
                 legal_children = [ch for ch in node.children if action_key(ch.action) in legal_keys or ch.action is None]
                 if not legal_children:
@@ -153,48 +163,58 @@ def run_is_mcts(env: ScoponeEnvMA,
             if not sim_env.done:
                 obs_s = sim_env._get_observation(sim_env.current_player)
                 legals_s = sim_env.get_valid_actions()
-                if legals_s:
+                if (torch.is_tensor(legals_s) and legals_s.size(0) > 0) or (not torch.is_tensor(legals_s) and legals_s):
                     try:
                         priors_s = policy_fn(obs_s, legals_s)
                     except NameError:
-                        priors_s = _np.ones(len(legals_s), dtype=_np.float32) / max(1, len(legals_s))
-                    if isinstance(priors_s, _np.ndarray):
-                        if prior_smooth_eps > 0 and len(priors_s) > 1:
-                            priors_s = (1 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / len(priors_s))
-                    else:
-                        import torch
-                        if not torch.is_tensor(priors_s):
-                            priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=torch.device('cuda'))
-                        if prior_smooth_eps > 0 and priors_s.numel() > 1:
-                            priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
+                        K = (legals_s.size(0) if torch.is_tensor(legals_s) else len(legals_s))
+                        priors_s = torch.ones(K, dtype=torch.float32, device=torch.device('cuda')) / max(1, K)
+                    if not torch.is_tensor(priors_s):
+                        priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=torch.device('cuda'))
+                    if prior_smooth_eps > 0 and priors_s.numel() > 1:
+                        priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
                     pk = public_key(sim_env)
-                    for a, p in zip(legals_s, (priors_s.tolist() if 'torch' in str(type(priors_s)) else priors_s)):
-                        ak = action_key(a)
-                        key = (pk, ak)
-                        if key in node_cache:
-                            ch = node_cache[key]
-                            ch.P = float(p)
-                            if ch not in node.children:
+                    if torch.is_tensor(legals_s):
+                        for i in range(legals_s.size(0)):
+                            a = legals_s[i]
+                            p = float(priors_s[i])
+                            ak = action_key(a)
+                            key = (pk, ak)
+                            if key in node_cache:
+                                ch = node_cache[key]
+                                ch.P = p
+                                if ch not in node.children:
+                                    node.children.append(ch)
+                            else:
+                                ch = ISMCTSNode(parent=node, action=a)
+                                ch.P = p
                                 node.children.append(ch)
-                        else:
-                            ch = ISMCTSNode(parent=node, action=a)
-                            ch.P = float(p)
-                            node.children.append(ch)
-                            node_cache[key] = ch
+                                node_cache[key] = ch
+                    else:
+                        for a, p in zip(legals_s, priors_s.tolist()):
+                            ak = action_key(a)
+                            key = (pk, ak)
+                            if key in node_cache:
+                                ch = node_cache[key]
+                                ch.P = float(p)
+                                if ch not in node.children:
+                                    node.children.append(ch)
+                            else:
+                                ch = ISMCTSNode(parent=node, action=a)
+                                ch.P = float(p)
+                                node.children.append(ch)
+                                node_cache[key] = ch
             # Evaluation
             if sim_env.done:
                 v = 0.0
             else:
                 obs_v = sim_env._get_observation(sim_env.current_player)
-                # value_fn deve restituire tensor CUDA 0-D
-                import torch
                 v_t = value_fn(obs_v)
-                # Keep GPU sync minimal; convert to Python float once
-                v = float(v_t.detach().to('cpu').item())
+                v = v_t
             # Backup
             while node is not None:
                 node.N += 1
-                node.W += v
+                node.W += float(v)
                 node.Q = node.W / node.N
                 node = node.parent
 
@@ -211,35 +231,17 @@ def run_is_mcts(env: ScoponeEnvMA,
             idx = int(idx_t)
             if return_stats:
                 # Ritorna anche le probabilità come tensore su CUDA in modalità GPU-only
-                if __import__('os').environ.get('GPU_ONLY', '1') == '1':
-                    return root.children[idx].action, probs_t
-                return root.children[idx].action, probs_t.detach().to('cpu').numpy()
+                return root.children[idx].action, probs_t
             return root.children[idx].action
         else:
             best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
             if return_stats:
                 visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
                 probs_t = visits_t / torch.clamp_min(visits_t.sum(), 1e-9)
-                if __import__('os').environ.get('GPU_ONLY', '1') == '1':
-                    return best.action, probs_t
-                return best.action, probs_t.detach().to('cpu').numpy()
+                return best.action, probs_t
             return best.action
     except Exception:
-        # Fallback CPU/numpy
-        if root_temperature and root_temperature > 1e-6:
-            visits = _np.array([ch.N for ch in root.children], dtype=_np.float64)
-            logits = _np.power(visits + 1e-9, 1.0 / root_temperature)
-            probs = logits / logits.sum()
-            idx = _np.random.choice(len(root.children), p=probs)
-            if return_stats:
-                return root.children[idx].action, probs
-            return root.children[idx].action
-        else:
-            best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
-            if return_stats:
-                visits = _np.array([ch.N for ch in root.children], dtype=_np.float64)
-                probs = visits / max(1.0, visits.sum())
-                return best.action, probs
-            return best.action
+        # GPU-only mode: do not fall back to CPU/numpy; re-raise for visibility
+        raise
 
 

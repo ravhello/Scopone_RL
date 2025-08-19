@@ -9,53 +9,57 @@ def njit(*args, **kwargs):
         return fn
     return _decorator
 
-if NUMBA_AVAILABLE:
-    @njit(cache=True)
-    def _subset_masks_with_sum(ranks, target):
-        n = ranks.shape[0]
-        results = []
-        for mask in range(1, 1 << n):
-            s = 0
-            for i in range(n):
-                if (mask >> i) & 1:
-                    s += ranks[i]
-            if s == target:
-                results.append(mask)
-        return results
+def _find_sum_subsets_fast_gpu(table_cards, target_rank):
+    """GPU-accelerated version that finds all subsets summing to target_rank"""
+    n = len(table_cards)
+    if n == 0:
+        return []
+    if n > 10:  # Limit per evitare esplosione di memoria (2^10 = 1024 masks)
+        # Fallback to CPU for very large tables
+        return _find_sum_subsets_fast_cpu(table_cards, target_rank)
+    
+    # Crea tensori su GPU
+    ranks = torch.tensor([c[0] if isinstance(c, tuple) else (c // 4 + 1) for c in table_cards], 
+                         dtype=torch.long, device=device)
+    
+    # Genera tutte le maschere possibili (2^n - 1, escludendo il set vuoto)
+    num_masks = (1 << n) - 1
+    masks = torch.arange(1, num_masks + 1, dtype=torch.long, device=device)
+    
+    # Crea matrice binaria per tutte le maschere (num_masks x n)
+    positions = torch.arange(n, device=device).unsqueeze(0)
+    mask_bits = ((masks.unsqueeze(1) >> positions) & 1).to(torch.bool)
+    
+    # Calcola somme per ogni maschera in parallelo
+    sums = (mask_bits * ranks.unsqueeze(0)).sum(dim=1)
+    
+    # Trova maschere valide
+    valid_masks = masks[sums == target_rank]
+    
+    # Converti maschere valide in subset (solo qui torniamo a Python)
+    subsets = []
+    for mask in valid_masks.cpu().tolist():
+        subset = [table_cards[i] for i in range(n) if (mask >> i) & 1]
+        subsets.append(subset)
+    
+    return subsets
 
-    def _find_sum_subsets_fast(table_cards, target_rank):
-        # Pure python fallback always
-        n = len(table_cards)
-        masks = []
-        for mask in range(1, 1 << n):
-            s = 0
-            for i in range(n):
-                if (mask >> i) & 1:
-                    s += table_cards[i][0]
-            if s == target_rank:
-                masks.append(mask)
-        subsets = []
-        for mask in masks:
-            subset = []
-            for i in range(n):
-                if (mask >> i) & 1:
-                    subset.append(table_cards[i])
+def _find_sum_subsets_fast_cpu(table_cards, target_rank):
+    """CPU fallback for compatibility"""
+    n = len(table_cards)
+    subsets = []
+    for mask in range(1, 1 << n):
+        s = 0
+        for i in range(n):
+            if (mask >> i) & 1:
+                s += table_cards[i][0] if isinstance(table_cards[i], tuple) else (table_cards[i] // 4 + 1)
+        if s == target_rank:
+            subset = [table_cards[i] for i in range(n) if (mask >> i) & 1]
             subsets.append(subset)
-        return subsets
-else:
-    def _find_sum_subsets_fast(table_cards, target_rank):
-        # Fallback: brute via bitmask in puro Python (n di solito piccolo)
-        n = len(table_cards)
-        subsets = []
-        for mask in range(1, 1 << n):
-            s = 0
-            for i in range(n):
-                if (mask >> i) & 1:
-                    s += table_cards[i][0]
-            if s == target_rank:
-                subset = [table_cards[i] for i in range(n) if (mask >> i) & 1]
-                subsets.append(subset)
-        return subsets
+    return subsets
+
+# Usa versione GPU di default
+_find_sum_subsets_fast = _find_sum_subsets_fast_gpu
 device = torch.device("cuda")
 
 def encode_action(card, cards_to_capture):
@@ -138,26 +142,20 @@ def _idx_to_id(row: int, col: int) -> int:
 def _decode_ids(vec_t: torch.Tensor):
     if vec_t.dim() != 1 or vec_t.numel() != 80:
         raise ValueError("decode_action_ids richiede un vettore 80-dim")
-    # Avoid per-element .item(); move once to CPU for indexing scalars
-    played_idx = torch.argmax(vec_t[:40])
-    captured_ids = torch.nonzero(vec_t[40:] > 0, as_tuple=False).flatten()
-    # keep GPU path by returning Python only at the very end
-    played_idx_cpu = int(played_idx.to(dtype=torch.long).item())
-    captured_cpu = captured_ids.detach().to('cpu').tolist()
-    return played_idx_cpu, captured_cpu
+    # GPU-only: ritorna tensori CUDA (long)
+    played_idx = torch.argmax(vec_t[:40]).to(dtype=torch.long)
+    captured_mask = (vec_t[40:] > 0)
+    captured_ids = torch.nonzero(captured_mask, as_tuple=False).flatten().to(dtype=torch.long)
+    return played_idx, captured_ids
 
 def decode_action_ids(action_vec):
     """
-    Decodifica un vettore azione 80-dim in (played_id, [captured_ids]) con card IDs 0..39.
+    Decodifica un vettore azione 80-dim e ritorna (played_idx_t, captured_ids_t) su CUDA (long).
     """
     if torch.is_tensor(action_vec):
         vec_t = action_vec.to(device=device, dtype=torch.float32).reshape(-1)
     else:
-        # supporta list o numpy array
-        try:
-            vec_t = torch.as_tensor(action_vec, dtype=torch.float32, device=device).reshape(-1)
-        except Exception:
-            vec_t = torch.tensor(list(action_vec), dtype=torch.float32, device=device).reshape(-1)
+        vec_t = torch.as_tensor(action_vec, dtype=torch.float32, device=device).reshape(-1)
     return _decode_ids(vec_t)
 
 def _decode_ids_torch(vec_t: torch.Tensor):
@@ -180,13 +178,13 @@ def decode_action_ids_torch(action_vec: torch.Tensor):
     return _decode_ids_torch(vec_t)
 
 def get_valid_actions(game_state, current_player):
-    """Azioni valide compute interamente su CUDA. Restituisce tensori 80-D su CUDA."""
+    """Azioni valide compute interamente su CUDA. Restituisce un tensore (K,80) su CUDA."""
     cp = current_player
     hand = game_state["hands"][cp]
     table = game_state["table"]
     actions = []
     if not hand:
-        return actions
+        return torch.zeros((0, 80), dtype=torch.float32, device=device)
     if not isinstance(hand[0], int) or (len(table) > 0 and not isinstance(table[0], int)):
         raise TypeError("get_valid_actions richiede game_state in ID (int)")
     from observation import RANK_OF_ID as _RANK_OF_ID
@@ -218,4 +216,6 @@ def get_valid_actions(game_state, current_player):
                     actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
             else:
                 actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
-    return actions
+    if actions:
+        return torch.stack(actions, dim=0)
+    return torch.zeros((0, 80), dtype=torch.float32, device=device)

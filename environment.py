@@ -7,8 +7,8 @@ from functools import lru_cache
 from collections import OrderedDict
 
 from state import initialize_game
-from observation import encode_state_for_player, encode_state_compact_for_player
-from actions import get_valid_actions, encode_action, decode_action, decode_action_ids
+from observation import encode_state_compact_for_player_fast
+from actions import decode_action_ids
 # line_profiler opzionale: disabilitato in test/produzione
 
 # Recupera il device globale (forzato a CUDA)
@@ -69,23 +69,27 @@ class ScoponeEnvMA(gym.Env):
         self._observation_cache = OrderedDict()
         self._cache_capacity = 128
         
-        # Stato del gioco
-        self.game_state = None  # usa rappresentazione a tuple (rank,suit) per compat, ma prevedi futura migrazione a ID/bitset
+        # Stato del gioco (GPU-only)
+        self.game_state = None
         self.done = False
         self.current_player = 0
-        self.rewards = [0,0]
-        # Cache ID/bitset (parziale)
-        self._use_id_cache = True
-        self._use_bitset = True
-        self._hands_ids = {p: [] for p in range(4)}
-        self._table_ids = []
-        self._hands_bits = {p: 0 for p in range(4)}
-        self._table_bits = 0
+        # ricompense cumulative (CUDA)
+        self.rewards_t = torch.zeros(2, dtype=torch.float32, device=device)
         # GPU mirrors: int64 bitsets on CUDA to keep state resident on device
         self._hands_bits_t = torch.zeros(4, dtype=torch.int64, device=device)
         self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
         self._captured_bits_t = torch.zeros(2, dtype=torch.int64, device=device)
         self._one_i64 = torch.tensor(1, dtype=torch.int64, device=device)
+        # Track remaining hand cards to avoid GPU->CPU sync for done flag
+        self._remaining_hand_cards = 0
+        self._last_capturing_team_t = torch.tensor(-1, dtype=torch.long, device=device)
+        # history tensor (max 40 moves). fields: player_id(1), capture_type(1), played_id(1), captured_mask(40)
+        self._max_moves = 40
+        self._history_len_t = torch.zeros((), dtype=torch.long, device=device)
+        self._history_player_t = torch.full((self._max_moves,), -1, dtype=torch.long, device=device)
+        self._history_capture_type_t = torch.zeros((self._max_moves,), dtype=torch.long, device=device)
+        self._history_played_t = torch.full((self._max_moves,), -1, dtype=torch.long, device=device)
+        self._history_captured_mask_t = torch.zeros((self._max_moves, 40), dtype=torch.float32, device=device)
         
         # Regole/varianti opzionali della partita
         # Nota: negli script con modalità di default, "asso_piglia_tutto" è disattivato
@@ -107,47 +111,80 @@ class ScoponeEnvMA(gym.Env):
         self._step_count = 0
         
         self.reset()
-    def _rebuild_id_caches(self):
-        if not self._use_id_cache:
-            return
+    def _set_game_state_from_deal(self, deal_state_dict):
+        """Inizializza i mirror bitset GPU a partire dallo stato iniziale (liste ID) e crea il game_state GPU-only."""
+        # hands
         for p in range(4):
-            ids = [_card_to_id(c) for c in self.game_state['hands'][p]]
-            self._hands_ids[p] = ids
-            self._hands_bits[p] = _ids_to_bitset(ids) if self._use_bitset else 0
-            # sync CUDA mirror
-            try:
-                self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
-            except Exception:
-                self._hands_bits_t[p] = torch.tensor(int(self._hands_bits[p]), dtype=torch.int64, device=device)
-        tids = [_card_to_id(c) for c in self.game_state['table']]
-        self._table_ids = tids
-        self._table_bits = _ids_to_bitset(tids) if self._use_bitset else 0
-        try:
-            self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
-        except Exception:
-            self._table_bits_t = torch.tensor(int(self._table_bits), dtype=torch.int64, device=device)
-        # captured squads mirror
-        try:
-            bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
-            bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
-        except Exception:
-            bits0, bits1 = 0, 0
-        self._captured_bits_t[0] = torch.as_tensor(bits0, dtype=torch.int64, device=device)
-        self._captured_bits_t[1] = torch.as_tensor(bits1, dtype=torch.int64, device=device)
+            lst = deal_state_dict['hands'][p]
+            if not lst:
+                self._hands_bits_t[p] = torch.zeros((), dtype=torch.int64, device=device)
+            else:
+                ids = torch.as_tensor(lst, dtype=torch.long, device=device)
+                shifts = (self._one_i64 << ids)
+                self._hands_bits_t[p] = shifts.sum()
+        # table
+        tbl = deal_state_dict['table']
+        if not tbl:
+            self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
+        else:
+            ids = torch.as_tensor(tbl, dtype=torch.long, device=device)
+            self._table_bits_t = (self._one_i64 << ids).sum()
+        # captured squads
+        for t in [0, 1]:
+            lst = deal_state_dict['captured_squads'][t]
+            if not lst:
+                self._captured_bits_t[t] = torch.zeros((), dtype=torch.int64, device=device)
+            else:
+                ids = torch.as_tensor(lst, dtype=torch.long, device=device)
+                self._captured_bits_t[t] = (self._one_i64 << ids).sum()
+        # remaining cards
+        self._remaining_hand_cards = sum(len(deal_state_dict['hands'][p]) for p in range(4))
+        # history tensors
+        self._history_len_t.zero_()
+        self._history_player_t.fill_(-1)
+        self._history_capture_type_t.zero_()
+        self._history_played_t.fill_(-1)
+        self._history_captured_mask_t.zero_()
+        # build GPU-only game_state dict for observation/rewards
+        self.game_state = {
+            '_hands_bits_t': self._hands_bits_t,
+            '_table_bits_t': self._table_bits_t,
+            '_captured_bits_t': self._captured_bits_t,
+            'history_len_t': self._history_len_t,
+            'history_player_t': self._history_player_t,
+            'history_capture_type_t': self._history_capture_type_t,
+            'history_played_t': self._history_played_t,
+            'history_captured_mask_t': self._history_captured_mask_t,
+        }
 
     
     def clone(self):
-        """Crea una copia profonda dell'ambiente per simulazione/ricerca."""
-        import copy
-        cloned = ScoponeEnvMA(rules=copy.deepcopy(self.rules), use_compact_obs=self.use_compact_obs, k_history=self.k_history)
-        cloned.game_state = copy.deepcopy(self.game_state)
-        cloned.done = self.done
-        cloned.current_player = self.current_player
-        cloned.rewards = list(self.rewards)
-        # reset cache per sicurezza
-        cloned._valid_actions_cache = OrderedDict()
-        cloned._observation_cache = OrderedDict()
-        cloned._last_state_hash = None
+        """Clona lo stato GPU dell'ambiente (solo campi necessari per MCTS)."""
+        cloned = ScoponeEnvMA(rules=dict(self.rules), use_compact_obs=True, k_history=self.k_history)
+        cloned.done = bool(self.done)
+        cloned.current_player = int(self.current_player)
+        cloned.rewards_t = self.rewards_t.clone()
+        cloned._hands_bits_t = self._hands_bits_t.clone()
+        cloned._table_bits_t = self._table_bits_t.clone()
+        cloned._captured_bits_t = self._captured_bits_t.clone()
+        cloned._one_i64 = self._one_i64
+        cloned._remaining_hand_cards = int(self._remaining_hand_cards)
+        cloned._last_capturing_team_t = self._last_capturing_team_t.clone()
+        cloned._history_len_t = self._history_len_t.clone()
+        cloned._history_player_t = self._history_player_t.clone()
+        cloned._history_capture_type_t = self._history_capture_type_t.clone()
+        cloned._history_played_t = self._history_played_t.clone()
+        cloned._history_captured_mask_t = self._history_captured_mask_t.clone()
+        cloned.game_state = {
+            '_hands_bits_t': cloned._hands_bits_t,
+            '_table_bits_t': cloned._table_bits_t,
+            '_captured_bits_t': cloned._captured_bits_t,
+            'history_len_t': cloned._history_len_t,
+            'history_player_t': cloned._history_player_t,
+            'history_capture_type_t': cloned._history_capture_type_t,
+            'history_played_t': cloned._history_played_t,
+            'history_captured_mask_t': cloned._history_captured_mask_t,
+        }
         return cloned
 
     def apply_determinization_gpu(self, owner_masks: torch.Tensor, observer_id: int):
@@ -183,7 +220,7 @@ class ScoponeEnvMA(gym.Env):
 
         if hand_ids_t.numel() == 0:
             self._get_valid_actions_time += time.time() - start_time
-            return valid_actions
+            return torch.zeros((0, 80), dtype=torch.float32, device=device)
 
         for pid_t in hand_ids_t:
             # resta su GPU
@@ -235,21 +272,21 @@ class ScoponeEnvMA(gym.Env):
         ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
         if not (ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0)) and table_ids_t.numel() > 0 and len(valid_actions) > 0:
             try:
-                stack = torch.stack(valid_actions).to(device=device, dtype=torch.float32)
+                stack = torch.stack(valid_actions, dim=0).to(device=device, dtype=torch.float32)
                 played_all = stack[:, :40].reshape(-1, 10, 4)
                 captured_all = stack[:, 40:]
                 ace_play = played_all[:, 0, :].any(dim=1)
                 no_capture = ~captured_all.any(dim=1)
                 keep_mask = ~(ace_play & no_capture)
-                if bool(keep_mask.all().item()):
-                    pass
-                else:
-                    valid_actions = [va for va, km in zip(valid_actions, keep_mask) if bool(km.item())]
+                stack = stack[keep_mask]
+                valid_actions = [row for row in stack]
             except Exception:
                 pass
 
         self._get_valid_actions_time += time.time() - start_time
-        return valid_actions
+        if len(valid_actions) == 0:
+            return torch.zeros((0, 80), dtype=torch.float32, device=device)
+        return torch.stack(valid_actions, dim=0)
     
     def step(self, action_vec):
         """
@@ -278,41 +315,41 @@ class ScoponeEnvMA(gym.Env):
         try:
             from actions import decode_action_ids_torch as _decode_ids_torch
             pid_t, cap_ids_t = _decode_ids_torch(action_vec)
-            pid = int(pid_t.item())
-            cap_ids = cap_ids_t.detach().to('cpu').tolist()
         except Exception:
-            pid, cap_ids = decode_action_ids(action_vec)
-            cap_ids_t = torch.as_tensor(cap_ids, dtype=torch.long, device=device)
+            pid_t, cap_ids_t = decode_action_ids(action_vec)
         
         # Verifica validità (come prima)
         current_player = self.current_player
-        hand = self.game_state["hands"][current_player]
-        table = self.game_state["table"]
-        pre_table_len = len(table)
-        if pid not in [_card_to_id(c) for c in hand] and pid not in hand:
-            raise ValueError(f"La carta {pid} non è nella mano del giocatore {current_player}.")
+        # Verifica appartenenza carta alla mano via bitset GPU
+        hand_has_pid = ((self._hands_bits_t[current_player] & (self._one_i64 << pid_t)) != 0)
+        if not hand_has_pid.ne(0).is_nonzero():
+            raise ValueError(f"La carta richiesta non è nella mano del giocatore {current_player}.")
         
         # Verifica carte da catturare (ID) interamente via bitset CUDA mirror (vectorized)
-        if len(cap_ids) > 0:
-            cap_ids_t = torch.as_tensor(cap_ids, dtype=torch.long, device=device)
+        if cap_ids_t.numel() > 0:
             present_mask = (((self._table_bits_t >> cap_ids_t) & self._one_i64) != 0)
-            if not present_mask.all():
+            if not present_mask.all().is_nonzero():
                 raise ValueError("Cattura non valida: alcune carte non sono sul tavolo.")
 
         # Applicazione nuova regola AP posabilità: forza presa totale se non è consentito posare
-        rank = pid // 4 + 1
+        rank_t = pid_t // 4 + 1
         ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
         ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
         ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
         forced_ace_capture_on_empty = False
         # Override one-shot: la UI può impostare questo flag per auto-presa su tavolo vuoto anche se posabile è ON
         force_self_capture_once = bool(self.rules.get("force_ace_self_capture_on_empty_once", False))
-        if ap_enabled and rank == 1:
-            can_place_now = ap_posabile and (not ap_only_empty or (ap_only_empty and len(table) == 0))
-            if (not can_place_now and len(cap_ids) == 0) or (force_self_capture_once and len(table) == 0 and len(cap_ids) == 0):
-                if len(table) > 0:
+        if ap_enabled:
+            # Usa IDS_CUDA precomputato per evitare arange ripetuti
+            from observation import IDS_CUDA as _IDS_CUDA
+            table_ids_t = _IDS_CUDA[((self._table_bits_t >> _IDS_CUDA) & 1).to(torch.bool)]
+            num_table_cards = int(table_ids_t.numel())
+            if (rank_t == 1).is_nonzero():
+                can_place_now = ap_posabile and (not ap_only_empty or (ap_only_empty and num_table_cards == 0))
+                if (not can_place_now and cap_ids_t.numel() == 0) or (force_self_capture_once and num_table_cards == 0 and cap_ids_t.numel() == 0):
+                    if num_table_cards > 0:
                     # Forza presa di tutto il tavolo
-                    cap_ids = [_card_to_id(c) for c in table]
+                        cap_ids_t = table_ids_t
                 else:
                     # Tavolo vuoto: la posa è vietata, tratta come cattura forzata per scopa
                     forced_ace_capture_on_empty = True
@@ -324,212 +361,153 @@ class ScoponeEnvMA(gym.Env):
                         pass
         
         # Verifica regole di cattura su GPU
-        ids = torch.arange(40, device=device, dtype=torch.int64)
-        table_ids_t = ids[((self._table_bits_t >> ids) & 1).bool()]
+        from observation import IDS_CUDA as _IDS_CUDA
+        table_ids_t = _IDS_CUDA[((self._table_bits_t >> _IDS_CUDA) & 1).to(torch.bool)]
         from observation import RANK_OF_ID as _RANK_OF_ID
-        same_rank_mask = (_RANK_OF_ID[table_ids_t].to(torch.int64) == int(rank))
+        same_rank_mask = (_RANK_OF_ID[table_ids_t].to(torch.int64) == rank_t)
         same_rank_ids_t = table_ids_t[same_rank_mask]
         if same_rank_ids_t.numel() > 0:
             # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta
-            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False)
-                    and len(cap_ids) == int(table_ids_t.numel())
-                    and torch.equal(torch.sort(torch.as_tensor(cap_ids, device=device).to(torch.long))[0], torch.sort(table_ids_t)[0])):
+            if not (((rank_t == 1) & torch.tensor(self.rules.get("asso_piglia_tutto", False), device=device)).is_nonzero()):
                 # Devi catturare UNA carta di pari rank
-                if not (len(cap_ids) == 1 and torch.isin(torch.as_tensor(cap_ids[0], device=device).view(1), same_rank_ids_t).any()):
+                cond_single = (cap_ids_t.numel() == 1)
+                cond_in = (torch.isin(cap_ids_t.view(-1), same_rank_ids_t).any() if cap_ids_t.numel() > 0 else torch.tensor(False, device=device))
+                if not ((cond_single and cond_in.is_nonzero())):
                     raise ValueError("Quando esistono carte di rank uguale, devi catturarne una (non una combinazione).")
-        elif len(cap_ids) > 0:
+        elif cap_ids_t.numel() > 0:
             # Verifica somma
             # Eccezione: Asso piglia tutto
-            cap_ids_t = torch.as_tensor(cap_ids, dtype=torch.long, device=device)
-            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False)
-                    and cap_ids_t.numel() == table_ids_t.numel()
+            if not ((rank_t == 1) and self.rules.get("asso_piglia_tutto", False)
+                    and (cap_ids_t.numel() == table_ids_t.numel())
                     and torch.equal(torch.sort(cap_ids_t)[0], torch.sort(table_ids_t)[0])):
-                sum_chosen = int(((cap_ids_t // 4) + 1).sum().item())
-                if sum_chosen != rank:
-                    raise ValueError(f"La somma delle carte catturate ({sum_chosen}) deve essere uguale al rank ({rank}).")
+                sum_chosen_ok = (((cap_ids_t // 4) + 1).sum() == rank_t)
+                if not sum_chosen_ok.is_nonzero():
+                    raise ValueError("La somma delle carte catturate deve essere uguale al rank della carta giocata.")
         
         # OTTIMIZZAZIONE: Esegui l'azione in modo più efficiente
         capture_type = "no_capture"
         
         # Rimuovi la carta giocata dalla mano (ID)
-        try:
-            hand.remove(pid)
-        except ValueError:
-            pass
-        # Aggiorna cache ID/bitset
-        if self._use_id_cache:
-            try:
-                self._hands_ids[current_player].remove(pid)
-            except Exception:
-                pass
-            if self._use_bitset:
-                self._hands_bits[current_player] &= ~(1 << pid)
-                # tensor mirror
-                try:
-                    mask = (self._one_i64 << int(pid))
-                    self._hands_bits_t[current_player] = self._hands_bits_t[current_player] & (~mask)
-                except Exception:
-                    pass
+        # Aggiorna bitset mano giocatore (GPU-only)
+        mask_played = (self._one_i64 << pid_t)
+        self._hands_bits_t[current_player] = self._hands_bits_t[current_player] & (~mask_played)
+        # decrementa contatore carte
+        self._remaining_hand_cards = max(0, self._remaining_hand_cards - 1)
         
         if forced_ace_capture_on_empty:
             # Cattura forzata su tavolo vuoto: conta come scopa (o cattura se disabilitata via opzione)
             squad_id = 0 if current_player in [0, 2] else 1
-            self.game_state["captured_squads"][squad_id].append(pid)
-            try:
-                self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | (self._one_i64 << int(pid))
-            except Exception:
-                pass
+            self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | mask_played
             # Scopa se non è l'ultima carta giocata
-            cards_left = sum(len(self.game_state["hands"][p]) for p in range(4))
-            if cards_left > 0:
+            if self._remaining_hand_cards > 0:
                 capture_type = "scopa"
             else:
                 capture_type = "scopa" if self.rules.get("scopa_on_last_capture", False) else "capture"
-        elif cap_ids:
+            self._last_capturing_team_t = torch.tensor(squad_id, dtype=torch.long, device=device)
+        elif cap_ids_t.numel() > 0:
             # Cattura carte
-            for cid in cap_ids:
-                try:
-                    table.remove(cid)
-                except Exception:
-                    try:
-                        table.remove(_id_to_card(cid))
-                    except Exception:
-                        pass
-                if self._use_id_cache:
-                    try:
-                        self._table_ids.remove(cid)
-                    except Exception:
-                        pass
-                    if self._use_bitset:
-                        self._table_bits &= ~(1 << cid)
-                        try:
-                            self._table_bits_t = self._table_bits_t & (~(self._one_i64 << int(cid)))
-                        except Exception:
-                            pass
-            
+            cap_mask = (self._one_i64 << cap_ids_t).sum() if cap_ids_t.numel() > 0 else torch.zeros((), dtype=torch.int64, device=device)
+            self._table_bits_t = self._table_bits_t & (~cap_mask)
             # Aggiungi le carte catturate e la carta giocata alla squadra
             squad_id = 0 if current_player in [0, 2] else 1
-            self.game_state["captured_squads"][squad_id].extend(cap_ids)
-            self.game_state["captured_squads"][squad_id].append(pid)
-            try:
-                take_mask = (self._one_i64 << int(pid))
-                for cid in cap_ids:
-                    take_mask = take_mask | (self._one_i64 << int(cid))
-                self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | take_mask
-            except Exception:
-                pass
+            take_mask = mask_played | cap_mask
+            self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | take_mask
             
             # Verifica scopa
-            if len(table) == 0:
+            if (self._table_bits_t == 0).is_nonzero():
                 # Verifica che non sia l'ultima giocata
-                cards_left = sum(len(self.game_state["hands"][p]) for p in range(4))
-                if cards_left > 0:
+                if self._remaining_hand_cards > 0:
                     capture_type = "scopa"
                 else:
                     # Scopa all'ultima presa: opzionale
                     capture_type = "scopa" if self.rules.get("scopa_on_last_capture", False) else "capture"
             else:
                 capture_type = "capture"
+            self._last_capturing_team_t = torch.tensor(squad_id, dtype=torch.long, device=device)
         else:
             # Nessuna cattura: la carta va sul tavolo
-            table.append(pid)
-            if self._use_id_cache:
-                self._table_ids.append(pid)
-                if self._use_bitset:
-                    self._table_bits |= (1 << pid)
-                    try:
-                        self._table_bits_t = self._table_bits_t | (self._one_i64 << int(pid))
-                    except Exception:
-                        pass
+            self._table_bits_t = self._table_bits_t | mask_played
         
         # Calcola reward shaping opzionale
-        shaped_reward = 0.0
+        shaped_reward_t = torch.zeros((), dtype=torch.float32, device=device)
         if capture_type == "scopa" and bool(self.rules.get("shape_scopa", False)):
             try:
-                shaped_reward = float(self.rules.get("scopa_reward", 0.1))
+                shaped_reward_t = torch.tensor(self.rules.get("scopa_reward", 0.1), dtype=torch.float32, device=device)
             except Exception:
-                shaped_reward = 0.1
+                shaped_reward_t = torch.tensor(0.1, dtype=torch.float32, device=device)
 
-        # Aggiorna history
-        move_info = {
-            "player": current_player,
-            "played_card": pid,
-            "capture_type": capture_type,
-            "captured_cards": list(cap_ids)
-        }
-        # Eccezione: Asso piglia tutto non conta scopa (a meno di opzione esplicita)
-        # Tuttavia, se sul tavolo c'era solo un asso ed è stato preso (anche usando AP),
-        # deve comunque contare come scopa come nella presa diretta normale.
-        if (move_info["capture_type"] == "scopa" and rank == 1 and 
-            self.rules.get("asso_piglia_tutto", False) and not self.rules.get("scopa_on_asso_piglia_tutto", False)):
-            try:
-                # Se prima della mossa c'era una sola carta sul tavolo ed era un asso,
-                # manteniamo la scopa.
-                single_ace_sweep = (pre_table_len == 1 and len(cap_ids) == 1 and ((cap_ids[0] // 4) + 1) == 1)
-            except Exception:
-                single_ace_sweep = False
-            if not single_ace_sweep:
-                move_info["capture_type"] = "capture"
+        # Aggiorna history GPU-only
+        ct_map = {"no_capture": 0, "capture": 1, "scopa": 2}
+        idx = self._history_len_t.long() if torch.is_tensor(self._history_len_t) else 0
+        if idx < self._max_moves:
+            self._history_player_t[idx] = torch.tensor(current_player, dtype=torch.long, device=device)
+            self._history_capture_type_t[idx] = torch.tensor(ct_map.get(capture_type, 0), dtype=torch.long, device=device)
+            self._history_played_t[idx] = pid_t.to(dtype=torch.long)
+            cap_mask_vec = torch.zeros(40, dtype=torch.float32, device=device)
+            if cap_ids_t.numel() > 0:
+                rows = (cap_ids_t // 4).clamp_(0, 9)
+                cols = (cap_ids_t % 4).clamp_(0, 3)
+                cap_mask_mat = cap_mask_vec.view(10, 4)
+                cap_mask_mat[rows, cols] = 1.0
+                cap_mask_vec = cap_mask_mat.reshape(-1)
+            self._history_captured_mask_t[idx] = cap_mask_vec
+            self._history_len_t += 1
+        # Nota: comportamento speciale "scopa_on_asso_piglia_tutto" non necessario in GPU-only
 
-        # Limite scope consecutive per team
-        if move_info["capture_type"] == "scopa":
+        # Limite scope consecutive per team: contiamo usando history tensors
+        if capture_type == "scopa":
             limit = self.rules.get("max_consecutive_scope")
             if isinstance(limit, int) and limit > 0:
                 team_id = 0 if current_player in [0, 2] else 1
-                consecutive = 0
-                for m in reversed(self.game_state["history"]):
-                    if m.get("capture_type") == "scopa":
-                        prev_team = 0 if m.get("player") in [0, 2] else 1
-                        if prev_team == team_id:
-                            consecutive += 1
-                        else:
+                consec = 0
+                hlen = self._history_len_t if torch.is_tensor(self._history_len_t) else 0
+                # Usa operazioni vettoriali invece di loop Python  
+                if hlen > 0:
+                    # Maschera per scope (tipo 2)
+                    scopa_mask = (self._history_capture_type_t[:hlen] == 2)
+                    players = self._history_player_t[:hlen]
+                    # Calcola team per ogni player: 0 se player in [0,2], 1 altrimenti
+                    teams = torch.where((players == 0) | (players == 2), 
+                                      torch.tensor(0, device=device),
+                                      torch.tensor(1, device=device))
+                    # Trova scope consecutive del team corrente
+                    team_scope_mask = scopa_mask & (teams == team_id)
+                    # Conta consecutive partendo dalla fine
+                    for j in range(hlen-1, -1, -1):
+                        if team_scope_mask[j]:
+                            consec += 1
+                        elif scopa_mask[j]:  # Scopa di altro team
                             break
-                    else:
-                        break
-                if consecutive >= limit:
-                    move_info["capture_type"] = "capture"
-
-        self.game_state["history"].append(move_info)
+                if consec >= limit:
+                    self._history_capture_type_t[hlen-1] = torch.tensor(1, dtype=torch.long, device=device)
         
         # OTTIMIZZAZIONE: Invalida la cache delle osservazioni (LRU)
         self._observation_cache = OrderedDict()
         
         # Verifica se la partita è finita
-        done = all(len(self.game_state["hands"][p]) == 0 for p in range(4))
+        done = (self._remaining_hand_cards == 0)
         self.done = done
         
         if done:
             # Assegna le carte rimaste sul tavolo (opzionale)
-            if self.game_state["table"]:
+            table_non_empty = (self._table_bits_t != 0).is_nonzero()
+            if table_non_empty:
                 if self.rules.get("last_cards_to_dealer", True):
-                    last_capturing_team = None
-                    for m in reversed(self.game_state["history"]):
-                        if m["capture_type"] in ["capture", "scopa"]:
-                            last_capturing_team = 0 if m["player"] in [0, 2] else 1
-                            break
-                    
-                    if last_capturing_team is not None:
-                        self.game_state["captured_squads"][last_capturing_team].extend(self.game_state["table"])
-                        try:
-                            add_mask = torch.zeros((), dtype=torch.int64, device=device)
-                            for cid in self.game_state["table"]:
-                                add_mask = add_mask | (self._one_i64 << int(_card_to_id(cid) if not isinstance(cid, int) else int(cid)))
-                            self._captured_bits_t[last_capturing_team] = self._captured_bits_t[last_capturing_team] | add_mask
-                        except Exception:
-                            pass
-                # In ogni caso svuota il tavolo a fine mano
-                self.game_state["table"].clear()
-                # reset cache table
-                if self._use_id_cache:
-                    self._table_ids.clear()
-                    self._table_bits = 0
-                    try:
-                        self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
-                    except Exception:
-                        pass
+                    if (self._last_capturing_team_t >= 0).any():
+                        lid = self._last_capturing_team_t.long()
+                        self._captured_bits_t[lid] = self._captured_bits_t[lid] | self._table_bits_t
+                # svuota tavolo
+                self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
             
             # Calcolo punteggio finale completamente su GPU
             from rewards import compute_final_score_breakdown_torch, compute_final_team_rewards_torch
+            # Espone mirror bitset nel game_state per funzioni rewards/obs
+            try:
+                self.game_state['_hands_bits_t'] = self._hands_bits_t
+                self.game_state['_table_bits_t'] = self._table_bits_t
+                self.game_state['_captured_bits_t'] = self._captured_bits_t
+            except Exception:
+                pass
             final_breakdown_t = compute_final_score_breakdown_torch(self.game_state, rules=self.rules)
             team_rewards_t = compute_final_team_rewards_torch(self.game_state, rules=self.rules)  # (2,) CUDA
             info = {
@@ -537,7 +515,7 @@ class ScoponeEnvMA(gym.Env):
                 "team_rewards_t": team_rewards_t,
             }
             
-            # OTTIMIZZAZIONE: Crea uno stato finale di zeri senza ricalcolo (rimane tensor su CUDA)
+            # Osservazione finale (zeros)
             obs_final = torch.zeros(self.observation_space.shape, dtype=torch.float32, device=device)
             
             # Aggiorna il tempo di esecuzione
@@ -545,7 +523,7 @@ class ScoponeEnvMA(gym.Env):
             
             # Restituisci la ricompensa finale per il team del giocatore corrente
             current_team = 0 if current_player in [0, 2] else 1
-            return obs_final, float(team_rewards_t[current_team].to('cpu').item()), True, info
+            return obs_final, team_rewards_t[current_team], True, info
         else:
             # Passa al prossimo giocatore
             self.current_player = (self.current_player + 1) % 4
@@ -559,103 +537,47 @@ class ScoponeEnvMA(gym.Env):
             # Aggiorna il tempo di esecuzione
             self._step_time += time.time() - step_start_time
             
-            return next_obs, shaped_reward, False, {"last_move": move_info}
+            return next_obs, shaped_reward_t, False, {"last_move_t": torch.tensor(1 if capture_type == 'scopa' else 0, device=device)}
     
     #@profile
     def _get_observation(self, player_id):
-        """
-        Versione ottimizzata per performance che utilizza caching aggressivo
-        """
+        """Osservazione compatta GPU-only, nessuna cache CPU."""
         start_time = time.time()
-        
-        # OTTIMIZZAZIONE: Crea una chiave di cache efficiente
-        # Usa solo le informazioni rilevanti
-        cache_key = (
-            player_id,
-            self.current_player,
-            tuple(sorted(_card_to_id(c) for c in self.game_state["hands"][player_id])),
-            tuple(sorted(_card_to_id(c) for c in self.game_state["table"])),
-            len(self.game_state["history"]),
-            tuple(sorted(_card_to_id(c) for c in self.game_state["captured_squads"][0])),
-            tuple(sorted(_card_to_id(c) for c in self.game_state["captured_squads"][1])),
-            self.use_compact_obs,
-            self.k_history
-        )
-        
-        # Verifica la cache
-        if cache_key in self._observation_cache:
-            result = self._observation_cache[cache_key]
-            # LRU refresh
-            self._observation_cache.move_to_end(cache_key)
-        else:
-            # Calcola l'osservazione
-            if self.use_compact_obs:
-                from observation import encode_state_compact_for_player_fast
-                try:
-                    # esponi mirrors per fast-path GPU
-                    self.game_state['_hands_bits_t'] = self._hands_bits_t
-                    self.game_state['_table_bits_t'] = self._table_bits_t
-                    self.game_state['_captured_bits_t'] = self._captured_bits_t
-                except Exception:
-                    pass
-                result = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
-            else:
-                result = encode_state_for_player(self.game_state, player_id)
-            
-            # Salva in cache (LRU)
-            self._observation_cache[cache_key] = result
-            self._observation_cache.move_to_end(cache_key)
-            while len(self._observation_cache) > self._cache_capacity:
-                self._observation_cache.popitem(last=False)
-        
-        # Aggiorna il tempo di esecuzione
+        # Esponi mirror per fast-path
+        self.game_state['_hands_bits_t'] = self._hands_bits_t
+        self.game_state['_table_bits_t'] = self._table_bits_t
+        self.game_state['_captured_bits_t'] = self._captured_bits_t
+        self.game_state['history_len_t'] = self._history_len_t
+        self.game_state['history_player_t'] = self._history_player_t
+        self.game_state['history_capture_type_t'] = self._history_capture_type_t
+        self.game_state['history_played_t'] = self._history_played_t
+        self.game_state['history_captured_mask_t'] = self._history_captured_mask_t
+        obs = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
         self._get_obs_time += time.time() - start_time
-        
-        return result
+        return obs
+
+    # ==== GPU helper for GUI (no CPU lists) ====
+    def get_table_vec(self) -> torch.Tensor:
+        """Ritorna vettore (40,) CUDA con 1 dove la carta è sul tavolo."""
+        ids = torch.arange(40, device=device, dtype=torch.int64)
+        return (((self._table_bits_t >> ids) & 1).to(torch.float32))
+
+    def get_hand_vec(self, player_id: int) -> torch.Tensor:
+        """Ritorna vettore (40,) CUDA con 1 dove la carta è in mano al player."""
+        ids = torch.arange(40, device=device, dtype=torch.int64)
+        return (((self._hands_bits_t[player_id] >> ids) & 1).to(torch.float32))
     
     def reset(self, starting_player=None):
         """Versione ottimizzata di reset"""
-        # Reimposta lo stato del gioco rispettando le regole/varianti
-        self.game_state = initialize_game(rules=self.rules)
-        # Mantieni lo stato in ID senza riconversioni
+        # Reimposta lo stato del gioco rispettando le regole/varianti (usa solo bitset)
+        deal_state = initialize_game(rules=self.rules)
         self.done = False
         self.current_player = starting_player if starting_player is not None else 0
-        self.rewards = [0, 0]
-        
-        # Reset delle cache (LRU)
+        self.rewards_t.zero_()
         self._valid_actions_cache = OrderedDict()
         self._last_state_hash = None
         self._observation_cache = OrderedDict()
-        # Ricostruisci cache ID/bitset
-        try:
-            # se in stato ID
-            if isinstance(self.game_state['hands'][0][0], int):
-                # popola cache con ID direttamente
-                for p in range(4):
-                    self._hands_ids[p] = list(self.game_state['hands'][p])
-                    self._hands_bits[p] = _ids_to_bitset(self._hands_ids[p]) if self._use_bitset else 0
-                    try:
-                        self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
-                    except Exception:
-                        self._hands_bits_t[p] = torch.tensor(int(self._hands_bits[p]), dtype=torch.int64, device=device)
-                self._table_ids = list(self.game_state['table'])
-                self._table_bits = _ids_to_bitset(self._table_ids) if self._use_bitset else 0
-                try:
-                    self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
-                except Exception:
-                    self._table_bits_t = torch.tensor(int(self._table_bits), dtype=torch.int64, device=device)
-            else:
-                self._rebuild_id_caches()
-        except Exception:
-            self._rebuild_id_caches()
-        # reset captured bits tensors
-        try:
-            bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
-            bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
-        except Exception:
-            bits0, bits1 = 0, 0
-        self._captured_bits_t[0] = torch.as_tensor(bits0, dtype=torch.int64, device=device)
-        self._captured_bits_t[1] = torch.as_tensor(bits1, dtype=torch.int64, device=device)
+        self._set_game_state_from_deal(deal_state)
         
         # Ottieni l'osservazione iniziale
         return self._get_observation(self.current_player)

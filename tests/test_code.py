@@ -439,8 +439,8 @@ def test_scopa_case(env_fixture):
     assert done2 is True
     # Adesso se la scopa era valida, nel breakdown finale vedremo scope=1 per team0
     bd_t = info2.get("score_breakdown_t")
-    final_scope_team0 = int(bd_t[0]["scope"].detach().to('cpu').item())
-    final_scope_team1 = int(bd_t[1]["scope"].detach().to('cpu').item())
+    final_scope_team0 = int(bd_t[0]["scope"].item())
+    final_scope_team1 = int(bd_t[1]["scope"].item())
     assert final_scope_team0 == 1, f"Team0 dovrebbe avere scope=1, invece {final_scope_team0}"
     assert final_scope_team1 == 0, f"Team1 deve avere scope=0, invece {final_scope_team1}"
 
@@ -478,8 +478,8 @@ def test_full_match_random(env_fixture):
     if done:
         assert "team_rewards_t" in info
         r0, r1 = info["team_rewards_t"]
-        r0 = float(r0.detach().to('cpu').item())
-        r1 = float(r1.detach().to('cpu').item())
+        r0 = float(r0.item())
+        r1 = float(r1.item())
         print("Partita terminata. Ricompense finali:", r0, r1)
 
         # Se r0>0 => Team0 vince, se <0 => Team1 vince, se =0 => pareggio
@@ -805,7 +805,7 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
         valid_actions_t_before = torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in valids1_before])
     obs_t1_before = torch.tensor(obs_team1_before, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
-        qvals_t1_before = agent_team1.online_qnet(obs_t1_before, valid_actions_t_before).detach().cpu()
+        qvals_t1_before = agent_team1.online_qnet(obs_t1_before, valid_actions_t_before)
 
     # Eseguiamo le 8 mosse forzate
     for move in forced_moves:
@@ -907,7 +907,7 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
     if done:
         # Fine partita
         tr_t = info["team_rewards_t"]
-        print(f"Team Rewards finali: {[float(tr_t[0].detach().to('cpu').item()), float(tr_t[1].detach().to('cpu').item())]}")
+        print(f"Team Rewards finali: {[float(tr_t[0].item()), float(tr_t[1].item())]}")
         
         # Termina gli episodi 
         agent_team0.end_episode()
@@ -952,7 +952,7 @@ def test_agents_final_reward_team1_with_4_scopes(seed, env_fixture, monkeypatch)
         valid_actions_t_after = torch.stack([torch.as_tensor(x, dtype=torch.float32, device=device) for x in valids1_after])
     obs_t1_after = torch.tensor(obs_team1_after, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
-        qvals_t1_after = agent_team1.online_qnet(obs_t1_after, valid_actions_t_after).detach().cpu()
+        qvals_t1_after = agent_team1.online_qnet(obs_t1_after, valid_actions_t_after)
 
     # Confrontiamo la differenza massima
     # Confronta massimo Q tra le rispettive insiemi di azioni
@@ -1213,9 +1213,7 @@ def test_gpu_tensor_transfer():
     Test that tensors are correctly moved to GPU in the forward pass,
     when running on a CUDA-enabled device.
     """
-    # Skip if CUDA is not available
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available, skipping GPU test")
+    # GPU-only pipeline: assume CUDA present; this test requires CUDA
     
     # Create a network on the GPU
     qnet = QNetwork()
@@ -1327,7 +1325,7 @@ def test_compute_denari_count():
     assert denari_count[1] == 1.0/10.0, f"Expected 0.1 for team 1, got {denari_count[1]}"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(False, reason="CUDA required")
 def test_pick_action_gpu():
     """
     Test that pick_action correctly handles GPU tensors.

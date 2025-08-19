@@ -67,7 +67,7 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
         raw_logits = agent.actor(obs, None, seat)  # (B, 80) or (80,)
         if raw_logits.dim() == 1:
             raw_logits = raw_logits.unsqueeze(0)
-        max_cnt = int(cnts.max().item()) if B > 0 else 0
+        max_cnt = cnts.max().long() if B > 0 else 0
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -136,6 +136,24 @@ def _load_frozen_actor(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
     actor.eval()
     return actor
 
+# Loader con cache per evitare torch.load ripetuti a ogni iterazione
+_ACTOR_CACHE: Dict[str, ActionConditionedActor] = {}
+
+def _load_frozen_actor_cached(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
+    try:
+        cached = _ACTOR_CACHE.get(ckpt_path)
+        if cached is not None:
+            return cached
+        actor = _load_frozen_actor(ckpt_path, obs_dim)
+        # Congela parametri per sicurezza
+        for p in actor.parameters():
+            p.requires_grad_(False)
+        _ACTOR_CACHE[ckpt_path] = actor
+        return actor
+    except Exception:
+        # fallback sicuro
+        return _load_frozen_actor(ckpt_path, obs_dim)
+
 
 def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: int = 128,
                        gamma: float = 0.99, lam: float = 0.95,
@@ -155,13 +173,13 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     routing_log = []  # (player_id, source)
 
     steps = 0
+    # inizializza osservazione una volta sola
+    obs = env._get_observation(env.current_player)
     while steps < horizon:
         if env.done:
-            env.reset()
-
-        obs = env._get_observation(env.current_player)
+            obs = env.reset()
         legal = env.get_valid_actions()
-        if not legal:
+        if (torch.is_tensor(legal) and legal.size(0) == 0) or (not torch.is_tensor(legal) and not legal):
             break
 
         cp = env.current_player
@@ -169,19 +187,20 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         seat_vec[cp] = 1.0
         seat_vec[4] = 1.0 if cp in [0, 2] else 0.0
         seat_vec[5] = 1.0 if cp in [1, 3] else 0.0
-        bsum_np = belief.belief_summary(env.game_state, cp)
-        bsum = torch.as_tensor(bsum_np, dtype=torch.float32, device=device)
+        bsum = belief.belief_summary(env.game_state, cp).to(device=device, dtype=torch.float32)
 
         # Selezione azione in base ai main_seats (default: [0,2])
         is_main = (main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats)
         if is_main:
-            with torch.no_grad():
-                # Keep tensors on device; avoid GPU->CPU syncs
-                o_t = obs.clone().detach().to(device=device, dtype=torch.float32).unsqueeze(0) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                s_t = seat_vec.unsqueeze(0)
-                b_t = bsum.unsqueeze(0)
-                _ = agent.critic(o_t, s_t, b_t)
-            chosen_act, _logp, idx_t = agent.select_action(obs, legal, seat_vec, bsum)
+            # Evita warm-up della value net in raccolta: la V verrà calcolata in batch dopo
+            # Convert legals tensor/list to tensor (K,80) on CUDA
+            if torch.is_tensor(legal):
+                legal_t = legal
+            else:
+                legal_t = torch.stack([
+                    x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
+                for x in legal], dim=0)
+            chosen_act, _logp, idx_t = agent.select_action(obs, legal_t, seat_vec, bsum)
             next_obs, rew, done, info = env.step(chosen_act)
             routing_log.append((cp, 'main'))
 
@@ -193,9 +212,13 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             seat_team_list.append(seat_vec)
             belief_sum_list.append(bsum)
             legals_offset.append(len(legals_list))
-            legals_count.append(len(legal))
+            leg_count = (legal.size(0) if torch.is_tensor(legal) else len(legal))
+            legals_count.append(leg_count)
             chosen_index_t_list.append(idx_t)
-            legals_list.extend(legal)
+            if torch.is_tensor(legal):
+                legals_list.extend([legal[i] for i in range(legal.size(0))])
+            else:
+                legals_list.extend(legal)
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
             is_partner_seat = (cp in [0, 2] and (main_seats == [1, 3])) or (cp in [1, 3] and (main_seats == [0, 2]))
@@ -203,32 +226,41 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             if frozen is not None:
                 with torch.no_grad():
                     o_t = obs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device=device)
-                    if len(legal) > 0 and torch.is_tensor(legal[0]):
-                        leg_t = torch.stack(legal).to(device=device, dtype=torch.float32)
-                    else:
-                        leg_t = torch.stack([
-                            x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
-                        for x in legal], dim=0)
+                    leg_t = (legal if torch.is_tensor(legal) else torch.stack([
+                        x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
+                    for x in legal], dim=0))
                     logits = frozen(o_t.unsqueeze(0), leg_t)
                     idx_t = torch.argmax(logits)
                     act = leg_t[idx_t]
             else:
-                idx_t = torch.randint(len(legal), (1,), device=device).squeeze(0)
-                # Build tensor batch of legals to pick without CPU sync
-                leg_t = torch.stack([
+                k = (legal.size(0) if torch.is_tensor(legal) else len(legal))
+                idx_t = torch.randint(k, (1,), device=device).squeeze(0)
+                leg_t = (legal if torch.is_tensor(legal) else torch.stack([
                     x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
-                for x in legal], dim=0)
+                for x in legal], dim=0))
                 act = leg_t[idx_t]
             next_obs, rew, done, info = env.step(act)
             routing_log.append((cp, 'partner' if is_partner_seat else 'opponent'))
 
+        # GPU-only: usa history tensoriale
         try:
-            last_move = env.game_state['history'][-1]
-            belief.update_with_move(last_move, env.game_state, env.rules, ess_threshold=0.5 * belief.num_particles)
+            hlen = env._history_len_t
+            if hlen > 0:
+                idx = hlen - 1
+                # Evita conversioni multiple, mantieni tutto su GPU
+                last_move = {
+                    'player': env._history_player_t[idx],  # Mantieni come tensore
+                    'played_card': env._history_played_t[idx],  # Mantieni come tensore
+                    'capture_type_idx': env._history_capture_type_t[idx],  # Indice invece di stringa
+                    'captured_cards': []  # non serve per belief di base
+                }
+                belief.update_with_move(last_move, env.game_state, env.rules, ess_threshold=0.5 * belief.num_particles)
         except Exception:
             pass
 
         steps += 1
+        # aggiorna l'osservazione corrente per il prossimo ciclo
+        obs = next_obs
 
     # CTDE: stima V(next) vettorizzata su GPU
     next_val_t = None
@@ -284,7 +316,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             if raw_logits.dim() == 1:
                 raw_logits = raw_logits.unsqueeze(0)
             B = obs_t.size(0)
-            max_cnt = int(legals_count_t.max().item()) if B > 0 else 0
+            max_cnt = legals_count_t.max().long() if B > 0 else 0
             if max_cnt > 0:
                 pos = torch.arange(max_cnt, device=device, dtype=torch.long)
                 rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -398,7 +430,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             if p_ckpt and os.path.isfile(p_ckpt):
                 partner_actor = _load_frozen_actor(p_ckpt, obs_dim)
             if o_ckpt and os.path.isfile(o_ckpt):
-                opponent_actor = _load_frozen_actor(o_ckpt, obs_dim)
+                opponent_actor = _load_frozen_actor_cached(o_ckpt, obs_dim)
         except Exception:
             partner_actor = None
         main_seats = even_main_seats if (it % 2 == 0) else odd_main_seats
@@ -434,7 +466,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             avg_return = 0.0  # skip CPU logging
         else:
             if len(batch['ret']):
-                avg_return = float(batch['ret'].mean().detach().cpu().item())
+                avg_return = batch['ret'].mean()  # Mantieni come tensore
             else:
                 avg_return = 0.0
             if avg_return > best_return:
@@ -498,15 +530,17 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     agent.save(best_wr_ckpt_path)
 
         if it % 50 == 0 and os.environ.get('GPU_ONLY', '1') != '1':
+            # Batch conversione alla fine per logging
             def _to_float(x):
-                return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
+                return float(x.cpu().item()) if torch.is_tensor(x) else float(x)
             pretty = {k: round(_to_float(v), 4) for k, v in info.items()}
             print(pretty)
         if writer is not None and os.environ.get('GPU_ONLY', '1') != '1':
-            def _to_float(x):
-                return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
-            for k, v in info.items():
-                writer.add_scalar(f'train/{k}', _to_float(v), it)
+            # Batch conversione per TensorBoard
+            with torch.no_grad():
+                for k, v in info.items():
+                    val = v.cpu().item() if torch.is_tensor(v) else v
+                    writer.add_scalar(f'train/{k}', float(val), it)
             writer.add_scalar('train/episode_time_s', dt, it)
             writer.add_scalar('train/avg_return', avg_return, it)
             writer.add_text('train/main_seats', str(main_seats), it)
@@ -541,9 +575,11 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     diag['by_seat/clip_frac_13'].to(torch.float32),
                 ]
                 stacked = torch.stack(vals)
-                numbers = stacked.detach().cpu().tolist()  # unica sincronizzazione CPU
-                for key, num in zip(keys, numbers):
-                    writer.add_scalar(key, float(num), it)
+                # Evita tolist(), converti uno alla volta solo quando necessario
+                with torch.no_grad():
+                    for key, val in zip(keys, vals):
+                        num = val.cpu().item() if torch.is_tensor(val) else val
+                        writer.add_scalar(key, float(num), it)
             except Exception:
                 pass
         if (it + 1) % save_every == 0:
