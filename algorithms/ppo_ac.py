@@ -7,11 +7,6 @@ from tests.torch_np import np
 from models.action_conditioned import ActionConditionedActor, CentralValueNet
 
 device = torch.device("cuda")
-# Ensure CUDA is default for new tensors
-try:
-    torch.set_default_device('cuda')
-except Exception:
-    pass
 autocast_device = 'cuda'
 autocast_dtype = torch.float16
 
@@ -86,30 +81,43 @@ class ActionConditionedPPO:
     def select_action(self, obs, legal_actions: List, seat_team_vec = None, belief_summary = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
-        # Avoid warning: if obs already tensor, use clone().detach().to(device)
+        # Prepare CPU-pinned → CUDA non_blocking transfers for per-step inference
         if torch.is_tensor(obs):
-            obs_t = obs.clone().detach().to(device=device, dtype=torch.float32).unsqueeze(0)
+            obs_cpu = obs.detach().to(device='cpu', dtype=torch.float32)
         else:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            obs_cpu = torch.as_tensor(obs, dtype=torch.float32, device='cpu')
+        obs_t = obs_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+
         if len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]):
-            actions_t = torch.stack(legal_actions).to(device=device, dtype=torch.float32)
+            actions_cpu = torch.stack(legal_actions).detach().to(device='cpu', dtype=torch.float32)
         else:
-            actions_t = torch.stack([
-                x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
+            actions_cpu = torch.stack([
+                (x.detach().to(device='cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device='cpu'))
             for x in legal_actions], dim=0)
+        actions_t = actions_cpu.pin_memory().to(device=device, non_blocking=True)
+
         st = None
         if seat_team_vec is not None:
             if torch.is_tensor(seat_team_vec):
-                st = seat_team_vec.clone().detach().to(device=device, dtype=torch.float32).unsqueeze(0)
+                st_cpu = seat_team_vec.detach().to('cpu', dtype=torch.float32)
             else:
-                st = torch.tensor(seat_team_vec, dtype=torch.float32, device=device).unsqueeze(0)
+                st_cpu = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
+            st = st_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+        bsum_t = None
+        if belief_summary is not None:
+            if torch.is_tensor(belief_summary):
+                b_cpu = belief_summary.detach().to('cpu', dtype=torch.float32)
+            else:
+                b_cpu = torch.as_tensor(belief_summary, dtype=torch.float32, device='cpu')
+            bsum_t = b_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+
         with torch.autocast(device_type='cuda', dtype=torch.float16):
-            logits = self.actor(obs_t, actions_t, st)
+            logits = self.actor(obs_t, actions_t, st, bsum_t)
         logp = torch.log_softmax(logits, dim=0)
         idx_t = torch.multinomial(torch.exp(logp), num_samples=1).squeeze(0)
-        chosen_act = actions_t[idx_t]
-        # Return GPU tensors; caller will keep them on device
-        return chosen_act, logp[idx_t], idx_t
+        # Move chosen action and metadata back to CPU for env.step
+        chosen_act = actions_t[idx_t].detach().to('cpu', non_blocking=False)
+        return chosen_act, logp[idx_t].detach().to('cpu'), idx_t.detach().to('cpu')
 
     def compute_loss(self, batch):
         """
@@ -127,17 +135,25 @@ class ActionConditionedPPO:
         to_f32 = lambda x: x.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
         to_long = lambda x: x.clone().detach().to(device=device, dtype=torch.long) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.long, device=device)
 
-        obs = to_f32(batch['obs'])
-        seat = to_f32(batch.get('seat_team', torch.zeros((obs.size(0), 6), device=device, dtype=torch.float32)))
-        belief = to_f32(batch.get('belief_summary', torch.zeros((obs.size(0), 120), device=device, dtype=torch.float32)))
-        act = to_f32(batch['act'])
+        # Accept CPU inputs; move to CUDA once in a pinned, non_blocking way
+        def to_cuda_nb(x, dtype):
+            if torch.is_tensor(x):
+                x_cpu = x.detach().to('cpu', dtype=dtype)
+            else:
+                x_cpu = torch.as_tensor(x, dtype=dtype, device='cpu')
+            return x_cpu.pin_memory().to(device=device, non_blocking=True)
+
+        obs = to_cuda_nb(batch['obs'], torch.float32)
+        seat = to_cuda_nb(batch['seat_team'], torch.float32)
+        belief = to_cuda_nb(batch['belief_summary'], torch.float32)
+        act = to_cuda_nb(batch['act'], torch.float32)
         old_logp = to_f32(batch['old_logp'])
         ret = to_f32(batch['ret'])
         adv = to_f32(batch['adv'])
-        legals = to_f32(batch['legals'])
-        offs = to_long(batch['legals_offset'])
-        cnts = to_long(batch['legals_count'])
-        chosen_idx = to_long(batch['chosen_index'])
+        legals = to_cuda_nb(batch['legals'], torch.float32)
+        offs = to_cuda_nb(batch['legals_offset'], torch.long)
+        cnts = to_cuda_nb(batch['legals_count'], torch.long)
+        chosen_idx = to_cuda_nb(batch['chosen_index'], torch.long)
 
         # Filtra eventuali sample senza azioni legali per evitare NaN
         valid_mask = cnts > 0
@@ -157,7 +173,8 @@ class ActionConditionedPPO:
             chosen_idx = chosen_idx[valid_mask]
         B = obs.size(0)
         # Forward actor una sola volta sul batch intero (logits pieni)
-        raw_logits = self.actor(obs, None, seat)  # (B, action_dim) or (action_dim,)
+        # torch.compile could reduce overhead if available
+        raw_logits = self.actor(obs, None, seat, belief)  # (B, action_dim) or (action_dim,)
         if raw_logits.dim() == 1:
             raw_logits = raw_logits.unsqueeze(0)
         # Prepara indici legal per minibatch usando offs/cnts contro legals globali
@@ -237,14 +254,17 @@ class ActionConditionedPPO:
                     total_sq = total_sq + p.grad.data.norm(2).pow(2)
             return total_sq.sqrt()
 
-        check_every = 4  # reduce CPU syncs for early-stop
+        check_every = 8  # reduce CPU syncs for early-stop
         for ep in range(epochs):
-            # keep indices on CUDA to avoid H2D copies during advanced indexing
-            perm = torch.randperm(num_samples, device=device)
+            # Keep indices on CPU to index CPU-stored batch efficiently; tensors will be moved in compute_loss
+            perm = torch.randperm(num_samples, device='cpu')
             for start in range(0, num_samples, minibatch_size):
                 idx_t = perm[start:start+minibatch_size]
                 # Use index_select to slice tensors by CUDA indices
                 def sel(x):
+                    # Ensure indexing on CPU tensors
+                    if torch.is_tensor(x) and x.device.type != 'cpu':
+                        x = x.detach().to('cpu')
                     return torch.index_select(x, 0, idx_t)
                 mini = {
                     'obs': sel(batch['obs']),
@@ -271,8 +291,8 @@ class ActionConditionedPPO:
                     # grad norm (prima del clip) per logging
                     gn_actor = _grad_norm(self.actor.parameters())
                     gn_critic = _grad_norm(self.critic.parameters())
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                     self.scaler.step(self.opt_actor)
                     self.scaler.step(self.opt_critic)
                     self.scaler.update()
@@ -282,8 +302,8 @@ class ActionConditionedPPO:
                     # grad norm (prima del clip) per logging
                     gn_actor = _grad_norm(self.actor.parameters())
                     gn_critic = _grad_norm(self.critic.parameters())
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                     self.opt_actor.step()
                     self.opt_critic.step()
                 last_info = info

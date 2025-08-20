@@ -47,10 +47,7 @@ python -c "from evaluation.eval import league_eval_and_update; print(league_eval
 ### GUI
 Integrate the actor/critic into `scopone_gui.py` selecting checkpoint and optional IS-MCTS (work-in-progress).
 
-Note: Full-history observation is disabled by default. To enable for debug only:
-```
-DEBUG_FULL_HISTORY=1 python trainers/train_ppo.py --iters 2000 --horizon 256 --compact --k-history 12 --seed 0 --ckpt checkpoints/ppo_ac.pth
-```
+Note: la codifica a storia completa legacy è stata rimossa. Usare l'osservazione compatta con `--k-history`.
 
 ## Parameters
 - Observation: `--compact`, `--k-history`
@@ -63,8 +60,7 @@ See `requirements.txt` (torch, numpy, tqdm, gym, pandas, openpyxl, scipy, tensor
 
 ## Structure
 - `environment.py` — Gym env with compact obs and caches
-- `observation.py` — encoders and features (compact + 10823)
-  - Full-history path is guarded by `DEBUG_FULL_HISTORY`. Use compact in production.
+- `observation.py` — encoders and features (compact + compatibilità 10823 fissa per legacy)
 - `models/` — action-conditioned actor/critic encoders
 - `algorithms/ppo_ac.py` — PPO (CTDE-ready) with schedules and KL control
 - `belief/` — particle filter for hidden hands

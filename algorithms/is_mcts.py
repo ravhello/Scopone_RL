@@ -128,6 +128,11 @@ def run_is_mcts(env: ScoponeEnvMA,
                             continue
                         # assegna direttamente ID
                         sim_env.game_state['hands'][pid] = list(ids)
+                    # Sincronizza cache ID/bitset con lo stato determinizzato
+                    try:
+                        sim_env._rebuild_id_caches()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             # Selection (ensure chosen child action is legal under current determinization)

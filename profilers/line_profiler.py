@@ -19,6 +19,7 @@ class LineProfiler:
     """
     def __init__(self):
         self.functions = {}  # Functions to profile
+        self.allowed_codes = set()  # Code objects of functions we trace
         # Stats structure: {func_name: {line_no: [hits, cpu_time, gpu_time, transfer_time]}}
         self.results = defaultdict(lambda: defaultdict(lambda: [0, 0, 0, 0]))
         self.current_stack = []  # Stack of currently executing functions
@@ -39,10 +40,28 @@ class LineProfiler:
         """Adds a function to profile with line-by-line instrumentation."""
         code = func.__code__
         self.functions[func.__name__] = func
+        self.allowed_codes.add(code)
         self.line_timings[id(code)] = {}
         
         # Create a tracing function for this code object
         def tracefunc(frame, event, arg):
+            if event == 'call':
+                # Initialize timing when entering a profiled function
+                if frame.f_code in self.allowed_codes:
+                    func_start_time = time.time()
+                    gpu_start_time = 0
+                    if self.use_cuda:
+                        torch.cuda.synchronize()
+                        gpu_start_time = time.time()
+                    self.start_times[id(frame)] = {
+                        'cpu_time': func_start_time,
+                        'gpu_time': gpu_start_time if self.use_cuda else 0,
+                        'line_start_time': func_start_time,
+                        'gpu_line_start': gpu_start_time if self.use_cuda else 0,
+                        'last_line': None
+                    }
+                    frame.f_trace = tracefunc
+                return tracefunc
             if event == 'line':
                 self._trace_line(frame)
             elif event == 'return':

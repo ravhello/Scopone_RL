@@ -1,5 +1,6 @@
 # environment.py - VERSIONE OTTIMIZZATA PER PERFORMANCE
 import torch
+import os
 import gym
 from gym import spaces
 import time
@@ -11,8 +12,10 @@ from observation import encode_state_for_player, encode_state_compact_for_player
 from actions import get_valid_actions, encode_action, decode_action, decode_action_ids
 # line_profiler opzionale: disabilitato in test/produzione
 
-# Recupera il device globale (forzato a CUDA)
-device = torch.device("cuda")
+# Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU;
+# i mirror CUDA possono essere disabilitati o resi opzionali.
+_ENV_DEVICE_STR = os.environ.get("ENV_DEVICE", "cpu")
+device = torch.device(_ENV_DEVICE_STR)
 
 def _suit_to_int(suit):
     if suit == 'denari':
@@ -42,7 +45,7 @@ def _ids_to_bitset(ids):
     return bits
 
 class ScoponeEnvMA(gym.Env):
-    def __init__(self, rules=None, use_compact_obs: bool = False, k_history: int = 12):
+    def __init__(self, rules=None, use_compact_obs: bool = False, k_history: int = 39):
         super().__init__()
         
         # Config osservazione
@@ -81,7 +84,7 @@ class ScoponeEnvMA(gym.Env):
         self._table_ids = []
         self._hands_bits = {p: 0 for p in range(4)}
         self._table_bits = 0
-        # GPU mirrors: int64 bitsets on CUDA to keep state resident on device
+        # Mirrors (on env device; default CPU). We keep API compatible.
         self._hands_bits_t = torch.zeros(4, dtype=torch.int64, device=device)
         self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
         self._captured_bits_t = torch.zeros(2, dtype=torch.int64, device=device)
@@ -151,12 +154,12 @@ class ScoponeEnvMA(gym.Env):
         return cloned
     #@profile
     def get_valid_actions(self):
-        """Calcola azioni valide interamente su GPU usando i mirror a bitset CUDA."""
+        """Calcola azioni valide su CPU usando bitset; evita micro-kernel su GPU."""
         start_time = time.time()
-        from observation import RANK_OF_ID as _RANK_OF_ID
+        # RANK_OF_ID è definito per CUDA; per CPU calcoliamo al volo
         from actions import encode_action_from_ids_gpu
 
-        # Estrai ID in mano e sul tavolo da bitset tensor
+        # Estrai ID in mano e sul tavolo da bitset tensor (CPU tensors)
         ids = torch.arange(40, device=device, dtype=torch.int64)
         hand_mask = ((self._hands_bits_t[self.current_player] >> ids) & 1).bool()
         table_mask = ((self._table_bits_t >> ids) & 1).bool()
@@ -170,12 +173,11 @@ class ScoponeEnvMA(gym.Env):
             return valid_actions
 
         for pid_t in hand_ids_t:
-            # resta su GPU
-            prank_t = _RANK_OF_ID[pid_t].to(torch.int64)
+            prank_t = (pid_t // 4 + 1).to(torch.int64)
 
             # Pari-rank sul tavolo
             if table_ids_t.numel() > 0:
-                table_ranks = _RANK_OF_ID[table_ids_t].to(torch.int64)
+                table_ranks = (table_ids_t // 4 + 1).to(torch.int64)
                 direct_sel = (table_ranks == prank_t)
                 direct_ids_t = table_ids_t[direct_sel]
             else:
@@ -189,7 +191,7 @@ class ScoponeEnvMA(gym.Env):
                 n = int(table_ids_t.numel())
                 if n > 0:
                     pos = torch.arange(n, device=device, dtype=torch.int64)
-                    ranks_k = _RANK_OF_ID[table_ids_t].to(torch.int64)
+                    ranks_k = (table_ids_t // 4 + 1).to(torch.int64)
                     masks = torch.arange(1, 1 << n, device=device, dtype=torch.int64)
                     sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.int64)
                     sums = (sel * ranks_k.unsqueeze(0)).sum(dim=1)
@@ -299,11 +301,10 @@ class ScoponeEnvMA(gym.Env):
                     except Exception:
                         pass
         
-        # Verifica regole di cattura su GPU
+        # Verifica regole di cattura via bitset su CPU
         ids = torch.arange(40, device=device, dtype=torch.int64)
         table_ids_t = ids[((self._table_bits_t >> ids) & 1).bool()]
-        from observation import RANK_OF_ID as _RANK_OF_ID
-        same_rank_ids_t = table_ids_t[(_RANK_OF_ID[table_ids_t].to(torch.int64) == int(rank))]
+        same_rank_ids_t = table_ids_t[((table_ids_t // 4 + 1).to(torch.int64) == int(rank))]
         same_rank_ids = same_rank_ids_t.tolist()
         if same_rank_ids:
             # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta
@@ -577,7 +578,12 @@ class ScoponeEnvMA(gym.Env):
                 result = encode_state_for_player(self.game_state, player_id)
             
             # Salva in cache (LRU)
-            self._observation_cache[cache_key] = result
+            try:
+                # Ensure observations returned on CPU to avoid GPU micro-kernels in env
+                result_cpu = result.detach().to('cpu') if torch.is_tensor(result) else result
+            except Exception:
+                result_cpu = result
+            self._observation_cache[cache_key] = result_cpu
             self._observation_cache.move_to_end(cache_key)
             while len(self._observation_cache) > self._cache_capacity:
                 self._observation_cache.popitem(last=False)
@@ -585,7 +591,11 @@ class ScoponeEnvMA(gym.Env):
         # Aggiorna il tempo di esecuzione
         self._get_obs_time += time.time() - start_time
         
-        return result
+        # Always return CPU tensor
+        try:
+            return result.detach().to('cpu') if torch.is_tensor(result) else result
+        except Exception:
+            return result
     
     def reset(self, starting_player=None):
         """Versione ottimizzata di reset"""

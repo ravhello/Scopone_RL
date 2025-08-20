@@ -1,5 +1,6 @@
 from tests.torch_np import np
 import torch
+import os
 from typing import List, Dict, Tuple
 import random
 
@@ -339,15 +340,23 @@ class BeliefState:
         """
         others = [(player_id + 1) % 4, (player_id + 2) % 4, (player_id + 3) % 4]
         marg = np.zeros((3, 40), dtype=np.float32)
-        # Le carte visibili hanno marginale 0 per tutti (sono già assegnate a osservatore/tavolo/captured)
-        # Conta fra le particelle la presenza di ciascuna carta nelle mani di ciascun altro giocatore
+        # Calcola direttamente l'insieme delle carte mancanti per l'osservatore
+        try:
+            visible, _ = self._visible_ids(game_state)
+        except Exception:
+            visible = set()
+        unknown = set(range(40)) - visible
+        # Conta fra le particelle SOLO le carte mancanti (nessuna probabilità per carte già uscite)
         for i, pid in enumerate(others):
             counts = np.zeros(40, dtype=np.float32)
             for w, part in zip(self.weights, self.particles):
-                for cid in part.get(pid, []):
-                    counts[cid] += w
+                hand_ids = part.get(pid, [])
+                for cid in hand_ids:
+                    if cid in unknown:
+                        counts[cid] += w
             marg[i] = counts.astype(np.float32)
-        return torch.as_tensor(marg.reshape(-1), dtype=torch.float32, device=torch.device('cuda'))  # 120
+        dev = os.environ.get('BELIEF_DEVICE', 'cpu')
+        return torch.as_tensor(marg.reshape(-1), dtype=torch.float32, device=torch.device(dev))  # 120
 
 
 

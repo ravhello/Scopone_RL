@@ -1,5 +1,6 @@
 # actions.py
 from collections import defaultdict
+import os
 import torch
 
 # Accel opzionale con numba per enumerazione subset-sum (DISABLED to keep torch-only path)
@@ -56,7 +57,9 @@ else:
                 subset = [table_cards[i] for i in range(n) if (mask >> i) & 1]
                 subsets.append(subset)
         return subsets
-device = torch.device("cuda")
+# Device for action encoding/decoding. Default to CPU for env-side logic to avoid GPU micro-kernels
+_ACTIONS_DEVICE_STR = os.environ.get("ACTIONS_DEVICE", "cpu")
+device = torch.device(_ACTIONS_DEVICE_STR)
 
 def encode_action(card, cards_to_capture):
     """
@@ -66,7 +69,7 @@ def encode_action(card, cards_to_capture):
     
     Totale: 80 dimensioni
     """
-    # Inizializza le matrici su GPU
+    # Inizializza le matrici sul device selezionato (di default CPU)
     played_card_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
     captured_cards_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
     
@@ -102,7 +105,7 @@ def encode_action_from_ids_gpu(played_id_t: torch.Tensor, captured_ids_t: torch.
     without converting to Python ints. Inputs can be scalar int64 tensor for played_id
     and 1-D int64 tensor for captured_ids (possibly empty).
     """
-    # Ensure tensors are on CUDA and correct dtypes/shapes
+    # Ensure tensors are on target device (CPU by default) and correct dtypes/shapes
     pid = played_id_t.to(device=device, dtype=torch.long).reshape(())
     cap = captured_ids_t.to(device=device, dtype=torch.long).reshape(-1)
 

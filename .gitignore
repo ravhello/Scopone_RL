@@ -11,5 +11,3 @@ profiling_report.txt
 .vscode/settings.json
 .gitignore
 profile_trace.json
-
-profile_trace.json
