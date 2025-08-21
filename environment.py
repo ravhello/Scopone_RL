@@ -216,10 +216,11 @@ class ScoponeEnvMA(gym.Env):
             if int(prank_t.item()) == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
                 valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
-        # Post-filtri AP: rimuovi posa asso non consentita se richiesto
+        # Post-filtri AP: rimuovi posa asso non consentita solo se AP è attivo
+        ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
         ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
         ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-        if not (ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0)) and table_ids_t.numel() > 0:
+        if ap_enabled and not (ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0)) and table_ids_t.numel() > 0:
             filtered = []
             for v in valid_actions:
                 try:
@@ -233,6 +234,10 @@ class ScoponeEnvMA(gym.Env):
                     pass
                 filtered.append(v)
             valid_actions = filtered
+
+        # In condizioni corrette, se il giocatore ha carte in mano, deve esistere almeno un'azione valida
+        if hand_ids_t.numel() > 0 and len(valid_actions) == 0:
+            raise RuntimeError(f"No valid actions for player {self.current_player} (hand_ids={hand_ids_t.tolist()}, table_ids={table_ids_t.tolist()}, rules={self.rules})")
 
         self._get_valid_actions_time += time.time() - start_time
         return valid_actions
