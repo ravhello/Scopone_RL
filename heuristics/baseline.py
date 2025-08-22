@@ -1,7 +1,6 @@
 """Bot euristico semplice per Scopone.
 Non è ottimale ma fornisce un prior ragionevole per distillazione/valutazione.
 """
-from tests.torch_np import np
 from typing import List, Tuple
 
 

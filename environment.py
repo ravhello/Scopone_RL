@@ -4,17 +4,17 @@ import os
 import gym
 from gym import spaces
 import time
-from functools import lru_cache
 from collections import OrderedDict
 
 from state import initialize_game
-from observation import encode_state_for_player, encode_state_compact_for_player
-from actions import get_valid_actions, encode_action, decode_action, decode_action_ids
+from actions import decode_action_ids
 # line_profiler opzionale: disabilitato in test/produzione
 
 # Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU;
 # i mirror CUDA possono essere disabilitati o resi opzionali.
-_ENV_DEVICE_STR = os.environ.get("ENV_DEVICE", "cpu")
+_ENV_DEVICE_STR = os.environ.get("ENV_DEVICE", os.environ.get(
+    'SCOPONE_DEVICE', 'cpu'
+))
 device = torch.device(_ENV_DEVICE_STR)
 
 def _suit_to_int(suit):
@@ -32,12 +32,6 @@ def _card_to_id(card):
     rank, suit = card
     return (rank - 1) * 4 + _suit_to_int(suit)
 
-def _id_to_card(cid):
-    # Legacy helper (evitare nuovo uso)
-    rank = cid // 4 + 1
-    suit = ['denari', 'coppe', 'spade', 'bastoni'][cid % 4]
-    return (rank, suit)
-
 def _ids_to_bitset(ids):
     bits = 0
     for cid in ids:
@@ -49,13 +43,15 @@ class ScoponeEnvMA(gym.Env):
         super().__init__()
         
         # Config osservazione
-        self.use_compact_obs = bool(use_compact_obs)
+        # Forza la modalità compatta: la legacy 10823 è deprecata
+        self.use_compact_obs = True if use_compact_obs is None else bool(use_compact_obs) or True
         self.k_history = int(k_history)
         if self.use_compact_obs:
             # Dimensione compatta: 43 + 40 + 82 + 61*k + 40 + 120 + 8 + 2 + 1 + 2 + 1 + 10 + 150
             obs_dim = 43 + 40 + 82 + 61 * self.k_history + 40 + 120 + 8 + 2 + 1 + 2 + 1 + 10 + 150
         else:
-            obs_dim = 10823
+            # Non dovrebbe mai accadere: legacy disattivata
+            raise NotImplementedError("La rappresentazione legacy 10823-dim è deprecata: usa use_compact_obs=True")
         # Observation space con la rappresentazione selezionata
         self.observation_space = spaces.Box(low=0, high=1, shape=(obs_dim,))
         
@@ -71,6 +67,8 @@ class ScoponeEnvMA(gym.Env):
         # OTTIMIZZAZIONE: Cache per encode_state_for_player (LRU)
         self._observation_cache = OrderedDict()
         self._cache_capacity = 128
+        # Cache DP per subset-sum sul tavolo (chiave: (table_bits, rank))
+        self._subset_sum_cache = {}
         
         # Stato del gioco
         self.game_state = None  # usa rappresentazione a tuple (rank,suit) per compat, ma prevedi futura migrazione a ID/bitset
@@ -151,6 +149,17 @@ class ScoponeEnvMA(gym.Env):
         cloned._valid_actions_cache = OrderedDict()
         cloned._observation_cache = OrderedDict()
         cloned._last_state_hash = None
+        # Ricostruisci le cache ID/bitset per allinearle allo stato copiato
+        try:
+            cloned._rebuild_id_caches()
+        except Exception:
+            # fallback: tenta un reset e poi riallinea
+            try:
+                cloned.reset(starting_player=self.current_player)
+                cloned.game_state = copy.deepcopy(self.game_state)
+                cloned._rebuild_id_caches()
+            except Exception:
+                pass
         return cloned
     #@profile
     def get_valid_actions(self):
@@ -158,6 +167,26 @@ class ScoponeEnvMA(gym.Env):
         start_time = time.time()
         # RANK_OF_ID è definito per CUDA; per CPU calcoliamo al volo
         from actions import encode_action_from_ids_gpu
+
+        # Chiave di cache LRU basata su (giocatore, mano, tavolo, regole AP)
+        try:
+            ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
+            ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
+            ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
+            state_key = (
+                int(self.current_player),
+                int(self._hands_bits_t[self.current_player].item()),
+                int(self._table_bits_t.item()),
+                ap_enabled, ap_posabile, ap_only_empty,
+            )
+            cached = self._valid_actions_cache.get(state_key)
+            if cached is not None:
+                self._cache_hits += 1
+                self._get_valid_actions_time += time.time() - start_time
+                # Ritorna una copia superficiale per evitare side-effect sulla lista
+                return list(cached)
+        except Exception:
+            state_key = None
 
         # Estrai ID in mano e sul tavolo da bitset tensor (CPU tensors)
         ids = torch.arange(40, device=device, dtype=torch.int64)
@@ -187,21 +216,46 @@ class ScoponeEnvMA(gym.Env):
                 for did_t in direct_ids_t:
                     valid_actions.append(encode_action_from_ids_gpu(pid_t, did_t.view(1)))
             else:
-                # Somma: trova tutti i subset con somma prank (GPU)
+                # Somma: trova subset con somma pari a prank (DP su somma-rank, n piccolo, rank<=10)
                 n = int(table_ids_t.numel())
                 if n > 0:
-                    pos = torch.arange(n, device=device, dtype=torch.int64)
-                    ranks_k = (table_ids_t // 4 + 1).to(torch.int64)
-                    masks = torch.arange(1, 1 << n, device=device, dtype=torch.int64)
-                    sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.int64)
-                    sums = (sel * ranks_k.unsqueeze(0)).sum(dim=1)
-                    good = (sums == prank_t).nonzero(as_tuple=False).flatten()
-                    if good.numel() > 0:
-                        for gi in good:
-                            cap_ids_t = table_ids_t[((masks[gi].unsqueeze(0) >> pos) & 1).bool()]
+                    table_ids = table_ids_t.tolist()
+                    ranks = [int((cid // 4) + 1) for cid in table_ids]
+                    target = int(prank_t.item())
+                    # Cache DP per (table_bits, target)
+                    try:
+                        subset_key = (int(self._table_bits_t.item()), target)
+                    except Exception:
+                        subset_key = None
+                    masks_list = None
+                    if subset_key is not None:
+                        masks_list = self._subset_sum_cache.get(subset_key)
+                    if masks_list is None:
+                        # DP: subs[somma] -> lista di bitmask
+                        subs = {0: [0]}
+                        for i, w in enumerate(ranks):
+                            # copia superficiale per iterare sugli stati correnti
+                            cur = {k: list(v) for k, v in subs.items()}
+                            for s, bms in subs.items():
+                                ns = s + w
+                                if ns > target:
+                                    continue
+                                lst = cur.get(ns, [])
+                                for bm in bms:
+                                    lst.append(bm | (1 << i))
+                                cur[ns] = lst
+                            subs = cur
+                        masks_list = subs.get(target, [])
+                        if subset_key is not None:
+                            self._subset_sum_cache[subset_key] = masks_list
+                    if masks_list:
+                        for bm in masks_list:
+                            # Ricostruisci gli ID da bitmask
+                            sel_ids = [table_ids[j] for j in range(n) if ((bm >> j) & 1) == 1]
+                            cap_ids_t = torch.as_tensor(sel_ids, dtype=torch.long, device=device)
                             valid_actions.append(encode_action_from_ids_gpu(pid_t, cap_ids_t))
                     else:
-                        # Scarto
+                        # Scarto (nessuna combinazione valida)
                         valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
                 else:
                     # Tavolo vuoto: solo scarto
@@ -238,6 +292,17 @@ class ScoponeEnvMA(gym.Env):
         # In condizioni corrette, se il giocatore ha carte in mano, deve esistere almeno un'azione valida
         if hand_ids_t.numel() > 0 and len(valid_actions) == 0:
             raise RuntimeError(f"No valid actions for player {self.current_player} (hand_ids={hand_ids_t.tolist()}, table_ids={table_ids_t.tolist()}, rules={self.rules})")
+
+        # Aggiorna cache LRU
+        try:
+            if state_key is not None:
+                self._cache_misses += 1
+                self._valid_actions_cache[state_key] = tuple(valid_actions)
+                self._valid_actions_cache.move_to_end(state_key)
+                while len(self._valid_actions_cache) > self._cache_capacity:
+                    self._valid_actions_cache.popitem(last=False)
+        except Exception:
+            pass
 
         self._get_valid_actions_time += time.time() - start_time
         return valid_actions
@@ -351,29 +416,29 @@ class ScoponeEnvMA(gym.Env):
                     pass
         
         if forced_ace_capture_on_empty:
-            # Cattura forzata su tavolo vuoto: conta come scopa (o cattura se disabilitata via opzione)
+            # Cattura forzata su tavolo vuoto con AP
             squad_id = 0 if current_player in [0, 2] else 1
             self.game_state["captured_squads"][squad_id].append(pid)
             try:
                 self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | (self._one_i64 << int(pid))
             except Exception:
                 pass
-            # Scopa se non è l'ultima carta giocata
+            # Regole scopa su AP a tavolo vuoto
+            ap_scopa_on = bool(self.rules.get("scopa_on_asso_piglia_tutto", False))
             cards_left = sum(len(self.game_state["hands"][p]) for p in range(4))
-            if cards_left > 0:
+            if ap_scopa_on:
+                # Se AP ha scopa attiva, conta sempre scopa (anche all'ultima presa)
                 capture_type = "scopa"
             else:
-                capture_type = "scopa" if self.rules.get("scopa_on_last_capture", False) else "capture"
+                # AP con scopa disattivata: mai scopa a tavolo vuoto
+                capture_type = "capture"
         elif cap_ids:
             # Cattura carte
             for cid in cap_ids:
                 try:
                     table.remove(cid)
                 except Exception:
-                    try:
-                        table.remove(_id_to_card(cid))
-                    except Exception:
-                        pass
+                    pass
                 if self._use_id_cache:
                     try:
                         self._table_ids.remove(cid)
@@ -441,9 +506,8 @@ class ScoponeEnvMA(gym.Env):
         # deve comunque contare come scopa come nella presa diretta normale.
         if (move_info["capture_type"] == "scopa" and rank == 1 and 
             self.rules.get("asso_piglia_tutto", False) and not self.rules.get("scopa_on_asso_piglia_tutto", False)):
+            # Demote salvo eccezione: presa DIRETTA di un asso su asso (unica carta prima della mossa)
             try:
-                # Se prima della mossa c'era una sola carta sul tavolo ed era un asso,
-                # manteniamo la scopa.
                 single_ace_sweep = (pre_table_len == 1 and len(cap_ids) == 1 and ((cap_ids[0] // 4) + 1) == 1)
             except Exception:
                 single_ace_sweep = False
@@ -456,14 +520,16 @@ class ScoponeEnvMA(gym.Env):
             if isinstance(limit, int) and limit > 0:
                 team_id = 0 if current_player in [0, 2] else 1
                 consecutive = 0
+                # Conta solo le scope consecutive nelle giocate della STESSA squadra
                 for m in reversed(self.game_state["history"]):
+                    prev_team = 0 if m.get("player") in [0, 2] else 1
+                    if prev_team != team_id:
+                        # mosse dell'altra squadra non interrompono né incrementano la serie
+                        continue
                     if m.get("capture_type") == "scopa":
-                        prev_team = 0 if m.get("player") in [0, 2] else 1
-                        if prev_team == team_id:
-                            consecutive += 1
-                        else:
-                            break
+                        consecutive += 1
                     else:
+                        # una giocata senza scopa della stessa squadra interrompe la serie
                         break
                 if consecutive >= limit:
                     move_info["capture_type"] = "capture"
@@ -478,6 +544,9 @@ class ScoponeEnvMA(gym.Env):
         self.done = done
         
         if done:
+            # Non è consentito terminare una mano senza alcuna presa effettuata
+            if not any(m.get("capture_type") in ("capture", "scopa") for m in self.game_state["history"]):
+                raise ValueError("La mano non può terminare senza alcuna presa.")
             # Assegna le carte rimaste sul tavolo (opzionale)
             if self.game_state["table"]:
                 if self.rules.get("last_cards_to_dealer", True):
@@ -571,16 +640,11 @@ class ScoponeEnvMA(gym.Env):
             # Calcola l'osservazione
             if self.use_compact_obs:
                 from observation import encode_state_compact_for_player_fast
-                try:
-                    # esponi mirrors per fast-path GPU
-                    self.game_state['_hands_bits_t'] = self._hands_bits_t
-                    self.game_state['_table_bits_t'] = self._table_bits_t
-                    self.game_state['_captured_bits_t'] = self._captured_bits_t
-                except Exception:
-                    pass
+                # esponi mirrors per fast-path GPU
+                self.game_state['_hands_bits_t'] = self._hands_bits_t
+                self.game_state['_table_bits_t'] = self._table_bits_t
+                self.game_state['_captured_bits_t'] = self._captured_bits_t
                 result = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
-            else:
-                result = encode_state_for_player(self.game_state, player_id)
             
             # Salva in cache (LRU)
             try:

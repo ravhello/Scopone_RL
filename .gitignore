@@ -11,3 +11,24 @@ profiling_report.txt
 .vscode/settings.json
 .gitignore
 profile_trace.json
+
+# TensorFlow / TensorBoard logs
+logs/
+log/
+tf_logs/
+tensorboard/
+.tensorboard/
+.tensorboard-info/
+events.out.tfevents.*
+*.tfevents*
+
+# Python caches
+*.pyc
+*.pyo
+*.pyd
+.cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+# already present: .pytest_cache/ and __pycache__
+

@@ -11,7 +11,6 @@ Usage:
 """
 
 import torch
-from tests.torch_np import np
 import argparse
 import os
 import time
@@ -30,12 +29,15 @@ import openpyxl
 from environment import ScoponeEnvMA
 from algorithms.is_mcts import run_is_mcts
 from models.action_conditioned import ActionConditionedActor, CentralValueNet
-from belief.belief import BeliefState
 import torch
 from main import DQNAgent
 
-# Use CUDA only
-device = torch.device("cuda")
+# Device selection with overrides
+import os
+device = torch.device(os.environ.get(
+    'SCOPONE_DEVICE',
+    ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
+))
 print(f"Using device: {device}")
 
 # Regole di default per l'ambiente (modalità standard senza varianti)
@@ -116,7 +118,6 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
             try:
                 actor = ActionConditionedActor()
                 critic = CentralValueNet()
-                belief = BeliefState(env.game_state, observer_id=env.current_player, num_particles=256)
                 def policy_fn(o, leg):
                     o_t = torch.tensor(o, dtype=torch.float32, device=device)
                     if len(leg) > 0 and torch.is_tensor(leg[0]):
@@ -134,7 +135,55 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
                     with torch.no_grad():
                         v = critic(o_t.unsqueeze(0)).item()
                     return v
-                action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=1.0, belief=belief, num_determinization=dets)
+                # Belief sampler neurale: determinizza le mani avversarie dai margini del BeliefNet
+                def belief_sampler_neural(_env):
+                    try:
+                        cp = _env.current_player
+                        obs_cur = _env._get_observation(cp)
+                        o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
+                        if torch.is_tensor(o_cpu):
+                            o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
+                        # seat/team vec: 6-dim
+                        s_cpu = torch.zeros(6, dtype=torch.float32)
+                        s_cpu[cp] = 1.0
+                        s_cpu[4] = 1.0 if cp in [0, 2] else 0.0
+                        s_cpu[5] = 1.0 if cp in [1, 3] else 0.0
+                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        with torch.no_grad():
+                            state_feat = actor.state_enc(o_t, s_t)
+                            logits = actor.belief_net(state_feat)
+                            hand_table = o_t[:, :83]
+                            hand_mask = hand_table[:, :40] > 0.5
+                            table_mask = hand_table[:, 43:83] > 0.5
+                            captured = o_t[:, 83:165]
+                            cap0_mask = captured[:, :40] > 0.5
+                            cap1_mask = captured[:, 40:80] > 0.5
+                            visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
+                            probs_flat = actor.belief_net.probs(logits, visible_mask)
+                        probs = probs_flat.view(3, 40).detach().cpu().numpy()
+                        vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
+                        unknown_ids = [cid for cid in range(40) if not vis[cid]]
+                        others = [(cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4]
+                        det = {pid: [] for pid in others}
+                        counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
+                        caps = [int(counts.get(pid, 0)) for pid in others]
+                        n = len(unknown_ids)
+                        if sum(caps) != n:
+                            caps[2] = max(0, n - caps[0] - caps[1])
+                        for cid in unknown_ids:
+                            pc = probs[:, cid]
+                            s = pc.sum()
+                            ps = pc / (s if s > 0 else 1e-9)
+                            j = int(torch.argmax(torch.tensor(ps)).item())
+                            if caps[j] > 0:
+                                det[others[j]].append(cid)
+                                caps[j] -= 1
+                        return det
+                    except Exception:
+                        return None
+                action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=1.0, belief=None, num_determinization=dets,
+                                     belief_sampler=belief_sampler_neural)
             except Exception:
                 action = agent.pick_action(obs, valid_actions, env)
         else:
@@ -160,7 +209,7 @@ def load_actor_critic(ckpt_path: str):
     actor = ActionConditionedActor()
     critic = CentralValueNet()
     try:
-        ckpt = torch.load(ckpt_path, map_location='cuda')
+        ckpt = torch.load(ckpt_path, map_location=device)
         # se si usa algorithms/ppo_ac save
         if 'actor' in ckpt and 'critic' in ckpt:
             actor.load_state_dict(ckpt['actor'])
@@ -195,7 +244,6 @@ def main_cli():
             if not legals:
                 break
             if args.mcts:
-                belief = BeliefState(env.game_state, observer_id=env.current_player, num_particles=256)
                 def policy_fn(o, leg):
                     o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
                     leg_t = torch.stack([
@@ -208,7 +256,53 @@ def main_cli():
                     o_t = torch.tensor(o, dtype=torch.float32, device=device)
                     with torch.no_grad():
                         return critic(o_t.unsqueeze(0)).item()
-                action = run_is_mcts(env, policy_fn, value_fn, num_simulations=args.sims, c_puct=1.0, belief=belief, num_determinization=args.dets)
+                def belief_sampler_neural(_env):
+                    try:
+                        cp = _env.current_player
+                        obs_cur = _env._get_observation(cp)
+                        o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
+                        if torch.is_tensor(o_cpu):
+                            o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
+                        s_cpu = torch.zeros(6, dtype=torch.float32)
+                        s_cpu[cp] = 1.0
+                        s_cpu[4] = 1.0 if cp in [0, 2] else 0.0
+                        s_cpu[5] = 1.0 if cp in [1, 3] else 0.0
+                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        with torch.no_grad():
+                            state_feat = actor.state_enc(o_t, s_t)
+                            logits = actor.belief_net(state_feat)
+                            hand_table = o_t[:, :83]
+                            hand_mask = hand_table[:, :40] > 0.5
+                            table_mask = hand_table[:, 43:83] > 0.5
+                            captured = o_t[:, 83:165]
+                            cap0_mask = captured[:, :40] > 0.5
+                            cap1_mask = captured[:, 40:80] > 0.5
+                            visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
+                            probs_flat = actor.belief_net.probs(logits, visible_mask)
+                        probs = probs_flat.view(3, 40).detach().cpu().numpy()
+                        vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
+                        unknown_ids = [cid for cid in range(40) if not vis[cid]]
+                        others = [(cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4]
+                        det = {pid: [] for pid in others}
+                        counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
+                        caps = [int(counts.get(pid, 0)) for pid in others]
+                        n = len(unknown_ids)
+                        if sum(caps) != n:
+                            caps[2] = max(0, n - caps[0] - caps[1])
+                        for cid in unknown_ids:
+                            pc = probs[:, cid]
+                            s = pc.sum()
+                            ps = pc / (s if s > 0 else 1e-9)
+                            j = int(torch.argmax(torch.tensor(ps)).item())
+                            if caps[j] > 0:
+                                det[others[j]].append(cid)
+                                caps[j] -= 1
+                        return det
+                    except Exception:
+                        return None
+                action = run_is_mcts(env, policy_fn, value_fn, num_simulations=args.sims, c_puct=1.0, belief=None, num_determinization=args.dets,
+                                      belief_sampler=belief_sampler_neural)
             else:
                 # pick best by actor scoring
                 with torch.no_grad():

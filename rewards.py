@@ -1,3 +1,4 @@
+import os
 import torch
 from observation import RANK_OF_ID, SUITCOL_OF_ID, PRIMIERA_VAL_T
 
@@ -5,7 +6,8 @@ def compute_final_score_breakdown(game_state, rules=None):
     """
     Breakdown finale calcolato su CUDA; i valori restituiti sono scalari Python.
     """
-    device = torch.device('cuda')
+    # Esegui su CPU per evitare dipendenze forzate da GPU (env/logica punteggio lato CPU)
+    device = torch.device(os.environ.get('REW_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')))
     squads = game_state["captured_squads"]
 
     rules = rules or {}
@@ -120,8 +122,9 @@ def compute_final_reward_from_breakdown(breakdown):
     """
     Calcolo su CUDA della ricompensa finale (ritorna scalari Python).
     """
-    device = torch.device('cuda')
+    device = torch.device(os.environ.get('REW_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')))
     diff = torch.tensor(breakdown[0]["total"] - breakdown[1]["total"], dtype=torch.float32, device=device)
-    pos = int((diff * 10.0).item())
+    # Mantieni reward final-only senza moltiplicatore artificiale
+    pos = int(diff.item())
     neg = -pos
     return {0: pos, 1: neg}

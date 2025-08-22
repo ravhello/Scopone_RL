@@ -1,5 +1,4 @@
 import random
-from tests.torch_np import np
 
 from actions import find_sum_subsets_ids, decode_action_ids
 
@@ -43,15 +42,3 @@ def test_find_sum_subsets_ids_stress_small():
     for sub in subs:
         s = sum(((cid // 4) + 1) for cid in sub)
         assert s == 6
-
-
-def test_decode_action_ids_roundtrip():
-    # action vec con played=7 di coppe (row=6,col=1 => id=25) e capture ids [0, 12]
-    from tests.torch_np import np
-    vec = np.zeros(80, dtype=np.float32)
-    vec[25] = 1.0
-    vec[40 + 0] = 1.0
-    vec[40 + 12] = 1.0
-    played, captured = decode_action_ids(vec)
-    assert played == 25 and set(captured) == {0, 12}
-

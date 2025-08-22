@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
-from tests.torch_np import np
+import os
 
-device = torch.device("cuda")
+device = torch.device(os.environ.get(
+    "SCOPONE_DEVICE",
+    ("cuda" if torch.cuda.is_available() and os.environ.get("TESTS_FORCE_CPU") != "1" else "cpu")
+))
 
 
 class StateEncoder10823(nn.Module):
@@ -86,16 +89,30 @@ class StateEncoderCompact(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.hand_table_processor = nn.Sequential(nn.Linear(83, 64), nn.ReLU())
-        self.captured_processor = nn.Sequential(nn.Linear(82, 64), nn.ReLU())
-        # history per-move head (61 -> 64), pooling su k mosse, poi un ulteriore layer 64->64
-        self.history_move_head = nn.Sequential(nn.Linear(61, 64), nn.ReLU())
-        self.history_pool_head = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        # Card embedding for permutation-invariant set encoding (40 card IDs)
+        self.card_emb = nn.Parameter(torch.randn(40, 32) * 0.02)
+        # Small processors for counts and concatenations
+        self.counts_head_hand = nn.Sequential(nn.Linear(3, 16), nn.ReLU())    # other hands sizes
+        self.counts_head_cap = nn.Sequential(nn.Linear(2, 16), nn.ReLU())     # captured counts
+        # Cross-attention mano↔tavolo per relazioni pari-rank e subset-sum
+        self.cross_attn_h2t = nn.MultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
+        self.cross_attn_t2h = nn.MultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
+        # set_merge: [hand(32) | table(32) | cap0(32) | cap1(32) | hand_attn(32) | table_attn(32) | counts(16+16)]
+        self.set_merge_head = nn.Sequential(nn.Linear(32 * 6 + 16 + 16, 64), nn.ReLU())
+
+        # History Transformer (sequence encoder)
+        self.hist_proj = nn.Linear(61, 64)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=64, nhead=4, dim_feedforward=128, batch_first=True)
+        self.hist_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.hist_pos_emb = nn.Embedding(40, 64)  # up to 40 recent moves
+
+        # Stats and seat/team
         self.stats_processor = nn.Sequential(nn.Linear(334, 64), nn.ReLU())
-        # Seat/team embedding: 6 -> 32
         self.seat_head = nn.Sequential(nn.Linear(6, 32), nn.ReLU())
-        # Combiner: 64*4 + 32 -> 256
-        self.combiner = nn.Sequential(nn.Linear(64 * 4 + 32, 256), nn.ReLU())
+
+        # Combiner to 256-d state context
+        # Inputs: set_merge(64) + hist(64) + stats(64) + seat(32) = 224 → 256
+        self.combiner = nn.Sequential(nn.Linear(224, 256), nn.ReLU())
         self.to(device)
 
     def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
@@ -119,28 +136,90 @@ class StateEncoderCompact(nn.Module):
         history = obs[:, hist_start:hist_end]
         stats = obs[:, hist_end:hist_end + 334]
 
-        # processa sezioni
-        ht_feat = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
-        cap_feat = F.relu(self.captured_processor[0](captured), inplace=True)
+        # ----- Set encoders -----
+        # hand_table: [hand(40) | other_counts(3) | table(40)]
+        hand_mask = hand_table[:, :40]
+        other_counts = hand_table[:, 40:43]
+        table_mask = hand_table[:, 43:83]
+        # Sum-pool embeddings
+        card_emb = self.card_emb.to(obs.device)
+        hand_feat = torch.matmul(hand_mask, card_emb)           # (B,32)
+        table_feat = torch.matmul(table_mask, card_emb)         # (B,32)
+        other_cnt_feat = self.counts_head_hand(other_counts)    # (B,16)
+        # Cross-attention mano↔tavolo (usa sequenze lunghezza 40 con padding via mask)
+        hand_present = (hand_mask > 0.5)
+        table_present = (table_mask > 0.5)
+        hand_seq = hand_mask.unsqueeze(-1) * card_emb           # (B,40,32)
+        table_seq = table_mask.unsqueeze(-1) * card_emb         # (B,40,32)
+        # key_padding_mask: True = ignora (assenza)
+        hand_kpm = (~hand_present)
+        table_kpm = (~table_present)
+        # Safe MHA wrapper per evitare NaN quando tutte le key sono mascherate
+        def _safe_mha(mha: nn.Module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
+            # kpm shape (B,S) boolean; True = masked
+            B = q.size(0)
+            out = torch.zeros_like(q)
+            if kpm.dim() == 2 and bool((~kpm.all(dim=1)).any()):
+                valid = (~kpm.all(dim=1)).nonzero(as_tuple=False).flatten()
+                o, _ = mha(query=q.index_select(0, valid),
+                           key=k.index_select(0, valid),
+                           value=v.index_select(0, valid),
+                           key_padding_mask=kpm.index_select(0, valid))
+                # Ensure dtype matches destination to avoid Float/Half mismatch under autocast
+                if o.dtype != out.dtype:
+                    o = o.to(dtype=out.dtype)
+                out.index_copy_(0, valid, o)
+            return out
+        # Q=mano, K,V=tavolo → informazioni su prese possibili dal tavolo
+        h2t = _safe_mha(self.cross_attn_h2t, hand_seq, table_seq, table_seq, table_kpm)
+        # Q=tavolo, K,V=mano → come il tavolo è influenzato dalla mano
+        t2h = _safe_mha(self.cross_attn_t2h, table_seq, hand_seq, hand_seq, hand_kpm)
+        # masked mean pooling su dimensione sequenza
+        def masked_mean(x: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
+            m = present.unsqueeze(-1).to(x.dtype)
+            summed = (x * m).sum(dim=1)
+            denom = m.sum(dim=1).clamp_min(1.0)
+            return summed / denom
+        hand_attn_feat = masked_mean(h2t, hand_present)         # (B,32)
+        table_attn_feat = masked_mean(t2h, table_present)       # (B,32)
+
+        # captured: [team0(40) | team1(40) | counts(2)]
+        cap0_mask = captured[:, :40]
+        cap1_mask = captured[:, 40:80]
+        cap_counts = captured[:, 80:82]
+        cap0_feat = torch.matmul(cap0_mask, card_emb)           # (B,32)
+        cap1_feat = torch.matmul(cap1_mask, card_emb)           # (B,32)
+        cap_cnt_feat = self.counts_head_cap(cap_counts)         # (B,16)
+
+        set_merged = torch.cat([
+            hand_feat, table_feat, cap0_feat, cap1_feat,
+            hand_attn_feat, table_attn_feat,
+            other_cnt_feat, cap_cnt_feat
+        ], dim=1)
+        set_feat = self.set_merge_head(set_merged)               # (B,64)
+
+        # ----- History Transformer -----
         if k > 0:
-            # reshaping in (B, k, 61)
-            hist_reshaped = history.view(B, k, 61)
-            # applica head per-move e poi pooling medio
-            move_feats = self.history_move_head[0](hist_reshaped)  # (B, k, 64)
-            move_feats = F.relu(move_feats, inplace=True)
-            pooled = move_feats.mean(dim=1)  # (B, 64)
-            hist_feat = F.relu(self.history_pool_head[0](pooled), inplace=True)
+            hist_reshaped = history.view(B, k, 61)               # (B,k,61)
+            hproj = self.hist_proj(hist_reshaped)                # (B,k,64)
+            pos_idx = torch.arange(k, device=obs.device, dtype=torch.long).unsqueeze(0).expand(B, k)
+            hpos = self.hist_pos_emb(pos_idx)
+            hseq = hproj + hpos
+            henc = self.hist_encoder(hseq)                       # (B,k,64)
+            hist_feat = henc.mean(dim=1)                         # (B,64)
         else:
             hist_feat = torch.zeros((B, 64), dtype=torch.float32, device=obs.device)
-        stats_feat = F.relu(self.stats_processor[0](stats), inplace=True)
 
+        # Stats and seat/team
+        stats_feat = F.relu(self.stats_processor[0](stats), inplace=True)
         if seat_team_vec is None:
             seat_team_vec = torch.zeros((B, 6), dtype=torch.float32, device=obs.device)
         elif seat_team_vec.dim() == 1:
             seat_team_vec = seat_team_vec.unsqueeze(0)
         seat_feat = F.relu(self.seat_head[0](seat_team_vec), inplace=True)
 
-        combined = torch.cat([ht_feat, cap_feat, hist_feat, stats_feat, seat_feat], dim=1)
+        # Combine
+        combined = torch.cat([set_feat, hist_feat, stats_feat, seat_feat], dim=1)  # (B,224)
         context = F.relu(self.combiner[0](combined), inplace=True)
         return context
 
@@ -165,6 +244,67 @@ class ActionEncoder80(nn.Module):
         return self.net(actions)
 
 
+class BeliefNet(nn.Module):
+    """
+    Belief network che predice 3x40 logits (altri giocatori) a partire da state features (256).
+    - Architettura profonda con residual, LayerNorm e GELU per capacità e stabilità.
+    - Parametro di temperatura per calibrazione delle probabilità.
+    """
+    def __init__(self, in_dim: int = 256, hidden_dim: int = 512):
+        super().__init__()
+        self.fc_in = nn.Linear(in_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc_mid1 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.fc_mid2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln3 = nn.LayerNorm(hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 120)
+        # temperatura appresa (clampata in (0.25, 4.0))
+        self._log_temp = nn.Parameter(torch.log(torch.tensor(1.0)))
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(p=0.1)
+        self.to(device)
+
+    def forward(self, state_feat: torch.Tensor) -> torch.Tensor:
+        x = state_feat
+        h = self.act(self.ln1(self.fc_in(x)))
+        h = self.dropout(h)
+        # residuo 1
+        r = self.act(self.ln2(self.fc_mid1(h)))
+        h = self.dropout(h + r)
+        # residuo 2
+        r2 = self.act(self.ln3(self.fc_mid2(h)))
+        h = self.dropout(h + r2)
+        logits = self.fc_out(h)
+        return logits  # (B,120) logits per 3x40
+
+    def temperature(self) -> torch.Tensor:
+        return torch.clamp(torch.exp(self._log_temp), 0.25, 4.0)
+
+    def probs(self, logits: torch.Tensor, visible_mask_40: torch.Tensor = None) -> torch.Tensor:
+        """
+        Converte logits 3x40 in probabilità normalizzate per-carta tra i 3 giocatori.
+        - logits: (B,120)
+        - visible_mask_40: (B,40) boolean, True = carta visibile → probabilità a 0
+        Ritorna: (B,120) flatten di (B,3,40) probabilità
+        """
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        B = logits.size(0)
+        t = self.temperature().to(logits.device, dtype=logits.dtype)
+        x = logits.view(B, 3, 40)
+        x = x / t
+        # softmax per-carta (dim=1 sui 3 giocatori)
+        probs = torch.softmax(x, dim=1)
+        if visible_mask_40 is not None:
+            if visible_mask_40.dim() == 1:
+                visible_mask_40 = visible_mask_40.unsqueeze(0)
+            # azzera probabilità per carte visibili
+            m = visible_mask_40.to(probs.dtype).unsqueeze(1)  # (B,1,40)
+            probs = probs * (1.0 - m)
+        return probs.view(B, 120)
+
+
 class ActionConditionedActor(torch.nn.Module):
     """
     Actor realmente action-conditioned:
@@ -172,27 +312,80 @@ class ActionConditionedActor(torch.nn.Module):
       - Belief head (120 → 64)
       - Proiezione stato → 64 e scoring via prodotto scalare con embedding azione (80 → 64)
     """
-    def __init__(self, obs_dim=10823, action_dim=80):
+    def __init__(self, obs_dim=10823, action_dim=80, state_encoder: StateEncoderCompact = None):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         # Encoders
-        self.state_enc = StateEncoderCompact()
+        self.state_enc = state_encoder if state_encoder is not None else StateEncoderCompact()
         self.belief_head = nn.Sequential(nn.Linear(120, 64), nn.ReLU())
-        self.merge = nn.Sequential(nn.Linear(256 + 64, 256), nn.ReLU())
+        # BeliefNet neurale migliorata (state_feat 256 -> logits 120)
+        self.belief_net = BeliefNet(in_dim=256, hidden_dim=512)
+        # Partner-aware: embed per-carta (40→32) e gating separato partner/opps
+        self.belief_card_emb = nn.Parameter(torch.randn(40, 32) * 0.02)
+        self.partner_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
+        self.opp_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
+        # Merge: stato 256 + belief_head 64 + partner 32 + opp 32 = 384
+        self.merge = nn.Sequential(nn.Linear(384, 256), nn.ReLU())
         self.state_to_action = nn.Linear(256, 64)
         self.action_enc = ActionEncoder80(action_dim)
+        # Embedding per la selezione carta (40 carte)
+        self.card_emb_play = nn.Parameter(torch.randn(40, 64) * 0.02)
         # Cache di tutte le azioni one-hot (80 x 80) per calcolare logits pieni
         self.register_buffer('all_actions_eye', torch.eye(action_dim, dtype=torch.float32))
-        self.to(torch.device('cuda'))
+        self.to(device)
+
+    @staticmethod
+    def _visible_mask_from_obs(x_obs: torch.Tensor) -> torch.Tensor:
+        hand_table = x_obs[:, :83]
+        hand_mask = hand_table[:, :40] > 0.5
+        table_mask = hand_table[:, 43:83] > 0.5
+        captured = x_obs[:, 83:165]
+        cap0_mask = captured[:, :40] > 0.5
+        cap1_mask = captured[:, 40:80] > 0.5
+        visible = hand_mask | table_mask | cap0_mask | cap1_mask
+        return visible
+
+    def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
+        if torch.is_tensor(obs):
+            x_obs = obs.to(device, dtype=torch.float32)
+        else:
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        if x_obs.dim() == 1:
+            x_obs = x_obs.unsqueeze(0)
+        if seat_team_vec is None:
+            seat_team_vec = torch.zeros((x_obs.size(0), 6), dtype=torch.float32, device=x_obs.device)
+        else:
+            seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
+            if seat_team_vec.dim() == 1:
+                seat_team_vec = seat_team_vec.unsqueeze(0)
+            seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
+        state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
+        # belief neurale interno con maschera carte visibili
+        visible_mask = self._visible_mask_from_obs(x_obs)
+        belief_logits = self.belief_net(state_feat)        # (B,120)
+        belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
+        belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
+        partner_slice = belief_probs_flat[:, 40:80]
+        opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
+        emb = self.belief_card_emb.to(x_obs.device)
+        partner_feat = torch.matmul(partner_slice, emb)     # (B,32)
+        opp_feat = torch.matmul(opps_slice, emb)            # (B,32)
+        pg = self.partner_gate(state_feat)
+        og = self.opp_gate(state_feat)
+        partner_feat = partner_feat * pg
+        opp_feat = opp_feat * og
+        state_ctx = self.merge(torch.cat([state_feat, belief_feat, partner_feat, opp_feat], dim=1))  # (B,256)
+        state_proj = self.state_to_action(state_ctx)  # (B,64)
+        return state_proj
 
     def forward(self, obs: torch.Tensor, legals: torch.Tensor = None,
-                seat_team_vec: torch.Tensor = None, belief_summary: torch.Tensor = None) -> torch.Tensor:
+                seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         # Stato: (B, D)
         if torch.is_tensor(obs):
-            x_obs = obs.to(torch.device('cuda'), dtype=torch.float32)
+            x_obs = obs.to(device, dtype=torch.float32)
         else:
-            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=torch.device('cuda'))
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         # Seat/team: opzionale
@@ -203,19 +396,24 @@ class ActionConditionedActor(torch.nn.Module):
             if seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
             seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
-        # Belief: opzionale (120)
-        if belief_summary is None:
-            belief_summary = torch.zeros((x_obs.size(0), 120), dtype=torch.float32, device=x_obs.device)
-        else:
-            belief_summary = (belief_summary if torch.is_tensor(belief_summary) else torch.as_tensor(belief_summary, dtype=torch.float32))
-            if belief_summary.dim() == 1:
-                belief_summary = belief_summary.unsqueeze(0)
-            belief_summary = belief_summary.to(x_obs.device, dtype=torch.float32)
-
-        # Encode stato (già incorpora seat_team_vec internamente)
+        # belief neurale interno con maschera carte visibili
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
-        belief_feat = self.belief_head(belief_summary)     # (B,64)
-        state_ctx = self.merge(torch.cat([state_feat, belief_feat], dim=1))  # (B,256)
+        visible_mask = self._visible_mask_from_obs(x_obs)
+        belief_logits = self.belief_net(state_feat)
+        belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
+        belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
+        # Partner index fisso nel nostro belief: slice centrale [40:80]
+        partner_slice = belief_probs_flat[:, 40:80]
+        opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
+        emb = self.belief_card_emb.to(x_obs.device)
+        partner_feat = torch.matmul(partner_slice, emb)     # (B,32)
+        opp_feat = torch.matmul(opps_slice, emb)            # (B,32)
+        # Gating dipendente dallo stato
+        pg = self.partner_gate(state_feat)
+        og = self.opp_gate(state_feat)
+        partner_feat = partner_feat * pg
+        opp_feat = opp_feat * og
+        state_ctx = self.merge(torch.cat([state_feat, belief_feat, partner_feat, opp_feat], dim=1))  # (B,256)
         state_proj = self.state_to_action(state_ctx)  # (B,64)
 
         if legals is None:
@@ -234,13 +432,8 @@ class ActionConditionedActor(torch.nn.Module):
         if state_proj.size(0) == 1:
             scores = torch.matmul(a_emb, state_proj.squeeze(0))  # (A)
         else:
-            # Broadcast: per semplicità calcola logits pieni e poi indicizza (fallback raro)
-            all_actions = self.all_actions_eye.to(state_proj.device)
-            action_emb = self.action_enc(all_actions)  # (80,64)
-            scores_full = torch.matmul(state_proj, action_emb.t())  # (B,80)
-            # Mappa legals a indici (assume one-hot) per B=1 usa prima riga
-            idx = torch.argmax(legals_t, dim=1)
-            scores = scores_full[torch.arange(state_proj.size(0))[0], idx]
+            # Row-wise dot product: (A,64) ⊙ (A,64) → (A)
+            scores = (a_emb * state_proj).sum(dim=1)
         return scores
 
 
@@ -248,21 +441,27 @@ class CentralValueNet(torch.nn.Module):
     """
     Critico condizionato: usa StateEncoderCompact (256) + belief (120→64).
     """
-    def __init__(self, obs_dim=10823):
+    def __init__(self, obs_dim=10823, state_encoder: StateEncoderCompact = None):
         super().__init__()
-        self.state_enc = StateEncoderCompact()
+        self.state_enc = state_encoder if state_encoder is not None else StateEncoderCompact()
         self.belief_head = nn.Sequential(nn.Linear(120, 64), nn.ReLU())
+        self.belief_net = BeliefNet(in_dim=256, hidden_dim=512)
+        # Partner-aware belief features (come nell'actor)
+        self.belief_card_emb = nn.Parameter(torch.randn(40, 32) * 0.02)
+        self.partner_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
+        self.opp_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
+        # Stato 256 + belief 64 + partner 32 + opp 32 = 384
         self.head = nn.Sequential(
-            nn.Linear(256 + 64, 256), nn.ReLU(),
+            nn.Linear(384, 256), nn.ReLU(),
             nn.Linear(256, 1)
         )
-        self.to(torch.device('cuda'))
+        self.to(device)
 
-    def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None, belief_summary: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         if torch.is_tensor(obs):
-            x_obs = obs.to(torch.device('cuda'), dtype=torch.float32)
+            x_obs = obs.to(device, dtype=torch.float32)
         else:
-            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=torch.device('cuda'))
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
@@ -272,19 +471,33 @@ class CentralValueNet(torch.nn.Module):
             if seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
             seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
-        if belief_summary is None:
-            belief_summary = torch.zeros((x_obs.size(0), 120), dtype=torch.float32, device=x_obs.device)
-        else:
-            belief_summary = (belief_summary if torch.is_tensor(belief_summary) else torch.as_tensor(belief_summary, dtype=torch.float32))
-            if belief_summary.dim() == 1:
-                belief_summary = belief_summary.unsqueeze(0)
-            belief_summary = belief_summary.to(x_obs.device, dtype=torch.float32)
+        # Belief neurale interno (ignora belief_summary esterno)
         state_feat = self.state_enc(x_obs, seat_team_vec)
-        belief_feat = self.belief_head(belief_summary)
-        out = self.head(torch.cat([state_feat, belief_feat], dim=1))
+        hand_table = x_obs[:, :83]
+        hand_mask = hand_table[:, :40] > 0.5
+        table_mask = hand_table[:, 43:83] > 0.5
+        captured = x_obs[:, 83:165]
+        cap0_mask = captured[:, :40] > 0.5
+        cap1_mask = captured[:, 40:80] > 0.5
+        visible_mask = hand_mask | table_mask | cap0_mask | cap1_mask
+        b_logits = self.belief_net(state_feat)
+        b_probs_flat = self.belief_net.probs(b_logits, visible_mask)
+        belief_feat = self.belief_head(b_probs_flat)
+        # Partner/opponent channel split con gating
+        partner_slice = b_probs_flat[:, 40:80]
+        opps_slice = b_probs_flat[:, 0:40] + b_probs_flat[:, 80:120]
+        emb = self.belief_card_emb.to(x_obs.device)
+        partner_feat = torch.matmul(partner_slice, emb)
+        opp_feat = torch.matmul(opps_slice, emb)
+        pg = self.partner_gate(state_feat)
+        og = self.opp_gate(state_feat)
+        partner_feat = partner_feat * pg
+        opp_feat = opp_feat * og
+        out = self.head(torch.cat([state_feat, belief_feat, partner_feat, opp_feat], dim=1))
         return out.squeeze(-1)
 
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
+        _ = strict  # keep arg for external callers; force non-strict loading
         return super().load_state_dict(state_dict, strict=False)
 
 

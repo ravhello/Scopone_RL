@@ -3,62 +3,9 @@ from collections import defaultdict
 import os
 import torch
 
-# Accel opzionale con numba per enumerazione subset-sum (DISABLED to keep torch-only path)
-NUMBA_AVAILABLE = False
-def njit(*args, **kwargs):
-    def _decorator(fn):
-        return fn
-    return _decorator
-
-if NUMBA_AVAILABLE:
-    @njit(cache=True)
-    def _subset_masks_with_sum(ranks, target):
-        n = ranks.shape[0]
-        results = []
-        for mask in range(1, 1 << n):
-            s = 0
-            for i in range(n):
-                if (mask >> i) & 1:
-                    s += ranks[i]
-            if s == target:
-                results.append(mask)
-        return results
-
-    def _find_sum_subsets_fast(table_cards, target_rank):
-        # Pure python fallback always
-        n = len(table_cards)
-        masks = []
-        for mask in range(1, 1 << n):
-            s = 0
-            for i in range(n):
-                if (mask >> i) & 1:
-                    s += table_cards[i][0]
-            if s == target_rank:
-                masks.append(mask)
-        subsets = []
-        for mask in masks:
-            subset = []
-            for i in range(n):
-                if (mask >> i) & 1:
-                    subset.append(table_cards[i])
-            subsets.append(subset)
-        return subsets
-else:
-    def _find_sum_subsets_fast(table_cards, target_rank):
-        # Fallback: brute via bitmask in puro Python (n di solito piccolo)
-        n = len(table_cards)
-        subsets = []
-        for mask in range(1, 1 << n):
-            s = 0
-            for i in range(n):
-                if (mask >> i) & 1:
-                    s += table_cards[i][0]
-            if s == target_rank:
-                subset = [table_cards[i] for i in range(n) if (mask >> i) & 1]
-                subsets.append(subset)
-        return subsets
+# Rimosso supporto numba e path legacy: usiamo solo implementazioni torch/python
 # Device for action encoding/decoding. Default to CPU for env-side logic to avoid GPU micro-kernels
-_ACTIONS_DEVICE_STR = os.environ.get("ACTIONS_DEVICE", "cpu")
+_ACTIONS_DEVICE_STR = os.environ.get("ACTIONS_DEVICE", os.environ.get('SCOPONE_DEVICE', 'cpu'))
 device = torch.device(_ACTIONS_DEVICE_STR)
 
 def encode_action(card, cards_to_capture):
@@ -132,16 +79,8 @@ def decode_action(action_vec):
     return decode_action_ids(action_vec)
 
 # ----- FAST PATH: decode to card IDs (0..39) -----
-try:
-    from numba import njit
-    NUMBA_JIT = True
-except Exception:
-    NUMBA_JIT = False
 
-_COL_TO_SUIT = {0: 'denari', 1: 'coppe', 2: 'spade', 3: 'bastoni'}
-
-def _idx_to_id(row: int, col: int) -> int:
-    return row * 4 + col
+# Helpers legacy rimossi: non necessari nelle nuove API ID-only
 
 def _decode_ids(vec_t: torch.Tensor):
     if vec_t.dim() != 1 or vec_t.numel() != 80:

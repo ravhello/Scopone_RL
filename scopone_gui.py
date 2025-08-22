@@ -13,7 +13,6 @@ from layout import LayoutManager
 # Import game components
 from environment import ScoponeEnvMA
 from actions import encode_action, decode_action
-from main import DQNAgent
 
 # Constants
 SCREEN_WIDTH = 1024

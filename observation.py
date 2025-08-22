@@ -1,6 +1,4 @@
 # observation.py - Versione Torch CUDA (no NumPy)
-import itertools
-from functools import lru_cache
 import os
 import torch
 
@@ -14,15 +12,17 @@ PRIMIERA_VAL = {1:16, 2:12, 3:13, 4:14, 5:15, 6:18, 7:21, 8:10, 9:10, 10:10}
 suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
 
 # ===== Device control (CPU default) =====
-OBS_DEVICE = torch.device(os.environ.get('OBS_DEVICE', 'cpu'))
-OBS_INCLUDE_INFERRED = os.environ.get('OBS_INCLUDE_INFERRED', '1') == '1'
-OBS_INCLUDE_RANK_PROBS = os.environ.get('OBS_INCLUDE_RANK_PROBS', '1') == '1'
-OBS_INCLUDE_SCOPA_PROBS = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '1') == '1'
+import os as _os
+OBS_DEVICE = torch.device(_os.environ.get('OBS_DEVICE', _os.environ.get('SCOPONE_DEVICE', 'cpu')))
+# Disabilita di default le feature probabilistiche per lasciare che la rete impari il belief
+OBS_INCLUDE_INFERRED = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
+OBS_INCLUDE_RANK_PROBS = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
+OBS_INCLUDE_SCOPA_PROBS = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
 
 # ===== ID/Bitset helpers (device = OBS_DEVICE) =====
 RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
 SUITCOL_OF_ID = torch.tensor([i % 4 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
-MASK_RANK = [(sum(1 << j for j in range(40) if (j // 4 + 1) == r)) for r in range(1, 11)]
+MASK_RANK = [(sum(1 << j for j in range(40) if (j // 4 + 1) == r)) for r in range(1, 11)]  # retained for potential bitset ops
 PRIMIERA_VAL_T = torch.tensor([0, 16, 12, 13, 14, 15, 18, 21, 10, 10, 10], dtype=torch.float32, device=OBS_DEVICE)
 IDS_CUDA = torch.arange(40, device=OBS_DEVICE, dtype=torch.int64)
 IS_DENARI_MASK_40 = (SUITCOL_OF_ID.to(torch.long) == 0)
@@ -50,8 +50,6 @@ def bitset_table_sum(bits: int) -> int:
     return int(torch.sum(active * ranks).item())
 
 # ----- OTTIMIZZAZIONE: CACHE PER FUNZIONI COSTOSE -----
-# Cache per risultati costosi
-cards_matrix_cache = {}
 
 def encode_cards_as_matrix(cards):
     """Codifica un insieme di carte come vettore 40-d su CUDA usando scatter, ID-only."""
@@ -709,119 +707,11 @@ def compute_rank_probabilities_by_player(game_state, player_id):
 # Cache per encode_state_for_player
 state_cache = {}
 
-def encode_state_for_player(game_state, player_id):
-    """
-    Versione ottimizzata con caching ma risultati identici.
-    """
-    # Chiave cache ottimizzata - include solo elementi che influenzano l'output
-    player_hand = tuple(sorted(game_state["hands"][player_id]))
-    table = tuple(sorted(game_state["table"]))
-    team0_cards = tuple(sorted(game_state["captured_squads"][0]))
-    team1_cards = tuple(sorted(game_state["captured_squads"][1]))
-    
-    # Includiamo la lunghezza della history. Nota: per coerenza dell'osservazione
-    # usiamo direttamente player_id come current player, dato che questa funzione
-    # viene chiamata per lo specifico giocatore osservatore e lo stato non mantiene
-    # una chiave affidabile "current_player".
-    history_len = len(game_state["history"])
-    cp = player_id
-    
-    # Carte in mano degli altri giocatori (solo lunghezze)
-    other_hands = tuple((p, len(game_state["hands"].get(p, []))) 
-                      for p in range(4) if p != player_id)
-    
-    cache_key = (player_id, player_hand, table, team0_cards, team1_cards, 
-                history_len, cp, other_hands)
-    
-    # Controlla cache
-    if cache_key in state_cache:
-        return state_cache[cache_key].clone()
-    
-    # Calcolo originale se non in cache
-    # 1) Mani
-    hands_enc = encode_hands(game_state["hands"], player_id)  # 43 dim
-    
-    # 2) Tavolo
-    table_enc = encode_table(game_state["table"])  # 40 dim
-    
-    # 3) Catture squadre
-    captured_enc = encode_captured_squads(game_state["captured_squads"])  # 82 dim
-    
-    # 4) current_player
-    cp_enc = encode_current_player(cp)  # 4 dim
-    
-    # 5) history (compatta opzionale)
-    # Mantieni la codifica completa per compatibilità; in futuro si può sostituire con storia corta
-    # La storia completa legacy è rimossa: manteniamo un vettore nullo fisso (10320 dim) per compatibilità dimensionale
-    hist_enc = torch.zeros(10320, dtype=torch.float32, device=OBS_DEVICE)
-    
-    # --- NUOVE INFORMAZIONI ---
-    
-    # 6) Matrice di carte mancanti
-    missing_cards = compute_missing_cards_matrix(game_state, player_id)  # 40 dim
-    
-    # 7) Probabilità inferite per gli altri giocatori (opzionale)
-    if OBS_INCLUDE_INFERRED:
-        inferred_probs = compute_inferred_probabilities(game_state, player_id)  # 120 dim
-    else:
-        inferred_probs = torch.zeros(120, dtype=torch.float32, device=OBS_DEVICE)
-    
-    # 8) Stato della primiera
-    primiera_status = compute_primiera_status(game_state)  # 8 dim
-    
-    # 9) Conteggio dei denari
-    denari_count = compute_denari_count(game_state)  # 2 dim
-    
-    # 10) Stato del settebello
-    settebello_status = compute_settebello_status(game_state)  # 1 dim
-    
-    # 11) Stima del punteggio attuale
-    score_estimate = compute_current_score_estimate(game_state)  # 2 dim
-    
-    # 12) Somma totale sul tavolo
-    table_sum = compute_table_sum(game_state)  # 1 dim
-    
-    # 13) Probabilità di scopa per ogni rank (opzionale)
-    if OBS_INCLUDE_SCOPA_PROBS:
-        scopa_probs = compute_next_player_scopa_probabilities(game_state, player_id)  # 10 dim
-    else:
-        scopa_probs = torch.zeros(10, dtype=torch.float32, device=OBS_DEVICE)
-    
-    # 14) Probabilità di rank per giocatore (opzionale)
-    if OBS_INCLUDE_RANK_PROBS:
-        rank_probs_by_player = compute_rank_probabilities_by_player(game_state, player_id).flatten()  # 150 dim
-    else:
-        rank_probs_by_player = torch.zeros(150, dtype=torch.float32, device=OBS_DEVICE)
-    
-    # Concatena tutte le features (tutte torch su CUDA -> converti a numpy solo in uscita per compat)
-    parts = [
-        hands_enc.reshape(-1),
-        table_enc.reshape(-1),
-        captured_enc.reshape(-1),
-        cp_enc.reshape(-1),
-        (hist_enc if torch.is_tensor(hist_enc) else torch.tensor(hist_enc, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (missing_cards if torch.is_tensor(missing_cards) else torch.tensor(missing_cards, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (inferred_probs if torch.is_tensor(inferred_probs) else torch.tensor(inferred_probs, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (primiera_status if torch.is_tensor(primiera_status) else torch.tensor(primiera_status, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (denari_count if torch.is_tensor(denari_count) else torch.tensor(denari_count, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (settebello_status if torch.is_tensor(settebello_status) else torch.tensor(settebello_status, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (score_estimate if torch.is_tensor(score_estimate) else torch.tensor(score_estimate, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (table_sum if torch.is_tensor(table_sum) else torch.tensor(table_sum, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (scopa_probs if torch.is_tensor(scopa_probs) else torch.tensor(scopa_probs, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-        (rank_probs_by_player if torch.is_tensor(rank_probs_by_player) else torch.tensor(rank_probs_by_player, dtype=torch.float32, device=OBS_DEVICE)).reshape(-1),
-    ]
-    result = torch.cat(parts)
-    
-    # Salva in cache, se non troppo grande
-    if len(state_cache) < 30:  # Cache molto piccola per evitare problemi di memoria
-        state_cache[cache_key] = result.clone()
-    
-    return result
+
 
 # Funzione per pulizia cache - utile se si vuole liberare memoria
 def clear_all_caches():
     """Pulisce tutte le cache usate per ottimizzare le funzioni"""
-    cards_matrix_cache.clear()
     missing_cards_cache.clear()
     inferred_probs_cache.clear()
     primiera_cache.clear()
@@ -902,7 +792,7 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
         _cached = state_compact_cache[cache_key]
         return _cached.clone() if hasattr(_cached, 'clone') else _cached.copy()
 
-    device = torch.device('cuda')
+    device = OBS_DEVICE
     hands_enc = encode_hands(game_state["hands"], player_id)  # 43 (torch)
     table_enc = encode_table(game_state["table"])  # 40 (torch)
     captured_enc = encode_captured_squads(game_state["captured_squads"])  # 82 (torch)
@@ -1042,7 +932,7 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     # 13) Rank probs by player (150) - fallback
     rank_probs_by_player = compute_rank_probabilities_by_player(game_state, player_id).flatten()
 
-    return torch.cat([
+    result = torch.cat([
         hands_enc,
         table_enc,
         captured_enc,
@@ -1057,3 +947,12 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
         scopa_probs,
         rank_probs_by_player
     ])
+    # Coerenza dimensionale con feature attive/disattive
+    expected_dim = 43 + 40 + 82 + 61 * k_history + 40 + 120 + 8 + 2 + 1 + 2 + 1 + 10 + 150
+    if result.numel() != expected_dim:
+        if result.numel() < expected_dim:
+            pad = torch.zeros((expected_dim - result.numel(),), dtype=result.dtype, device=result.device)
+            result = torch.cat([result, pad], dim=0)
+        else:
+            result = result[:expected_dim]
+    return result

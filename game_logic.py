@@ -17,8 +17,12 @@ def update_game_state(game_state, action_id, current_player, rules=None):
         final_reward = compute_final_reward_from_breakdown(final_breakdown)
         return game_state, [final_reward[0], final_reward[1]], True, {"final_score": {0: final_breakdown[0]["total"], 1: final_breakdown[1]["total"]}, "score_breakdown": final_breakdown}
 
-    # Helpers per conversioni (ID/tuple) e operazioni su CUDA
-    device = torch.device('cuda')
+    # Helpers per conversioni (ID/tuple) e operazioni su device selezionato
+    import os
+    device = torch.device(os.environ.get(
+        'SCOPONE_DEVICE',
+        ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
+    ))
     def to_id(x):
         if isinstance(x, int):
             return int(x)
@@ -97,6 +101,9 @@ def update_game_state(game_state, action_id, current_player, rules=None):
 
     done = all(len(game_state["hands"][p]) == 0 for p in range(4))
     if done:
+        # Non è consentito terminare una mano senza alcuna presa effettuata
+        if not any(m.get("capture_type") in ("capture", "scopa") for m in game_state["history"]):
+            raise ValueError("La mano non può terminare senza alcuna presa.")
         # Se ci sono carte rimaste sul tavolo, assegnale alla squadra dell'ultima presa
         if game_state["table"]:
             last_capturing_team = None

@@ -58,7 +58,7 @@ def main():
                 global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         except Exception:
             pass
-        train_fn(num_iterations=max(1, args.iters), horizon=max(32, args.horizon), use_compact_obs=True, k_history=12)
+        train_fn(num_iterations=max(1, args.iters), horizon=max(32, args.horizon), use_compact_obs=True, k_history=12, num_envs=1)
 
         # Print per-function and per-line stats (includes line numbers and source)
         try:
