@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
 import os
+from utils.device import get_compute_device
 
-device = torch.device(os.environ.get(
-    "SCOPONE_DEVICE",
-    ("cuda" if torch.cuda.is_available() and os.environ.get("TESTS_FORCE_CPU") != "1" else "cpu")
-))
+device = get_compute_device()
 
 
 class StateEncoder10823(nn.Module):
@@ -114,6 +112,13 @@ class StateEncoderCompact(nn.Module):
         # Inputs: set_merge(64) + hist(64) + stats(64) + seat(32) = 224 → 256
         self.combiner = nn.Sequential(nn.Linear(224, 256), nn.ReLU())
         self.to(device)
+        # opzionale: torch.compile per accelerare inference/training
+        try:
+            if os.environ.get('ENABLE_TORCH_COMPILE', '0') == '1' and hasattr(torch, 'compile'):
+                mode = os.environ.get('TORCH_COMPILE_MODE', 'default')
+                self.forward = torch.compile(self.forward, mode=mode, fullgraph=False, dynamic=False)  # type: ignore
+        except Exception:
+            pass
 
     def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         import torch.nn.functional as F
@@ -233,6 +238,12 @@ class ActionEncoder80(nn.Module):
             nn.Linear(128, 64), nn.ReLU(),
         )
         self.to(device)
+        try:
+            if os.environ.get('ENABLE_TORCH_COMPILE', '0') == '1' and hasattr(torch, 'compile'):
+                mode = os.environ.get('TORCH_COMPILE_MODE', 'default')
+                self.forward = torch.compile(self.forward, mode=mode, fullgraph=False, dynamic=False)  # type: ignore
+        except Exception:
+            pass
 
     def forward(self, actions: torch.Tensor) -> torch.Tensor:
         if not torch.is_tensor(actions):
@@ -264,6 +275,12 @@ class BeliefNet(nn.Module):
         self.act = nn.GELU()
         self.dropout = nn.Dropout(p=0.1)
         self.to(device)
+        try:
+            if os.environ.get('ENABLE_TORCH_COMPILE', '0') == '1' and hasattr(torch, 'compile'):
+                mode = os.environ.get('TORCH_COMPILE_MODE', 'default')
+                self.forward = torch.compile(self.forward, mode=mode, fullgraph=False, dynamic=False)  # type: ignore
+        except Exception:
+            pass
 
     def forward(self, state_feat: torch.Tensor) -> torch.Tensor:
         x = state_feat
@@ -333,6 +350,8 @@ class ActionConditionedActor(torch.nn.Module):
         self.card_emb_play = nn.Parameter(torch.randn(40, 64) * 0.02)
         # Cache di tutte le azioni one-hot (80 x 80) per calcolare logits pieni
         self.register_buffer('all_actions_eye', torch.eye(action_dim, dtype=torch.float32))
+        # Cache embedding azioni (solo per inference)
+        self._cached_action_emb = None
         self.to(device)
 
     @staticmethod
@@ -379,6 +398,21 @@ class ActionConditionedActor(torch.nn.Module):
         state_proj = self.state_to_action(state_ctx)  # (B,64)
         return state_proj
 
+    def invalidate_action_cache(self) -> None:
+        """Invalida la cache degli embedding delle azioni (usata in inference)."""
+        self._cached_action_emb = None
+
+    def get_action_emb_table_cached(self) -> torch.Tensor:
+        """Ritorna la tabella (80,64) degli embedding azione usando la cache in inference.
+        Viene ricalcolata on-demand quando assente o invalidata. Non traccia gradiente.
+        """
+        if self._cached_action_emb is not None:
+            return self._cached_action_emb
+        with torch.no_grad():
+            eye = self.all_actions_eye.to(device=device, dtype=torch.float32)
+            self._cached_action_emb = self.action_enc(eye)
+        return self._cached_action_emb
+
     def forward(self, obs: torch.Tensor, legals: torch.Tensor = None,
                 seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         # Stato: (B, D)
@@ -419,7 +453,11 @@ class ActionConditionedActor(torch.nn.Module):
         if legals is None:
             # Calcola logits per tutte le 80 azioni: (B,64) @ (64,80) -> (B,80)
             all_actions = self.all_actions_eye
-            action_emb = self.action_enc(all_actions)  # (80,64)
+            # usa cache embedding azioni se disponibile
+            try:
+                action_emb = self.get_action_emb_table_cached()
+            except Exception:
+                action_emb = self.action_enc(all_actions)
             logits = torch.matmul(state_proj, action_emb.t())  # (B,80)
             return logits if logits.size(0) > 1 else logits.squeeze(0)
         # legals: (A,80). Calcola score per azioni legali via prodotto scalare
@@ -428,7 +466,12 @@ class ActionConditionedActor(torch.nn.Module):
         else:
             legals_t = legals.to(state_proj.device, dtype=torch.float32)
         # B atteso = 1 in path di selezione
-        a_emb = self.action_enc(legals_t)  # (A,64)
+        # usa tabella cachata per ottenere gli embedding legali via singola mm
+        try:
+            a_tbl = self.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_t.device)
+            a_emb = torch.matmul(legals_t, a_tbl)
+        except Exception:
+            a_emb = self.action_enc(legals_t)  # fallback
         if state_proj.size(0) == 1:
             scores = torch.matmul(a_emb, state_proj.squeeze(0))  # (A)
         else:

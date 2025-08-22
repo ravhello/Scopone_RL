@@ -3,6 +3,9 @@ import random
 from typing import List, Tuple
 
 from environment import ScoponeEnvMA
+import os
+import torch
+from utils.device import get_compute_device
 # BeliefState legacy rimosso: MCTS usa SOLO belief_sampler neurale; nessun fallback a filtri particellari
 
 
@@ -237,11 +240,7 @@ def run_is_mcts(env: ScoponeEnvMA,
 
     # Scelta finale: robust child o soft a seconda di temperature (preferisci torch su CUDA)
     try:
-        import torch, os
-        device = torch.device(os.environ.get(
-            'SCOPONE_DEVICE',
-            ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
-        ))
+        device = get_compute_device()
         if root_temperature and root_temperature > 1e-6:
             visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
             logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))

@@ -1,6 +1,7 @@
 # environment.py - VERSIONE OTTIMIZZATA PER PERFORMANCE
 import torch
 import os
+from utils.device import get_env_device
 import gym
 from gym import spaces
 import time
@@ -10,12 +11,9 @@ from state import initialize_game
 from actions import decode_action_ids
 # line_profiler opzionale: disabilitato in test/produzione
 
-# Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU;
-# i mirror CUDA possono essere disabilitati o resi opzionali.
-_ENV_DEVICE_STR = os.environ.get("ENV_DEVICE", os.environ.get(
-    'SCOPONE_DEVICE', 'cpu'
-))
-device = torch.device(_ENV_DEVICE_STR)
+# Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU.
+# Può essere forzato impostando ENV_DEVICE, ma di default resta CPU.
+device = get_env_device()
 
 def _suit_to_int(suit):
     if suit == 'denari':
@@ -87,6 +85,8 @@ class ScoponeEnvMA(gym.Env):
         self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
         self._captured_bits_t = torch.zeros(2, dtype=torch.int64, device=device)
         self._one_i64 = torch.tensor(1, dtype=torch.int64, device=device)
+        # Precompute id range to avoid per-call allocations
+        self._id_range = torch.arange(40, dtype=torch.int64, device=device)
         
         # Regole/varianti opzionali della partita
         # Nota: negli script con modalità di default, "asso_piglia_tutto" è disattivato
@@ -189,7 +189,7 @@ class ScoponeEnvMA(gym.Env):
             state_key = None
 
         # Estrai ID in mano e sul tavolo da bitset tensor (CPU tensors)
-        ids = torch.arange(40, device=device, dtype=torch.int64)
+        ids = self._id_range
         hand_mask = ((self._hands_bits_t[self.current_player] >> ids) & 1).bool()
         table_mask = ((self._table_bits_t >> ids) & 1).bool()
         hand_ids_t = ids[hand_mask]
@@ -220,9 +220,8 @@ class ScoponeEnvMA(gym.Env):
                 n = int(table_ids_t.numel())
                 if n > 0:
                     table_ids = table_ids_t.tolist()
-                    ranks = [int((cid // 4) + 1) for cid in table_ids]
                     target = int(prank_t.item())
-                    # Cache DP per (table_bits, target)
+                    # Cache per (table_bits, target)
                     try:
                         subset_key = (int(self._table_bits_t.item()), target)
                     except Exception:
@@ -231,26 +230,23 @@ class ScoponeEnvMA(gym.Env):
                     if subset_key is not None:
                         masks_list = self._subset_sum_cache.get(subset_key)
                     if masks_list is None:
-                        # DP: subs[somma] -> lista di bitmask
-                        subs = {0: [0]}
-                        for i, w in enumerate(ranks):
-                            # copia superficiale per iterare sugli stati correnti
-                            cur = {k: list(v) for k, v in subs.items()}
-                            for s, bms in subs.items():
-                                ns = s + w
-                                if ns > target:
-                                    continue
-                                lst = cur.get(ns, [])
-                                for bm in bms:
-                                    lst.append(bm | (1 << i))
-                                cur[ns] = lst
-                            subs = cur
-                        masks_list = subs.get(target, [])
+                        # Via vettoriale: calcola tutti i sottoinsiemi validi con Torch
+                        from actions import find_sum_subsets_ids as _find_sum_subsets_ids
+                        subsets = _find_sum_subsets_ids(table_ids, target)
+                        # Converte liste di ID in bitmask locali (rispetto a table_ids)
+                        idx_map = {cid: j for j, cid in enumerate(table_ids)}
+                        masks_list = []
+                        for subset in subsets:
+                            bm = 0
+                            for cid in subset:
+                                j = idx_map.get(int(cid))
+                                if j is not None:
+                                    bm |= (1 << j)
+                            masks_list.append(bm)
                         if subset_key is not None:
                             self._subset_sum_cache[subset_key] = masks_list
                     if masks_list:
                         for bm in masks_list:
-                            # Ricostruisci gli ID da bitmask
                             sel_ids = [table_ids[j] for j in range(n) if ((bm >> j) & 1) == 1]
                             cap_ids_t = torch.as_tensor(sel_ids, dtype=torch.long, device=device)
                             valid_actions.append(encode_action_from_ids_gpu(pid_t, cap_ids_t))
@@ -341,9 +337,16 @@ class ScoponeEnvMA(gym.Env):
         if pid not in [_card_to_id(c) for c in hand] and pid not in hand:
             raise ValueError(f"La carta {pid} non è nella mano del giocatore {current_player}.")
         
-        # Verifica carte da catturare (ID) interamente via bitset CUDA mirror
+        # Verifica carte da catturare (ID) via bitset CPU (evita sync GPU)
         for cid in cap_ids:
-            present = int(((self._table_bits_t >> int(cid)) & self._one_i64).item())
+            try:
+                present = (self._table_bits >> int(cid)) & 1
+            except Exception:
+                try:
+                    table_id_set = {_card_to_id(c) for c in table}
+                except Exception:
+                    table_id_set = set()
+                present = 1 if int(cid) in table_id_set else 0
             if present == 0:
                 raise ValueError(f"La carta {cid} non si trova sul tavolo; cattura non valida.")
 
@@ -372,14 +375,16 @@ class ScoponeEnvMA(gym.Env):
                         pass
         
         # Verifica regole di cattura via bitset su CPU
-        ids = torch.arange(40, device=device, dtype=torch.int64)
-        table_ids_t = ids[((self._table_bits_t >> ids) & 1).bool()]
-        same_rank_ids_t = table_ids_t[((table_ids_t // 4 + 1).to(torch.int64) == int(rank))]
-        same_rank_ids = same_rank_ids_t.tolist()
+        # Usa solo strutture CPU per evitare kernel micro e sync
+        try:
+            table_ids_list = list(self._table_ids) if self._use_id_cache else [_card_to_id(c) for c in table]
+        except Exception:
+            table_ids_list = [_card_to_id(c) for c in table]
+        same_rank_ids = [i for i in table_ids_list if (i // 4 + 1) == int(rank)]
         if same_rank_ids:
             # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta
             ace_take_all = (rank == 1 and self.rules.get("asso_piglia_tutto", False)
-                            and set(cap_ids) == set(table_ids_t.tolist()))
+                            and set(cap_ids) == set(table_ids_list))
             if not ace_take_all:
                 # Devi catturare UNA carta di pari rank
                 if not (len(cap_ids) == 1 and (cap_ids[0] in same_rank_ids)):
@@ -387,7 +392,7 @@ class ScoponeEnvMA(gym.Env):
         elif cap_ids:
             # Verifica somma
             # Eccezione: Asso piglia tutto
-            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False) and set(cap_ids) == set(table_ids_t.tolist())):
+            if not (rank == 1 and self.rules.get("asso_piglia_tutto", False) and set(cap_ids) == set(table_ids_list)):
                 sum_chosen = sum(((cid // 4) + 1) for cid in cap_ids)
                 if sum_chosen != rank:
                     raise ValueError(f"La somma delle carte catturate ({sum_chosen}) deve essere uguale al rank ({rank}).")

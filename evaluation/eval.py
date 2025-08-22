@@ -11,14 +11,11 @@ try:
 except Exception:
     TB_AVAILABLE = False
 from models.action_conditioned import ActionConditionedActor
+from utils.device import get_compute_device
 from algorithms.is_mcts import run_is_mcts
 # BeliefState legacy opzionale (non usato nello scenario corrente)
 
-_DEVICE_STR = os.environ.get(
-    'SCOPONE_DEVICE',
-    ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
-)
-device = torch.device(_DEVICE_STR)
+device = get_compute_device()
 try:
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True

@@ -5,16 +5,12 @@ from typing import List, Tuple
 from contextlib import nullcontext
 
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
+from utils.device import get_compute_device, get_amp_dtype
 
 import os as _os
-_DEVICE_STR = _os.environ.get(
-    'SCOPONE_DEVICE',
-    ('cuda' if torch.cuda.is_available() and _os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
-)
-device = torch.device(_DEVICE_STR)
+device = get_compute_device()
 autocast_device = device.type
-_AMP_DTYPE = _os.environ.get('AMP_DTYPE', 'fp16')
-autocast_dtype = torch.bfloat16 if _AMP_DTYPE == 'bf16' else torch.float16
+autocast_dtype = get_amp_dtype()
 
 
 class ActionConditionedPPO:
@@ -100,7 +96,10 @@ class ActionConditionedPPO:
             obs_cpu = torch.as_tensor(obs, dtype=torch.float32, device='cpu')
         obs_t = obs_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
 
-        if len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]):
+        if torch.is_tensor(legal_actions):
+            # Already a stacked tensor (A,80)
+            actions_cpu = legal_actions.detach().to(device='cpu', dtype=torch.float32)
+        elif len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]):
             actions_cpu = torch.stack(legal_actions).detach().to(device='cpu', dtype=torch.float32)
         else:
             actions_cpu = torch.stack([
@@ -121,6 +120,7 @@ class ActionConditionedPPO:
         with cm:
             # Scoring simultaneo di tutte le azioni legali via fattorizzazione
             state_proj = self.actor.compute_state_proj(obs_t, st)  # (1,64)
+            # Precompute logits carta una volta
             card_emb = self.actor.card_emb_play
             card_logits_all = torch.matmul(state_proj, card_emb.t()).squeeze(0)  # (40)
             played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
@@ -129,8 +129,12 @@ class ActionConditionedPPO:
             allowed_mask[played_ids_all] = True
             masked_card_logits = card_logits_all.masked_fill(~allowed_mask, float('-inf'))
             logp_cards = torch.log_softmax(masked_card_logits, dim=0)  # (40)
-            # capture logits per-legal
-            a_emb = self.actor.action_enc(actions_t)  # (A,64)
+            # capture logits per-legal via action embedding (usa tabella cachata in inference)
+            try:
+                a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=actions_t.device)
+                a_emb = actions_t @ a_tbl  # (A,64)
+            except Exception:
+                a_emb = self.actor.action_enc(actions_t)  # fallback
             cap_logits = torch.matmul(a_emb, state_proj.squeeze(0))  # (A)
             # log-softmax within group (card)
             group_ids = played_ids_all  # (A)
@@ -183,12 +187,23 @@ class ActionConditionedPPO:
           - legals_count: (B) numero di azioni legali per sample
           - chosen_index: (B) indice della scelta nel proprio sottoinsieme legale
         """
-        to_f32 = lambda x: x.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device=device)
-        to_long = lambda x: x.clone().detach().to(device=device, dtype=torch.long) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.long, device=device)
+        def to_f32(x):
+            if torch.is_tensor(x):
+                # Evita copie inutili: se è già su device e fp32, restituisci conversione non_blocking
+                return x.to(device=device, dtype=torch.float32, non_blocking=True)
+            return torch.as_tensor(x, dtype=torch.float32, device=device)
+        def to_long(x):
+            if torch.is_tensor(x):
+                return x.to(device=device, dtype=torch.long, non_blocking=True)
+            return torch.as_tensor(x, dtype=torch.long, device=device)
 
         # Accept CPU inputs; move to CUDA once in a pinned, non_blocking way
         def to_cuda_nb(x, dtype):
+            # Se il tensore è già su device, non riportarlo su CPU: casistica principale per ridurre copy
             if torch.is_tensor(x):
+                if x.device.type == device.type:
+                    return x.to(device=device, dtype=dtype, non_blocking=True)
+                # CPU → pin → device
                 x_cpu = x.detach().to('cpu', dtype=dtype)
             else:
                 x_cpu = torch.as_tensor(x, dtype=dtype, device='cpu')
@@ -245,18 +260,31 @@ class ActionConditionedPPO:
             card_mask[sample_idx_per_legal, played_ids_mb] = True
             masked_card_logits = card_logits_all.masked_fill(~card_mask, float('-inf'))
             logp_cards = torch.log_softmax(masked_card_logits, dim=1)   # (B,40)
-            # chosen abs indices e played ids
+            # chosen abs indices e played ids (evita pos_map grande)
             chosen_clamped = torch.minimum(chosen_idx, (cnts - 1).clamp_min(0))
-            chosen_abs_idx = (offs + chosen_clamped)
-            total_legals = legals.size(0)
-            pos_map = torch.full((total_legals,), -1, dtype=torch.long, device=device)
-            pos_map[abs_idx] = torch.arange(abs_idx.numel(), device=device, dtype=torch.long)
-            chosen_pos = pos_map[chosen_abs_idx]
+            chosen_abs_idx = (offs + chosen_clamped)                                 # (B)
+            # posizioni relative nella maschera (per-legal all'interno del proprio sample)
+            pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+            rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
+            pos_in_sample = rel_pos_2d[mask]                                         # (M_mb)
+            chosen_abs_idx_per_legal = chosen_abs_idx[sample_idx_per_legal]          # (M_mb)
+            match = (abs_idx == chosen_abs_idx_per_legal)                            # (M_mb)
+            # Raccogli posizioni scelte per ciascun sample tramite index_copy
+            chosen_pos = torch.full((B,), -1, dtype=torch.long, device=device)
+            if bool(match.any()):
+                chosen_pos_vals = pos_in_sample[match]
+                chosen_pos_idx = sample_idx_per_legal[match]
+                chosen_pos.index_copy_(0, chosen_pos_idx, chosen_pos_vals)
             played_ids_all = torch.argmax(legals[:, :40], dim=1)
             chosen_card_ids = played_ids_all[chosen_abs_idx]
             logp_card = logp_cards[row_idx, chosen_card_ids]
             # capture logits per-legal via action embedding
-            a_emb_mb = self.actor.action_enc(legals_mb)                # (M_mb,64)
+            # usa tabella cachata per ridurre compute della MLP azione
+            try:
+                a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_mb.device)
+                a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
+            except Exception:
+                a_emb_mb = self.actor.action_enc(legals_mb)           # fallback (M_mb,64)
             cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
             # segment logsumexp per gruppo (sample, card)
             group_ids = sample_idx_per_legal * 40 + played_ids_mb
@@ -278,12 +306,18 @@ class ActionConditionedPPO:
             logp_cap_per_legal = cap_logits - lse_per_legal
             logp_cap = logp_cap_per_legal[chosen_pos]
             logp_new = logp_card + logp_cap
-            # Distribuzione completa sui legali per entropia/KL
-            logp_total_per_legal = logp_cards[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
-            logp_total_padded = torch.full((B, max_cnt), float('-inf'), dtype=cap_logits.dtype, device=device)
-            logp_total_padded[mask] = logp_total_per_legal
-            probs_group = torch.exp(logp_total_padded)
-            entropy = (-(probs_group * logp_total_padded).nan_to_num(0.0).sum(dim=1)).mean()
+            # Distribuzione completa sui legali per entropia/KL (computata solo se serve)
+            need_entropy = (float(self.entropy_coef) > 0.0)
+            if need_entropy:
+                # Entropia per-sample senza padding: H = -Σ p * log p
+                logp_total_per_legal = logp_cards[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
+                probs = torch.exp(logp_total_per_legal)
+                neg_p_logp = -(probs * logp_total_per_legal)
+                ent_per_row = torch.zeros((B,), dtype=neg_p_logp.dtype, device=device)
+                ent_per_row.index_add_(0, sample_idx_per_legal, neg_p_logp)
+                entropy = ent_per_row.mean()
+            else:
+                entropy = torch.tensor(0.0, device=device)
         else:
             logp_new = torch.zeros((B,), device=device, dtype=state_proj.dtype)
             entropy = torch.tensor(0.0, device=device)
@@ -299,11 +333,17 @@ class ActionConditionedPPO:
         else:
             loss_v = nn.MSELoss()(v, ret)
 
-        # Distillazione MCTS: costruisci target per-gruppo da mcts_policy_flat (raggruppato con offs/cnts)
+        # Schedula coefficienti (prima per evitare calcoli inutili)
+        distill_coef_base = float(_os.environ.get('DISTILL_COEF', '0.1'))
+        warm = int(_os.environ.get('DISTILL_WARMUP', '100'))
+        coef = 0.0 if self.update_steps < warm else distill_coef_base
+        belief_coef = float(_os.environ.get('BELIEF_AUX_COEF', '0.1'))
+
+        # Distillazione MCTS: costruisci target per-gruppo solo se necessario
         distill_loss = torch.tensor(0.0, device=device)
-        # Loss ausiliaria per BeliefNet: cross-entropy 3x40 verso mani reali altrui (mascherando carte visibili)
+        # Loss ausiliaria per BeliefNet solo se necessario
         belief_aux = torch.tensor(0.0, device=device)
-        if max_cnt > 0 and mcts_weight.numel() == B and (mcts_weight.sum() > 0) and mcts_policy_flat.numel() >= int(cnts.sum().item()):
+        if (coef > 0.0) and max_cnt > 0 and mcts_weight.numel() == B and (mcts_weight.sum() > 0) and mcts_policy_flat.numel() >= int(cnts.sum().item()):
             # Ricostruisci (B, max_cnt) target evitando contributi sui padding (restano a 0)
             target = torch.full((B, max_cnt), 0.0, device=device, dtype=torch.float32)
             start = 0
@@ -317,6 +357,11 @@ class ActionConditionedPPO:
             mask_pos = (target > 0)
             safe_log_t = torch.zeros_like(target)
             safe_log_t[mask_pos] = torch.log(torch.clamp(target[mask_pos], min=eps))
+            # Se entropia è disattivata, serve calcolare logp_total_padded qui
+            if not need_entropy:
+                logp_total_per_legal = logp_cards[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
+                logp_total_padded = torch.full((B, max_cnt), float('-inf'), dtype=cap_logits.dtype, device=device)
+                logp_total_padded[mask] = logp_total_per_legal
             diff = safe_log_t - logp_total_padded
             kl_per_row = (target * diff).sum(dim=1)
             # Peso per incertezza calcolato sulle posizioni valide
@@ -334,7 +379,7 @@ class ActionConditionedPPO:
                 distill_loss = (kl_per_row * w).sum() / torch.clamp_min(w.sum(), 1.0)
         # Prepara target belief supervision (se batch fornisce mani reali degli altri)
         real_hands = batch.get('others_hands', None)  # shape (B,3,40) one-hot o multi-hot per altri giocatori
-        if real_hands is not None:
+        if (belief_coef > 0.0) and (real_hands is not None):
             rh = to_cuda_nb(real_hands, torch.float32)
             # calcola logits/probs dal BeliefNet dell'actor per il batch
             with torch.no_grad():
@@ -359,12 +404,6 @@ class ActionConditionedPPO:
             denom = m.sum(dim=(1,2)).clamp_min(1.0) if m.dim()==3 else m.sum(dim=2).clamp_min(1.0)
             belief_aux = (ce_per_card.sum(dim=1) / torch.clamp_min((~visible_mask).sum(dim=1).to(torch.float32), 1.0)).mean()
 
-        # Schedule coefficiente distillazione
-        distill_coef_base = float(_os.environ.get('DISTILL_COEF', '0.1'))
-        warm = int(_os.environ.get('DISTILL_WARMUP', '100'))
-        coef = 0.0 if self.update_steps < warm else distill_coef_base
-        # coefficiente belief aux
-        belief_coef = float(_os.environ.get('BELIEF_AUX_COEF', '0.1'))
         loss = loss_pi + self.value_coef * loss_v - self.entropy_coef * entropy + coef * distill_loss + belief_coef * belief_aux
         approx_kl = (old_logp - logp_new).mean().abs()
         # clip fraction reale: frazione di sample con |ratio-1| > clip_ratio
@@ -401,29 +440,43 @@ class ActionConditionedPPO:
             return total_sq.sqrt()
 
         check_every = 8  # reduce CPU syncs for early-stop
+        # Stage intero batch su CUDA una sola volta
+        batch_cuda = {}
+        for k, v in batch.items():
+            if k in ('routing_log',):
+                continue
+            if torch.is_tensor(v):
+                # mappa tensori principali su device
+                dtype = v.dtype
+                if k in ('obs', 'act', 'ret', 'adv'):
+                    dtype = torch.float32
+                batch_cuda[k] = v.detach().to(device=device, dtype=dtype, non_blocking=True)
+            else:
+                batch_cuda[k] = v
+        # 'legals' è globale: porta su device una volta
+        if 'legals' in batch_cuda:
+            batch_cuda['legals'] = batch_cuda['legals'].to(device=device, dtype=torch.float32, non_blocking=True)
+
         for ep in range(epochs):
-            # Keep indices on CPU to index CPU-stored batch efficiently; tensors will be moved in compute_loss
-            perm = torch.randperm(num_samples, device='cpu')
+            # Indici su CUDA per evitare hop CPU↔GPU
+            perm = torch.randperm(num_samples, device=device)
             for start in range(0, num_samples, minibatch_size):
                 idx_t = perm[start:start+minibatch_size]
-                # Use index_select to slice tensors by CUDA indices
-                def sel(x):
-                    # Ensure indexing on CPU tensors
-                    if torch.is_tensor(x) and x.device.type != 'cpu':
-                        x = x.detach().to('cpu')
+                # Slice direttamente su CUDA
+                def sel_cuda(x):
                     return torch.index_select(x, 0, idx_t)
                 mini = {
-                    'obs': sel(batch['obs']),
-                    'act': sel(batch['act']),
-                    'old_logp': sel(batch['old_logp']),
-                    'ret': sel(batch['ret']),
-                    'adv': sel(batch['adv']),
-                    'legals': batch['legals'],  # globale
-                    'legals_offset': sel(batch['legals_offset']),
-                    'legals_count': sel(batch['legals_count']),
-                    'chosen_index': sel(batch['chosen_index']),
-                    'seat_team': sel(batch['seat_team']) if batch.get('seat_team', None) is not None else None,
-                    'others_hands': sel(batch['others_hands']) if batch.get('others_hands', None) is not None else None,
+                    'obs': sel_cuda(batch_cuda['obs']),
+                    'act': sel_cuda(batch_cuda['act']),
+                    'old_logp': sel_cuda(batch_cuda['old_logp']),
+                    'ret': sel_cuda(batch_cuda['ret']),
+                    'adv': sel_cuda(batch_cuda['adv']),
+                    'legals': batch_cuda['legals'],  # globale su device
+                    'legals_offset': sel_cuda(batch_cuda['legals_offset']),
+                    'legals_count': sel_cuda(batch_cuda['legals_count']),
+                    'chosen_index': sel_cuda(batch_cuda['chosen_index']),
+                    'seat_team': sel_cuda(batch_cuda['seat_team']) if batch_cuda.get('seat_team', None) is not None else None,
+                    'others_hands': sel_cuda(batch_cuda['others_hands']) if batch_cuda.get('others_hands', None) is not None else None,
                 }
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
@@ -442,6 +495,11 @@ class ActionConditionedPPO:
                     self.scaler.step(self.opt_actor)
                     self.scaler.step(self.opt_critic)
                     self.scaler.update()
+                    # invalidate any inference caches after params changed
+                    try:
+                        self.actor.invalidate_action_cache()
+                    except Exception:
+                        pass
                 else:
                     loss, info = self.compute_loss(mini)
                     loss.backward()
@@ -452,6 +510,10 @@ class ActionConditionedPPO:
                     nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                     self.opt_actor.step()
                     self.opt_critic.step()
+                    try:
+                        self.actor.invalidate_action_cache()
+                    except Exception:
+                        pass
                 last_info = info
                 self.update_steps += 1
                 avg_kl_acc += info.get('approx_kl', torch.tensor(0.0, device=device))

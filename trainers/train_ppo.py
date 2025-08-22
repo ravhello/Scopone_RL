@@ -14,6 +14,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
+from utils.device import get_compute_device
  
 from selfplay.league import League
 from models.action_conditioned import ActionConditionedActor
@@ -22,11 +23,7 @@ from evaluation.eval import evaluate_pair_actors
 
 import torch.optim as optim
 
-_DEVICE_STR = os.environ.get(
-    'SCOPONE_DEVICE',
-    ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
-)
-device = torch.device(_DEVICE_STR)
+device = get_compute_device()
 # Global perf flags
 try:
     torch.backends.cudnn.benchmark = True
@@ -872,20 +869,19 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                                           return_stats=True,
                                           belief_sampler=belief_sampler_neural)
                 chosen_act = mcts_action if torch.is_tensor(mcts_action) else torch.as_tensor(mcts_action, dtype=torch.float32)
-                # trova indice dell'azione scelta tra i legali con key robusto (posizioni non-zero)
-                def _act_key(x_t: torch.Tensor):
-                    xt = x_t if torch.is_tensor(x_t) else torch.as_tensor(x_t, dtype=torch.float32)
-                    return tuple(torch.nonzero(xt > 0.5, as_tuple=False).flatten().tolist())
-                key_target = _act_key(chosen_act)
-                idx_t = None
-                for i_a, a in enumerate(legal):
-                    try:
-                        if _act_key(a) == key_target:
-                            idx_t = torch.tensor(i_a, dtype=torch.long)
-                            break
-                    except Exception:
-                        continue
-                if idx_t is None:
+                # trova indice dell'azione scelta tra i legali in O(A) vettoriale
+                try:
+                    legals_t = legal if torch.is_tensor(legal) else torch.stack([
+                        (x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal
+                    ], dim=0)
+                    # match su vettore: tutte e sole le posizioni non-zero devono coincidere
+                    nz_ch = (chosen_act > 0.5)
+                    nz_leg = (legals_t > 0.5)
+                    same = (nz_leg == nz_ch.unsqueeze(0))
+                    full_match = same.all(dim=1)
+                    idxs = torch.nonzero(full_match, as_tuple=False).flatten()
+                    idx_t = (idxs[0] if idxs.numel() > 0 else torch.tensor(0, dtype=torch.long))
+                except Exception:
                     idx_t = torch.tensor(0, dtype=torch.long)
                 next_obs, rew, done, info = env.step(chosen_act)
                 routing_log.append((cp, 'mcts'))
@@ -1149,7 +1145,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     else:
         old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
 
-    # Package CPU copies; transfer inside update to minimize H2D events
+    # Mantieni batch già tensori CPU; l'update ora li mapperà tutti su CUDA in un solo passaggio
     batch = {
         'obs': obs_cpu,
         'act': act_cpu,
@@ -1578,6 +1574,12 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             partner_actor = None
         main_seats = even_main_seats if (it % 2 == 0) else odd_main_seats
         use_parallel = (num_envs is not None and int(num_envs) > 1)
+        # Eval mode during data collection (dropout/BN off)
+        try:
+            agent.actor.eval()
+            agent.critic.eval()
+        except Exception:
+            pass
         if use_parallel:
             episodes_hint = max(1, horizon // 40)
             batch = collect_trajectory_parallel(agent,
@@ -1622,7 +1624,14 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             std = adv.std()
             std = torch.clamp(std, min=1e-8)
             batch['adv'] = (adv - mean) / std
-        info = agent.update(batch, epochs=4, minibatch_size=256)
+        # Ensure training mode on update
+        try:
+            agent.actor.train()
+            agent.critic.train()
+        except Exception:
+            pass
+        # Aumenta minibatch_size approfittando della VRAM ampia
+        info = agent.update(batch, epochs=4, minibatch_size=1024)
         dt = time.time() - t0
 
         # proxy per best: media return del batch

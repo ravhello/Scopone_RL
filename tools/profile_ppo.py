@@ -13,8 +13,8 @@ from trainers.train_ppo import train_ppo
 
 def main():
     parser = argparse.ArgumentParser(description='Profile short PPO run (torch or line-level).')
-    parser.add_argument('--iters', type=int, default=10, help='Iterations to run')
-    parser.add_argument('--horizon', type=int, default=256, help='Rollout horizon per iteration')
+    parser.add_argument('--iters', type=int, default=1, help='Iterations to run')
+    parser.add_argument('--horizon', type=int, default=128, help='Rollout horizon per iteration')
     parser.add_argument('--line', dest='line', action='store_true', default=True, help='Enable line-by-line profiler with per-line timings (default: on)')
     parser.add_argument('--no-line', dest='line', action='store_false', help='Disable line-by-line profiler')
     parser.add_argument('--wrap-update', dest='wrap_update', action='store_true', default=True, help='Also profile ActionConditionedPPO.update (default: on; slower)')
