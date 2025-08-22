@@ -6,7 +6,7 @@ from environment import ScoponeEnvMA
 from heuristics.baseline import pick_action_heuristic
 from selfplay.league import League
 try:
-    from torch.utils.tensorboard import SummaryWriter
+    from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
     TB_AVAILABLE = True
 except Exception:
     TB_AVAILABLE = False
@@ -72,7 +72,12 @@ def series_to_points(win_func, target_points=11):
 
 
 def eval_vs_baseline(games=50, use_compact_obs=True, k_history=12, log_tb=False):
-    writer = SummaryWriter(log_dir='runs/eval') if (log_tb and TB_AVAILABLE) else None
+    writer = None
+    if log_tb and TB_AVAILABLE and os.environ.get('SCOPONE_DISABLE_TB', '0') != '1':
+        try:
+            writer = _SummaryWriter(log_dir='runs/eval')
+        except Exception:
+            writer = None
     def agent_fn_team0(env):
         # actor placeholder: usa euristica come baseline anche per team0 se serve
         return pick_action_heuristic(env.get_valid_actions())

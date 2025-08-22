@@ -144,7 +144,8 @@ class ActionConditionedPPO:
                 tmp.index_copy_(0, group_ids, cap_logits)
                 group_max = torch.maximum(group_max, tmp)
             gmax_per_legal = group_max[group_ids]
-            exp_shifted = torch.exp(cap_logits - gmax_per_legal)
+            # Ensure dtype consistency under autocast (exp may return float32)
+            exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
             group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
             group_sum.index_add_(0, group_ids, exp_shifted)
             lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
@@ -270,7 +271,8 @@ class ActionConditionedPPO:
                 tmp.index_copy_(0, group_ids, cap_logits)
                 group_max = torch.maximum(group_max, tmp)
             gmax_per_legal = group_max[group_ids]
-            exp_shifted = torch.exp(cap_logits - gmax_per_legal)
+            # Ensure dtype consistency under autocast (exp may return float32)
+            exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
             group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
             group_sum.index_add_(0, group_ids, exp_shifted)
             lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))

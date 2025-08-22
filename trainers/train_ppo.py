@@ -11,11 +11,6 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TB_AVAILABLE = True
-except Exception:
-    TB_AVAILABLE = False
 
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
@@ -1506,7 +1501,13 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     else:
         agent.set_entropy_schedule(lambda s: entropy_schedule_linear(s))
 
-    writer = SummaryWriter(log_dir='runs/ppo_ac') if TB_AVAILABLE else None
+    writer = None
+    if os.environ.get('SCOPONE_DISABLE_TB', '0') != '1':
+        try:
+            from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
+            writer = _SummaryWriter(log_dir='runs/ppo_ac')
+        except Exception:
+            writer = None
     if writer is not None:
         # Spiega le metriche chiave in TensorBoard
         writer.add_text('help/metrics',
