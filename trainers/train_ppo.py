@@ -326,24 +326,27 @@ def _env_worker(worker_id: int,
                 # Fallback: store only chosen action as the single legal to keep API compatible
                 legals_list.append(act_t.clone().detach().to('cpu', dtype=torch.float32))
             chosen_index_list.append(int(idx))
-            # Others' hands supervision target (3x40)
+            # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
             try:
-                hands = env.game_state.get('hands', None)
-                if hands is not None:
-                    others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-                    target = torch.zeros((3,40), dtype=torch.float32)
-                    for i,pid in enumerate(others):
-                        for c in hands[pid]:
-                            if isinstance(c, int):
-                                cid = c
-                            else:
-                                r, s = c
-                                suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                                cid = int((r - 1) * 4 + suit_to_int[s])
-                            target[i, int(cid)] = 1.0
-                    others_hands_list.append(target)
-                else:
+                if float(os.environ.get('BELIEF_AUX_COEF', '0.1')) <= 0.0:
                     others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
+                else:
+                    hands = env.game_state.get('hands', None)
+                    if hands is not None:
+                        others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                        target = torch.zeros((3,40), dtype=torch.float32)
+                        for i,pid in enumerate(others):
+                            for c in hands[pid]:
+                                if isinstance(c, int):
+                                    cid = c
+                                else:
+                                    r, s = c
+                                    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+                                    cid = int((r - 1) * 4 + suit_to_int[s])
+                                target[i, int(cid)] = 1.0
+                        others_hands_list.append(target)
+                    else:
+                        others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
             except Exception:
                 others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
 
@@ -640,6 +643,14 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     routing_log = []  # (player_id, source)
 
     steps = 0
+    # Cache seat vectors (CPU) to avoid per-step allocations
+    _seat_cache = []
+    for cp_i in range(4):
+        v = torch.zeros(6, dtype=torch.float32)
+        v[cp_i] = 1.0
+        v[4] = 1.0 if cp_i in [0, 2] else 0.0
+        v[5] = 1.0 if cp_i in [1, 3] else 0.0
+        _seat_cache.append(v)
     if final_reward_only:
         # Raccogli per episodi completi: se non specificato, usa multipli di 40 derivati da horizon
         episodes = (max(1, horizon // 40) if episodes is None else max(1, int(episodes)))
@@ -661,33 +672,32 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             break
 
         cp = env.current_player
-        seat_vec = torch.zeros(6, dtype=torch.float32, device='cpu')
-        seat_vec[cp] = 1.0
-        seat_vec[4] = 1.0 if cp in [0, 2] else 0.0
-        seat_vec[5] = 1.0 if cp in [1, 3] else 0.0
+        seat_vec = _seat_cache[cp]
 
         # Selezione azione: se train_both_teams è True, tutti i seat sono "main"
         is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
         if is_main:
-            # Belief summary per il giocatore corrente ad ogni sua mossa
-            # belief neurale: usa actor per predire marginali; mantieni tensor 120-d su CPU per batch
-            o_cpu = obs.clone().detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device='cpu')
-            s_cpu = seat_vec.clone().detach().to('cpu', dtype=torch.float32)
-            o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-            s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-            with torch.no_grad():
-                state_feat = agent.actor.state_enc(o_t, s_t)
-                logits = agent.actor.belief_net(state_feat)
-                # visible mask da obs
-                hand_table = o_t[:, :83]
-                hand_mask = hand_table[:, :40] > 0.5
-                table_mask = hand_table[:, 43:83] > 0.5
-                captured = o_t[:, 83:165]
-                cap0_mask = captured[:, :40] > 0.5
-                cap1_mask = captured[:, 40:80] > 0.5
-                visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
-                probs_flat = agent.actor.belief_net.probs(logits, visible_mask)
-            bsum = probs_flat.squeeze(0).detach().to('cpu')
+            # Belief summary per il giocatore corrente: opzionale (disabilitato di default)
+            _enable_bsum = (os.environ.get('ENABLE_BELIEF_SUMMARY', '0') == '1')
+            if _enable_bsum:
+                o_cpu = obs.clone().detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device='cpu')
+                s_cpu = seat_vec.clone().detach().to('cpu', dtype=torch.float32)
+                o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                with torch.no_grad():
+                    state_feat = agent.actor.state_enc(o_t, s_t)
+                    logits = agent.actor.belief_net(state_feat)
+                    hand_table = o_t[:, :83]
+                    hand_mask = hand_table[:, :40] > 0.5
+                    table_mask = hand_table[:, 43:83] > 0.5
+                    captured = o_t[:, 83:165]
+                    cap0_mask = captured[:, :40] > 0.5
+                    cap1_mask = captured[:, 40:80] > 0.5
+                    visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
+                    probs_flat = agent.actor.belief_net.probs(logits, visible_mask)
+                bsum = probs_flat.squeeze(0).detach().to('cpu')
+            else:
+                bsum = torch.zeros(120, dtype=torch.float32)
             # MCTS sempre attivo (stile AlphaZero): poche simulazioni sempre, scala con il progresso della mano
             try:
                 progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
@@ -894,9 +904,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 chosen_act, _logp, idx_t = agent.select_action(obs, legal, seat_vec)
                 next_obs, rew, done, info = env.step(chosen_act)
                 routing_log.append((cp, 'main'))
-                # Nessuna distillazione per questo sample
-                mcts_policy_flat.extend([0.0] * len(legal))
-                mcts_weight_list.append(0.0)
+                # Nessuna distillazione per questo sample (evita di costruire zeri per risparmiare CPU)
+                pass
 
             obs_list.append(obs)
             next_obs_list.append(next_obs)
@@ -909,25 +918,27 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             legals_count.append(len(legal))
             chosen_index_t_list.append(idx_t)
             legals_list.extend(legal)
-            # costruisci target mani reali altrui (3x40) da stato env
+            # costruisci target mani reali altrui (3x40) da stato env (salta se BELIEF_AUX_COEF <= 0)
             try:
-                hands = env.game_state.get('hands', None)
-                if hands is not None:
-                    others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-                    target = torch.zeros((3,40), dtype=torch.float32)
-                    for i,pid in enumerate(others):
-                        for c in hands[pid]:
-                            # env hands should be IDs; if tuple, convert inline
-                            if isinstance(c, int):
-                                cid = c
-                            else:
-                                r, s = c
-                                suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                                cid = int((r - 1) * 4 + suit_to_int[s])
-                            target[i, int(cid)] = 1.0
-                    others_hands_targets.append(target)
-                else:
+                if float(os.environ.get('BELIEF_AUX_COEF', '0.1')) <= 0.0:
                     others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
+                else:
+                    hands = env.game_state.get('hands', None)
+                    if hands is not None:
+                        others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                        target = torch.zeros((3,40), dtype=torch.float32)
+                        for i,pid in enumerate(others):
+                            for c in hands[pid]:
+                                if isinstance(c, int):
+                                    cid = c
+                                else:
+                                    r, s = c
+                                    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+                                    cid = int((r - 1) * 4 + suit_to_int[s])
+                                target[i, int(cid)] = 1.0
+                        others_hands_targets.append(target)
+                    else:
+                        others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
             except Exception:
                 others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
         else:
@@ -1046,8 +1057,9 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     legals_offset_cpu = torch.as_tensor(legals_offset, dtype=torch.long) if len(legals_offset)>0 else torch.zeros((0,), dtype=torch.long)
     legals_count_cpu = torch.as_tensor(legals_count, dtype=torch.long) if len(legals_count)>0 else torch.zeros((0,), dtype=torch.long)
     chosen_index_cpu = (torch.stack(chosen_index_t_list, dim=0).to(dtype=torch.long) if len(chosen_index_t_list)>0 else torch.zeros((0,), dtype=torch.long))
-    mcts_policy_cpu = torch.as_tensor(mcts_policy_flat, dtype=torch.float32) if mcts_policy_flat else torch.zeros((0,), dtype=torch.float32)
-    mcts_weight_cpu = torch.as_tensor(mcts_weight_list, dtype=torch.float32) if mcts_weight_list else torch.zeros((0,), dtype=torch.float32)
+    # Evita tensori inutili pieni di zeri quando MCTS non è usato
+    mcts_policy_cpu = torch.as_tensor(mcts_policy_flat, dtype=torch.float32) if any((x != 0.0) for x in mcts_policy_flat) else torch.zeros((0,), dtype=torch.float32)
+    mcts_weight_cpu = torch.as_tensor(mcts_weight_list, dtype=torch.float32) if any((x != 0.0) for x in mcts_weight_list) else torch.zeros((0,), dtype=torch.float32)
     others_hands_cpu = torch.stack(others_hands_targets, dim=0) if len(others_hands_targets)>0 else torch.zeros((0,3,40), dtype=torch.float32)
     # Sanitizza lunghezze: policy_flat deve avere somma(cnts) elementi e weight deve avere len(obs)
     total_legals = int(legals_count_cpu.sum().item()) if len(legals_count_cpu) > 0 else 0
@@ -1089,7 +1101,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             max_cnt = int(legals_count_t.max().item()) if B > 0 else 0
             if max_cnt > 0:
                 state_proj = agent.actor.compute_state_proj(obs_t, seat_team_t)  # (B,64)
-                card_emb = agent.actor.card_emb_play.to(device)
+                card_emb = agent.actor.card_emb_play
                 card_logits_all = torch.matmul(state_proj, card_emb.t())  # (B,40)
                 pos = torch.arange(max_cnt, device=device, dtype=torch.long)
                 rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -1346,14 +1358,16 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     for ep in episodes_payloads:
         cnts_ep = ep['leg_cnt']
         if 'mcts_policy' in ep:
-            mcts_policy_flat.extend(ep['mcts_policy'])
-            mcts_weight.extend(ep.get('mcts_weight', [0.0]*len(ep['obs'])))
+            # Appendi solo se esiste almeno un contributo non-zero per ridurre overhead
+            if any((v != 0.0) for v in ep['mcts_policy']):
+                mcts_policy_flat.extend(ep['mcts_policy'])
+                mcts_weight.extend(ep.get('mcts_weight', [0.0]*len(ep['obs'])))
         if 'others_hands' in ep:
             for oh in ep['others_hands']:
                 others_hands.append(torch.as_tensor(oh, dtype=torch.float32))
         base += len(cnts_ep)
-    mcts_policy_t = torch.as_tensor(mcts_policy_flat, dtype=torch.float32)
-    mcts_weight_t = torch.as_tensor(mcts_weight, dtype=torch.float32)
+    mcts_policy_t = torch.as_tensor(mcts_policy_flat, dtype=torch.float32) if any((x != 0.0) for x in mcts_policy_flat) else torch.zeros((0,), dtype=torch.float32)
+    mcts_weight_t = torch.as_tensor(mcts_weight, dtype=torch.float32) if any((x != 0.0) for x in mcts_weight) else torch.zeros((0,), dtype=torch.float32)
     others_hands_t = torch.stack(others_hands, dim=0) if len(others_hands)>0 else torch.zeros((0,3,40), dtype=torch.float32)
 
     # Compute values and advantages on GPU similar to collect_trajectory
@@ -1395,7 +1409,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             if max_cnt > 0:
                 # State projection and card logits
                 state_proj = agent.actor.compute_state_proj(obs_t, seat_t)  # (B,64)
-                card_emb = agent.actor.card_emb_play.to(device)
+                card_emb = agent.actor.card_emb_play
                 card_logits_all = torch.matmul(state_proj, card_emb.t())  # (B,40)
                 pos = torch.arange(max_cnt, device=device, dtype=torch.long)
                 rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -1468,7 +1482,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
 
 def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 200, ckpt_path: str = 'checkpoints/ppo_ac.pth', use_compact_obs: bool = True, k_history: int = 39, seed: int = 0,
               entropy_schedule_type: str = 'linear', eval_every: int = 0, eval_games: int = 10, belief_particles: int = 512, belief_ess_frac: float = 0.5,
-              mcts_in_eval: bool = True, mcts_sims: int = 128, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
+              mcts_in_eval: bool = True, mcts_sims: int = 128, mcts_sims_eval: Optional[int] = None, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
               mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25,
               num_envs: int = 32,
               on_iter_end: Optional[Callable[[int], None]] = None):
@@ -1635,7 +1649,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 mcts_cfg = None
                 if mcts_in_eval:
                     mcts_cfg = {
-                        'sims': mcts_sims,
+                        'sims': int(mcts_sims_eval if mcts_sims_eval is not None else mcts_sims),
                         'dets': mcts_dets,
                         'c_puct': mcts_c_puct,
                         'root_temp': mcts_root_temp,
@@ -1765,6 +1779,7 @@ if __name__ == '__main__':
     parser.add_argument('--mcts-train', action='store_true', default=True, help='Use MCTS during training action selection for main seats')
     parser.add_argument('--train-both-teams', action='store_true', help='Train both teams simultaneously (all seats are main)')
     parser.add_argument('--mcts-sims', type=int, default=128)
+    parser.add_argument('--mcts-sims-eval', type=int, default=None, help='Override eval MCTS sims (default: same as --mcts-sims)')
     parser.add_argument('--mcts-dets', type=int, default=4)
     parser.add_argument('--mcts-c-puct', type=float, default=1.0)
     parser.add_argument('--mcts-root-temp', type=float, default=0.0)
@@ -1777,7 +1792,7 @@ if __name__ == '__main__':
               use_compact_obs=args.compact, k_history=args.k_history, seed=args.seed,
               entropy_schedule_type=args.entropy_schedule, eval_every=args.eval_every, eval_games=args.eval_games,
               belief_particles=args.belief_particles, belief_ess_frac=args.belief_ess_frac,
-              mcts_in_eval=args.mcts_eval, mcts_sims=args.mcts_sims, mcts_dets=args.mcts_dets, mcts_c_puct=args.mcts_c_puct,
+              mcts_in_eval=args.mcts_eval, mcts_sims=args.mcts_sims, mcts_sims_eval=args.mcts_sims_eval, mcts_dets=args.mcts_dets, mcts_c_puct=args.mcts_c_puct,
               mcts_root_temp=args.mcts_root_temp, mcts_prior_smooth_eps=args.mcts_prior_smooth_eps,
               mcts_dirichlet_alpha=args.mcts_dirichlet_alpha, mcts_dirichlet_eps=args.mcts_dirichlet_eps,
               num_envs=args.num_envs)

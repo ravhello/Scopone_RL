@@ -34,7 +34,6 @@ class ActionConditionedPPO:
         shared_enc = StateEncoderCompact()
         self.actor = ActionConditionedActor(obs_dim, action_dim, state_encoder=shared_enc)
         self.critic = CentralValueNet(obs_dim, state_encoder=shared_enc)
-        # esecuzione diretta (rimosso torch.compile)
 
         # Optimizers with fused/foreach when available to reduce kernel launches
         try:
@@ -122,7 +121,7 @@ class ActionConditionedPPO:
         with cm:
             # Scoring simultaneo di tutte le azioni legali via fattorizzazione
             state_proj = self.actor.compute_state_proj(obs_t, st)  # (1,64)
-            card_emb = self.actor.card_emb_play.to(device)
+            card_emb = self.actor.card_emb_play
             card_logits_all = torch.matmul(state_proj, card_emb.t()).squeeze(0)  # (40)
             played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
             # logp carta con mask sulle sole carte presenti nei legali
@@ -230,7 +229,7 @@ class ActionConditionedPPO:
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # State projection e logits per carta
         state_proj = self.actor.compute_state_proj(obs, seat)  # (B,64)
-        card_emb = self.actor.card_emb_play.to(device)
+        card_emb = self.actor.card_emb_play
         card_logits_all = torch.matmul(state_proj, card_emb.t())       # (B,40)
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
@@ -304,7 +303,7 @@ class ActionConditionedPPO:
         distill_loss = torch.tensor(0.0, device=device)
         # Loss ausiliaria per BeliefNet: cross-entropy 3x40 verso mani reali altrui (mascherando carte visibili)
         belief_aux = torch.tensor(0.0, device=device)
-        if max_cnt > 0 and mcts_policy_flat.numel() >= int(cnts.sum().item()) and mcts_weight.numel() == B:
+        if max_cnt > 0 and mcts_weight.numel() == B and (mcts_weight.sum() > 0) and mcts_policy_flat.numel() >= int(cnts.sum().item()):
             # Ricostruisci (B, max_cnt) target evitando contributi sui padding (restano a 0)
             target = torch.full((B, max_cnt), 0.0, device=device, dtype=torch.float32)
             start = 0

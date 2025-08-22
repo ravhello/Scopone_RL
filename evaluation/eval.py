@@ -14,6 +14,18 @@ from models.action_conditioned import ActionConditionedActor
 from algorithms.is_mcts import run_is_mcts
 # BeliefState legacy opzionale (non usato nello scenario corrente)
 
+_DEVICE_STR = os.environ.get(
+    'SCOPONE_DEVICE',
+    ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
+)
+device = torch.device(_DEVICE_STR)
+try:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
 
 def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs: bool = True, k_history: int = 12) -> Tuple[float, dict]:
     """
@@ -104,8 +116,8 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
     obs_dim = env0.observation_space.shape[0]
     del env0
     # Carica attori
-    actor_a = ActionConditionedActor(obs_dim=obs_dim)
-    actor_b = ActionConditionedActor(obs_dim=obs_dim)
+    actor_a = ActionConditionedActor(obs_dim=obs_dim).to(device)
+    actor_b = ActionConditionedActor(obs_dim=obs_dim).to(device)
     try:
         if ckpt_a and os.path.isfile(ckpt_a):
             st_a = torch.load(ckpt_a, map_location=device)
@@ -146,7 +158,7 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                     leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
                     s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
                     with torch.no_grad():
-                        logits = actor_model(o_t, leg_t, s_t, None)
+                        logits = actor_model(o_t, leg_t, s_t)
                         probs = torch.softmax(logits, dim=0).detach().cpu().numpy()
                     return probs
                 # belief sampler neurale
@@ -222,7 +234,7 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
             leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
             s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
             with torch.no_grad():
-                logits = actor_model(o_t, leg_t, s_t, None)
+                logits = actor_model(o_t, leg_t, s_t)
                 idx = torch.argmax(logits).to('cpu')
             return leg_cpu[idx]
         return _select

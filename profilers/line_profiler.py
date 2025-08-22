@@ -4,6 +4,7 @@ import pandas as pd
 import contextlib
 import sys
 import time
+import types
 
 # Try to import torch for GPU profiling
 try:
@@ -47,7 +48,12 @@ class LineProfiler:
         def tracefunc(frame, event, arg):
             if event == 'call':
                 # Initialize timing when entering a profiled function
-                if frame.f_code in self.allowed_codes:
+                try:
+                    codeobj = getattr(frame, 'f_code', None)
+                    in_allowed = (isinstance(codeobj, types.CodeType) and (codeobj in self.allowed_codes))
+                except Exception:
+                    in_allowed = False
+                if in_allowed:
                     func_start_time = time.time()
                     gpu_start_time = 0
                     if self.use_cuda:
@@ -118,7 +124,9 @@ class LineProfiler:
     def _trace_line(self, frame):
         """Trace a line execution within a profiled function."""
         frame_id = id(frame)
-        code = frame.f_code
+        code = getattr(frame, 'f_code', None)
+        if not isinstance(code, types.CodeType):
+            return
         func_name = code.co_name
         line_no = frame.f_lineno
         
@@ -171,7 +179,9 @@ class LineProfiler:
     def _trace_return(self, frame):
         """Handle function return while profiling."""
         frame_id = id(frame)
-        code = frame.f_code
+        code = getattr(frame, 'f_code', None)
+        if not isinstance(code, types.CodeType):
+            return
         func_name = code.co_name
         
         # Verify this is a function we're profiling

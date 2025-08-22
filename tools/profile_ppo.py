@@ -15,8 +15,10 @@ def main():
     parser = argparse.ArgumentParser(description='Profile short PPO run (torch or line-level).')
     parser.add_argument('--iters', type=int, default=10, help='Iterations to run')
     parser.add_argument('--horizon', type=int, default=256, help='Rollout horizon per iteration')
-    parser.add_argument('--line', action='store_true', help='Enable line-by-line profiler with per-line timings')
-    parser.add_argument('--wrap-update', action='store_true', help='Also profile ActionConditionedPPO.update (slower)')
+    parser.add_argument('--line', dest='line', action='store_true', default=True, help='Enable line-by-line profiler with per-line timings (default: on)')
+    parser.add_argument('--no-line', dest='line', action='store_false', help='Disable line-by-line profiler')
+    parser.add_argument('--wrap-update', dest='wrap_update', action='store_true', default=True, help='Also profile ActionConditionedPPO.update (default: on; slower)')
+    parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
     args = parser.parse_args()
 
@@ -58,7 +60,7 @@ def main():
                 global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         except Exception:
             pass
-        train_fn(num_iterations=max(1, args.iters), horizon=max(32, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0)
+        train_fn(num_iterations=max(1, args.iters), horizon=max(32, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False)
 
         # Print per-function and per-line stats (includes line numbers and source)
         try:

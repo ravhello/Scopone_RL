@@ -142,7 +142,7 @@ class StateEncoderCompact(nn.Module):
         other_counts = hand_table[:, 40:43]
         table_mask = hand_table[:, 43:83]
         # Sum-pool embeddings
-        card_emb = self.card_emb.to(obs.device)
+        card_emb = self.card_emb
         hand_feat = torch.matmul(hand_mask, card_emb)           # (B,32)
         table_feat = torch.matmul(table_mask, card_emb)         # (B,32)
         other_cnt_feat = self.counts_head_hand(other_counts)    # (B,16)
@@ -368,7 +368,7 @@ class ActionConditionedActor(torch.nn.Module):
         belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
         partner_slice = belief_probs_flat[:, 40:80]
         opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
-        emb = self.belief_card_emb.to(x_obs.device)
+        emb = self.belief_card_emb
         partner_feat = torch.matmul(partner_slice, emb)     # (B,32)
         opp_feat = torch.matmul(opps_slice, emb)            # (B,32)
         pg = self.partner_gate(state_feat)
@@ -405,7 +405,7 @@ class ActionConditionedActor(torch.nn.Module):
         # Partner index fisso nel nostro belief: slice centrale [40:80]
         partner_slice = belief_probs_flat[:, 40:80]
         opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
-        emb = self.belief_card_emb.to(x_obs.device)
+        emb = self.belief_card_emb
         partner_feat = torch.matmul(partner_slice, emb)     # (B,32)
         opp_feat = torch.matmul(opps_slice, emb)            # (B,32)
         # Gating dipendente dallo stato
@@ -418,7 +418,7 @@ class ActionConditionedActor(torch.nn.Module):
 
         if legals is None:
             # Calcola logits per tutte le 80 azioni: (B,64) @ (64,80) -> (B,80)
-            all_actions = self.all_actions_eye.to(state_proj.device)
+            all_actions = self.all_actions_eye
             action_emb = self.action_enc(all_actions)  # (80,64)
             logits = torch.matmul(state_proj, action_emb.t())  # (B,80)
             return logits if logits.size(0) > 1 else logits.squeeze(0)
@@ -486,7 +486,7 @@ class CentralValueNet(torch.nn.Module):
         # Partner/opponent channel split con gating
         partner_slice = b_probs_flat[:, 40:80]
         opps_slice = b_probs_flat[:, 0:40] + b_probs_flat[:, 80:120]
-        emb = self.belief_card_emb.to(x_obs.device)
+        emb = self.belief_card_emb
         partner_feat = torch.matmul(partner_slice, emb)
         opp_feat = torch.matmul(opps_slice, emb)
         pg = self.partner_gate(state_feat)
