@@ -1,6 +1,5 @@
 import os
 import sys
-import torch
 import argparse
 
 # Ensure project root on sys.path for module imports
@@ -8,13 +7,51 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# Align environment/device behavior with main.py BEFORE importing training code
+# Silence TF/absl noise and enable TB by default
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+os.environ.setdefault('ABSL_LOGGING_MIN_LOG_LEVEL', '3')
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
+## Abilita torch.compile di default anche nel profiler (override via env)
+os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
+os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
+## Disabilita max_autotune_gemm di Inductor per evitare warning su GPU con poche SM
+os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
+## Evita graph break su .item() catturando scalari nei grafi
+os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
+os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
+## Non forzare TORCH_LOGS ad un valore non valido; lascia default
+## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
+os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
+
+import torch
+
+# Prefer GPU for models if available; never force CPU unless explicitly requested
+if os.environ.get('TESTS_FORCE_CPU') == '1':
+    try:
+        del os.environ['TESTS_FORCE_CPU']
+    except Exception:
+        pass
+
+# Ensure device selection consistent with main
+try:
+    from utils.device import get_compute_device
+    _dev = get_compute_device()
+    # If CUDA is available but not selected, allow override
+    if torch.cuda.is_available() and str(_dev) != 'cuda':
+        os.environ.setdefault('SCOPONE_DEVICE', 'cuda')
+except Exception:
+    pass
+
 from trainers.train_ppo import train_ppo
 
 
 def main():
     parser = argparse.ArgumentParser(description='Profile short PPO run (torch or line-level).')
-    parser.add_argument('--iters', type=int, default=1, help='Iterations to run')
-    parser.add_argument('--horizon', type=int, default=128, help='Rollout horizon per iteration')
+    parser.add_argument('--iters', type=int, default=30, help='Iterations to run')
+    parser.add_argument('--horizon', type=int, default=2048, help='Rollout horizon per iteration')
     parser.add_argument('--line', dest='line', action='store_true', default=True, help='Enable line-by-line profiler with per-line timings (default: on)')
     parser.add_argument('--no-line', dest='line', action='store_false', help='Disable line-by-line profiler')
     parser.add_argument('--wrap-update', dest='wrap_update', action='store_true', default=True, help='Also profile ActionConditionedPPO.update (default: on; slower)')
@@ -60,7 +97,7 @@ def main():
                 global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         except Exception:
             pass
-        train_fn(num_iterations=max(1, args.iters), horizon=max(32, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False)
+        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False)
 
         # Print per-function and per-line stats (includes line numbers and source)
         try:
@@ -142,7 +179,7 @@ def main():
         #experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         # Short run for signal; adjust if needed
-        train_ppo(num_iterations=max(1, args.iters), horizon=max(32, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0)
+        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0)
 
     # Export chrome trace
     #prof.export_chrome_trace(trace_path)

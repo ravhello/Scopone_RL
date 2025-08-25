@@ -624,6 +624,11 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                        mcts_progress_full: float = 0.75,
                        mcts_min_sims: int = 0,
                        train_both_teams: bool = False) -> Dict:
+    # Enforce minimum horizon of 40 (full hand length)
+    try:
+        horizon = max(40, int(horizon))
+    except Exception:
+        horizon = 40
     obs_list, next_obs_list = [], []
     act_list = []
     rew_list, done_list = [], []
@@ -666,6 +671,21 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         obs = env._get_observation(env.current_player)
         legal = env.get_valid_actions()
         if not legal:
+            if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
+                try:
+                    cp = env.current_player
+                    hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
+                    table_ids_dbg = list(env._table_ids) if hasattr(env, '_table_ids') else []
+                    print("[DEBUG] No legal actions computed", {
+                        'current_player': cp,
+                        'hand_ids': hand_ids_dbg,
+                        'table_ids': table_ids_dbg,
+                        'done': bool(env.done),
+                        'history_len': len(env.game_state.get('history', [])) if isinstance(env.game_state, dict) else None,
+                        'rules': getattr(env, 'rules', {})
+                    })
+                except Exception:
+                    pass
             break
 
         cp = env.current_player
@@ -883,7 +903,37 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                     idx_t = (idxs[0] if idxs.numel() > 0 else torch.tensor(0, dtype=torch.long))
                 except Exception:
                     idx_t = torch.tensor(0, dtype=torch.long)
-                next_obs, rew, done, info = env.step(chosen_act)
+                try:
+                    next_obs, rew, done, info = env.step(chosen_act)
+                except Exception as e:
+                    if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
+                        try:
+                            import traceback as _tb
+                            cp = env.current_player
+                            hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
+                            table_ids_dbg = list(env._table_ids) if hasattr(env, '_table_ids') else []
+                            # Summarize chosen action
+                            try:
+                                nz = (chosen_act > 0.5)
+                                played_id = int(torch.argmax(chosen_act[:40]).item()) if torch.is_tensor(chosen_act) else None
+                                captured_ids = [int(i) for i in torch.nonzero(nz[40:], as_tuple=False).flatten().tolist()] if torch.is_tensor(chosen_act) else []
+                            except Exception:
+                                played_id, captured_ids = None, []
+                            print("[DEBUG] Exception in env.step during MCTS/main path:", str(e))
+                            _tb.print_exc()
+                            print({
+                                'current_player': cp,
+                                'hand_ids': hand_ids_dbg,
+                                'table_ids': table_ids_dbg,
+                                'chosen_played_id': played_id,
+                                'chosen_captured_ids': captured_ids,
+                                'num_legals': int(len(legal)),
+                                'matches_any_legal': any(bool(((l > 0.5) == (chosen_act > 0.5)).all().item()) for l in legal) if (torch.is_tensor(chosen_act) and isinstance(legal, list) and len(legal)>0 and torch.is_tensor(legal[0])) else 'n/a',
+                                'rules': getattr(env, 'rules', {})
+                            })
+                        except Exception:
+                            pass
+                    raise
                 routing_log.append((cp, 'mcts'))
                 # registra target distillazione per questo sample (ordine legali corrente)
                 try:
@@ -898,7 +948,36 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 mcts_weight_list.append(1.0)
             else:
                 chosen_act, _logp, idx_t = agent.select_action(obs, legal, seat_vec)
-                next_obs, rew, done, info = env.step(chosen_act)
+                try:
+                    next_obs, rew, done, info = env.step(chosen_act)
+                except Exception as e:
+                    if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
+                        try:
+                            import traceback as _tb
+                            cp = env.current_player
+                            hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
+                            table_ids_dbg = list(env._table_ids) if hasattr(env, '_table_ids') else []
+                            try:
+                                nz = (chosen_act > 0.5)
+                                played_id = int(torch.argmax(chosen_act[:40]).item()) if torch.is_tensor(chosen_act) else None
+                                captured_ids = [int(i) for i in torch.nonzero(nz[40:], as_tuple=False).flatten().tolist()] if torch.is_tensor(chosen_act) else []
+                            except Exception:
+                                played_id, captured_ids = None, []
+                            print("[DEBUG] Exception in env.step during main (no-MCTS) path:", str(e))
+                            _tb.print_exc()
+                            print({
+                                'current_player': cp,
+                                'hand_ids': hand_ids_dbg,
+                                'table_ids': table_ids_dbg,
+                                'chosen_played_id': played_id,
+                                'chosen_captured_ids': captured_ids,
+                                'num_legals': int(len(legal)),
+                                'matches_any_legal': any(bool(((l > 0.5) == (chosen_act > 0.5)).all().item()) for l in legal) if (torch.is_tensor(chosen_act) and isinstance(legal, list) and len(legal)>0 and torch.is_tensor(legal[0])) else 'n/a',
+                                'rules': getattr(env, 'rules', {})
+                            })
+                        except Exception:
+                            pass
+                    raise
                 routing_log.append((cp, 'main'))
                 # Nessuna distillazione per questo sample (evita di costruire zeri per risparmiare CPU)
                 pass
@@ -923,15 +1002,17 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                     if hands is not None:
                         others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
                         target = torch.zeros((3,40), dtype=torch.float32)
+                        # Pre-bind mapping to avoid inside-loop dict lookups
+                        suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
                         for i,pid in enumerate(others):
-                            for c in hands[pid]:
+                            cards = hands[pid]
+                            for c in cards:
                                 if isinstance(c, int):
-                                    cid = c
+                                    cid = int(c)
                                 else:
                                     r, s = c
-                                    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                                    cid = int((r - 1) * 4 + suit_to_int[s])
-                                target[i, int(cid)] = 1.0
+                                    cid = int((int(r) - 1) * 4 + suit_to_int[s])
+                                target[i, cid] = 1.0
                         others_hands_targets.append(target)
                     else:
                         others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
@@ -957,7 +1038,35 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                     x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device='cpu')
                 for x in legal], dim=0)
                 act = leg_t[idx_t]
-            next_obs, rew, done, info = env.step(act)
+            try:
+                next_obs, rew, done, info = env.step(act)
+            except Exception as e:
+                if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
+                    try:
+                        import traceback as _tb
+                        cp = env.current_player
+                        hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
+                        table_ids_dbg = list(env._table_ids) if hasattr(env, '_table_ids') else []
+                        try:
+                            nz = (act > 0.5)
+                            played_id = int(torch.argmax(act[:40]).item()) if torch.is_tensor(act) else None
+                            captured_ids = [int(i) for i in torch.nonzero(nz[40:], as_tuple=False).flatten().tolist()] if torch.is_tensor(act) else []
+                        except Exception:
+                            played_id, captured_ids = None, []
+                        print("[DEBUG] Exception in env.step during frozen/opponent path:", str(e))
+                        _tb.print_exc()
+                        print({
+                            'current_player': cp,
+                            'hand_ids': hand_ids_dbg,
+                            'table_ids': table_ids_dbg,
+                            'chosen_played_id': played_id,
+                            'chosen_captured_ids': captured_ids,
+                            'num_legals': int(len(legal)),
+                            'rules': getattr(env, 'rules', {})
+                        })
+                    except Exception:
+                        pass
+                raise
             routing_log.append((cp, 'partner' if is_partner_seat else 'opponent'))
         
 
@@ -1097,7 +1206,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             max_cnt = int(legals_count_t.max().item()) if B > 0 else 0
             if max_cnt > 0:
                 state_proj = agent.actor.compute_state_proj(obs_t, seat_team_t)  # (B,64)
-                card_emb = agent.actor.card_emb_play
+                card_emb = agent.actor.card_emb_play.to(device=state_proj.device, dtype=state_proj.dtype)
                 card_logits_all = torch.matmul(state_proj, card_emb.t())  # (B,40)
                 pos = torch.arange(max_cnt, device=device, dtype=torch.long)
                 rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -1149,9 +1258,10 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     batch = {
         'obs': obs_cpu,
         'act': act_cpu,
-        'old_logp': old_logp_t.detach().to('cpu'),
-        'ret': ret_t.detach().to('cpu'),
-        'adv': adv_t.detach().to('cpu'),
+        # lascia tensori chiave su CUDA quando presenti
+        'old_logp': old_logp_t.detach(),
+        'ret': ret_t.detach(),
+        'adv': adv_t.detach(),
         'rew': rew_t,
         'done': done_t,
         'seat_team': seat_team_cpu,
@@ -1199,6 +1309,12 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     action_queues = [ctx.Queue(maxsize=2) for _ in range(num_envs)]
     # Distribute episodes roughly equally
     episodes_per_env = max(1, int((episodes_total_hint + num_envs - 1) // num_envs))
+    try:
+        total_eps = episodes_per_env * num_envs
+        print(f"[collector] num_envs={num_envs} episodes_total_hint={episodes_total_hint} "
+              f"episodes_per_env={episodes_per_env} total_env_episodes={total_eps}", flush=True)
+    except Exception:
+        pass
     workers = []
     cfg = {
         'rules': {'shape_scopa': False},
@@ -1405,7 +1521,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             if max_cnt > 0:
                 # State projection and card logits
                 state_proj = agent.actor.compute_state_proj(obs_t, seat_t)  # (B,64)
-                card_emb = agent.actor.card_emb_play
+                card_emb = agent.actor.card_emb_play.to(device=state_proj.device, dtype=state_proj.dtype)
                 card_logits_all = torch.matmul(state_proj, card_emb.t())  # (B,40)
                 pos = torch.arange(max_cnt, device=device, dtype=torch.long)
                 rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -1457,9 +1573,10 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     batch = {
         'obs': obs_cpu_t,
         'act': act_cpu_t,
-        'old_logp': old_logp_t.detach().to('cpu'),
-        'ret': ret_vec.detach().to('cpu'),
-        'adv': adv_vec.detach().to('cpu'),
+        # Mantieni tensori chiave su CUDA per evitare D2H→H2D
+        'old_logp': old_logp_t.detach(),
+        'ret': ret_vec.detach(),
+        'adv': adv_vec.detach(),
         'rew': rew_t,
         'done': torch.as_tensor(done_list, dtype=torch.bool, device=device) if len(done_list)>0 else torch.zeros((0,), dtype=torch.bool, device=device),
         'seat_team': seat_cpu_t,
@@ -1482,6 +1599,11 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
               mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25,
               num_envs: int = 32,
               on_iter_end: Optional[Callable[[int], None]] = None):
+    # Enforce minimum horizon of 40
+    try:
+        horizon = max(40, int(horizon))
+    except Exception:
+        horizon = 40
     set_global_seeds(seed)
     # Disattiva reward shaping intermedio: solo reward finale
     env = ScoponeEnvMA(rules={'shape_scopa': False}, use_compact_obs=use_compact_obs, k_history=k_history)
@@ -1515,7 +1637,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     if os.environ.get('SCOPONE_DISABLE_TB', '0') != '1':
         try:
             from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
-            writer = _SummaryWriter(log_dir='runs/ppo_ac')
+            flush_secs = int(os.environ.get('TB_FLUSH_SECS', '2'))
+            writer = _SummaryWriter(log_dir='runs/ppo_ac', flush_secs=flush_secs)
         except Exception:
             writer = None
     if writer is not None:
@@ -1553,7 +1676,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     best_wr = -1e9
     best_wr_ckpt_path = ckpt_path.replace('.pth', '_bestwr.pth')
 
-    for it in tqdm(range(num_iterations), desc="PPO iterations"):
+    # Two-line UI: top line shows metrics, second line is the progress bar
+    metrics_bar = tqdm(total=1, desc="", position=0, dynamic_ncols=True, bar_format='{desc}', leave=True)
+    pbar = tqdm(range(num_iterations), desc="PPO iterations", dynamic_ncols=True, position=1, leave=True)
+    for it in pbar:
         t0 = time.time()
         try:
             p_ckpt, o_ckpt = league.sample_pair()
@@ -1582,6 +1708,14 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             pass
         if use_parallel:
             episodes_hint = max(1, horizon // 40)
+            # Debug: mostra hint e distribuzione per-env
+            try:
+                eps_per_env_dbg = max(1, (episodes_hint + int(num_envs) - 1) // int(num_envs))
+                total_eps_dbg = eps_per_env_dbg * int(num_envs)
+                print(f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
+                      f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}", flush=True)
+            except Exception:
+                pass
             batch = collect_trajectory_parallel(agent,
                                                 num_envs=int(num_envs),
                                                 episodes_total_hint=episodes_hint,
@@ -1631,7 +1765,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         except Exception:
             pass
         # Aumenta minibatch_size approfittando della VRAM ampia
-        info = agent.update(batch, epochs=4, minibatch_size=1024)
+        info = agent.update(batch, epochs=4, minibatch_size=4096)
         dt = time.time() - t0
 
         # proxy per best: media return del batch
@@ -1700,11 +1834,23 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         pass
                     agent.save(best_wr_ckpt_path)
 
-        if it % 50 == 0:
+        # Aggiorna output terminale ad ogni iterazione
+        try:
             def _to_float(x):
                 return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
-            pretty = {k: round(_to_float(v), 4) for k, v in info.items()}
-            print(pretty)
+            preview_keys = ['loss_pi', 'loss_v', 'approx_kl', 'clip_frac', 'avg_clip_frac', 'avg_kl']
+            preview = {k: round(_to_float(info[k]), 4) for k in preview_keys if k in info}
+            preview.update({'avg_ret': round(avg_return, 4), 't_s': round(dt, 2)})
+            # One line above the progress bar
+            metrics_str = (
+                f"it {it} | " +
+                " ".join([f"{k}:{v}" for k, v in preview.items()])
+            )
+            metrics_bar.set_description_str(metrics_str)
+            metrics_bar.refresh()
+            pbar.set_postfix(preview)
+        except Exception:
+            pass
         if writer is not None:
             def _to_float(x):
                 return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
@@ -1749,6 +1895,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     writer.add_scalar(key, float(num), it)
             except Exception:
                 pass
+            try:
+                writer.flush()
+            except Exception:
+                pass
         if (it + 1) % save_every == 0:
             try:
                 os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
@@ -1767,13 +1917,18 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 pass
     if writer is not None:
         writer.close()
+    try:
+        metrics_bar.close()
+        pbar.close()
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Train PPO Action-Conditioned for Scopone')
     parser.add_argument('--iters', type=int, default=2000, help='Number of PPO iterations')
-    parser.add_argument('--horizon', type=int, default=256, help='Rollout horizon (steps) per iteration; con solo reward finale raccoglie ~horizon//40 episodi')
+    parser.add_argument('--horizon', type=int, default=256, help='Rollout horizon (steps) per iteration (minimo 40); con solo reward finale raccoglie ~horizon//40 episodi')
     parser.add_argument('--save-every', type=int, default=200, help='Save checkpoint every N iterations')
     parser.add_argument('--ckpt', type=str, default='checkpoints/ppo_ac.pth', help='Checkpoint path')
     parser.add_argument('--compact', action='store_true', help='Use compact observation (recommended)')
@@ -1797,7 +1952,7 @@ if __name__ == '__main__':
     parser.add_argument('--mcts-dirichlet-eps', type=float, default=0.25)
     parser.add_argument('--num-envs', type=int, default=32, help='Number of parallel env workers (>=1). 1 disables parallel mode')
     args = parser.parse_args()
-    train_ppo(num_iterations=args.iters, horizon=args.horizon, save_every=args.save_every, ckpt_path=args.ckpt,
+    train_ppo(num_iterations=args.iters, horizon=max(40, int(args.horizon)), save_every=args.save_every, ckpt_path=args.ckpt,
               use_compact_obs=args.compact, k_history=args.k_history, seed=args.seed,
               entropy_schedule_type=args.entropy_schedule, eval_every=args.eval_every, eval_games=args.eval_games,
               belief_particles=args.belief_particles, belief_ess_frac=args.belief_ess_frac,

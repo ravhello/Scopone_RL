@@ -45,8 +45,17 @@ class ScoponeEnvMA(gym.Env):
         self.use_compact_obs = True if use_compact_obs is None else bool(use_compact_obs) or True
         self.k_history = int(k_history)
         if self.use_compact_obs:
-            # Dimensione compatta: 43 + 40 + 82 + 61*k + 40 + 120 + 8 + 2 + 1 + 2 + 1 + 10 + 150
-            obs_dim = 43 + 40 + 82 + 61 * self.k_history + 40 + 120 + 8 + 2 + 1 + 2 + 1 + 10 + 150
+            # Dimensione compatta dinamica in base ai flag OBS_INCLUDE_*:
+            # Base fisse: 43 (mani) + 40 (tavolo) + 82 (catture) + 61*k (history) + 40 (missing)
+            #            + 120 (inferred) + 8 (primiera) + 2 (denari) + 1 (settebello) + 2 (score)
+            #            + 1 (table sum) + 10 (table possible sums) + 2 (scopa counts)
+            include_rank = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
+            include_scopa = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
+            include_inferred = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
+            # Part fisse comuni (senza inferred): 43+40+82 + 61*k + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30
+            fixed = 43 + 40 + 82 + 61 * self.k_history + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30
+            base = fixed + (120 if include_inferred else 0)
+            obs_dim = base + (10 if include_scopa else 0) + (150 if include_rank else 0)
         else:
             # Non dovrebbe mai accadere: legacy disattivata
             raise NotImplementedError("La rappresentazione legacy 10823-dim è deprecata: usa use_compact_obs=True")
@@ -201,12 +210,18 @@ class ScoponeEnvMA(gym.Env):
             self._get_valid_actions_time += time.time() - start_time
             return valid_actions
 
+        # Hoist invariants out of per-hand loop
+        encode_fn = encode_action_from_ids_gpu
+        if table_ids_t.numel() > 0:
+            table_ranks = (table_ids_t // 4 + 1).to(torch.int64)
+        else:
+            table_ranks = None
+
         for pid_t in hand_ids_t:
             prank_t = (pid_t // 4 + 1).to(torch.int64)
 
-            # Pari-rank sul tavolo
-            if table_ids_t.numel() > 0:
-                table_ranks = (table_ids_t // 4 + 1).to(torch.int64)
+            # Pari-rank sul tavolo (use hoisted table_ranks if available)
+            if table_ranks is not None:
                 direct_sel = (table_ranks == prank_t)
                 direct_ids_t = table_ids_t[direct_sel]
             else:
@@ -214,7 +229,7 @@ class ScoponeEnvMA(gym.Env):
 
             if direct_ids_t.numel() > 0:
                 for did_t in direct_ids_t:
-                    valid_actions.append(encode_action_from_ids_gpu(pid_t, did_t.view(1)))
+                    valid_actions.append(encode_fn(pid_t, did_t.view(1)))
             else:
                 # Somma: trova subset con somma pari a prank (DP su somma-rank, n piccolo, rank<=10)
                 n = int(table_ids_t.numel())
@@ -249,7 +264,7 @@ class ScoponeEnvMA(gym.Env):
                         for bm in masks_list:
                             sel_ids = [table_ids[j] for j in range(n) if ((bm >> j) & 1) == 1]
                             cap_ids_t = torch.as_tensor(sel_ids, dtype=torch.long, device=device)
-                            valid_actions.append(encode_action_from_ids_gpu(pid_t, cap_ids_t))
+                            valid_actions.append(encode_fn(pid_t, cap_ids_t))
                     else:
                         # Scarto (nessuna combinazione valida)
                         valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))

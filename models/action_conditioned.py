@@ -5,6 +5,14 @@ from utils.device import get_compute_device
 
 device = get_compute_device()
 
+# Optional: alias to torch._dynamo.disable for eager-only helpers
+try:
+    import torch._dynamo as _dynamo  # type: ignore
+    _dynamo_disable = _dynamo.disable  # type: ignore[attr-defined]
+except Exception:
+    def _dynamo_disable(fn):  # type: ignore
+        return fn
+
 
 class StateEncoder10823(nn.Module):
     """
@@ -76,13 +84,12 @@ class StateEncoder10823(nn.Module):
 
 class StateEncoderCompact(nn.Module):
     """
-    Encoder per osservazione compatta (dim = 499 + 61*k), con storia-k trattata come
-    k blocchi da 61 e pooling, senza slicing fisso dipendente da k.
-    Sezioni:
+    Encoder per osservazione compatta con storia-k (blocchi da 61) e stats a
+    dimensione variabile (in base ai flag di osservazione). Le sezioni sono:
       - hand_table: 83
       - captured: 82
-      - history: 61*k  (k variabile)
-      - stats: 334 (resto delle feature)
+      - history: 61*k (k variabile)
+      - stats: variabile (resto delle feature)
       - seat/team: 6 (passato separatamente)
     """
     def __init__(self):
@@ -104,21 +111,14 @@ class StateEncoderCompact(nn.Module):
         self.hist_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
         self.hist_pos_emb = nn.Embedding(40, 64)  # up to 40 recent moves
 
-        # Stats and seat/team
-        self.stats_processor = nn.Sequential(nn.Linear(334, 64), nn.ReLU())
+        # Stats and seat/team (dimensione variabile → LazyLinear)
+        self.stats_processor = nn.Sequential(nn.LazyLinear(64), nn.ReLU())
         self.seat_head = nn.Sequential(nn.Linear(6, 32), nn.ReLU())
 
         # Combiner to 256-d state context
         # Inputs: set_merge(64) + hist(64) + stats(64) + seat(32) = 224 → 256
         self.combiner = nn.Sequential(nn.Linear(224, 256), nn.ReLU())
         self.to(device)
-        # opzionale: torch.compile per accelerare inference/training
-        try:
-            if os.environ.get('ENABLE_TORCH_COMPILE', '0') == '1' and hasattr(torch, 'compile'):
-                mode = os.environ.get('TORCH_COMPILE_MODE', 'default')
-                self.forward = torch.compile(self.forward, mode=mode, fullgraph=False, dynamic=False)  # type: ignore
-        except Exception:
-            pass
 
     def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         import torch.nn.functional as F
@@ -131,15 +131,45 @@ class StateEncoderCompact(nn.Module):
 
         B = obs.size(0)
         D = obs.size(1)
-        # Calcola k dalla dimensione complessiva: D = 499 + 61*k
-        k = max(0, int((D - 499) // 61))
+        # Calcola k in modo robusto dal totale D sapendo le combinazioni possibili delle stats.
+        # D = 165 + 61*k + stats_len, con stats_len = 96 + [0/120] + [0/10] + [0/150]
+        base_prefix = 165
+        base_stats = 96
+        option_dims = [120, 10, 150]
+        # Trova k (<=40) che rende remainder compatibile con una somma base_stats + subset(option_dims)
+        k = 0
+        found = False
+        for kk in range(40, -1, -1):
+            rem = D - base_prefix - 61 * kk
+            if rem < base_stats:
+                continue
+            delta = rem - base_stats
+            # Verifica se delta è somma di un sottoinsieme di option_dims
+            ok = False
+            for a in (0, 1):
+                for b in (0, 1):
+                    for c in (0, 1):
+                        if (a * option_dims[0] + b * option_dims[1] + c * option_dims[2]) == delta:
+                            ok = True
+                            break
+                    if ok:
+                        break
+                if ok:
+                    break
+            if ok:
+                k = kk
+                found = True
+                break
+        if not found:
+            # Fallback conservativo
+            k = max(0, min(40, int((D - base_prefix - base_stats) // 61)))
         # Sezioni
         hand_table = obs[:, :83]
         captured = obs[:, 83:165]
         hist_start = 165
         hist_end = 165 + 61 * k
         history = obs[:, hist_start:hist_end]
-        stats = obs[:, hist_end:hist_end + 334]
+        stats = obs[:, hist_end:]
 
         # ----- Set encoders -----
         # hand_table: [hand(40) | other_counts(3) | table(40)]
@@ -216,7 +246,7 @@ class StateEncoderCompact(nn.Module):
             hist_feat = torch.zeros((B, 64), dtype=torch.float32, device=obs.device)
 
         # Stats and seat/team
-        stats_feat = F.relu(self.stats_processor[0](stats), inplace=True)
+        stats_feat = self.stats_processor(stats)
         if seat_team_vec is None:
             seat_team_vec = torch.zeros((B, 6), dtype=torch.float32, device=obs.device)
         elif seat_team_vec.dim() == 1:
@@ -238,12 +268,6 @@ class ActionEncoder80(nn.Module):
             nn.Linear(128, 64), nn.ReLU(),
         )
         self.to(device)
-        try:
-            if os.environ.get('ENABLE_TORCH_COMPILE', '0') == '1' and hasattr(torch, 'compile'):
-                mode = os.environ.get('TORCH_COMPILE_MODE', 'default')
-                self.forward = torch.compile(self.forward, mode=mode, fullgraph=False, dynamic=False)  # type: ignore
-        except Exception:
-            pass
 
     def forward(self, actions: torch.Tensor) -> torch.Tensor:
         if not torch.is_tensor(actions):
@@ -275,12 +299,6 @@ class BeliefNet(nn.Module):
         self.act = nn.GELU()
         self.dropout = nn.Dropout(p=0.1)
         self.to(device)
-        try:
-            if os.environ.get('ENABLE_TORCH_COMPILE', '0') == '1' and hasattr(torch, 'compile'):
-                mode = os.environ.get('TORCH_COMPILE_MODE', 'default')
-                self.forward = torch.compile(self.forward, mode=mode, fullgraph=False, dynamic=False)  # type: ignore
-        except Exception:
-            pass
 
     def forward(self, state_feat: torch.Tensor) -> torch.Tensor:
         x = state_feat
@@ -408,10 +426,19 @@ class ActionConditionedActor(torch.nn.Module):
         """
         if self._cached_action_emb is not None:
             return self._cached_action_emb
+        # Evita cattura in cudagraph/compile: calcola in eager e clona storage
+        return self._compute_action_emb_table_eager()
+
+    @_dynamo_disable
+    def _compute_action_emb_table_eager(self) -> torch.Tensor:
         with torch.no_grad():
-            eye = self.all_actions_eye.to(device=device, dtype=torch.float32)
-            self._cached_action_emb = self.action_enc(eye)
-        return self._cached_action_emb
+            # Clona l'input per assicurare storage indipendente
+            eye = self.all_actions_eye.to(device=device, dtype=torch.float32).clone()
+            tbl = self.action_enc(eye).detach().clone()
+            # Materializza su device predefinito e contiguo
+            tbl = tbl.to(device=device, dtype=torch.float32).contiguous()
+            self._cached_action_emb = tbl
+            return self._cached_action_emb
 
     def forward(self, obs: torch.Tensor, legals: torch.Tensor = None,
                 seat_team_vec: torch.Tensor = None) -> torch.Tensor:

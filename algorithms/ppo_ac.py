@@ -6,6 +6,7 @@ from contextlib import nullcontext
 
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
 from utils.device import get_compute_device, get_amp_dtype
+from utils.compile import maybe_compile_module, maybe_compile_function
 
 import os as _os
 device = get_compute_device()
@@ -30,6 +31,36 @@ class ActionConditionedPPO:
         shared_enc = StateEncoderCompact()
         self.actor = ActionConditionedActor(obs_dim, action_dim, state_encoder=shared_enc)
         self.critic = CentralValueNet(obs_dim, state_encoder=shared_enc)
+
+        # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) outside no_grad/inference
+        try:
+            with torch.enable_grad():
+                _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
+                _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device, requires_grad=True)
+                # Initialize encoder path shared by actor/critic
+                _ = self.actor.compute_state_proj(_obs_w, _seat_w)
+                _ = self.critic(_obs_w, _seat_w)
+        except Exception:
+            pass
+
+        # Unified compile: wrap modules and hotspots if enabled via utils.compile
+        self.actor = maybe_compile_module(self.actor, name='ActionConditionedActor')
+        self.critic = maybe_compile_module(self.critic, name='CentralValueNet')
+        # compute_state_proj is heavily used outside actor.__call__; compile it separately
+        try:
+            self.actor.compute_state_proj = maybe_compile_function(self.actor.compute_state_proj, name='ActionConditionedActor.compute_state_proj')
+        except Exception:
+            pass
+        # Hot functions in profiler: compute_loss and select_action
+        try:
+            self.compute_loss = maybe_compile_function(self.compute_loss, name='ActionConditionedPPO.compute_loss')
+        except Exception:
+            pass
+        # compile the pure compute core of select_action (I/O wrapper remains eager)
+        try:
+            self._select_action_core = maybe_compile_function(self._select_action_core, name='ActionConditionedPPO._select_action_core')
+        except Exception:
+            pass
 
         # Optimizers with fused/foreach when available to reduce kernel launches
         try:
@@ -85,7 +116,6 @@ class ActionConditionedPPO:
                 except Exception:
                     self.scaler = None
 
-    @torch.inference_mode()
     def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
@@ -116,63 +146,75 @@ class ActionConditionedPPO:
             st = st_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
         # belief handled internally by the actor
 
+        with torch.no_grad():
+            chosen_act_d, logp_total_d, idx_t_d = self._select_action_core(obs_t, actions_t, st)
+        # Move chosen action and metadata back to CPU for env.step
+        chosen_act = chosen_act_d.detach().to('cpu', non_blocking=False)
+        return chosen_act, logp_total_d.detach().to('cpu'), idx_t_d.detach().to('cpu')
+
+    def _select_action_core(self, obs_t: torch.Tensor, actions_t: torch.Tensor, seat_team_t: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure compute core for select_action. Expects inputs already on device.
+        Returns (chosen_action_tensor_on_device, logp_total_on_device, idx_on_device).
+        """
         cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
         with cm:
             # Scoring simultaneo di tutte le azioni legali via fattorizzazione
-            state_proj = self.actor.compute_state_proj(obs_t, st)  # (1,64)
-            # Precompute logits carta una volta
-            card_emb = self.actor.card_emb_play
-            card_logits_all = torch.matmul(state_proj, card_emb.t()).squeeze(0)  # (40)
-            played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
-            # logp carta con mask sulle sole carte presenti nei legali
-            allowed_mask = torch.zeros(40, dtype=torch.bool, device=device)
-            allowed_mask[played_ids_all] = True
-            masked_card_logits = card_logits_all.masked_fill(~allowed_mask, float('-inf'))
-            logp_cards = torch.log_softmax(masked_card_logits, dim=0)  # (40)
-            # capture logits per-legal via action embedding (usa tabella cachata in inference)
-            try:
-                a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=actions_t.device)
-                a_emb = actions_t @ a_tbl  # (A,64)
-            except Exception:
-                a_emb = self.actor.action_enc(actions_t)  # fallback
-            cap_logits = torch.matmul(a_emb, state_proj.squeeze(0))  # (A)
-            # log-softmax within group (card)
-            group_ids = played_ids_all  # (A)
-            num_groups = 40
-            group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
-            try:
-                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-            except Exception:
-                tmp = torch.zeros_like(group_max)
-                tmp.index_copy_(0, group_ids, cap_logits)
-                group_max = torch.maximum(group_max, tmp)
-            gmax_per_legal = group_max[group_ids]
-            # Ensure dtype consistency under autocast (exp may return float32)
-            exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
-            group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
-            group_sum.index_add_(0, group_ids, exp_shifted)
-            lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
-            logp_cap_per_legal = cap_logits - lse_per_legal  # (A)
-            # logp totale per legal = logp(card played) + logp(capture|card)
-            logp_totals = logp_cards[played_ids_all] + logp_cap_per_legal  # (A)
-            probs = torch.softmax(logp_totals, dim=0)
-            # Sanitize before sampling: clamp negatives/NaN, renormalize; fallback to uniform
-            probs = probs.nan_to_num(0.0)
-            probs = torch.clamp(probs, min=0.0)
-            s = probs.sum()
-            if not torch.isfinite(s) or s <= 0:
-                A = probs.numel()
-                probs = torch.full_like(probs, 1.0 / max(1, A))
-            else:
-                probs = probs / s
-            try:
-                idx_t = torch.multinomial(probs, num_samples=1).squeeze(0)
-            except Exception:
-                idx_t = torch.argmax(probs)
-            logp_total = logp_totals[idx_t].detach()
-        # Move chosen action and metadata back to CPU for env.step
-        chosen_act = actions_t[idx_t].detach().to('cpu', non_blocking=False)
-        return chosen_act, logp_total.to('cpu'), idx_t.detach().to('cpu')
+            state_proj = self.actor.compute_state_proj(obs_t, seat_team_t)  # (1,64)
+        # Precompute logits carta una volta (match dtype/device under autocast)
+        card_emb = self.actor.card_emb_play.to(device=state_proj.device, dtype=state_proj.dtype)
+        card_logits_all = torch.matmul(state_proj, card_emb.t()).squeeze(0)  # (40)
+        played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
+        # logp carta solo sulle carte presenti nei legali, deduplicando gli ID
+        # per evitare il costo del masking a 40 elementi ad ogni chiamata
+        unique_ids, inverse_idx = torch.unique(played_ids_all, sorted=False, return_inverse=True)
+        allowed_logits_unique = card_logits_all[unique_ids]  # (U)
+        logp_cards_unique = torch.log_softmax(allowed_logits_unique, dim=0)  # (U)
+        logp_cards_per_legal = logp_cards_unique[inverse_idx]  # (A)
+        # capture logits per-legal via action embedding (usa tabella cachata in inference)
+        try:
+            # Usa copia della tabella per evitare aliasing con cudagraphs
+            a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=actions_t.device).clone()
+            a_emb = actions_t.to(dtype=state_proj.dtype) @ a_tbl  # (A,64)
+        except Exception:
+            a_emb = self.actor.action_enc(actions_t)
+            a_emb = a_emb.to(dtype=state_proj.dtype)
+        cap_logits = torch.matmul(a_emb, state_proj.squeeze(0).to(dtype=a_emb.dtype))  # (A)
+        # log-softmax within group (card)
+        group_ids = played_ids_all  # (A)
+        num_groups = 40
+        group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=actions_t.device)
+        try:
+            group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
+        except Exception:
+            tmp = torch.zeros_like(group_max)
+            tmp.index_copy_(0, group_ids, cap_logits)
+            group_max = torch.maximum(group_max, tmp)
+        gmax_per_legal = group_max[group_ids]
+        # Ensure dtype consistency under autocast (exp may return float32)
+        exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
+        group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=actions_t.device)
+        group_sum.index_add_(0, group_ids, exp_shifted)
+        lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
+        logp_cap_per_legal = cap_logits - lse_per_legal  # (A)
+        # logp totale per legal = logp(card played) + logp(capture|card)
+        logp_totals = logp_cards_per_legal + logp_cap_per_legal  # (A)
+        probs = torch.softmax(logp_totals, dim=0)
+        # Sanitize before sampling: clamp negatives/NaN, renormalize; fallback to uniform
+        probs = probs.nan_to_num(0.0)
+        probs = torch.clamp(probs, min=0.0)
+        s = probs.sum()
+        if not torch.isfinite(s) or s <= 0:
+            A = probs.numel()
+            probs = torch.full_like(probs, 1.0 / max(1, A))
+        else:
+            probs = probs / s
+        try:
+            idx_t = torch.multinomial(probs, num_samples=1).squeeze(0)
+        except Exception:
+            idx_t = torch.argmax(probs)
+        logp_total = logp_totals[idx_t].detach()
+        chosen_act = actions_t[idx_t].detach()
+        return chosen_act, logp_total, idx_t
 
     def compute_loss(self, batch):
         """
@@ -199,15 +241,20 @@ class ActionConditionedPPO:
 
         # Accept CPU inputs; move to CUDA once in a pinned, non_blocking way
         def to_cuda_nb(x, dtype):
-            # Se il tensore è già su device, non riportarlo su CPU: casistica principale per ridurre copy
+            # Se il tensore è già su device, non riportarlo su CPU
             if torch.is_tensor(x):
                 if x.device.type == device.type:
                     return x.to(device=device, dtype=dtype, non_blocking=True)
-                # CPU → pin → device
                 x_cpu = x.detach().to('cpu', dtype=dtype)
             else:
                 x_cpu = torch.as_tensor(x, dtype=dtype, device='cpu')
-            return x_cpu.pin_memory().to(device=device, non_blocking=True)
+            # Evita pin_memory durante la compilazione o su tensori vuoti (FakeTensor NYI)
+            try:
+                if (hasattr(torch, '_dynamo') and getattr(torch._dynamo, 'is_compiling', lambda: False)()) or (x_cpu.numel() == 0):
+                    return x_cpu.to(device=device, dtype=dtype, non_blocking=True)
+            except Exception:
+                pass
+            return x_cpu.pin_memory().to(device=device, dtype=dtype, non_blocking=True)
 
         obs = to_cuda_nb(batch['obs'], torch.float32)
         seat = to_cuda_nb(batch['seat_team'], torch.float32)
@@ -220,8 +267,8 @@ class ActionConditionedPPO:
         cnts = to_cuda_nb(batch['legals_count'], torch.long)
         chosen_idx = to_cuda_nb(batch['chosen_index'], torch.long)
         # distillazione MCTS (targets raggruppati per sample): policy piatta e peso per-sample
-        mcts_policy_flat = to_cuda_nb(batch.get('mcts_policy', torch.zeros((0,), dtype=torch.float32)), torch.float32)
-        mcts_weight = to_cuda_nb(batch.get('mcts_weight', torch.zeros((0,), dtype=torch.float32)), torch.float32)
+        mcts_policy_flat = to_cuda_nb(batch.get('mcts_policy', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
+        mcts_weight = to_cuda_nb(batch.get('mcts_weight', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
 
         # Filtra eventuali sample senza azioni legali per evitare NaN
         valid_mask = cnts > 0
@@ -244,7 +291,7 @@ class ActionConditionedPPO:
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # State projection e logits per carta
         state_proj = self.actor.compute_state_proj(obs, seat)  # (B,64)
-        card_emb = self.actor.card_emb_play
+        card_emb = self.actor.card_emb_play.to(device=state_proj.device, dtype=state_proj.dtype)
         card_logits_all = torch.matmul(state_proj, card_emb.t())       # (B,40)
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)

@@ -504,6 +504,100 @@ def compute_table_sum(game_state):
     
     return result
 
+# Cache per somme possibili sul tavolo (subset-sum 1..10)
+table_possible_sums_cache = {}
+
+def compute_table_possible_sums(game_state):
+    """
+    Restituisce un vettore 10-d (rank 1..10) con 1.0 se esiste un sottoinsieme
+    delle carte sul tavolo la cui somma dei rank è uguale a quel valore.
+    Risultato normalizzato in [0,1] (booleana) e cache-ato per tavolo.
+    """
+    tbl = game_state["table"]
+    table_key = tuple(sorted(tbl))
+    cached = table_possible_sums_cache.get(table_key)
+    if cached is not None:
+        return cached.clone()
+    if len(tbl) == 0:
+        vec = torch.zeros(10, dtype=torch.float32, device=OBS_DEVICE)
+        table_possible_sums_cache[table_key] = vec.clone()
+        return vec
+    # Converte in ID
+    if isinstance(tbl[0], int):
+        ids = torch.as_tensor(tbl, dtype=torch.long, device=OBS_DEVICE)
+    else:
+        suit_to_idx = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+        ids_py = [int((r - 1) * 4 + suit_to_idx[s]) for (r, s) in tbl]
+        ids = torch.as_tensor(ids_py, dtype=torch.long, device=OBS_DEVICE)
+    ranks = RANK_OF_ID[ids].to(torch.long)
+    n = int(ranks.numel())
+    possible = torch.zeros(10, dtype=torch.float32, device=OBS_DEVICE)
+    if n == 0:
+        table_possible_sums_cache[table_key] = possible.clone()
+        return possible
+    # Genera tutte le somme possibili via bitmask (n <= 10 tipicamente)
+    pos = torch.arange(n, device=OBS_DEVICE, dtype=torch.long)
+    masks = torch.arange(1, 1 << n, device=OBS_DEVICE, dtype=torch.long)
+    sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
+    sums = (sel * ranks.unsqueeze(0)).sum(dim=1)
+    for r in range(1, 11):
+        hit = bool((sums == r).any().item())
+        possible[r-1] = 1.0 if hit else 0.0
+    table_possible_sums_cache[table_key] = possible.clone()
+    # Limita cache
+    if len(table_possible_sums_cache) > 100:
+        import random
+        for ck in random.sample(list(table_possible_sums_cache.keys()), 50):
+            del table_possible_sums_cache[ck]
+    return possible
+
+# Cache per conteggio scope per team
+scopa_counts_cache = {}
+
+def compute_scopa_counts(game_state):
+    """
+    Ritorna un vettore (2,) con il numero di scope per team [team0, team1],
+    normalizzato dividendo per 10.0.
+    """
+    history_len = len(game_state.get("history", []))
+    key = history_len
+    cached = scopa_counts_cache.get(key)
+    if cached is not None:
+        return cached.clone()
+    scope0 = 0
+    scope1 = 0
+    for mv in game_state.get("history", []):
+        if mv.get("capture_type") == "scopa":
+            if mv.get("player") in [0, 2]:
+                scope0 += 1
+            else:
+                scope1 += 1
+    result = torch.tensor([scope0 / 10.0, scope1 / 10.0], dtype=torch.float32, device=OBS_DEVICE)
+    scopa_counts_cache[key] = result.clone()
+    # Limita cache
+    if len(scopa_counts_cache) > 100:
+        import random
+        for ck in random.sample(list(scopa_counts_cache.keys()), 50):
+            del scopa_counts_cache[ck]
+    return result
+
+def compute_rank_presence_probs_from_inferred(game_state, player_id):
+    """
+    Condensa le inferred probs (3 x 40 carte per altri giocatori) in probabilità per-rank (1..10)
+    per ciascuno dei 3 giocatori avversari, sommando le probabilità sulle 4 carte del rank.
+    Output: (30,) flatten: [opp0(10), opp1(10), opp2(10)]. Se OBS_INCLUDE_INFERRED=0,
+    restituisce zeri.
+    """
+    if not OBS_INCLUDE_INFERRED:
+        return torch.zeros(30, dtype=torch.float32, device=OBS_DEVICE)
+    probs_3x40 = compute_inferred_probabilities(game_state, player_id)
+    if torch.is_tensor(probs_3x40):
+        x = probs_3x40.view(3, 10, 4).sum(dim=2)  # (3,10)
+        return x.reshape(-1)
+    else:
+        t = torch.as_tensor(probs_3x40, dtype=torch.float32, device=OBS_DEVICE).view(3, 10, 4)
+        return t.sum(dim=2).reshape(-1)
+
 # Cache per scopa probabilities
 scopa_probs_cache = {}
 
@@ -798,19 +892,30 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     captured_enc = encode_captured_squads(game_state["captured_squads"])  # 82 (torch)
     hist_k_np = encode_recent_history_k(game_state, k=k_history)  # np (61*k)
     missing_cards_np = compute_missing_cards_matrix(game_state, player_id)  # np (40)
-    inferred_probs_np = compute_inferred_probabilities(game_state, player_id)  # np (120)
+    inferred_probs_np = (compute_inferred_probabilities(game_state, player_id) if OBS_INCLUDE_INFERRED else None)
     primiera_status_np = compute_primiera_status(game_state)  # np (8)
     denari_count_np = compute_denari_count(game_state)  # np (2)
     settebello_status_np = compute_settebello_status(game_state)  # np (1)
     score_estimate_np = compute_current_score_estimate(game_state)  # np (2)
     table_sum_np = compute_table_sum(game_state)  # np (1)
-    scopa_probs_np = compute_next_player_scopa_probabilities(game_state, player_id)  # np (10)
-    rank_probs_by_player_np = compute_rank_probabilities_by_player(game_state, player_id).flatten()  # np (150)
+    # Opzionali: scopa probs e rank probs
+    scopa_probs_np = (compute_next_player_scopa_probabilities(game_state, player_id)
+                      if OBS_INCLUDE_SCOPA_PROBS else torch.zeros(10, dtype=torch.float32, device=device))
+    rank_probs_by_player_np = (compute_rank_probabilities_by_player(game_state, player_id).flatten()
+                               if OBS_INCLUDE_RANK_PROBS else torch.zeros(150, dtype=torch.float32, device=device))
+    # Nuove feature
+    scopa_counts_np = compute_scopa_counts(game_state)  # (2)
+    table_possible_sums_np = compute_table_possible_sums(game_state)  # (10)
+    # Cond. rank presence from inferred (3 players x 10 ranks = 30)
+    rank_presence_from_inferred_np = compute_rank_presence_probs_from_inferred(game_state, player_id)
 
     # Convert to torch CUDA tensors
     hist_k = (hist_k_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(hist_k_np) else torch.as_tensor(hist_k_np, dtype=torch.float32, device=device))
     missing_cards = (missing_cards_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(missing_cards_np) else torch.as_tensor(missing_cards_np, dtype=torch.float32, device=device))
-    inferred_probs = (inferred_probs_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(inferred_probs_np) else torch.as_tensor(inferred_probs_np, dtype=torch.float32, device=device))
+    if inferred_probs_np is not None:
+        inferred_probs = (inferred_probs_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(inferred_probs_np) else torch.as_tensor(inferred_probs_np, dtype=torch.float32, device=device))
+    else:
+        inferred_probs = None
     primiera_status = (primiera_status_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(primiera_status_np) else torch.as_tensor(primiera_status_np, dtype=torch.float32, device=device))
     denari_count = (denari_count_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(denari_count_np) else torch.as_tensor(denari_count_np, dtype=torch.float32, device=device))
     settebello_status = (settebello_status_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(settebello_status_np) else torch.as_tensor(settebello_status_np, dtype=torch.float32, device=device))
@@ -818,22 +923,50 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     table_sum = (table_sum_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(table_sum_np) else torch.as_tensor(table_sum_np, dtype=torch.float32, device=device))
     scopa_probs = (scopa_probs_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(scopa_probs_np) else torch.as_tensor(scopa_probs_np, dtype=torch.float32, device=device))
     rank_probs_by_player = (rank_probs_by_player_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(rank_probs_by_player_np) else torch.as_tensor(rank_probs_by_player_np, dtype=torch.float32, device=device))
+    scopa_counts = (scopa_counts_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(scopa_counts_np) else torch.as_tensor(scopa_counts_np, dtype=torch.float32, device=device))
+    table_possible_sums = (table_possible_sums_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(table_possible_sums_np) else torch.as_tensor(table_possible_sums_np, dtype=torch.float32, device=device))
+    rank_presence_from_inferred = (rank_presence_from_inferred_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(rank_presence_from_inferred_np) else torch.as_tensor(rank_presence_from_inferred_np, dtype=torch.float32, device=device))
 
-    result = torch.cat([
+    parts = [
         hands_enc,
         table_enc,
         captured_enc,
         hist_k,
         missing_cards,
-        inferred_probs,
+    ]
+    if inferred_probs is not None:
+        parts.append(inferred_probs)
+    parts.extend([
         primiera_status,
         denari_count,
         settebello_status,
         score_estimate,
         table_sum,
-        scopa_probs,
-        rank_probs_by_player
+        table_possible_sums,
+        scopa_counts,
     ])
+    # Aggiungi rank_presence_from_inferred solo se le probabilità inferite sono abilitate
+    if OBS_INCLUDE_INFERRED:
+        parts.append(rank_presence_from_inferred)
+    # Aggiungi opzionali (scopa/rank) sempre nella costruzione, ma normalizza poi alla dim attesa
+    parts.extend([
+        scopa_probs,
+        rank_probs_by_player,
+    ])
+    result = torch.cat(parts)
+
+    # Normalizza la dimensione all'atteso (allinea con fast path)
+    include_scopa = OBS_INCLUDE_SCOPA_PROBS
+    include_rank = OBS_INCLUDE_RANK_PROBS
+    include_inferred = OBS_INCLUDE_INFERRED
+    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2
+                    + (10 if include_scopa else 0) + (150 if include_rank else 0))
+    if result.numel() != expected_dim:
+        if result.numel() < expected_dim:
+            pad = torch.zeros((expected_dim - result.numel(),), dtype=result.dtype, device=result.device)
+            result = torch.cat([result, pad], dim=0)
+        else:
+            result = result[:expected_dim]
 
     # Cache limitata
     if len(state_compact_cache) < 50:
@@ -887,8 +1020,9 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     visible_bits = hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
     missing_vec = (1 - (((visible_bits >> IDS_CUDA) & 1).to(torch.float32)))
 
-    # 6) Inferred probs (120) - fallback GPU funzione esistente
-    inferred_probs = compute_inferred_probabilities(game_state, player_id)
+    # 6) Inferred probs (120) - opzionale
+    inferred_probs = (compute_inferred_probabilities(game_state, player_id)
+                      if OBS_INCLUDE_INFERRED else None)
 
     # 7) Primiera status (8) via bitset
     def _primiera_from_bits(bits_t):
@@ -926,29 +1060,52 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
         (RANK_OF_ID.to(torch.int64)[IDS_CUDA].to(torch.float32) * (((table_bits_t >> IDS_CUDA) & 1).to(torch.float32))).sum() / 30.0
     ], dtype=torch.float32, device=device)
 
-    # 12) Scopa probs next (10) - fallback
-    scopa_probs = compute_next_player_scopa_probabilities(game_state, player_id)
+    # 12) Scopa probs next (10) - opzionale
+    scopa_probs = (compute_next_player_scopa_probabilities(game_state, player_id)
+                   if OBS_INCLUDE_SCOPA_PROBS else torch.zeros(10, dtype=torch.float32, device=device))
 
-    # 13) Rank probs by player (150) - fallback
-    rank_probs_by_player = compute_rank_probabilities_by_player(game_state, player_id).flatten()
+    # 13) Rank probs by player (150) - opzionale
+    rank_probs_by_player = (compute_rank_probabilities_by_player(game_state, player_id).flatten()
+                            if OBS_INCLUDE_RANK_PROBS else torch.zeros(150, dtype=torch.float32, device=device))
 
-    result = torch.cat([
+    # 14) Scopa counts (2)
+    scopa_counts = compute_scopa_counts(game_state)
+
+    # 15) Table possible sums (10)
+    table_possible_sums = compute_table_possible_sums(game_state)
+
+    parts = [
         hands_enc,
         table_enc,
         captured_enc,
         hist_k,
         missing_vec,
-        inferred_probs,
+    ]
+    if inferred_probs is not None:
+        parts.append(inferred_probs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(inferred_probs) else torch.as_tensor(inferred_probs, dtype=torch.float32, device=device))
+    parts.extend([
         primiera_status,
         denari_count,
         settebello_status,
         score_estimate,
         table_sum,
+        table_possible_sums,
+        scopa_counts,
         scopa_probs,
         rank_probs_by_player
     ])
+    result = torch.cat(parts)
     # Coerenza dimensionale con feature attive/disattive
-    expected_dim = 43 + 40 + 82 + 61 * k_history + 40 + 120 + 8 + 2 + 1 + 2 + 1 + 10 + 150
+    include_scopa = OBS_INCLUDE_SCOPA_PROBS
+    include_rank = OBS_INCLUDE_RANK_PROBS
+    include_inferred = OBS_INCLUDE_INFERRED
+    # Aggiungi rank_presence_from_inferred (30) per simmetria con slow-path
+    # Calcola e aggiungi alla fine prima del check dimensionale
+    rpf = compute_rank_presence_probs_from_inferred(game_state, player_id)
+    rpf = rpf.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(rpf) else torch.as_tensor(rpf, dtype=torch.float32, device=device)
+    result = torch.cat([result, rpf], dim=0)
+    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30
+                    + (10 if include_scopa else 0) + (150 if include_rank else 0))
     if result.numel() != expected_dim:
         if result.numel() < expected_dim:
             pad = torch.zeros((expected_dim - result.numel(),), dtype=result.dtype, device=result.device)
