@@ -23,21 +23,15 @@ from algorithms.is_mcts import run_is_mcts
 from models.action_conditioned import ActionConditionedActor, CentralValueNet
 
 
-def load_actor_critic(ckpt_path: str):
-    # Placeholder; real dims filled at call site
-    actor = None
-    critic = None
+def load_actor_critic(ckpt_path: str, obs_dim: int, map_dev: torch.device):
+    actor = ActionConditionedActor(obs_dim=obs_dim)
+    critic = CentralValueNet(obs_dim=obs_dim)
     try:
-        import os
-        map_dev = torch.device(os.environ.get(
-            'SCOPONE_DEVICE',
-            ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
-        ))
         ckpt = torch.load(ckpt_path, map_location=map_dev)
-        if 'actor' in ckpt and 'critic' in ckpt:
-            if actor is not None and critic is not None:
-                actor.load_state_dict(ckpt['actor'])
-                critic.load_state_dict(ckpt['critic'])
+        if 'actor' in ckpt:
+            actor.load_state_dict(ckpt['actor'])
+        if 'critic' in ckpt:
+            critic.load_state_dict(ckpt['critic'])
     except Exception as e:
         print(f"[WARN] Failed to load checkpoint {ckpt_path}: {e}")
     return actor, critic
@@ -67,11 +61,7 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
                 'SCOPONE_DEVICE',
                 ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
             ))
-            ckpt = torch.load(ckpt_path, map_location=map_dev)
-            if 'actor' in ckpt:
-                actor.load_state_dict(ckpt['actor'])
-            if 'critic' in ckpt:
-                critic.load_state_dict(ckpt['critic'])
+            actor, critic = load_actor_critic(ckpt_path, obs_dim, map_dev)
         except Exception as e:
             print(f"[WARN] Failed to load checkpoint {ckpt_path}: {e}")
     actor.eval(); critic.eval()
@@ -105,8 +95,17 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
                     return torch.softmax(logits, dim=0)
                 def value_fn(o, _env=None):
                     o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
+                    # build seat vector
+                    if _env is not None:
+                        cp = _env.current_player
+                        s = torch.zeros(6, dtype=torch.float32, device=device)
+                        s[cp] = 1.0
+                        s[4] = 1.0 if cp in [0, 2] else 0.0
+                        s[5] = 1.0 if cp in [1, 3] else 0.0
+                    else:
+                        s = torch.zeros(6, dtype=torch.float32, device=device)
                     with torch.no_grad():
-                        return critic(o_t.unsqueeze(0)).item()
+                        return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
                 # belief sampler neurale per determinizzazione
                 def belief_sampler_neural(_env):
                     try:

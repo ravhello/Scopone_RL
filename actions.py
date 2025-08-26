@@ -46,11 +46,11 @@ def encode_action(card, cards_to_capture):
     # Appiattisci le matrici e concatenale
     return torch.cat([played_card_matrix.reshape(-1), captured_cards_matrix.reshape(-1)], dim=0)
 
-def encode_action_from_ids_gpu(played_id_t: torch.Tensor, captured_ids_t: torch.Tensor) -> torch.Tensor:
+def encode_action_from_ids_tensor(played_id_t: torch.Tensor, captured_ids_t: torch.Tensor) -> torch.Tensor:
     """
-    GPU-native variant: build the 80-d action vector directly from CUDA int tensors
-    without converting to Python ints. Inputs can be scalar int64 tensor for played_id
-    and 1-D int64 tensor for captured_ids (possibly empty).
+    Variant tensor-native: costruisce il vettore azione 80-d direttamente da tensori int
+    (CPU o CUDA) senza conversioni in Python int.
+    Accetta uno scalare int64 per la carta giocata e un tensore 1-D int64 per le catture (anche vuoto).
     """
     # Ensure tensors are on target device (CPU by default) and correct dtypes/shapes
     pid = played_id_t.to(device=device, dtype=torch.long).reshape(())

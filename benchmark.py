@@ -130,11 +130,19 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
                         logits = actor(o_t.unsqueeze(0), leg_t)
                     probs = torch.softmax(logits, dim=0)
                     return probs
-                def value_fn(o):
-                    o_t = torch.tensor(o, dtype=torch.float32, device=device)
+                def value_fn(o, _env=None):
+                    o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
+                    # build seat vector if env available
+                    if _env is not None:
+                        cp = _env.current_player
+                        s = torch.zeros(6, dtype=torch.float32, device=device)
+                        s[cp] = 1.0
+                        s[4] = 1.0 if cp in [0, 2] else 0.0
+                        s[5] = 1.0 if cp in [1, 3] else 0.0
+                    else:
+                        s = torch.zeros(6, dtype=torch.float32, device=device)
                     with torch.no_grad():
-                        v = critic(o_t.unsqueeze(0)).item()
-                    return v
+                        return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
                 # Belief sampler neurale: determinizza le mani avversarie dai margini del BeliefNet
                 def belief_sampler_neural(_env):
                     try:
@@ -216,7 +224,11 @@ def load_actor_critic(ckpt_path: str):
             critic.load_state_dict(ckpt['critic'])
         else:
             # fallback: niente pesi
-            pass
+            try:
+                from utils.fallback import notify_fallback
+                notify_fallback('benchmark.load_actor_critic.no_weights_in_ckpt')
+            except Exception:
+                pass
     except Exception:
         pass
     return actor, critic
@@ -248,14 +260,16 @@ def main_cli():
                     o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
                     leg_t = torch.stack([
                         x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
-                    for x in leg], dim=0)
+                    for x in legals], dim=0)
                     with torch.no_grad():
                         logits = actor(o_t.unsqueeze(0), leg_t)
                     return torch.softmax(logits, dim=0)
                 def value_fn(o):
                     o_t = torch.tensor(o, dtype=torch.float32, device=device)
+                    # derive a simple seat vector from env state is not available here; use zeros
+                    s = torch.zeros(6, dtype=torch.float32, device=device)
                     with torch.no_grad():
-                        return critic(o_t.unsqueeze(0)).item()
+                        return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
                 def belief_sampler_neural(_env):
                     try:
                         cp = _env.current_player

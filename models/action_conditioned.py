@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import os
 from utils.device import get_compute_device
+from utils.fallback import notify_fallback
 
 device = get_compute_device()
 
@@ -63,6 +64,7 @@ class StateEncoder10823(nn.Module):
 
         if seat_team_vec is None:
             # fallback: vettore zero
+            notify_fallback('models.state_encoder10823.seat_team_missing')
             seat_team_vec = torch.zeros((obs.size(0), 6), dtype=torch.float32, device=obs.device)
         elif seat_team_vec.dim() == 1:
             seat_team_vec = seat_team_vec.unsqueeze(0)
@@ -117,6 +119,8 @@ class StateEncoderCompact(nn.Module):
 
         # Combiner to 256-d state context
         # Inputs: set_merge(64) + hist(64) + stats(64) + seat(32) = 224 → 256
+        # Se OBS_INCLUDE_DEALER=1 aggiungiamo +4 nelle stats. Usiamo Linear(224,256) e
+        # deleghiamo a self.stats_processor (LazyLinear) l'adattamento alla nuova dimensione.
         self.combiner = nn.Sequential(nn.Linear(224, 256), nn.ReLU())
         self.to(device)
 
@@ -132,10 +136,11 @@ class StateEncoderCompact(nn.Module):
         B = obs.size(0)
         D = obs.size(1)
         # Calcola k in modo robusto dal totale D sapendo le combinazioni possibili delle stats.
-        # D = 165 + 61*k + stats_len, con stats_len = 96 + [0/120] + [0/10] + [0/150]
+        # D = 165 + 61*k + stats_len, con stats_len = 99 + [0/120] + [0/10] + [0/150]
         base_prefix = 165
-        base_stats = 96
-        option_dims = [120, 10, 150]
+        base_stats = 99
+        # Opzioni possibili nelle stats: inferred(120), scopa_probs(10), rank_probs(150), dealer(4)
+        option_dims = [120, 10, 150, 4]
         # Trova k (<=40) che rende remainder compatibile con una somma base_stats + subset(option_dims)
         k = 0
         found = False
@@ -149,8 +154,11 @@ class StateEncoderCompact(nn.Module):
             for a in (0, 1):
                 for b in (0, 1):
                     for c in (0, 1):
-                        if (a * option_dims[0] + b * option_dims[1] + c * option_dims[2]) == delta:
-                            ok = True
+                        for d in (0, 1):
+                            if (a * option_dims[0] + b * option_dims[1] + c * option_dims[2] + d * option_dims[3]) == delta:
+                                ok = True
+                                break
+                        if ok:
                             break
                     if ok:
                         break
@@ -162,6 +170,7 @@ class StateEncoderCompact(nn.Module):
                 break
         if not found:
             # Fallback conservativo
+            notify_fallback('models.state_encoder_compact.heuristic_k')
             k = max(0, min(40, int((D - base_prefix - base_stats) // 61)))
         # Sezioni
         hand_table = obs[:, :83]
@@ -245,7 +254,7 @@ class StateEncoderCompact(nn.Module):
         else:
             hist_feat = torch.zeros((B, 64), dtype=torch.float32, device=obs.device)
 
-        # Stats and seat/team
+        # Stats and seat/team (stats_processor è LazyLinear e si adatta alla prima forward)
         stats_feat = self.stats_processor(stats)
         if seat_team_vec is None:
             seat_team_vec = torch.zeros((B, 6), dtype=torch.float32, device=obs.device)
@@ -391,6 +400,7 @@ class ActionConditionedActor(torch.nn.Module):
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
+            notify_fallback('models.actor.compute_state_proj.seat_team_missing')
             seat_team_vec = torch.zeros((x_obs.size(0), 6), dtype=torch.float32, device=x_obs.device)
         else:
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
@@ -451,6 +461,8 @@ class ActionConditionedActor(torch.nn.Module):
             x_obs = x_obs.unsqueeze(0)
         # Seat/team: opzionale
         if seat_team_vec is None:
+            from utils.fallback import notify_fallback
+            notify_fallback('models.critic.forward.seat_team_missing')
             seat_team_vec = torch.zeros((x_obs.size(0), 6), dtype=torch.float32, device=x_obs.device)
         else:
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
@@ -484,6 +496,8 @@ class ActionConditionedActor(torch.nn.Module):
             try:
                 action_emb = self.get_action_emb_table_cached()
             except Exception:
+                from utils.fallback import notify_fallback
+                notify_fallback('models.actor.action_emb_table_failed')
                 action_emb = self.action_enc(all_actions)
             logits = torch.matmul(state_proj, action_emb.t())  # (B,80)
             return logits if logits.size(0) > 1 else logits.squeeze(0)
@@ -493,12 +507,17 @@ class ActionConditionedActor(torch.nn.Module):
         else:
             legals_t = legals.to(state_proj.device, dtype=torch.float32)
         # B atteso = 1 in path di selezione
-        # usa tabella cachata per ottenere gli embedding legali via singola mm
-        try:
-            a_tbl = self.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_t.device)
-            a_emb = torch.matmul(legals_t, a_tbl)
-        except Exception:
-            a_emb = self.action_enc(legals_t)  # fallback
+        # In training evita la tabella cache per mantenere gradiente
+        if self.training:
+            a_emb = self.action_enc(legals_t)
+        else:
+            try:
+                a_tbl = self.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_t.device)
+                a_emb = torch.matmul(legals_t, a_tbl)
+            except Exception:
+                from utils.fallback import notify_fallback
+                notify_fallback('models.actor.action_emb_table_failed.legals')
+                a_emb = self.action_enc(legals_t)  # fallback
         if state_proj.size(0) == 1:
             scores = torch.matmul(a_emb, state_proj.squeeze(0))  # (A)
         else:
@@ -520,6 +539,13 @@ class CentralValueNet(torch.nn.Module):
         self.belief_card_emb = nn.Parameter(torch.randn(40, 32) * 0.02)
         self.partner_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
         self.opp_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
+        # CTDE opzionale: usa others_hands (3x40) per modulare state_feat via FiLM
+        self.ctde_cond = nn.Sequential(
+            nn.Linear(120, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+        )
+        self.ctde_scale = nn.Linear(128, 256)
+        self.ctde_shift = nn.Linear(128, 256)
         # Stato 256 + belief 64 + partner 32 + opp 32 = 384
         self.head = nn.Sequential(
             nn.Linear(384, 256), nn.ReLU(),
@@ -527,7 +553,7 @@ class CentralValueNet(torch.nn.Module):
         )
         self.to(device)
 
-    def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None, others_hands: torch.Tensor = None) -> torch.Tensor:
         if torch.is_tensor(obs):
             x_obs = obs.to(device, dtype=torch.float32)
         else:
@@ -543,6 +569,26 @@ class CentralValueNet(torch.nn.Module):
             seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         # Belief neurale interno (ignora belief_summary esterno)
         state_feat = self.state_enc(x_obs, seat_team_vec)
+        # CTDE FiLM gating se others_hands è disponibile (training centralizzato)
+        if others_hands is not None:
+            oh = others_hands
+            if not torch.is_tensor(oh):
+                oh = torch.as_tensor(oh, dtype=torch.float32, device=x_obs.device)
+            else:
+                oh = oh.to(x_obs.device, dtype=torch.float32)
+            if oh.dim() == 2 and oh.size(1) == 120:
+                oh_flat = oh
+            elif oh.dim() == 3 and oh.size(1) == 3 and oh.size(2) == 40:
+                oh_flat = oh.view(oh.size(0), -1)
+            else:
+                # fallback: tenta reshape
+                from utils.fallback import notify_fallback
+                notify_fallback('models.critic.forward.others_hands_shape')
+                oh_flat = oh.view(oh.size(0), -1)
+            cond = self.ctde_cond(oh_flat)
+            scale = torch.sigmoid(self.ctde_scale(cond))  # (B,256) in (0,1)
+            shift = torch.tanh(self.ctde_shift(cond)) * 0.1  # small bias
+            state_feat = state_feat * (0.5 + scale) + shift
         hand_table = x_obs[:, :83]
         hand_mask = hand_table[:, :40] > 0.5
         table_mask = hand_table[:, 43:83] > 0.5

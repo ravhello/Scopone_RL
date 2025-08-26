@@ -1,5 +1,5 @@
 import torch
-from actions import encode_action, decode_action_ids, encode_action_from_ids_gpu, find_sum_subsets_ids
+from actions import encode_action, decode_action_ids, encode_action_from_ids_tensor, find_sum_subsets_ids
 
 
 def test_encode_decode_roundtrip_ids():
@@ -16,7 +16,7 @@ def test_encode_decode_roundtrip_ids():
 def test_encode_from_ids_gpu_matches_cpu_encoding():
     pid = torch.tensor(9, dtype=torch.long)
     captured = torch.tensor([0, 15, 39], dtype=torch.long)
-    a_gpu = encode_action_from_ids_gpu(pid, captured)
+    a_gpu = encode_action_from_ids_tensor(pid, captured)
     a_cpu = encode_action(int(pid.item()), [int(x.item()) for x in captured])
     assert torch.allclose(a_gpu, a_cpu)
 

@@ -25,7 +25,66 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 ## Non forzare TORCH_LOGS ad un valore non valido; lascia default
 ## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
 os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
+## Abilita di default feature dell'osservazione (dealer one-hot)
+os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
 
+_SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
+if _SILENCE_ABSL:
+    try:
+        _ORIG_STDERR = sys.stderr
+        _SUPPRESS_SUBSTRINGS = (
+            "All log messages before absl::InitializeLog() is called are written to STDERR",
+            "Unable to register cuDNN factory",
+            "Unable to register cuBLAS factory",
+            "cuda_dnn.cc",
+            "cuda_blas.cc",
+        )
+
+        class _FilteredStderr:
+            def __init__(self, stream, suppressed):
+                self._stream = stream
+                self._suppressed = suppressed
+                self._buffer = ""
+
+            def write(self, text):
+                try:
+                    self._buffer += str(text)
+                    while "\n" in self._buffer:
+                        line, self._buffer = self._buffer.split("\n", 1)
+                        if not any(s in line for s in self._suppressed):
+                            self._stream.write(line + "\n")
+                except Exception:
+                    try:
+                        self._stream.write(text)
+                    except Exception:
+                        pass
+
+            def flush(self):
+                try:
+                    if self._buffer:
+                        if not any(s in self._buffer for s in self._suppressed):
+                            self._stream.write(self._buffer)
+                        self._buffer = ""
+                    if hasattr(self._stream, "flush"):
+                        self._stream.flush()
+                except Exception:
+                    pass
+
+            def isatty(self):
+                try:
+                    return self._stream.isatty()
+                except Exception:
+                    return False
+
+            def fileno(self):
+                return self._stream.fileno()
+
+        sys.stderr = _FilteredStderr(_ORIG_STDERR, _SUPPRESS_SUBSTRINGS)
+    except Exception:
+        pass
+
+import threading
+import io
 import torch
 
 # Prefer GPU for models if available; never force CPU unless explicitly requested
@@ -46,11 +105,12 @@ except Exception:
     pass
 
 from trainers.train_ppo import train_ppo
+from utils.seed import resolve_seed
 
 
 def main():
     parser = argparse.ArgumentParser(description='Profile short PPO run (torch or line-level).')
-    parser.add_argument('--iters', type=int, default=30, help='Iterations to run')
+    parser.add_argument('--iters', type=int, default=5, help='Iterations to run')
     parser.add_argument('--horizon', type=int, default=2048, help='Rollout horizon per iteration')
     parser.add_argument('--line', dest='line', action='store_true', default=True, help='Enable line-by-line profiler with per-line timings (default: on)')
     parser.add_argument('--no-line', dest='line', action='store_false', help='Disable line-by-line profiler')
@@ -58,6 +118,12 @@ def main():
     parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
     args = parser.parse_args()
+    # Default to random seed for profiling runs; allow override via env/CLI passthrough
+    try:
+        seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
+    except Exception:
+        seed_env = -1
+    seed = resolve_seed(seed_env)
 
     # Perf flags
     torch.backends.cudnn.benchmark = True
@@ -97,7 +163,7 @@ def main():
                 global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         except Exception:
             pass
-        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False)
+        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
 
         # Print per-function and per-line stats (includes line numbers and source)
         try:
@@ -179,7 +245,7 @@ def main():
         #experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         # Short run for signal; adjust if needed
-        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0)
+        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, seed=seed)
 
     # Export chrome trace
     #prof.export_chrome_trace(trace_path)

@@ -8,6 +8,10 @@ def compute_final_score_breakdown(game_state, rules=None):
     """
     # Esegui su CPU per evitare dipendenze forzate da GPU (env/logica punteggio lato CPU)
     device = torch.device(os.environ.get('REW_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')))
+    # Allinea i tensori costanti di indicizzazione al device di lavoro per evitare mismatch
+    RID = RANK_OF_ID.to(device=device)
+    SUID = SUITCOL_OF_ID.to(device=device)
+    PV = PRIMIERA_VAL_T.to(device=device)
     squads = game_state["captured_squads"]
 
     rules = rules or {}
@@ -33,8 +37,8 @@ def compute_final_score_breakdown(game_state, rules=None):
     # Denari (suit==0)
     ids0 = torch.as_tensor(squads[0] or [], dtype=torch.long, device=device)
     ids1 = torch.as_tensor(squads[1] or [], dtype=torch.long, device=device)
-    den0 = int(((ids0.numel() > 0) and (SUITCOL_OF_ID[ids0] == 0).sum().item()) or 0)
-    den1 = int(((ids1.numel() > 0) and (SUITCOL_OF_ID[ids1] == 0).sum().item()) or 0)
+    den0 = int(((ids0.numel() > 0) and (SUID[ids0] == 0).sum().item()) or 0)
+    den1 = int(((ids1.numel() > 0) and (SUID[ids1] == 0).sum().item()) or 0)
     pt_d0, pt_d1 = ((1, 0) if den0 > den1 else (0, 1) if den1 > den0 else (0, 0))
 
     # Settebello (ID=24)
@@ -45,9 +49,9 @@ def compute_final_score_breakdown(game_state, rules=None):
     def _primiera_points(ids_t: torch.Tensor) -> float:
         if ids_t.numel() == 0:
             return 0.0
-        ranks = RANK_OF_ID[ids_t].to(torch.long)
-        suits = SUITCOL_OF_ID[ids_t].to(torch.long)
-        vals = PRIMIERA_VAL_T[ranks]
+        ranks = RID[ids_t].to(torch.long)
+        suits = SUID[ids_t].to(torch.long)
+        vals = PV[ranks]
         out = torch.zeros(4, dtype=torch.float32, device=device)
         try:
             out.scatter_reduce_(0, suits, vals, reduce='amax', include_self=True)
@@ -120,7 +124,8 @@ def compute_final_score_breakdown(game_state, rules=None):
 
 def compute_final_reward_from_breakdown(breakdown):
     """
-    Calcolo su CUDA della ricompensa finale (ritorna scalari Python).
+    Calcola la ricompensa finale come differenza di punteggio tra i team.
+    Ritorna un dizionario {0: reward_team0, 1: reward_team1}.
     """
     device = torch.device(os.environ.get('REW_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')))
     diff = torch.tensor(breakdown[0]["total"] - breakdown[1]["total"], dtype=torch.float32, device=device)

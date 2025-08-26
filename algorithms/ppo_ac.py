@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
 from utils.device import get_compute_device, get_amp_dtype
 from utils.compile import maybe_compile_module, maybe_compile_function
+from utils.fallback import notify_fallback
 
 import os as _os
 device = get_compute_device()
@@ -160,9 +161,8 @@ class ActionConditionedPPO:
         with cm:
             # Scoring simultaneo di tutte le azioni legali via fattorizzazione
             state_proj = self.actor.compute_state_proj(obs_t, seat_team_t)  # (1,64)
-        # Precompute logits carta una volta (match dtype/device under autocast)
-        card_emb = self.actor.card_emb_play.to(device=state_proj.device, dtype=state_proj.dtype)
-        card_logits_all = torch.matmul(state_proj, card_emb.t()).squeeze(0)  # (40)
+            # Precompute logits carta una volta (keep inside autocast for dtype alignment)
+            card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t()).squeeze(0)  # (40)
         played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
         # logp carta solo sulle carte presenti nei legali, deduplicando gli ID
         # per evitare il costo del masking a 40 elementi ad ogni chiamata
@@ -172,10 +172,15 @@ class ActionConditionedPPO:
         logp_cards_per_legal = logp_cards_unique[inverse_idx]  # (A)
         # capture logits per-legal via action embedding (usa tabella cachata in inference)
         try:
-            # Usa copia della tabella per evitare aliasing con cudagraphs
-            a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=actions_t.device).clone()
-            a_emb = actions_t.to(dtype=state_proj.dtype) @ a_tbl  # (A,64)
+            # Usa tabella cache senza clone; allinea dtype a state_proj
+            a_tbl = self.actor.get_action_emb_table_cached()
+            if a_tbl.device != actions_t.device:
+                a_tbl = a_tbl.to(device=actions_t.device)
+            if a_tbl.dtype != state_proj.dtype:
+                a_tbl = a_tbl.to(dtype=state_proj.dtype)
+            a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
         except Exception:
+            notify_fallback('ppo.select_action.a_emb_table_failed')
             a_emb = self.actor.action_enc(actions_t)
             a_emb = a_emb.to(dtype=state_proj.dtype)
         cap_logits = torch.matmul(a_emb, state_proj.squeeze(0).to(dtype=a_emb.dtype))  # (A)
@@ -186,6 +191,7 @@ class ActionConditionedPPO:
         try:
             group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
         except Exception:
+            notify_fallback('ppo.select_action.scatter_reduce_failed')
             tmp = torch.zeros_like(group_max)
             tmp.index_copy_(0, group_ids, cap_logits)
             group_max = torch.maximum(group_max, tmp)
@@ -205,12 +211,18 @@ class ActionConditionedPPO:
         s = probs.sum()
         if not torch.isfinite(s) or s <= 0:
             A = probs.numel()
+            try:
+                s_val = float(s.detach().item())
+            except Exception:
+                s_val = float('nan')
+            notify_fallback('ppo.select_action.uniform_probs', f'sum={s_val}, A={int(A)}')
             probs = torch.full_like(probs, 1.0 / max(1, A))
         else:
             probs = probs / s
         try:
             idx_t = torch.multinomial(probs, num_samples=1).squeeze(0)
         except Exception:
+            notify_fallback('ppo.select_action.multinomial_failed')
             idx_t = torch.argmax(probs)
         logp_total = logp_totals[idx_t].detach()
         chosen_act = actions_t[idx_t].detach()
@@ -291,8 +303,9 @@ class ActionConditionedPPO:
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # State projection e logits per carta
         state_proj = self.actor.compute_state_proj(obs, seat)  # (B,64)
-        card_emb = self.actor.card_emb_play.to(device=state_proj.device, dtype=state_proj.dtype)
-        card_logits_all = torch.matmul(state_proj, card_emb.t())       # (B,40)
+        # Align activation to parameter dtype to avoid matmul dtype mismatch under autocast
+        state_proj = state_proj.to(dtype=self.actor.card_emb_play.dtype)
+        card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t())       # (B,40)
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -326,12 +339,17 @@ class ActionConditionedPPO:
             chosen_card_ids = played_ids_all[chosen_abs_idx]
             logp_card = logp_cards[row_idx, chosen_card_ids]
             # capture logits per-legal via action embedding
-            # usa tabella cachata per ridurre compute della MLP azione
-            try:
-                a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_mb.device)
-                a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
-            except Exception:
-                a_emb_mb = self.actor.action_enc(legals_mb)           # fallback (M_mb,64)
+            # In training, evita la tabella cache staccata per propagare gradiente e non
+            # limitare l'espressività (multi-hot non è somma di one-hot dopo MLP non lineare)
+            if self.actor.training:
+                a_emb_mb = self.actor.action_enc(legals_mb)
+            else:
+                try:
+                    a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_mb.device)
+                    a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
+                except Exception:
+                    notify_fallback('ppo.compute_loss.a_emb_table_failed')
+                    a_emb_mb = self.actor.action_enc(legals_mb)           # fallback (M_mb,64)
             cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
             # segment logsumexp per gruppo (sample, card)
             group_ids = sample_idx_per_legal * 40 + played_ids_mb
@@ -341,6 +359,7 @@ class ActionConditionedPPO:
                 group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
             except Exception:
                 # fallback semplice
+                notify_fallback('ppo.compute_loss.scatter_reduce_failed')
                 tmp = torch.zeros_like(group_max)
                 tmp.index_copy_(0, group_ids, cap_logits)
                 group_max = torch.maximum(group_max, tmp)
@@ -371,9 +390,27 @@ class ActionConditionedPPO:
 
         ratio = torch.exp(logp_new - old_logp)
         clipped = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv
-        loss_pi = -(torch.min(ratio * adv, clipped)).mean()
+        # Maschera off-policy per step MCTS: quando presente mcts_weight>0, escludi la loss di policy
+        mcts_w = batch.get('mcts_weight', None)
+        if mcts_w is not None:
+            if not torch.is_tensor(mcts_w):
+                mcts_w = torch.as_tensor(mcts_w, dtype=torch.float32, device=device)
+            else:
+                mcts_w = mcts_w.to(device=device, dtype=torch.float32)
+            # costruiamo un mask 0/1 allineato al minibatch corrente (B,)
+            if mcts_w.dim() > 1:
+                mcts_w = mcts_w.view(-1)
+            # clamp and invert: 1.0 per step senza MCTS, 0.0 per step con MCTS
+            mask_no_mcts = (mcts_w <= 0.0).to(torch.float32)
+            # applica la maschera alla parte di policy; somma eps per evitare divisione 0
+            ppo_term = torch.min(ratio * adv, clipped) * mask_no_mcts
+            denom = mask_no_mcts.sum().clamp_min(1.0)
+            loss_pi = -(ppo_term.sum() / denom)
+        else:
+            loss_pi = -(torch.min(ratio * adv, clipped)).mean()
 
-        v = self.critic(obs, seat)
+        # Passa others_hands (se disponibile) al critico per percorso CTDE opzionale
+        v = self.critic(obs, seat, batch.get('others_hands', None))
         if self.value_clip is not None and self.value_clip > 0:
             v_clipped = torch.clamp(v, ret - self.value_clip, ret + self.value_clip)
             loss_v = torch.max((v - ret) ** 2, (v_clipped - ret) ** 2).mean()
@@ -391,24 +428,20 @@ class ActionConditionedPPO:
         # Loss ausiliaria per BeliefNet solo se necessario
         belief_aux = torch.tensor(0.0, device=device)
         if (coef > 0.0) and max_cnt > 0 and mcts_weight.numel() == B and (mcts_weight.sum() > 0) and mcts_policy_flat.numel() >= int(cnts.sum().item()):
-            # Ricostruisci (B, max_cnt) target evitando contributi sui padding (restano a 0)
-            target = torch.full((B, max_cnt), 0.0, device=device, dtype=torch.float32)
-            start = 0
-            for i in range(B):
-                ni = int(cnts[i].item())
-                if ni > 0:
-                    target[i, :ni] = mcts_policy_flat[start:start+ni]
-                    start += ni
+            # Ricostruisci (B, max_cnt) target evitando loop Python: usa masked_scatter
+            target = torch.zeros((B, max_cnt), device=device, dtype=torch.float32)
+            valid_mask = torch.arange(max_cnt, device=device).unsqueeze(0).expand(B, max_cnt) < cnts.unsqueeze(1)
+            flat_len = int(cnts.sum().item())
+            target.masked_scatter_(valid_mask, mcts_policy_flat[:flat_len])
             # KL(pi_target || pi_actor) solo per posizioni con target>0 → niente 0 * (-inf)
             eps = 1e-8
             mask_pos = (target > 0)
             safe_log_t = torch.zeros_like(target)
             safe_log_t[mask_pos] = torch.log(torch.clamp(target[mask_pos], min=eps))
-            # Se entropia è disattivata, serve calcolare logp_total_padded qui
-            if not need_entropy:
-                logp_total_per_legal = logp_cards[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
-                logp_total_padded = torch.full((B, max_cnt), float('-inf'), dtype=cap_logits.dtype, device=device)
-                logp_total_padded[mask] = logp_total_per_legal
+            # Costruisci sempre i log-prob totali per-legal paddati (usati dalla KL MCTS)
+            logp_total_per_legal = logp_cards[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
+            logp_total_padded = torch.full((B, max_cnt), float('-inf'), dtype=cap_logits.dtype, device=device)
+            logp_total_padded[mask] = logp_total_per_legal
             diff = safe_log_t - logp_total_padded
             kl_per_row = (target * diff).sum(dim=1)
             # Peso per incertezza calcolato sulle posizioni valide
@@ -444,15 +477,15 @@ class ActionConditionedPPO:
             logits_3x40 = logits_b.view(Bsz, 3, 40)
             # softmax over players dim
             log_probs = torch.log_softmax(logits_3x40, dim=1)
-            # mask visible cards: zero their contribution
+            # mask visible cards: zero their contribution, then average over unknown only
             m = (~visible_mask).to(log_probs.dtype).unsqueeze(1)  # True on unknown
             ce_per_card = -(rh * log_probs).sum(dim=1)  # (B,40)
             ce_per_card = ce_per_card * m.squeeze(1)
-            denom = m.sum(dim=(1,2)).clamp_min(1.0) if m.dim()==3 else m.sum(dim=2).clamp_min(1.0)
-            belief_aux = (ce_per_card.sum(dim=1) / torch.clamp_min((~visible_mask).sum(dim=1).to(torch.float32), 1.0)).mean()
+            denom = m.sum(dim=(1,2)).clamp_min(1.0)
+            belief_aux = (ce_per_card.sum(dim=1) / denom).mean()
 
         loss = loss_pi + self.value_coef * loss_v - self.entropy_coef * entropy + coef * distill_loss + belief_coef * belief_aux
-        approx_kl = (old_logp - logp_new).mean().abs()
+        approx_kl = (old_logp - logp_new).mean()
         # clip fraction reale: frazione di sample con |ratio-1| > clip_ratio
         if B > 0:
             clip_frac = (torch.abs(ratio - 1.0) > self.clip_ratio).float().mean()

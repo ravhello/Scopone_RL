@@ -18,6 +18,7 @@ OBS_DEVICE = torch.device(_os.environ.get('OBS_DEVICE', _os.environ.get('SCOPONE
 OBS_INCLUDE_INFERRED = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
 OBS_INCLUDE_RANK_PROBS = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
 OBS_INCLUDE_SCOPA_PROBS = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
+OBS_INCLUDE_DEALER = os.environ.get('OBS_INCLUDE_DEALER', '0') == '1'
 
 # ===== ID/Bitset helpers (device = OBS_DEVICE) =====
 RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
@@ -908,6 +909,17 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     table_possible_sums_np = compute_table_possible_sums(game_state)  # (10)
     # Cond. rank presence from inferred (3 players x 10 ranks = 30)
     rank_presence_from_inferred_np = compute_rank_presence_probs_from_inferred(game_state, player_id)
+    # Progress della mano (1): len(history)/40
+    progress_np = torch.tensor([min(1.0, float(len(game_state.get("history", [])))/40.0)], dtype=torch.float32, device=device)
+    # Last capturing team (2 one-hot): [team0, team1]
+    lct0, lct1 = 0.0, 0.0
+    for mv in reversed(game_state.get("history", [])):
+        ct = mv.get("capture_type")
+        if ct in ("capture", "scopa"):
+            lct0 = 1.0 if (mv.get("player") in [0,2]) else 0.0
+            lct1 = 1.0 - lct0
+            break
+    last_capturing_team_np = torch.tensor([lct0, lct1], dtype=torch.float32, device=device)
 
     # Convert to torch CUDA tensors
     hist_k = (hist_k_np.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(hist_k_np) else torch.as_tensor(hist_k_np, dtype=torch.float32, device=device))
@@ -944,10 +956,30 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
         table_sum,
         table_possible_sums,
         scopa_counts,
+        progress_np,
+        last_capturing_team_np,
     ])
-    # Aggiungi rank_presence_from_inferred solo se le probabilità inferite sono abilitate
-    if OBS_INCLUDE_INFERRED:
-        parts.append(rank_presence_from_inferred)
+    # Dealer one-hot opzionale (4-d): derivabile da current_player e history
+    if OBS_INCLUDE_DEALER:
+        try:
+            current_player = int(game_state.get('current_player', -1))
+        except Exception:
+            current_player = -1
+        hlen = len(game_state.get('history', []))
+        if current_player >= 0:
+            starting_seat = (current_player - (hlen % 4)) % 4
+            dealer_seat = (starting_seat - 1) % 4
+        else:
+            # fallback quando current_player non è nello stato
+            from utils.fallback import notify_fallback
+            notify_fallback('observation.dealer_seat.fallback_current_player')
+            dealer_seat = ((-1 - 1) % 4)
+        dealer_vec = torch.zeros(4, dtype=torch.float32, device=device)
+        if 0 <= dealer_seat <= 3:
+            dealer_vec[dealer_seat] = 1.0
+        parts.append(dealer_vec)
+    # Aggiungi rank_presence_from_inferred sempre (ritorna zeri se OBS_INCLUDE_INFERRED=0)
+    parts.append(rank_presence_from_inferred)
     # Aggiungi opzionali (scopa/rank) sempre nella costruzione, ma normalizza poi alla dim attesa
     parts.extend([
         scopa_probs,
@@ -959,8 +991,8 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     include_scopa = OBS_INCLUDE_SCOPA_PROBS
     include_rank = OBS_INCLUDE_RANK_PROBS
     include_inferred = OBS_INCLUDE_INFERRED
-    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2
-                    + (10 if include_scopa else 0) + (150 if include_rank else 0))
+    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+                    + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if OBS_INCLUDE_DEALER else 0))
     if result.numel() != expected_dim:
         if result.numel() < expected_dim:
             pad = torch.zeros((expected_dim - result.numel(),), dtype=result.dtype, device=result.device)
@@ -990,6 +1022,8 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
               OBS_DEVICE)
     if hands_bits_t is None or table_bits_t is None or captured_bits_t is None:
         # fallback
+        from utils.fallback import notify_fallback
+        notify_fallback('observation.fast_path_missing_bitsets')
         return encode_state_compact_for_player(game_state, player_id, k_history=k_history)
 
     # 1) Mani (43): 40 one-hot + 3 conteggi altri giocatori
@@ -1073,6 +1107,20 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
 
     # 15) Table possible sums (10)
     table_possible_sums = compute_table_possible_sums(game_state)
+    # 16) Progress (1)
+    progress = torch.tensor([min(1.0, float(len(game_state.get("history", [])))/40.0)], dtype=torch.float32, device=device)
+    # 17) Last capturing team (2)
+    lct0, lct1 = 0.0, 0.0
+    try:
+        for mv in reversed(game_state.get("history", [])):
+            ct = mv.get("capture_type")
+            if ct in ("capture", "scopa"):
+                lct0 = 1.0 if (int(mv.get("player")) in [0,2]) else 0.0
+                lct1 = 1.0 - lct0
+                break
+    except Exception:
+        pass
+    last_capturing_team = torch.tensor([lct0, lct1], dtype=torch.float32, device=device)
 
     parts = [
         hands_enc,
@@ -1092,8 +1140,26 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
         table_possible_sums,
         scopa_counts,
         scopa_probs,
-        rank_probs_by_player
+        rank_probs_by_player,
+        progress,
+        last_capturing_team
     ])
+    # Dealer one-hot opzionale (4-d): calcolato da current_player e history
+    if OBS_INCLUDE_DEALER:
+        try:
+            current_player = int(game_state.get('current_player', -1))
+        except Exception:
+            current_player = -1
+        hlen = len(game_state.get('history', []))
+        if current_player >= 0:
+            starting_seat = (current_player - (hlen % 4)) % 4
+            dealer_seat = (starting_seat - 1) % 4
+        else:
+            dealer_seat = ((-1 - 1) % 4)
+        dealer_vec = torch.zeros(4, dtype=torch.float32, device=device)
+        if 0 <= dealer_seat <= 3:
+            dealer_vec[dealer_seat] = 1.0
+        parts.append(dealer_vec)
     result = torch.cat(parts)
     # Coerenza dimensionale con feature attive/disattive
     include_scopa = OBS_INCLUDE_SCOPA_PROBS
@@ -1104,8 +1170,8 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     rpf = compute_rank_presence_probs_from_inferred(game_state, player_id)
     rpf = rpf.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(rpf) else torch.as_tensor(rpf, dtype=torch.float32, device=device)
     result = torch.cat([result, rpf], dim=0)
-    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30
-                    + (10 if include_scopa else 0) + (150 if include_rank else 0))
+    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+                    + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if OBS_INCLUDE_DEALER else 0))
     if result.numel() != expected_dim:
         if result.numel() < expected_dim:
             pad = torch.zeros((expected_dim - result.numel(),), dtype=result.dtype, device=result.device)

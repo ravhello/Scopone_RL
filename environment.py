@@ -40,25 +40,23 @@ class ScoponeEnvMA(gym.Env):
     def __init__(self, rules=None, use_compact_obs: bool = False, k_history: int = 39):
         super().__init__()
         
-        # Config osservazione
-        # Forza la modalità compatta: la legacy 10823 è deprecata
-        self.use_compact_obs = True if use_compact_obs is None else bool(use_compact_obs) or True
+        # Config osservazione (solo compatta)
+        # Forza sempre la modalità compatta; il flag use_compact_obs è ignorato e mantenuto solo per compatibilità API
+        self.use_compact_obs = True
         self.k_history = int(k_history)
-        if self.use_compact_obs:
-            # Dimensione compatta dinamica in base ai flag OBS_INCLUDE_*:
-            # Base fisse: 43 (mani) + 40 (tavolo) + 82 (catture) + 61*k (history) + 40 (missing)
-            #            + 120 (inferred) + 8 (primiera) + 2 (denari) + 1 (settebello) + 2 (score)
-            #            + 1 (table sum) + 10 (table possible sums) + 2 (scopa counts)
-            include_rank = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
-            include_scopa = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
-            include_inferred = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
-            # Part fisse comuni (senza inferred): 43+40+82 + 61*k + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30
-            fixed = 43 + 40 + 82 + 61 * self.k_history + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30
-            base = fixed + (120 if include_inferred else 0)
-            obs_dim = base + (10 if include_scopa else 0) + (150 if include_rank else 0)
-        else:
-            # Non dovrebbe mai accadere: legacy disattivata
-            raise NotImplementedError("La rappresentazione legacy 10823-dim è deprecata: usa use_compact_obs=True")
+        # Dimensione compatta dinamica in base ai flag OBS_INCLUDE_*:
+        # Base fisse: 43 (mani) + 40 (tavolo) + 82 (catture) + 61*k (history) + 40 (missing)
+        #            + 120 (inferred) + 8 (primiera) + 2 (denari) + 1 (settebello) + 2 (score)
+        #            + 1 (table sum) + 10 (table possible sums) + 2 (scopa counts)
+        #            + 30 (rank_presence_from_inferred) + 1 (progress) + 2 (last capturing team)
+        include_rank = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
+        include_scopa = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
+        include_inferred = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
+        include_dealer = os.environ.get('OBS_INCLUDE_DEALER', '0') == '1'
+        # Part fisse comuni (senza inferred): 43+40+82 + 61*k + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+        fixed = 43 + 40 + 82 + 61 * self.k_history + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+        base = fixed + (120 if include_inferred else 0)
+        obs_dim = base + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if include_dealer else 0)
         # Observation space con la rappresentazione selezionata
         self.observation_space = spaces.Box(low=0, high=1, shape=(obs_dim,))
         
@@ -149,7 +147,7 @@ class ScoponeEnvMA(gym.Env):
     def clone(self):
         """Crea una copia profonda dell'ambiente per simulazione/ricerca."""
         import copy
-        cloned = ScoponeEnvMA(rules=copy.deepcopy(self.rules), use_compact_obs=self.use_compact_obs, k_history=self.k_history)
+        cloned = ScoponeEnvMA(rules=copy.deepcopy(self.rules), use_compact_obs=True, k_history=self.k_history)
         cloned.game_state = copy.deepcopy(self.game_state)
         cloned.done = self.done
         cloned.current_player = self.current_player
@@ -164,6 +162,11 @@ class ScoponeEnvMA(gym.Env):
         except Exception:
             # fallback: tenta un reset e poi riallinea
             try:
+                from utils.fallback import notify_fallback
+                notify_fallback('env.clone.rebuild_id_caches_failed')
+            except Exception:
+                pass
+            try:
                 cloned.reset(starting_player=self.current_player)
                 cloned.game_state = copy.deepcopy(self.game_state)
                 cloned._rebuild_id_caches()
@@ -175,7 +178,8 @@ class ScoponeEnvMA(gym.Env):
         """Calcola azioni valide su CPU usando bitset; evita micro-kernel su GPU."""
         start_time = time.time()
         # RANK_OF_ID è definito per CUDA; per CPU calcoliamo al volo
-        from actions import encode_action_from_ids_gpu
+        # Usa la variante tensor-native (device-agnostica) per codificare le azioni
+        from actions import encode_action_from_ids_tensor as encode_action_from_ids
 
         # Chiave di cache LRU basata su (giocatore, mano, tavolo, regole AP)
         try:
@@ -211,7 +215,7 @@ class ScoponeEnvMA(gym.Env):
             return valid_actions
 
         # Hoist invariants out of per-hand loop
-        encode_fn = encode_action_from_ids_gpu
+        encode_fn = encode_action_from_ids
         if table_ids_t.numel() > 0:
             table_ranks = (table_ids_t // 4 + 1).to(torch.int64)
         else:
@@ -267,19 +271,19 @@ class ScoponeEnvMA(gym.Env):
                             valid_actions.append(encode_fn(pid_t, cap_ids_t))
                     else:
                         # Scarto (nessuna combinazione valida)
-                        valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+                        valid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
                 else:
                     # Tavolo vuoto: solo scarto
-                    valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+                    valid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
             # Variante: Asso piglia tutto (aggiungi cattura completa)
             if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and int(prank_t.item()) == 1:
-                valid_actions.append(encode_action_from_ids_gpu(pid_t, table_ids_t))
+                valid_actions.append(encode_fn(pid_t, table_ids_t))
             # Ace place action if allowed
             ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
             ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
             if int(prank_t.item()) == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
-                valid_actions.append(encode_action_from_ids_gpu(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+                valid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
         # Post-filtri AP: rimuovi posa asso non consentita solo se AP è attivo
         ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
@@ -647,7 +651,6 @@ class ScoponeEnvMA(gym.Env):
             len(self.game_state["history"]),
             tuple(sorted(_card_to_id(c) for c in self.game_state["captured_squads"][0])),
             tuple(sorted(_card_to_id(c) for c in self.game_state["captured_squads"][1])),
-            self.use_compact_obs,
             self.k_history
         )
         
@@ -657,14 +660,18 @@ class ScoponeEnvMA(gym.Env):
             # LRU refresh
             self._observation_cache.move_to_end(cache_key)
         else:
-            # Calcola l'osservazione
-            if self.use_compact_obs:
-                from observation import encode_state_compact_for_player_fast
-                # esponi mirrors per fast-path GPU
-                self.game_state['_hands_bits_t'] = self._hands_bits_t
-                self.game_state['_table_bits_t'] = self._table_bits_t
-                self.game_state['_captured_bits_t'] = self._captured_bits_t
-                result = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
+            # Calcola l'osservazione (solo compatta)
+            from observation import encode_state_compact_for_player_fast
+            # esponi mirrors per fast-path GPU
+            self.game_state['_hands_bits_t'] = self._hands_bits_t
+            self.game_state['_table_bits_t'] = self._table_bits_t
+            self.game_state['_captured_bits_t'] = self._captured_bits_t
+            # esponi anche il current_player per feature derivate (es. dealer)
+            try:
+                self.game_state['current_player'] = int(self.current_player)
+            except Exception:
+                self.game_state['current_player'] = self.current_player
+            result = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
             
             # Salva in cache (LRU)
             try:

@@ -10,6 +10,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# Abilita di default feature dell'osservazione (dealer one-hot)
+os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+
 
 def _aggregate_and_print_line_profiler_results(global_profiler, project_root: str, extended_report: bool = False) -> None:
     """Replicates the per-file and top-lines summaries used in tools/profile_ppo.py."""
