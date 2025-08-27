@@ -2,8 +2,8 @@
 import torch
 import os
 from utils.device import get_env_device
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import time
 from collections import OrderedDict
 

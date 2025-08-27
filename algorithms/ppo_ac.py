@@ -117,18 +117,48 @@ class ActionConditionedPPO:
                 except Exception:
                     self.scaler = None
 
+        # Pre-allocate pinned CPU buffers to cut repeated pin_memory/allocations in select_action
+        # These are sized for single-step inference (batch size 1) and dynamic actions buffer
+        try:
+            self._obs_cpu_pinned = torch.empty((1, obs_dim), dtype=torch.float32, pin_memory=True)
+            # seat_team_vec is expected to be length 6 (one-hot seats + team flags)
+            self._seat_cpu_pinned = torch.empty((1, 6), dtype=torch.float32, pin_memory=True)
+        except Exception:
+            # Fallback if pin_memory not available (e.g., CPU-only builds)
+            self._obs_cpu_pinned = None
+            self._seat_cpu_pinned = None
+        self._actions_cpu_pinned = None
+        self._actions_cpu_capacity = 0
+
+    def _ensure_actions_pinned_capacity(self, capacity: int):
+        # Lazily allocate or grow the pinned actions buffer
+        if (self._actions_cpu_pinned is None) or (capacity > self._actions_cpu_capacity):
+            new_cap = max(capacity, int(self._actions_cpu_capacity * 1.5) if self._actions_cpu_capacity > 0 else 64)
+            try:
+                self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32, pin_memory=True)
+                self._actions_cpu_capacity = new_cap
+            except Exception:
+                # Fallback without pinning
+                self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32)
+                self._actions_cpu_capacity = new_cap
+
     def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
-        # Prepare CPU-pinned → CUDA non_blocking transfers for per-step inference
+        # Prepare CPU-pinned → CUDA non_blocking transfers for per-step inference, reusing pinned buffers
         if torch.is_tensor(obs):
             obs_cpu = obs.detach().to(device='cpu', dtype=torch.float32)
         else:
             obs_cpu = torch.as_tensor(obs, dtype=torch.float32, device='cpu')
-        obs_t = obs_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+        if (self._obs_cpu_pinned is not None) and (obs_cpu.numel() == self._obs_cpu_pinned.size(1)):
+            # Copy into pre-pinned buffer to avoid new pinned allocations
+            self._obs_cpu_pinned[0].copy_(obs_cpu, non_blocking=True)
+            obs_t = self._obs_cpu_pinned.to(device=device, non_blocking=True)
+        else:
+            obs_t = obs_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
 
+        # Stack legal actions on CPU and copy into (or allocate) pinned buffer once
         if torch.is_tensor(legal_actions):
-            # Already a stacked tensor (A,80)
             actions_cpu = legal_actions.detach().to(device='cpu', dtype=torch.float32)
         elif len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]):
             actions_cpu = torch.stack(legal_actions).detach().to(device='cpu', dtype=torch.float32)
@@ -136,7 +166,13 @@ class ActionConditionedPPO:
             actions_cpu = torch.stack([
                 (x.detach().to(device='cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device='cpu'))
             for x in legal_actions], dim=0)
-        actions_t = actions_cpu.pin_memory().to(device=device, non_blocking=True)
+        A = actions_cpu.size(0)
+        if self._actions_cpu_pinned is not None:
+            self._ensure_actions_pinned_capacity(A)
+            self._actions_cpu_pinned[:A].copy_(actions_cpu, non_blocking=True)
+            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
+        else:
+            actions_t = actions_cpu.pin_memory().to(device=device, non_blocking=True)
 
         st = None
         if seat_team_vec is not None:
@@ -144,7 +180,11 @@ class ActionConditionedPPO:
                 st_cpu = seat_team_vec.detach().to('cpu', dtype=torch.float32)
             else:
                 st_cpu = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
-            st = st_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+            if (self._seat_cpu_pinned is not None) and (st_cpu.numel() == self._seat_cpu_pinned.size(1)):
+                self._seat_cpu_pinned[0].copy_(st_cpu, non_blocking=True)
+                st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
+            else:
+                st = st_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
         # belief handled internally by the actor
 
         with torch.no_grad():
@@ -172,12 +212,14 @@ class ActionConditionedPPO:
         logp_cards_per_legal = logp_cards_unique[inverse_idx]  # (A)
         # capture logits per-legal via action embedding (usa tabella cachata in inference)
         try:
-            # Usa tabella cache senza clone; allinea dtype a state_proj
-            a_tbl = self.actor.get_action_emb_table_cached()
-            if a_tbl.device != actions_t.device:
-                a_tbl = a_tbl.to(device=actions_t.device)
-            if a_tbl.dtype != state_proj.dtype:
-                a_tbl = a_tbl.to(dtype=state_proj.dtype)
+            # Usa tabella cache nella variante richiesta per evitare cast ricorrenti
+            try:
+                a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)
+            except TypeError:
+                # Compatibilità con versioni senza keyword
+                a_tbl = self.actor.get_action_emb_table_cached()
+                if a_tbl.device != actions_t.device or a_tbl.dtype != state_proj.dtype:
+                    a_tbl = a_tbl.to(device=actions_t.device, dtype=state_proj.dtype).contiguous()
             a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
         except Exception:
             notify_fallback('ppo.select_action.a_emb_table_failed')
@@ -200,6 +242,7 @@ class ActionConditionedPPO:
         exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
         group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=actions_t.device)
         group_sum.index_add_(0, group_ids, exp_shifted)
+        # numerically stable logsumexp per-legal within group
         lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
         logp_cap_per_legal = cap_logits - lse_per_legal  # (A)
         # logp totale per legal = logp(card played) + logp(capture|card)
@@ -278,6 +321,8 @@ class ActionConditionedPPO:
         offs = to_cuda_nb(batch['legals_offset'], torch.long)
         cnts = to_cuda_nb(batch['legals_count'], torch.long)
         chosen_idx = to_cuda_nb(batch['chosen_index'], torch.long)
+        # Optional precomputed global action embeddings to avoid recomputation per minibatch
+        a_emb_global = batch.get('a_emb_global', None)
         # distillazione MCTS (targets raggruppati per sample): policy piatta e peso per-sample
         mcts_policy_flat = to_cuda_nb(batch.get('mcts_policy', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
         mcts_weight = to_cuda_nb(batch.get('mcts_weight', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
@@ -339,17 +384,25 @@ class ActionConditionedPPO:
             chosen_card_ids = played_ids_all[chosen_abs_idx]
             logp_card = logp_cards[row_idx, chosen_card_ids]
             # capture logits per-legal via action embedding
-            # In training, evita la tabella cache staccata per propagare gradiente e non
-            # limitare l'espressività (multi-hot non è somma di one-hot dopo MLP non lineare)
-            if self.actor.training:
-                a_emb_mb = self.actor.action_enc(legals_mb)
+            # Prefer precomputed global embeddings to avoid recomputation per minibatch
+            if a_emb_global is not None:
+                a_emb_mb = a_emb_global[abs_idx]
             else:
-                try:
-                    a_tbl = self.actor.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_mb.device)
-                    a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
-                except Exception:
-                    notify_fallback('ppo.compute_loss.a_emb_table_failed')
-                    a_emb_mb = self.actor.action_enc(legals_mb)           # fallback (M_mb,64)
+                # In training, avoid cached table to keep gradients flowing
+                if self.actor.training:
+                    a_emb_mb = self.actor.action_enc(legals_mb)
+                else:
+                    try:
+                        try:
+                            a_tbl = self.actor.get_action_emb_table_cached(device=legals_mb.device, dtype=state_proj.dtype)
+                        except TypeError:
+                            a_tbl = self.actor.get_action_emb_table_cached()
+                            if a_tbl.device != legals_mb.device or a_tbl.dtype != state_proj.dtype:
+                                a_tbl = a_tbl.to(device=legals_mb.device, dtype=state_proj.dtype).contiguous()
+                        a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
+                    except Exception:
+                        notify_fallback('ppo.compute_loss.a_emb_table_failed')
+                        a_emb_mb = self.actor.action_enc(legals_mb)           # fallback (M_mb,64)
             cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
             # segment logsumexp per gruppo (sample, card)
             group_ids = sample_idx_per_legal * 40 + played_ids_mb
@@ -513,6 +566,7 @@ class ActionConditionedPPO:
         early_stop = False
 
         def _grad_norm(params):
+            # Deprecated: we now use the value returned by clip_grad_norm_ to cut kernel launches
             total_sq = torch.zeros((), device=device)
             for p in params:
                 if p.grad is not None:
@@ -536,6 +590,15 @@ class ActionConditionedPPO:
         # 'legals' è globale: porta su device una volta
         if 'legals' in batch_cuda:
             batch_cuda['legals'] = batch_cuda['legals'].to(device=device, dtype=torch.float32, non_blocking=True)
+            # Precompute global embeddings ONLY when not training to avoid graph reuse across backward
+            # which leads to "Trying to backward through the graph a second time" errors.
+            if not self.actor.training:
+                try:
+                    batch_cuda['a_emb_global'] = self.actor.action_enc(batch_cuda['legals']).detach()
+                except Exception:
+                    batch_cuda['a_emb_global'] = None
+            else:
+                batch_cuda['a_emb_global'] = None
 
         for ep in range(epochs):
             # Indici su CUDA per evitare hop CPU↔GPU
@@ -557,6 +620,7 @@ class ActionConditionedPPO:
                     'chosen_index': sel_cuda(batch_cuda['chosen_index']),
                     'seat_team': sel_cuda(batch_cuda['seat_team']) if batch_cuda.get('seat_team', None) is not None else None,
                     'others_hands': sel_cuda(batch_cuda['others_hands']) if batch_cuda.get('others_hands', None) is not None else None,
+                    'a_emb_global': batch_cuda.get('a_emb_global', None),
                 }
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
@@ -567,11 +631,12 @@ class ActionConditionedPPO:
                     # Unscale prima del grad clip
                     self.scaler.unscale_(self.opt_actor)
                     self.scaler.unscale_(self.opt_critic)
-                    # grad norm (prima del clip) per logging
-                    gn_actor = _grad_norm(self.actor.parameters())
-                    gn_critic = _grad_norm(self.critic.parameters())
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
+                    gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    # garanzia tensor per logging coerente
+                    gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
+                    gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
                     self.scaler.step(self.opt_actor)
                     self.scaler.step(self.opt_critic)
                     self.scaler.update()
@@ -583,11 +648,11 @@ class ActionConditionedPPO:
                 else:
                     loss, info = self.compute_loss(mini)
                     loss.backward()
-                    # grad norm (prima del clip) per logging
-                    gn_actor = _grad_norm(self.actor.parameters())
-                    gn_critic = _grad_norm(self.critic.parameters())
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
+                    gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
+                    gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
                     self.opt_actor.step()
                     self.opt_critic.step()
                     try:

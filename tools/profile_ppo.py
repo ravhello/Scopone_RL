@@ -27,6 +27,8 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
 ## Abilita di default feature dell'osservazione (dealer one-hot)
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+## Forza metodo di start del multiprocessing a 'fork' di default su Linux/WSL per evitare hang
+os.environ.setdefault('SCOPONE_MP_START', 'fork')
 
 _SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
 if _SILENCE_ABSL:
@@ -117,6 +119,7 @@ def main():
     parser.add_argument('--wrap-update', dest='wrap_update', action='store_true', default=True, help='Also profile ActionConditionedPPO.update (default: on; slower)')
     parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
+    parser.add_argument('--num-envs', type=int, default=None, help='Number of parallel environments (default: 17 with --line, 1 without)')
     args = parser.parse_args()
     # Default to random seed for profiling runs; allow override via env/CLI passthrough
     try:
@@ -163,7 +166,8 @@ def main():
                 global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         except Exception:
             pass
-        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
+        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 17
+        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
 
         # Print per-function and per-line stats (includes line numbers and source)
         try:
@@ -245,7 +249,8 @@ def main():
         #experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
     ) as prof:
         # Short run for signal; adjust if needed
-        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=1, mcts_sims=0, seed=seed)
+        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
+        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
 
     # Export chrome trace
     #prof.export_chrome_trace(trace_path)

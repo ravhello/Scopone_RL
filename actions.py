@@ -56,21 +56,18 @@ def encode_action_from_ids_tensor(played_id_t: torch.Tensor, captured_ids_t: tor
     pid = played_id_t.to(device=device, dtype=torch.long).reshape(())
     cap = captured_ids_t.to(device=device, dtype=torch.long).reshape(-1)
 
-    played_card_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
-    captured_cards_matrix = torch.zeros((10, 4), dtype=torch.float32, device=device)
-
-    # Set played bit
-    prow = pid // 4
-    pcol = pid % 4
-    played_card_matrix[prow, pcol] = 1.0
-
-    # Set captured bits if any
+    # Fast flat 80-d vector: 0..39 played one-hot, 40..79 captured multi-hot
+    vec = torch.zeros((80,), dtype=torch.float32, device=device)
+    # Played bit
+    pid_clamped = torch.clamp(pid, 0, 39)
+    vec[pid_clamped] = 1.0
+    # Captured bits
     if cap.numel() > 0:
-        rows = (cap // 4).clamp_(0, 9)
-        cols = (cap % 4).clamp_(0, 3)
-        captured_cards_matrix[rows, cols] = 1.0
-
-    return torch.cat([played_card_matrix.reshape(-1), captured_cards_matrix.reshape(-1)], dim=0)
+        cap_clamped = torch.clamp(cap, 0, 39)
+        idx = cap_clamped + 40
+        # Avoid out-of-bounds and duplicate writes are fine (idempotent to 1.0)
+        vec.index_fill_(0, idx, 1.0)
+    return vec
 
 def decode_action(action_vec):
     """

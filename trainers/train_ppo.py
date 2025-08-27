@@ -5,6 +5,8 @@ import os
 import time
 import sys
 import multiprocessing as mp
+import platform
+import queue
 
 # Ensure project root is on sys.path when running as script
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +49,20 @@ def _env_worker(worker_id: int,
                 request_q: mp.Queue,
                 action_q: mp.Queue,
                 episode_q: mp.Queue):
+    # Limit CPU threads per worker to reduce contention on the host
+    try:
+        os.environ.setdefault('OMP_NUM_THREADS', '1')
+        os.environ.setdefault('MKL_NUM_THREADS', '1')
+        try:
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+        try:
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+    except Exception:
+        pass
     # Ensure different RNG streams per worker for robustness
     try:
         set_global_seeds(int(cfg.get('seed', 0)) + int(worker_id))
@@ -102,38 +118,54 @@ def _env_worker(worker_id: int,
                 else:
                     leg_serial = []
                 def policy_fn_mcts(_obs, _legals):
+                    # Invia tensori CPU direttamente (no conversione a liste) per ridurre overhead IPC
+                    o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
+                    leg_cpu = torch.stack([ (y.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
                     request_q.put({
                         'type': 'score_policy',
                         'wid': worker_id,
-                        'obs': (_obs.tolist() if torch.is_tensor(_obs) else list(_obs)),
-                        'legals': [ (y.tolist() if torch.is_tensor(y) else list(y)) for y in _legals ],
-                        'seat': seat_vec.tolist(),
+                        'obs': o_cpu,
+                        'legals': leg_cpu,
+                        'seat': seat_vec.clone(),
                     })
-                    resp = action_q.get()
+                    try:
+                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                    except queue.Empty:
+                        pri = [1.0 / max(1, len(_legals))] * max(1, len(_legals))
+                        import numpy as _np
+                        return _np.asarray(pri, dtype=_np.float32)
                     pri = resp.get('priors', None)
                     import numpy as _np
                     return _np.asarray(pri, dtype=_np.float32) if pri is not None else _np.ones((len(_legals),), dtype=_np.float32) / max(1, len(_legals))
                 def value_fn_mcts(_obs, _env):
                     s_vec = _seat_vec_for(_env.current_player)
+                    o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
                     request_q.put({
                         'type': 'score_value',
                         'wid': worker_id,
-                        'obs': (_obs.tolist() if torch.is_tensor(_obs) else list(_obs)),
-                        'seat': s_vec.tolist(),
+                        'obs': o_cpu,
+                        'seat': s_vec,
                     })
-                    resp = action_q.get()
+                    try:
+                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                    except queue.Empty:
+                        return 0.0
                     return float(resp.get('value', 0.0))
                 def belief_sampler_neural(_env):
                     try:
                         o_cur = _env._get_observation(_env.current_player)
                         s_vec = _seat_vec_for(_env.current_player)
+                        o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
                         request_q.put({
                             'type': 'score_belief',
                             'wid': worker_id,
-                            'obs': (o_cur.tolist() if torch.is_tensor(o_cur) else list(o_cur)),
-                            'seat': s_vec.tolist(),
+                            'obs': o_cpu,
+                            'seat': s_vec,
                         })
-                        resp = action_q.get()
+                        try:
+                            resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                        except queue.Empty:
+                            return None
                         probs_flat = resp.get('belief_probs', None)
                         if probs_flat is None:
                             return None
@@ -231,18 +263,21 @@ def _env_worker(worker_id: int,
                 if sims_scaled <= 0:
                     # Fallback: usa selezione dal master (GPU) come nel ramo non-MCTS
                     if send_legals:
-                        leg_serial = [ (x.tolist() if torch.is_tensor(x) else list(x)) for x in legal ]
+                        leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
                     else:
-                        leg_serial = []
+                        leg_serial = torch.zeros((0,80), dtype=torch.float32)
                     request_q.put({
                         'type': 'step',
                         'wid': worker_id,
-                        'obs': (obs.tolist() if torch.is_tensor(obs) else list(obs)),
+                        'obs': (obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)),
                         'legals': leg_serial,
-                        'seat': seat_vec.tolist(),
+                        'seat': seat_vec.clone(),
                     })
-                    resp = action_q.get()
-                    idx = int(resp.get('idx', 0))
+                    try:
+                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                        idx = int(resp.get('idx', 0))
+                    except queue.Empty:
+                        idx = 0
                     idx = max(0, min(idx, len(legal) - 1))
                     act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
                     next_obs, rew, done, info = env.step(act_t)
@@ -293,18 +328,21 @@ def _env_worker(worker_id: int,
             else:
                 # Request action selection from master (GPU)
                 if send_legals:
-                    leg_serial = [ (x.tolist() if torch.is_tensor(x) else list(x)) for x in legal ]
+                    leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
                 else:
-                    leg_serial = []
+                    leg_serial = torch.zeros((0,80), dtype=torch.float32)
                 request_q.put({
                     'type': 'step',
                     'wid': worker_id,
-                    'obs': (obs.tolist() if torch.is_tensor(obs) else list(obs)),
+                    'obs': (obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)),
                     'legals': leg_serial,
-                    'seat': seat_vec.tolist(),
+                    'seat': seat_vec.clone(),
                 })
-                resp = action_q.get()
-                idx = int(resp.get('idx', 0))
+                try:
+                    resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                    idx = int(resp.get('idx', 0))
+                except queue.Empty:
+                    idx = 0
                 idx = max(0, min(idx, len(legal) - 1))
                 act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
                 next_obs, rew, done, info = env.step(act_t)
@@ -352,25 +390,69 @@ def _env_worker(worker_id: int,
             except Exception:
                 others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
 
-        # Episode payload back to master
-        episode_q.put({
+        # Episode payload back to master using tensors (prefer shared memory when possible)
+        try:
+            obs_t = (torch.stack(obs_list, dim=0) if len(obs_list) > 0 else torch.zeros((0, 1), dtype=torch.float32)).share_memory_()
+            next_obs_t = (torch.stack(next_obs_list, dim=0) if len(next_obs_list) > 0 else torch.zeros((0, 1), dtype=torch.float32)).share_memory_()
+            act_t = (torch.stack(act_list, dim=0) if len(act_list) > 0 else torch.zeros((0, 80), dtype=torch.float32)).share_memory_()
+            seat_t = (torch.stack(seat_team_list, dim=0) if len(seat_team_list) > 0 else torch.zeros((0, 6), dtype=torch.float32)).share_memory_()
+            belief_t = (torch.stack(belief_sum_list, dim=0) if len(belief_sum_list) > 0 else torch.zeros((0, 120), dtype=torch.float32)).share_memory_()
+            legals_t = (torch.stack(legals_list, dim=0) if len(legals_list) > 0 else torch.zeros((0, 80), dtype=torch.float32)).share_memory_()
+            leg_off_t = torch.as_tensor(legals_offset, dtype=torch.long).share_memory_()
+            leg_cnt_t = torch.as_tensor(legals_count, dtype=torch.long).share_memory_()
+            chosen_idx_t = torch.as_tensor(chosen_index_list, dtype=torch.long).share_memory_()
+            mcts_policy_t = torch.as_tensor(mcts_policy_list, dtype=torch.float32).share_memory_() if len(mcts_policy_list) > 0 else torch.zeros((0,), dtype=torch.float32)
+            mcts_weight_t = torch.as_tensor(mcts_weight_list, dtype=torch.float32).share_memory_() if len(mcts_weight_list) > 0 else torch.zeros((0,), dtype=torch.float32)
+            others_hands_t = (torch.stack(others_hands_list, dim=0).share_memory_() if len(others_hands_list) > 0 else torch.zeros((0,3,40), dtype=torch.float32))
+        except Exception:
+            obs_t = torch.stack(obs_list, dim=0) if len(obs_list) > 0 else torch.zeros((0, 1), dtype=torch.float32)
+            next_obs_t = torch.stack(next_obs_list, dim=0) if len(next_obs_list) > 0 else torch.zeros((0, 1), dtype=torch.float32)
+            act_t = torch.stack(act_list, dim=0) if len(act_list) > 0 else torch.zeros((0, 80), dtype=torch.float32)
+            seat_t = torch.stack(seat_team_list, dim=0) if len(seat_team_list) > 0 else torch.zeros((0, 6), dtype=torch.float32)
+            belief_t = torch.stack(belief_sum_list, dim=0) if len(belief_sum_list) > 0 else torch.zeros((0, 120), dtype=torch.float32)
+            legals_t = torch.stack(legals_list, dim=0) if len(legals_list) > 0 else torch.zeros((0, 80), dtype=torch.float32)
+            leg_off_t = torch.as_tensor(legals_offset, dtype=torch.long)
+            leg_cnt_t = torch.as_tensor(legals_count, dtype=torch.long)
+            chosen_idx_t = torch.as_tensor(chosen_index_list, dtype=torch.long)
+            mcts_policy_t = torch.as_tensor(mcts_policy_list, dtype=torch.float32) if len(mcts_policy_list) > 0 else torch.zeros((0,), dtype=torch.float32)
+            mcts_weight_t = torch.as_tensor(mcts_weight_list, dtype=torch.float32) if len(mcts_weight_list) > 0 else torch.zeros((0,), dtype=torch.float32)
+            others_hands_t = torch.stack(others_hands_list, dim=0) if len(others_hands_list) > 0 else torch.zeros((0,3,40), dtype=torch.float32)
+
+        # Non-blocking put with timeout to avoid deadlocks if the master is slow
+        payload = {
             'wid': worker_id,
-            'obs': [x.tolist() for x in obs_list],
-            'next_obs': [x.tolist() for x in next_obs_list],
-            'act': [x.tolist() for x in act_list],
+            'obs': obs_t,
+            'next_obs': next_obs_t,
+            'act': act_t,
             'rew': rew_list,
             'done': done_list,
-            'seat': [x.tolist() for x in seat_team_list],
-            'belief_summary': [x.tolist() for x in belief_sum_list],
-            'legals': [x.tolist() for x in legals_list],
-            'leg_off': legals_offset,
-            'leg_cnt': legals_count,
-            'chosen_idx': chosen_index_list,
+            'seat': seat_t,
+            'belief_summary': belief_t,
+            'legals': legals_t,
+            'leg_off': leg_off_t,
+            'leg_cnt': leg_cnt_t,
+            'chosen_idx': chosen_idx_t,
             'team_rewards': (info.get('team_rewards', [0.0, 0.0]) if isinstance(info, dict) else [0.0, 0.0]),
-            'mcts_policy': mcts_policy_list,
-            'mcts_weight': mcts_weight_list,
-            'others_hands': [x.tolist() for x in others_hands_list],
-        })
+            'mcts_policy': mcts_policy_t,
+            'mcts_weight': mcts_weight_t,
+            'others_hands': others_hands_t,
+        }
+        try:
+            episode_q.put(payload, timeout=float(os.environ.get('SCOPONE_EP_PUT_TIMEOUT_S', '15')))
+        except Exception:
+            # Best-effort fallback: try once more blocking briefly; otherwise drop to avoid total stall
+            try:
+                episode_q.put(payload, timeout=1.0)
+            except Exception:
+                pass
+    # Signal completion to master
+    try:
+        episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
+    except Exception:
+        try:
+            episode_q.put({'wid': worker_id, 'type': 'done'})
+        except Exception:
+            pass
 
 
 def _batched_select_indices(agent: ActionConditionedPPO,
@@ -395,9 +477,15 @@ def _batched_select_indices(agent: ActionConditionedPPO,
         return [(int(reqs[i]['wid']), 0) for i in range(len(reqs))]
     leg_cpu = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in flat_legals], dim=0)
     with torch.no_grad():
-        o_t = obs_cpu.pin_memory().to(device=device, non_blocking=True)
-        s_t = seat_cpu.pin_memory().to(device=device, non_blocking=True)
-        leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
+        # Avoid pin_memory/non_blocking transfers when running on CPU-only to prevent accelerator access errors
+        if getattr(device, 'type', str(device)) == 'cuda':
+            o_t = obs_cpu.pin_memory().to(device=device, non_blocking=True)
+            s_t = seat_cpu.pin_memory().to(device=device, non_blocking=True)
+            leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
+        else:
+            o_t = obs_cpu
+            s_t = seat_cpu
+            leg_t = leg_cpu
         state_proj = agent.actor.compute_state_proj(o_t, s_t)  # (B,64)
         a_emb_all = agent.actor.action_enc(leg_t)             # (M,64)
         B = o_t.size(0)
@@ -472,71 +560,136 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
     """
     if len(reqs) == 0:
         return []
-    # Group by type
+    # Stack obs/seat for all reqs once
     obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
     seat_cpu = torch.stack([torch.as_tensor(r.get('seat', [0,0,0,0,0,0]), dtype=torch.float32) for r in reqs], dim=0)
-    # Prepare CUDA once
     with torch.no_grad():
-        o_t = obs_cpu.pin_memory().to(device=device, non_blocking=True)
-        s_t = seat_cpu.pin_memory().to(device=device, non_blocking=True)
-        state_proj = agent.actor.compute_state_proj(o_t, s_t)
-    results: List[Dict] = []
-    cursor = 0
-    for r in reqs:
-        rtype = r.get('type')
-        if rtype == 'score_policy':
-            legals = r.get('legals', [])
-            if len(legals) == 0:
-                results.append({'priors': []})
-                cursor += 1
-                continue
-            leg_t = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in legals], dim=0).pin_memory().to(device=device, non_blocking=True)
-            with torch.no_grad():
-                # Policy prior coerente con la policy fattorizzata (carta ⊕ presa)
-                sp = state_proj[cursor]
-                # Logits per carta (40) — evita cast/copie ripetute del parametro
-                card_logits_all = torch.matmul(sp.unsqueeze(0), agent.actor.card_emb_play.t()).squeeze(0)  # (40)
-                # ID carta giocata per ciascun legal
-                played_ids = torch.argmax(leg_t[:, :40], dim=1)
-                # log p(carta) solo sulle carte presenti tra i legali
-                unique_ids, inv_idx = torch.unique(played_ids, sorted=False, return_inverse=True)
-                allowed_logits = card_logits_all[unique_ids]
-                logp_cards_unique = torch.log_softmax(allowed_logits, dim=0)
-                logp_cards_per_legal = logp_cards_unique[inv_idx]
-                # log p(capture | carta) via action embedding e log-softmax per gruppo carta
-                a_emb = agent.actor.action_enc(leg_t)
-                cap_logits = torch.matmul(a_emb, sp)  # (A)
-                group_ids = played_ids
-                num_groups = 40
-                group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=leg_t.device)
-                try:
-                    group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-                except Exception:
-                    tmp = torch.zeros_like(group_max)
-                    tmp.index_copy_(0, group_ids, cap_logits)
-                    group_max = torch.maximum(group_max, tmp)
-                gmax_per_legal = group_max[group_ids]
-                exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
-                group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=leg_t.device)
-                group_sum.index_add_(0, group_ids, exp_shifted)
-                lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
-                logp_cap_per_legal = cap_logits - lse_per_legal
-                logp_total = logp_cards_per_legal + logp_cap_per_legal
-                priors = torch.softmax(logp_total, dim=0).nan_to_num(0.0)
-                priors = torch.clamp(priors, min=0.0)
-                s = priors.sum()
-                if (not torch.isfinite(s)) or (s <= 0):
-                    priors = torch.full_like(priors, 1.0 / max(1, priors.numel()))
+        # Use CPU tensors directly when not targeting CUDA to avoid unnecessary pinned memory
+        if getattr(device, 'type', str(device)) == 'cuda':
+            o_t = obs_cpu.pin_memory().to(device=device, non_blocking=True)
+            s_t = seat_cpu.pin_memory().to(device=device, non_blocking=True)
+        else:
+            o_t = obs_cpu
+            s_t = seat_cpu
+        state_proj_all = agent.actor.compute_state_proj(o_t, s_t)  # (N,64)
+
+    results: List[Dict] = [{} for _ in reqs]
+
+    # 1) Batch all score_policy requests together
+    policy_positions: List[int] = []
+    policy_cnts: List[int] = []
+    policy_legals_rows: List[torch.Tensor] = []
+    for i, r in enumerate(reqs):
+        if r.get('type') == 'score_policy':
+            leg = r.get('legals', [])
+            if isinstance(leg, torch.Tensor):
+                if leg.dim() == 1:
+                    leg = leg.unsqueeze(0)
+                cnt = int(leg.size(0))
+                if cnt > 0:
+                    policy_positions.append(i)
+                    policy_cnts.append(cnt)
+                    policy_legals_rows.append(leg)
                 else:
-                    priors = priors / s
-                priors = priors.detach().cpu().tolist()
-            results.append({'priors': priors})
-            cursor += 1
-        elif rtype == 'score_value':
+                    results[i] = {'priors': []}
+            else:
+                # list-like
+                cnt = len(leg)
+                if cnt > 0:
+                    policy_positions.append(i)
+                    policy_cnts.append(cnt)
+                    policy_legals_rows.append(torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in leg], dim=0))
+                else:
+                    results[i] = {'priors': []}
+
+    if len(policy_positions) > 0:
+        with torch.no_grad():
+            # Concatenate legals
+            legals_flat = torch.cat(policy_legals_rows, dim=0).pin_memory().to(device=device, non_blocking=True)
+            Bp = len(policy_positions)
+            cnts_t = torch.as_tensor(policy_cnts, dtype=torch.long, device=device)
+            max_cnt = int(cnts_t.max().item()) if Bp > 0 else 0
+            # Map from each legal to its policy-sample index
+            sample_idx_per_legal = torch.repeat_interleave(torch.arange(Bp, device=device, dtype=torch.long), cnts_t)
+            sp = state_proj_all[torch.as_tensor(policy_positions, dtype=torch.long, device=device)]  # (Bp,64)
+
+            # Card logits and mask per sample
+            card_logits_all = torch.matmul(sp, agent.actor.card_emb_play.t())  # (Bp,40)
+            played_ids_all = torch.argmax(legals_flat[:, :40], dim=1)  # (M_flat)
+            card_mask = torch.zeros((Bp, 40), dtype=torch.bool, device=device)
+            card_mask[sample_idx_per_legal, played_ids_all] = True
+            masked_card_logits = card_logits_all.masked_fill(~card_mask, float('-inf'))
+            logp_cards = torch.log_softmax(masked_card_logits, dim=1)  # (Bp,40)
+            logp_cards_per_legal = logp_cards[sample_idx_per_legal, played_ids_all]
+
+            # Capture logits per-legal
+            a_emb_flat = agent.actor.action_enc(legals_flat)  # (M_flat,64)
+            cap_logits = (a_emb_flat * sp[sample_idx_per_legal]).sum(dim=1)
+            # Log-softmax within (sample,card) group
+            group_ids = sample_idx_per_legal * 40 + played_ids_all
+            num_groups = Bp * 40
+            group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
+            try:
+                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
+            except Exception:
+                tmp = torch.full_like(group_max, float('-inf'))
+                tmp.index_copy_(0, group_ids, cap_logits)
+                group_max = torch.maximum(group_max, tmp)
+            gmax_per_legal = group_max[group_ids]
+            exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
+            group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
+            group_sum.index_add_(0, group_ids, exp_shifted)
+            lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
+            logp_cap_per_legal = cap_logits - lse_per_legal
+
+            logp_total_per_legal = logp_cards_per_legal + logp_cap_per_legal
+
+            # Softmax over legals per sample
+            if max_cnt > 0:
+                pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+                rel_pos_2d = pos.unsqueeze(0).expand(Bp, max_cnt)
+                mask = rel_pos_2d < cnts_t.unsqueeze(1)
+                padded = torch.full((Bp, max_cnt), float('-inf'), dtype=logp_total_per_legal.dtype, device=device)
+                # Write in flatten order
+                # Compute absolute indices in flattened per-sample view (vectorized)
+                if Bp > 0:
+                    cnts_t = torch.as_tensor(policy_cnts, dtype=torch.long, device=device)
+                    starts = torch.cumsum(torch.nn.functional.pad(cnts_t[:-1], (1, 0)), dim=0)
+                    offs_t = torch.repeat_interleave(starts, cnts_t)
+                else:
+                    offs_t = torch.zeros((0,), dtype=torch.long, device=device)
+                # Above is heavy; alternatively fill by iterating slices
+                # Use a simple loop in CUDA graph-free context for clarity
+                start = 0
+                for j, c in enumerate(policy_cnts):
+                    if c > 0:
+                        padded[j, :c] = logp_total_per_legal[start:start+c]
+                        start += c
+                priors_padded = torch.softmax(padded, dim=1).nan_to_num(0.0)
+                # Clamp and renormalize per row
+                priors_padded = torch.clamp(priors_padded, min=0.0)
+                row_sums = priors_padded.sum(dim=1, keepdim=True)
+                row_sums = torch.where(row_sums > 0, row_sums, torch.ones_like(row_sums))
+                priors_padded = priors_padded / row_sums
+                # Scatter back to per-request lists
+                start = 0
+                for j, (pos_j, c) in enumerate(zip(policy_positions, policy_cnts)):
+                    if c > 0:
+                        pri = priors_padded[j, :c].detach().to('cpu').tolist()
+                    else:
+                        pri = []
+                    results[pos_j] = {'priors': pri}
+            else:
+                for pos_j in policy_positions:
+                    results[pos_j] = {'priors': []}
+
+    # 2) Process score_value and score_belief (can remain per-request)
+    for i, r in enumerate(reqs):
+        rtype = r.get('type')
+        if rtype == 'score_value':
             with torch.no_grad():
-                # Predici others_hands dal BeliefNet per coerenza CTDE anche nel servizio value
-                o_one = o_t[cursor].unsqueeze(0)
-                s_one = s_t[cursor].unsqueeze(0)
+                o_one = o_t[i:i+1]
+                s_one = s_t[i:i+1]
                 state_feat = agent.actor.state_enc(o_one, s_one)
                 logits = agent.actor.belief_net(state_feat)
                 hand_table = o_one[:, :83]
@@ -549,25 +702,20 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                 probs_flat = agent.actor.belief_net.probs(logits, visible_mask)
                 oh = probs_flat.view(1, 3, 40)
                 val = agent.critic(o_one, s_one, oh).squeeze(0)
-            results.append({'value': float(val.detach().cpu().item())})
-            cursor += 1
+            results[i] = {'value': float(val.detach().cpu().item())}
         elif rtype == 'score_belief':
             with torch.no_grad():
-                # Compute belief probs (120) with masking inside model
-                logits = agent.actor.belief_net(agent.actor.state_enc(o_t[cursor].unsqueeze(0), s_t[cursor].unsqueeze(0)))
-                hand_table = o_t[cursor:cursor+1, :83]
+                logits = agent.actor.belief_net(agent.actor.state_enc(o_t[i:i+1], s_t[i:i+1]))
+                hand_table = o_t[i:i+1, :83]
                 hand_mask = hand_table[:, :40] > 0.5
                 table_mask = hand_table[:, 43:83] > 0.5
-                captured = o_t[cursor:cursor+1, 83:165]
+                captured = o_t[i:i+1, 83:165]
                 cap0_mask = captured[:, :40] > 0.5
                 cap1_mask = captured[:, 40:80] > 0.5
                 visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
                 probs_flat = agent.actor.belief_net.probs(logits, visible_mask).squeeze(0).detach().cpu().tolist()
-            results.append({'belief_probs': probs_flat})
-            cursor += 1
-        else:
-            results.append({})
-            cursor += 1
+            results[i] = {'belief_probs': probs_flat}
+
     return results
 def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> Dict[str, torch.Tensor]:
     """Calcola approx_kl, entropia e clip_frac per gruppi seat 0/2 vs 1/3.
@@ -731,6 +879,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
 
         # All env logic on CPU
         obs = env._get_observation(env.current_player)
+        # Fast-path: get_valid_actions already caches by state; avoid recomputing identical lists
         legal = env.get_valid_actions()
         if not legal:
             if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
@@ -1099,26 +1248,40 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             legals_count.append(len(legal))
             chosen_index_t_list.append(idx_t)
             legals_list.extend(legal)
-            # costruisci target mani reali altrui (3x40) da stato env (salta se BELIEF_AUX_COEF <= 0)
+            # costruisci target mani reali altrui (3x40) vettoriale sfruttando bitset CPU
             try:
-                # CTDE: raccogli sempre le mani reali degli altri giocatori dal game_state
-                hands = env.game_state.get('hands', None)
-                if hands is not None:
-                    others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                # usa mirror bitset CPU se disponibile per evitare loop Python
+                if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
+                    ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
                     target = torch.zeros((3,40), dtype=torch.float32)
-                    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                    for i,pid in enumerate(others):
-                        cards = hands[pid]
-                        for c in cards:
-                            if isinstance(c, int):
-                                cid = int(c)
-                            else:
-                                r, s = c
-                                cid = int((int(r) - 1) * 4 + suit_to_int[s])
-                            target[i, cid] = 1.0
+                    for i, pid in enumerate(others):
+                        try:
+                            bits_t = env._hands_bits_t[pid]
+                            bits = int(bits_t.item()) if torch.is_tensor(bits_t) else int(bits_t)
+                        except Exception:
+                            bits = 0
+                        mask = (((torch.tensor(bits, dtype=torch.int64) >> ids) & 1).to(torch.float32))
+                        target[i] = mask
                     others_hands_targets.append(target)
                 else:
-                    others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
+                    # fallback lento su struttura game_state
+                    hands = env.game_state.get('hands', None)
+                    if hands is not None:
+                        target = torch.zeros((3,40), dtype=torch.float32)
+                        suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+                        for i, pid in enumerate(others):
+                            cards = hands[pid]
+                            for c in cards:
+                                if isinstance(c, int):
+                                    cid = int(c)
+                                else:
+                                    r, s = c
+                                    cid = int((int(r) - 1) * 4 + suit_to_int[s])
+                                target[i, cid] = 1.0
+                        others_hands_targets.append(target)
+                    else:
+                        others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
             except Exception:
                 others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
         else:
@@ -1421,14 +1584,30 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                                 seed: int = 0,
                                 show_progress_env: bool = True,
                                 tqdm_base_pos: int = 2) -> Dict:
-    # Use 'spawn' on CUDA to avoid fork+CUDA deadlocks; fallback to 'fork' otherwise
+    # Choose start method with env override and platform/device awareness.
+    # - Windows: 'spawn'
+    # - POSIX with CUDA or background threads: prefer 'forkserver' (avoid forking after CUDA/threads)
+    # - Otherwise: 'fork'
     try:
-        start_method = 'spawn' if (hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'fork'
+        override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
+        if override in {'spawn', 'fork', 'forkserver'}:
+            start_method = override
+        else:
+            if platform.system().lower() == 'windows':
+                start_method = 'spawn'
+            else:
+                # If CUDA is in use, avoid plain fork
+                if getattr(device, 'type', str(device)) == 'cuda' or (hasattr(torch, 'cuda') and torch.cuda.is_available()):
+                    start_method = 'forkserver'
+                else:
+                    start_method = 'fork'
     except Exception:
-        start_method = 'fork'
+        start_method = 'forkserver'
     ctx = mp.get_context(start_method)
     request_q = ctx.Queue(maxsize=num_envs * 4)
-    episode_q = ctx.Queue(maxsize=num_envs * 2)
+    # Make episode queue large enough to avoid backpressure when multiple workers finish close together
+    _episodes_hint = max(1, int(episodes_total_hint))
+    episode_q = ctx.Queue(maxsize=max(num_envs * 4, _episodes_hint * 2))
     action_queues = [ctx.Queue(maxsize=2) for _ in range(num_envs)]
     # Distribute episodes roughly equally
     episodes_per_env = max(1, int((episodes_total_hint + num_envs - 1) // num_envs))
@@ -1481,26 +1660,57 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             env_pbars = [None] * num_envs
     except Exception:
         env_pbars = [None] * num_envs
-    # Main loop: service action requests and collect episodes
-    while episodes_received < num_envs * episodes_per_env:
-        # Gather a micro-batch of requests
+    # Main loop: drain episodes first (to avoid backpressure), then service requests
+    _last_activity_ts = time.time()
+    _expected_total = num_envs * episodes_per_env
+    _done_flags = [False] * num_envs
+    while episodes_received < _expected_total:
+        # 1) Drain any completed episodes first to free episode_q
+        drained_any = False
+        while True:
+            try:
+                ep = episode_q.get_nowait()
+                # Handle completion markers
+                if isinstance(ep, dict) and ep.get('type') == 'done':
+                    wid = int(ep.get('wid', -1))
+                    if 0 <= wid < len(_done_flags):
+                        _done_flags[wid] = True
+                    drained_any = True
+                else:
+                    episodes_payloads.append(ep)
+                    episodes_received += 1
+                    drained_any = True
+                    # Update per-env progress bar
+                    try:
+                        wid = int(ep.get('wid', -1))
+                        if 0 <= wid < len(env_pbars) and env_pbars[wid] is not None:
+                            env_pbars[wid].update(1)
+                    except Exception:
+                        pass
+            except Exception:
+                break
+        if drained_any:
+            _last_activity_ts = time.time()
+
+        # 2) Gather a micro-batch of requests without blocking
         reqs = []
-        try:
-            r0 = request_q.get(timeout=0.05)
-            # Always enqueue the first request regardless of type ('step', 'score_*', etc.)
-            reqs.append(r0)
-        except Exception:
-            pass
-        # Drain more without blocking (collect both 'step' and other request types)
-        for _ in range(max(1, num_envs)):
+        batch_target = max(4 * num_envs, 64)
+        for _ in range(batch_target):
             try:
                 r = request_q.get_nowait()
                 reqs.append(r)
             except Exception:
                 break
-        # Process batch on GPU
+        # If none, do a short timed wait to avoid spin and to allow new requests to arrive
+        if len(reqs) == 0:
+            try:
+                r0 = request_q.get(timeout=0.01)
+                reqs.append(r0)
+            except Exception:
+                pass
+        # 3) Process batch on GPU
         if len(reqs) > 0:
-            # Split by type: 'step' vs scoring
+            _last_activity_ts = time.time()
             step_reqs = [r for r in reqs if r.get('type') == 'step']
             other_reqs = [r for r in reqs if r.get('type') != 'step']
             if len(step_reqs) > 0:
@@ -1518,29 +1728,21 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                         action_queues[wid].put(out, block=False)
                     except Exception:
                         action_queues[wid].put(out)
-        # Drain any completed episodes
-        while True:
-            try:
-                ep = episode_q.get_nowait()
-                episodes_payloads.append(ep)
-                episodes_received += 1
-                # Update per-env progress bar
-                try:
-                    wid = int(ep.get('wid', -1))
-                    if 0 <= wid < len(env_pbars) and env_pbars[wid] is not None:
-                        env_pbars[wid].update(1)
-                except Exception:
-                    pass
-            except Exception:
-                break
-        # Detect worker crashes and raise immediately
+
+        # 4) Detect worker crashes and stale state
         for _wid, _p in enumerate(workers):
             try:
                 if (not _p.is_alive()) and (_p.exitcode is not None) and (int(_p.exitcode) != 0):
                     raise RuntimeError(f"Env worker wid={_wid} pid={_p.pid} crashed with exitcode={_p.exitcode}")
             except Exception:
-                # Re-raise detection exceptions as-is
                 raise
+        # 5) Watchdog: if no activity for long, attempt graceful shutdown based on done flags
+        if (time.time() - _last_activity_ts) > float(os.environ.get('SCOPONE_COLLECTOR_STALL_S', '30')):
+            # If all workers have signaled 'done', break even if some episodes were dropped
+            if all(_done_flags):
+                break
+            alive = [(i, p.pid, p.is_alive(), p.exitcode) for i, p in enumerate(workers)]
+            raise RuntimeError(f"Collector stalled: episodes_received={episodes_received}/{_expected_total}; workers={alive}")
 
     # Close per-env progress bars
     try:
@@ -1929,6 +2131,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                       f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}", flush=True)
             except Exception:
                 pass
+            # Warmup: disattiva MCTS nelle prime iterazioni anche in parallelo
+            parallel_use_mcts = bool(it >= 500)
             batch = collect_trajectory_parallel(agent,
                                                 num_envs=int(num_envs),
                                                 episodes_total_hint=episodes_hint,
@@ -1936,7 +2140,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                 k_history=k_history,
                                                 gamma=1.0,
                                                 lam=0.95,
-                                                use_mcts=True,
+                                                use_mcts=parallel_use_mcts,
                                                 train_both_teams=True,
                                                 main_seats=main_seats,
                                                 mcts_sims=mcts_sims,
@@ -2060,12 +2264,13 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             preview_keys = ['loss_pi', 'loss_v', 'approx_kl', 'clip_frac', 'avg_clip_frac', 'avg_kl']
             preview = {k: round(_to_float(info[k]), 4) for k in preview_keys if k in info}
             preview.update({'avg_ret': round(avg_return, 4), 't_s': round(dt, 2)})
-            # One line above the progress bar
-            metrics_str = (
-                f"it {it} | " +
-                " ".join([f"{k}:{v}" for k, v in preview.items()])
-            )
-            metrics_bar.set_description_str(metrics_str, refresh=False)
+            # In non-parallel mode evita duplicazione: mostra metriche solo nel postfix della progress bar
+            if use_parallel:
+                metrics_str = (
+                    f"it {it} | " +
+                    " ".join([f"{k}:{v}" for k, v in preview.items()])
+                )
+                metrics_bar.set_description_str(metrics_str, refresh=False)
             pbar.set_postfix(preview)
         except Exception:
             pass

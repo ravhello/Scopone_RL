@@ -72,6 +72,8 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 ## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
 # Abilita di default feature dell'osservazione
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+## Imposta metodo mp sicuro per CUDA: forkserver (override con SCOPONE_MP_START)
+os.environ.setdefault('SCOPONE_MP_START', 'forkserver')
 
 import torch
 from utils.device import get_compute_device
