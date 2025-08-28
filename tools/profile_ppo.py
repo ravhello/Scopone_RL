@@ -205,8 +205,6 @@ def main():
         try:
             import cProfile
             import pstats
-            import subprocess
-            import shlex
         except Exception as e:
             print(f"cProfile unavailable: {e}")
             return

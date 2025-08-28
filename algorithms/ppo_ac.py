@@ -197,7 +197,8 @@ class ActionConditionedPPO:
                     notify_fallback('ppo.select_action.seat_pin_memory_failed')
         # belief handled internally by the actor
 
-        with torch.no_grad():
+        # inference_mode disables autograd and some dispatcher overhead vs no_grad
+        with torch.inference_mode():
             chosen_act_d, logp_total_d, idx_t_d = self._select_action_core(obs_t, actions_t, st)
         # Move chosen action and metadata back to CPU for env.step
         chosen_act = chosen_act_d.detach().to('cpu', non_blocking=False)
@@ -352,8 +353,6 @@ class ActionConditionedPPO:
         state_feat = self.actor.compute_state_features(obs, seat)  # (B,256)
         # State projection e logits per carta
         state_proj = self.actor.compute_state_proj_from_state(state_feat, obs)  # (B,64)
-        # Align activation to parameter dtype to avoid matmul dtype mismatch under autocast
-        state_proj = state_proj.to(dtype=self.actor.card_emb_play.dtype)
         card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t())       # (B,40)
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
