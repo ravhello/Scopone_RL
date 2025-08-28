@@ -225,6 +225,7 @@ class ActionConditionedPPO:
         # log-softmax within group (card)
         group_ids = played_ids_all  # (A)
         num_groups = 40
+        # Preallocate in local scope to avoid Python new allocations where possible
         group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=actions_t.device)
         try:
             group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
@@ -351,8 +352,16 @@ class ActionConditionedPPO:
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # Compute state features once; reuse for actor and critic
         state_feat = self.actor.compute_state_features(obs, seat)  # (B,256)
+        # Precompute visible mask once and reuse
+        hand_table = obs[:, :83]
+        hand_mask = hand_table[:, :40] > 0.5
+        table_mask = hand_table[:, 43:83] > 0.5
+        captured = obs[:, 83:165]
+        cap0_mask = captured[:, :40] > 0.5
+        cap1_mask = captured[:, 40:80] > 0.5
+        visible_mask_40 = (hand_mask | table_mask | cap0_mask | cap1_mask)
         # State projection e logits per carta
-        state_proj = self.actor.compute_state_proj_from_state(state_feat, obs)  # (B,64)
+        state_proj = self.actor.compute_state_proj_from_state(state_feat, obs, visible_mask_40=visible_mask_40)  # (B,64)
         card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t())       # (B,40)
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
@@ -453,7 +462,7 @@ class ActionConditionedPPO:
             loss_pi = -(torch.min(ratio * adv, clipped)).mean()
 
         # Passa others_hands (se disponibile) al critico per percorso CTDE opzionale
-        v = self.critic.forward_from_state(state_feat, obs, batch.get('others_hands', None))
+        v = self.critic.forward_from_state(state_feat, obs, batch.get('others_hands', None), visible_mask_40=visible_mask_40)
         if self.value_clip is not None and self.value_clip > 0:
             v_clipped = torch.clamp(v, ret - self.value_clip, ret + self.value_clip)
             loss_v = torch.max((v - ret) ** 2, (v_clipped - ret) ** 2).mean()

@@ -522,13 +522,13 @@ class ActionConditionedActor(torch.nn.Module):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         return self.state_enc(x_obs, seat_team_vec)  # (B,256)
 
-    def compute_state_proj_from_state(self, state_feat: torch.Tensor, x_obs: torch.Tensor) -> torch.Tensor:
+    def compute_state_proj_from_state(self, state_feat: torch.Tensor, x_obs: torch.Tensor, visible_mask_40: torch.Tensor = None) -> torch.Tensor:
         """Proietta feature di stato (256) in spazio azione (64) usando belief/gating dell'actor.
         Richiede l'osservazione per calcolare la maschera carte visibili.
         """
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
-        visible_mask = self._visible_mask_from_obs(x_obs)
+        visible_mask = (visible_mask_40 if visible_mask_40 is not None else self._visible_mask_from_obs(x_obs))
         belief_logits = self.belief_net(state_feat)        # (B,120)
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
         belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
@@ -768,7 +768,7 @@ class CentralValueNet(torch.nn.Module):
         return out.squeeze(-1)
 
     def forward_from_state(self, state_feat: torch.Tensor, x_obs: torch.Tensor,
-                            others_hands: torch.Tensor = None) -> torch.Tensor:
+                            others_hands: torch.Tensor = None, visible_mask_40: torch.Tensor = None) -> torch.Tensor:
         """Valuta il valore partendo da feature di stato (256) già calcolate.
         Usa la stessa testa belief/gating del critico.
         """
@@ -799,7 +799,8 @@ class CentralValueNet(torch.nn.Module):
         captured = x_obs[:, 83:165]
         cap0_mask = captured[:, :40] > 0.5
         cap1_mask = captured[:, 40:80] > 0.5
-        visible_mask = hand_mask | table_mask | cap0_mask | cap1_mask
+        visible_mask_local = hand_mask | table_mask | cap0_mask | cap1_mask
+        visible_mask = (visible_mask_40 if visible_mask_40 is not None else visible_mask_local)
         b_logits = self.belief_net(sf)
         b_probs_flat = self.belief_net.probs(b_logits, visible_mask)
         belief_feat = self.belief_head(b_probs_flat)
