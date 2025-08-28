@@ -348,8 +348,10 @@ class ActionConditionedPPO:
         # Prepara indici legal per minibatch usando offs/cnts contro legals globali
         max_cnt = int(cnts.max().item()) if B > 0 else 0
         row_idx = torch.arange(B, device=device, dtype=torch.long)
+        # Compute state features once; reuse for actor and critic
+        state_feat = self.actor.compute_state_features(obs, seat)  # (B,256)
         # State projection e logits per carta
-        state_proj = self.actor.compute_state_proj(obs, seat)  # (B,64)
+        state_proj = self.actor.compute_state_proj_from_state(state_feat, obs)  # (B,64)
         # Align activation to parameter dtype to avoid matmul dtype mismatch under autocast
         state_proj = state_proj.to(dtype=self.actor.card_emb_play.dtype)
         card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t())       # (B,40)
@@ -452,7 +454,7 @@ class ActionConditionedPPO:
             loss_pi = -(torch.min(ratio * adv, clipped)).mean()
 
         # Passa others_hands (se disponibile) al critico per percorso CTDE opzionale
-        v = self.critic(obs, seat, batch.get('others_hands', None))
+        v = self.critic.forward_from_state(state_feat, obs, batch.get('others_hands', None))
         if self.value_clip is not None and self.value_clip > 0:
             v_clipped = torch.clamp(v, ret - self.value_clip, ret + self.value_clip)
             loss_v = torch.max((v - ret) ** 2, (v_clipped - ret) ** 2).mean()

@@ -82,6 +82,8 @@ if _SILENCE_ABSL:
 import threading
 import io
 import torch
+import subprocess
+import webbrowser
 
 # Prefer GPU for models if available; never force CPU unless explicitly requested
 if os.environ.get('TESTS_FORCE_CPU') == '1':
@@ -118,6 +120,12 @@ def main():
     parser.add_argument('--cprofile-out', type=str, default=os.path.abspath('ppo_profile.prof'), help='Output path for cProfile stats file (.prof)')
     parser.add_argument('--snakeviz', dest='snakeviz', action='store_true', default=True, help='Open SnakeViz on the generated .prof (default: on)')
     parser.add_argument('--no-snakeviz', dest='snakeviz', action='store_false', help='Do not open SnakeViz after profiling')
+    parser.add_argument('--scalene', action='store_true', default=False, help='Run training under Scalene and generate an HTML report')
+    parser.add_argument('--scalene-out', type=str, default=os.path.abspath('ppo_scalene.html'), help='Output HTML path for Scalene report (.html)')
+    parser.add_argument('--scalene-open', dest='scalene_open', action='store_true', default=True, help='Open Scalene HTML report in a browser (default: on)')
+    parser.add_argument('--no-scalene-open', dest='scalene_open', action='store_false', help='Do not open Scalene report after profiling')
+    parser.add_argument('--scalene-cpu-only', dest='scalene_cpu_only', action='store_true', default=False, help='Limit Scalene to CPU profiling only (default: off)')
+    parser.add_argument('--scalene-run', action='store_true', default=False, help=argparse.SUPPRESS)
     args = parser.parse_args()
     # Default to random seed for profiling runs; allow override via env/CLI passthrough
     try:
@@ -134,6 +142,63 @@ def main():
         torch.set_float32_matmul_precision('high')
     except Exception:
         pass
+
+    # If requested, re-exec this script under Scalene to produce an HTML report.
+    if getattr(args, 'scalene', False) and not getattr(args, 'scalene_run', False):
+        script_path = os.path.abspath(__file__)
+        out_path = args.scalene_out if getattr(args, 'scalene_out', None) else os.path.abspath('ppo_scalene.html')
+        try:
+            ne = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
+        except Exception:
+            ne = 1
+        scalene_cmd = [sys.executable, '-m', 'scalene']
+        if getattr(args, 'scalene_cpu_only', False):
+            scalene_cmd.append('--cpu-only')
+        scalene_cmd += [
+            '--html',
+            '--reduced-profile',
+            '--outfile', out_path,
+            script_path,
+            '--scalene-run',
+            '--no-line',
+            '--no-wrap-update',
+            '--iters', str(max(1, args.iters)),
+            '--horizon', str(max(40, args.horizon)),
+            '--num-envs', str(ne),
+        ]
+        print("Running under Scalene... this may add overhead.")
+        try:
+            env = os.environ.copy()
+            try:
+                env['SCOPONE_SEED'] = str(seed)
+            except Exception:
+                pass
+            subprocess.run(scalene_cmd, check=False, env=env)
+        except FileNotFoundError:
+            print("Scalene is not installed. Install with: pip install scalene")
+        except Exception as e:
+            print(f"Failed to run Scalene: {e}")
+        else:
+            print(f"\nScalene HTML report: {out_path}")
+            if getattr(args, 'scalene_open', True):
+                try:
+                    url = 'file://' + out_path if not out_path.startswith('file://') else out_path
+                    opened = webbrowser.open(url)
+                    if not opened:
+                        try:
+                            subprocess.Popen(['xdg-open', out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"Could not open report automatically: {e}")
+                print("If it didn't open, open the HTML file manually in your browser.")
+        return
+
+    # Inner run invoked by Scalene: execute training without additional profilers.
+    if getattr(args, 'scalene_run', False):
+        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
+        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
+        return
 
     # cProfile mode takes precedence over line/torch profiler
     if getattr(args, 'cprofile', False):

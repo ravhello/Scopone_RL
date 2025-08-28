@@ -498,6 +498,59 @@ class ActionConditionedActor(torch.nn.Module):
         state_proj = self.state_to_action(state_ctx)  # (B,64)
         return state_proj
 
+    def compute_state_features(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
+        """Calcola solo le feature di stato (256) dal pair (obs, seat)."""
+        if torch.is_tensor(obs):
+            if (obs.device.type == device.type) and (obs.dtype == torch.float32):
+                x_obs = obs
+            elif obs.device.type == device.type:
+                x_obs = obs.to(dtype=torch.float32)
+            else:
+                x_obs = obs.to(device=device, dtype=torch.float32)
+        else:
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        if x_obs.dim() == 1:
+            x_obs = x_obs.unsqueeze(0)
+        if seat_team_vec is None:
+            notify_fallback('models.actor.compute_state_features.seat_team_missing')
+            seat_team_vec = torch.zeros((x_obs.size(0), 6), dtype=torch.float32, device=x_obs.device)
+        else:
+            seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
+            if seat_team_vec.dim() == 1:
+                seat_team_vec = seat_team_vec.unsqueeze(0)
+            if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
+                seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
+        return self.state_enc(x_obs, seat_team_vec)  # (B,256)
+
+    def compute_state_proj_from_state(self, state_feat: torch.Tensor, x_obs: torch.Tensor) -> torch.Tensor:
+        """Proietta feature di stato (256) in spazio azione (64) usando belief/gating dell'actor.
+        Richiede l'osservazione per calcolare la maschera carte visibili.
+        """
+        if x_obs.dim() == 1:
+            x_obs = x_obs.unsqueeze(0)
+        visible_mask = self._visible_mask_from_obs(x_obs)
+        belief_logits = self.belief_net(state_feat)        # (B,120)
+        belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
+        belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
+        partner_slice = belief_probs_flat[:, 40:80]
+        opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
+        emb = self.belief_card_emb
+        partner_feat = torch.matmul(partner_slice, emb)     # (B,32)
+        opp_feat = torch.matmul(opps_slice, emb)            # (B,32)
+        pg = self.partner_gate(state_feat)
+        og = self.opp_gate(state_feat)
+        partner_feat = partner_feat * pg
+        opp_feat = opp_feat * og
+        B_ctx = state_feat.size(0)
+        ctx_in = torch.empty((B_ctx, 256 + 64 + 32 + 32), dtype=state_feat.dtype, device=state_feat.device)
+        p = 0
+        ctx_in[:, p:p+256] = state_feat; p += 256
+        ctx_in[:, p:p+64] = belief_feat; p += 64
+        ctx_in[:, p:p+32] = partner_feat; p += 32
+        ctx_in[:, p:p+32] = opp_feat; p += 32
+        state_ctx = self.merge(ctx_in)  # (B,256)
+        return self.state_to_action(state_ctx)
+
     def invalidate_action_cache(self) -> None:
         """Invalida la cache degli embedding delle azioni (usata in inference)."""
         self._cached_action_emb = None
@@ -708,6 +761,60 @@ class CentralValueNet(torch.nn.Module):
         head_in = torch.empty((B_head, 256 + 64 + 32 + 32), dtype=state_feat.dtype, device=state_feat.device)
         hp = 0
         head_in[:, hp:hp+256] = state_feat; hp += 256
+        head_in[:, hp:hp+64] = belief_feat; hp += 64
+        head_in[:, hp:hp+32] = partner_feat; hp += 32
+        head_in[:, hp:hp+32] = opp_feat; hp += 32
+        out = self.head(head_in)
+        return out.squeeze(-1)
+
+    def forward_from_state(self, state_feat: torch.Tensor, x_obs: torch.Tensor,
+                            others_hands: torch.Tensor = None) -> torch.Tensor:
+        """Valuta il valore partendo da feature di stato (256) già calcolate.
+        Usa la stessa testa belief/gating del critico.
+        """
+        if x_obs.dim() == 1:
+            x_obs = x_obs.unsqueeze(0)
+        sf = state_feat
+        # CTDE gating opzionale
+        if others_hands is not None:
+            oh = others_hands
+            if not torch.is_tensor(oh):
+                oh = torch.as_tensor(oh, dtype=torch.float32, device=x_obs.device)
+            else:
+                oh = oh.to(x_obs.device, dtype=torch.float32)
+            if oh.dim() == 2 and oh.size(1) == 120:
+                oh_flat = oh
+            elif oh.dim() == 3 and oh.size(1) == 3 and oh.size(2) == 40:
+                oh_flat = oh.view(oh.size(0), -1)
+            else:
+                notify_fallback('models.critic.forward_from_state.others_hands_shape')
+            cond = self.ctde_cond(oh_flat)
+            scale = torch.sigmoid(self.ctde_scale(cond))  # (B,256) in (0,1)
+            shift = torch.tanh(self.ctde_shift(cond)) * 0.1
+            sf = sf * (0.5 + scale) + shift
+        # visible mask
+        hand_table = x_obs[:, :83]
+        hand_mask = hand_table[:, :40] > 0.5
+        table_mask = hand_table[:, 43:83] > 0.5
+        captured = x_obs[:, 83:165]
+        cap0_mask = captured[:, :40] > 0.5
+        cap1_mask = captured[:, 40:80] > 0.5
+        visible_mask = hand_mask | table_mask | cap0_mask | cap1_mask
+        b_logits = self.belief_net(sf)
+        b_probs_flat = self.belief_net.probs(b_logits, visible_mask)
+        belief_feat = self.belief_head(b_probs_flat)
+        partner_slice = b_probs_flat[:, 40:80]
+        opps_slice = b_probs_flat[:, 0:40] + b_probs_flat[:, 80:120]
+        emb = self.belief_card_emb
+        partner_feat = torch.matmul(partner_slice, emb)
+        opp_feat = torch.matmul(opps_slice, emb)
+        pg = self.partner_gate(sf)
+        og = self.opp_gate(sf)
+        partner_feat = partner_feat * pg
+        opp_feat = opp_feat * og
+        head_in = torch.empty((sf.size(0), 256 + 64 + 32 + 32), dtype=sf.dtype, device=sf.device)
+        hp = 0
+        head_in[:, hp:hp+256] = sf; hp += 256
         head_in[:, hp:hp+64] = belief_feat; hp += 64
         head_in[:, hp:hp+32] = partner_feat; hp += 32
         head_in[:, hp:hp+32] = opp_feat; hp += 32
