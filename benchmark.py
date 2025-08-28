@@ -223,12 +223,8 @@ def load_actor_critic(ckpt_path: str):
             actor.load_state_dict(ckpt['actor'])
             critic.load_state_dict(ckpt['critic'])
         else:
-            # fallback: niente pesi
-            try:
-                from utils.fallback import notify_fallback
-                notify_fallback('benchmark.load_actor_critic.no_weights_in_ckpt')
-            except Exception:
-                pass
+            from utils.fallback import notify_fallback
+            notify_fallback('benchmark.load_actor_critic.no_weights_in_ckpt')
     except Exception:
         pass
     return actor, critic

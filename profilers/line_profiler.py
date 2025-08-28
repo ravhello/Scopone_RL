@@ -313,8 +313,9 @@ class LineProfiler:
                 try:
                     import inspect
                     source_lines = inspect.getsourcelines(self.functions[func_name])
-                except:
-                    pass
+                except Exception:
+                    from utils.fallback import notify_fallback
+                    notify_fallback('profiler.getsourcelines_failed', f'func={func_name}')
             
             # Get line numbers and timings
             func_lines = sorted(self.results[func_name].items())

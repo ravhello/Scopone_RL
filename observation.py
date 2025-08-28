@@ -970,10 +970,8 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
             starting_seat = (current_player - (hlen % 4)) % 4
             dealer_seat = (starting_seat - 1) % 4
         else:
-            # fallback quando current_player non è nello stato
             from utils.fallback import notify_fallback
-            notify_fallback('observation.dealer_seat.fallback_current_player')
-            dealer_seat = ((-1 - 1) % 4)
+            notify_fallback('observation.dealer_seat.missing_current_player')
         dealer_vec = torch.zeros(4, dtype=torch.float32, device=device)
         if 0 <= dealer_seat <= 3:
             dealer_vec[dealer_seat] = 1.0
@@ -1021,10 +1019,9 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
               captured_bits_t.device if torch.is_tensor(captured_bits_t) else
               OBS_DEVICE)
     if hands_bits_t is None or table_bits_t is None or captured_bits_t is None:
-        # fallback
         from utils.fallback import notify_fallback
+        # Strict: fast-path requires bitsets provided by env
         notify_fallback('observation.fast_path_missing_bitsets')
-        return encode_state_compact_for_player(game_state, player_id, k_history=k_history)
 
     # 1) Mani (43): 40 one-hot + 3 conteggi altri giocatori
     hand_vec = (((hands_bits_t[player_id] >> IDS_CUDA) & 1).to(torch.float32))  # (40,)
@@ -1058,15 +1055,15 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     inferred_probs = (compute_inferred_probabilities(game_state, player_id)
                       if OBS_INCLUDE_INFERRED else None)
 
-    # 7) Primiera status (8) via bitset
+    # 7) Primiera status (8) via bitset (evita .item()/.any() sync)
     def _primiera_from_bits(bits_t):
         present = (((bits_t >> IDS_CUDA) & 1).to(torch.bool))
         vals = PRIMIERA_PER_ID.to(torch.float32)
         prim = torch.zeros(4, dtype=torch.float32, device=device)
         for s in range(4):
             mask_s = (SUITCOL_OF_ID.to(torch.long) == s)
-            v = vals.where(mask_s & present, torch.zeros((), device=device))
-            prim[s] = v.max() if bool((mask_s & present).any().item()) else 0.0
+            v = torch.where(mask_s & present, vals, torch.zeros_like(vals))
+            prim[s] = v.max()
         return prim / 21.0
     primiera_status = torch.cat([_primiera_from_bits(captured_bits_t[0]), _primiera_from_bits(captured_bits_t[1])])
 
@@ -1080,11 +1077,10 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
 
     # 9) Settebello (1)
     settebello_id = 24
-    settebello_status = torch.tensor([
-        1.0 if bool(((captured_bits_t[0] >> settebello_id) & 1).item()) else
-        (2.0 if bool(((captured_bits_t[1] >> settebello_id) & 1).item()) else
-         (3.0 if bool(((table_bits_t >> settebello_id) & 1).item()) else 0.0))
-    ], dtype=torch.float32, device=device) / 3.0
+    have0 = (((captured_bits_t[0] >> settebello_id) & 1).to(torch.float32))
+    have1 = (((captured_bits_t[1] >> settebello_id) & 1).to(torch.float32))
+    on_tbl = (((table_bits_t >> settebello_id) & 1).to(torch.float32))
+    settebello_status = (have0 * 1.0 + have1 * 2.0 + on_tbl * 3.0).unsqueeze(0) / 3.0
 
     # 10) Score estimate (2) - fallback
     score_estimate = compute_current_score_estimate(game_state)
@@ -1122,29 +1118,39 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
         pass
     last_capturing_team = torch.tensor([lct0, lct1], dtype=torch.float32, device=device)
 
-    parts = [
-        hands_enc,
-        table_enc,
-        captured_enc,
-        hist_k,
-        missing_vec,
-    ]
-    if inferred_probs is not None:
-        parts.append(inferred_probs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(inferred_probs) else torch.as_tensor(inferred_probs, dtype=torch.float32, device=device))
-    parts.extend([
-        primiera_status,
-        denari_count,
-        settebello_status,
-        score_estimate,
-        table_sum,
-        table_possible_sums,
-        scopa_counts,
-        scopa_probs,
-        rank_probs_by_player,
-        progress,
-        last_capturing_team
-    ])
-    # Dealer one-hot opzionale (4-d): calcolato da current_player e history
+    # Prealloc result and write slices to reduce cat overhead
+    include_scopa = OBS_INCLUDE_SCOPA_PROBS
+    include_rank = OBS_INCLUDE_RANK_PROBS
+    include_inferred = OBS_INCLUDE_INFERRED
+    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+                    + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if OBS_INCLUDE_DEALER else 0))
+    result = torch.empty((expected_dim,), dtype=torch.float32, device=device)
+    pos = 0
+    def _w(t):
+        nonlocal pos
+        n = int(t.numel())
+        result[pos:pos+n] = t.reshape(-1).to(dtype=torch.float32, device=device)
+        pos += n
+    _w(hands_enc)
+    _w(table_enc)
+    _w(captured_enc)
+    _w(hist_k)
+    _w(missing_vec)
+    if include_inferred and inferred_probs is not None:
+        _w(inferred_probs if torch.is_tensor(inferred_probs) else torch.as_tensor(inferred_probs, dtype=torch.float32, device=device))
+    _w(primiera_status)
+    _w(denari_count)
+    _w(settebello_status)
+    _w(score_estimate)
+    _w(table_sum)
+    _w(table_possible_sums)
+    _w(scopa_counts)
+    if include_scopa:
+        _w(scopa_probs)
+    if include_rank:
+        _w(rank_probs_by_player)
+    _w(progress)
+    _w(last_capturing_team)
     if OBS_INCLUDE_DEALER:
         try:
             current_player = int(game_state.get('current_player', -1))
@@ -1159,23 +1165,9 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
         dealer_vec = torch.zeros(4, dtype=torch.float32, device=device)
         if 0 <= dealer_seat <= 3:
             dealer_vec[dealer_seat] = 1.0
-        parts.append(dealer_vec)
-    result = torch.cat(parts)
-    # Coerenza dimensionale con feature attive/disattive
-    include_scopa = OBS_INCLUDE_SCOPA_PROBS
-    include_rank = OBS_INCLUDE_RANK_PROBS
-    include_inferred = OBS_INCLUDE_INFERRED
-    # Aggiungi rank_presence_from_inferred (30) per simmetria con slow-path
-    # Calcola e aggiungi alla fine prima del check dimensionale
+        _w(dealer_vec)
+    # rank_presence_from_inferred (30) always appended at end for fast-path coherence
     rpf = compute_rank_presence_probs_from_inferred(game_state, player_id)
-    rpf = rpf.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(rpf) else torch.as_tensor(rpf, dtype=torch.float32, device=device)
-    result = torch.cat([result, rpf], dim=0)
-    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
-                    + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if OBS_INCLUDE_DEALER else 0))
-    if result.numel() != expected_dim:
-        if result.numel() < expected_dim:
-            pad = torch.zeros((expected_dim - result.numel(),), dtype=result.dtype, device=result.device)
-            result = torch.cat([result, pad], dim=0)
-        else:
-            result = result[:expected_dim]
+    rpf = rpf if torch.is_tensor(rpf) else torch.as_tensor(rpf, dtype=torch.float32, device=device)
+    _w(rpf)
     return result

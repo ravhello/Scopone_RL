@@ -1,4 +1,3 @@
-# environment.py - VERSIONE OTTIMIZZATA PER PERFORMANCE
 import torch
 import os
 from utils.device import get_env_device
@@ -6,10 +5,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import time
 from collections import OrderedDict
-
 from state import initialize_game
 from actions import decode_action_ids
-# line_profiler opzionale: disabilitato in test/produzione
 
 # Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU.
 # Può essere forzato impostando ENV_DEVICE, ma di default resta CPU.
@@ -74,6 +71,10 @@ class ScoponeEnvMA(gym.Env):
         self._cache_capacity = 128
         # Cache DP per subset-sum sul tavolo (chiave: (table_bits, rank))
         self._subset_sum_cache = {}
+        # Cache maschere per numero di carte sul tavolo: n -> (masks[1..(1<<n)-1], pos[0..n-1])
+        self._subset_masks_cache = {}
+        # Cache invarianti per stato del tavolo: table_bits -> (table_ids_t, table_ranks, masks, pos)
+        self._table_invariants_cache = {}
         
         # Stato del gioco
         self.game_state = None  # usa rappresentazione a tuple (rank,suit) per compat, ma prevedi futura migrazione a ID/bitset
@@ -160,20 +161,11 @@ class ScoponeEnvMA(gym.Env):
         try:
             cloned._rebuild_id_caches()
         except Exception:
-            # fallback: tenta un reset e poi riallinea
-            try:
-                from utils.fallback import notify_fallback
-                notify_fallback('env.clone.rebuild_id_caches_failed')
-            except Exception:
-                pass
-            try:
-                cloned.reset(starting_player=self.current_player)
-                cloned.game_state = copy.deepcopy(self.game_state)
-                cloned._rebuild_id_caches()
-            except Exception:
-                pass
+            from utils.fallback import notify_fallback
+            # Segnala e interrompi: nessun fallback consentito
+            notify_fallback('env.clone.rebuild_id_caches_failed')
         return cloned
-    #@profile
+
     def get_valid_actions(self):
         """Calcola azioni valide su CPU usando bitset; evita micro-kernel su GPU."""
         start_time = time.time()
@@ -216,13 +208,42 @@ class ScoponeEnvMA(gym.Env):
 
         # Hoist invariants out of per-hand loop
         encode_fn = encode_action_from_ids
+        # Precompute invariants for this table state
         if table_ids_t.numel() > 0:
-            table_ranks = (table_ids_t // 4 + 1).to(torch.int64)
+            try:
+                tbl_bits_key = int(self._table_bits_t.item())
+            except Exception:
+                tbl_bits_key = None
+            inv = self._table_invariants_cache.get(tbl_bits_key, None) if tbl_bits_key is not None else None
+            if inv is not None:
+                table_ids_t = inv['ids']
+                table_ranks = inv['ranks']
+                masks_all = inv['masks']
+                pos = inv['pos']
+            else:
+                table_ranks = (table_ids_t // 4 + 1).to(torch.int64)
+                n = int(table_ids_t.numel())
+                mp = self._subset_masks_cache.get(n)
+                if mp is None:
+                    pos = torch.arange(n, dtype=torch.long, device=device)
+                    masks_all = torch.arange(1, 1 << n, dtype=torch.long, device=device)
+                    self._subset_masks_cache[n] = (masks_all, pos)
+                else:
+                    masks_all, pos = mp
+                if tbl_bits_key is not None:
+                    self._table_invariants_cache[tbl_bits_key] = {
+                        'ids': table_ids_t,
+                        'ranks': table_ranks,
+                        'masks': masks_all,
+                        'pos': pos,
+                    }
         else:
             table_ranks = None
+            masks_all, pos = None, None
 
         for pid_t in hand_ids_t:
             prank_t = (pid_t // 4 + 1).to(torch.int64)
+            per_pid_actions = []
 
             # Pari-rank sul tavolo (use hoisted table_ranks if available)
             if table_ranks is not None:
@@ -232,8 +253,8 @@ class ScoponeEnvMA(gym.Env):
                 direct_ids_t = torch.empty(0, dtype=torch.int64, device=device)
 
             if direct_ids_t.numel() > 0:
-                for did_t in direct_ids_t:
-                    valid_actions.append(encode_fn(pid_t, did_t.view(1)))
+                for i in range(int(direct_ids_t.numel())):
+                    per_pid_actions.append(encode_fn(pid_t, direct_ids_t[i:i+1]))
             else:
                 # Somma: trova subset con somma pari a prank (DP su somma-rank, n piccolo, rank<=10)
                 n = int(table_ids_t.numel())
@@ -249,41 +270,43 @@ class ScoponeEnvMA(gym.Env):
                     if subset_key is not None:
                         masks_list = self._subset_sum_cache.get(subset_key)
                     if masks_list is None:
-                        # Via vettoriale: calcola tutti i sottoinsiemi validi con Torch
-                        from actions import find_sum_subsets_ids as _find_sum_subsets_ids
-                        subsets = _find_sum_subsets_ids(table_ids, target)
-                        # Converte liste di ID in bitmask locali (rispetto a table_ids)
-                        idx_map = {cid: j for j, cid in enumerate(table_ids)}
-                        masks_list = []
-                        for subset in subsets:
-                            bm = 0
-                            for cid in subset:
-                                j = idx_map.get(int(cid))
-                                if j is not None:
-                                    bm |= (1 << j)
-                            masks_list.append(bm)
+                        # Vectorized subset search using precomputed masks_all/pos
+                        if masks_all is not None and pos is not None:
+                            sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.long)
+                            sums = (sel * table_ranks.unsqueeze(0)).sum(dim=1)
+                            good = (sums == prank_t).nonzero(as_tuple=False).flatten()
+                            if good.numel() > 0:
+                                masks_list = [int(masks_all[gi].item()) for gi in good]
+                            else:
+                                masks_list = []
+                        else:
+                            masks_list = []
                         if subset_key is not None:
                             self._subset_sum_cache[subset_key] = masks_list
                     if masks_list:
                         for bm in masks_list:
                             sel_ids = [table_ids[j] for j in range(n) if ((bm >> j) & 1) == 1]
                             cap_ids_t = torch.as_tensor(sel_ids, dtype=torch.long, device=device)
-                            valid_actions.append(encode_fn(pid_t, cap_ids_t))
+                            per_pid_actions.append(encode_fn(pid_t, cap_ids_t))
                     else:
                         # Scarto (nessuna combinazione valida)
-                        valid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+                        per_pid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
                 else:
                     # Tavolo vuoto: solo scarto
-                    valid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+                    per_pid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
 
             # Variante: Asso piglia tutto (aggiungi cattura completa)
             if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and int(prank_t.item()) == 1:
-                valid_actions.append(encode_fn(pid_t, table_ids_t))
+                per_pid_actions.append(encode_fn(pid_t, table_ids_t))
             # Ace place action if allowed
             ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
             ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
             if int(prank_t.item()) == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
-                valid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+                per_pid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+
+            # Append tutte le azioni per la carta corrente in un colpo solo
+            if per_pid_actions:
+                valid_actions.extend(per_pid_actions)
 
         # Post-filtri AP: rimuovi posa asso non consentita solo se AP è attivo
         ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
@@ -752,3 +775,5 @@ class ScoponeEnvMA(gym.Env):
             if total_cache > 0:
                 hit_rate = self._cache_hits / total_cache * 100
                 print(f"  Action cache hit rate: {hit_rate:.1f}% ({self._cache_hits}/{total_cache})")
+
+

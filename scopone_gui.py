@@ -531,8 +531,9 @@ class ResourceManager:
         if sound:
             try:
                 sound.play()
-            except:
-                pass  # Silently fail if sound playback fails
+            except Exception:
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.sound.play_failed', f'name={sound_name}')
 class NetworkManager:
     """Manages network communication for multiplayer games over the internet"""
     def __init__(self, is_host=False, host='localhost', port=5555):
@@ -575,7 +576,8 @@ class NetworkManager:
                 conn['public_ip'] = self.public_ip
                 conn['port'] = self.port
             except Exception:
-                pass
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.network.prepare_connection_info_failed')
             
             # Start thread to accept connections
             threading.Thread(target=self.accept_connections, daemon=True).start()
@@ -873,24 +875,28 @@ class NetworkManager:
                 try:
                     c.sendall(data)
                 except Exception:
-                    pass
+                    from utils.fallback import notify_fallback
+                    notify_fallback('gui.network.broadcast_player_left_failed')
             # Close all client sockets gracefully
             for c, pid in list(self.clients):
                 try:
                     c.close()
                 except Exception:
-                    pass
+                    from utils.fallback import notify_fallback
+                    notify_fallback('gui.network.close_client_socket_failed')
             # Close server socket
             try:
                 if self.socket:
                     self.socket.close()
             except Exception:
-                pass
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.network.close_server_socket_failed')
             self.socket = None
             self.clients = []
             self.connected = False
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.network.disconnect_cleanup_failed')
         # Remove player from lobby seats/players and broadcast the update so seats become free
         try:
             if hasattr(self, 'game_state') and isinstance(self.game_state, dict):
@@ -907,7 +913,8 @@ class NetworkManager:
                     # Broadcast lobby update so remaining clients see freed seat
                     self.broadcast_lobby_state()
         except Exception as _e:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.network.remove_player_from_lobby_failed')
     
     def receive_updates(self):
         """Receive game state updates from server (for clients) with buffered multi-message parsing"""
@@ -1214,8 +1221,9 @@ class NetworkManager:
         for client, _ in self.clients:
             try:
                 client.sendall(data_rules)
-            except:
-                pass
+            except Exception:
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.network.send_rules_failed')
 
         # Send player names if present
         try:
@@ -1232,10 +1240,12 @@ class NetworkManager:
                 for client, _ in self.clients:
                     try:
                         client.sendall(data_names)
-                    except:
-                        pass
+                    except Exception:
+                        from utils.fallback import notify_fallback
+                        notify_fallback('gui.network.send_names_failed')
         except Exception:
-                pass
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.network.build_names_failed')
 
         message = {"type": "start_game"}
         data = pickle.dumps(message)
@@ -1243,8 +1253,9 @@ class NetworkManager:
         for client, _ in self.clients:
             try:
                 client.sendall(data)
-            except:
-                pass
+            except Exception:
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.network.send_start_failed')
 
     def broadcast_series_state(self, state: dict):
         """Broadcast series/overlay state to clients (host only)."""
@@ -1256,7 +1267,8 @@ class NetworkManager:
             try:
                 client.sendall(data)
             except Exception:
-                pass
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.network.send_series_failed')
     
     def broadcast_room_closed(self):
         """Notify clients that the host closed the room (kick clients back to menu)."""
@@ -1396,8 +1408,9 @@ class NetworkManager:
         for client, _ in self.clients:
             try:
                 client.sendall(data)
-            except:
-                pass
+            except Exception:
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.network.send_chat_broadcast_failed')
     
     def close(self):
         """Close network connection"""
@@ -1407,20 +1420,23 @@ class NetworkManager:
             if self.is_host:
                 self.broadcast_room_closed()
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.network.broadcast_room_closed_failed')
         # Best-effort notify host that this client is leaving (so lobby frees the seat)
         try:
             if not self.is_host and self.socket and self.player_id is not None:
                 payload = {"type": "client_leaving", "player_id": self.player_id}
                 self.socket.sendall(pickle.dumps(payload))
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.network.notify_host_leaving_failed')
 
         if self.socket:
             try:
                 self.socket.close()
-            except:
-                pass
+            except Exception:
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.network.socket_close_failed')
             
         self.socket = None
         self.clients = []
@@ -1429,14 +1445,12 @@ class NetworkManager:
         """Get public IP address for internet play"""
         try:
             import urllib.request
-            # Usiamo un servizio che restituisce solo l'IP come testo puro
             response = urllib.request.urlopen('https://api.ipify.org')
             self.public_ip = response.read().decode('utf8')
             return self.public_ip
-        except Exception as e:
-            print(f"Impossibile recuperare l'IP pubblico: {e}")
-            # Fallback su IP locale se non possiamo ottenere quello pubblico
-            return get_local_ip()
+        except Exception:
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.network.public_ip_failed')
 
 class BaseScreen:
     """Base class for all game screens"""
@@ -2543,42 +2557,17 @@ class GameModeScreen(BaseScreen):
         self.status_message = f"Connecting to {host}..."
 
     def _get_clipboard_text(self):
-        """Return clipboard text using multiple backends; empty string if none."""
-        # Try tkinter (robust across OS)
+        """Return clipboard text; no fallback allowed."""
         try:
             import tkinter as _tk
             _r = _tk.Tk()
             _r.withdraw()
             data = _r.clipboard_get()
             _r.destroy()
-            if isinstance(data, str):
-                return data
+            return data if isinstance(data, str) else str(data)
         except Exception:
-            pass
-        # Try pygame.scrap
-        try:
-            if hasattr(pygame, 'scrap'):
-                try:
-                    pygame.scrap.init()
-                except Exception:
-                    pass
-                raw = pygame.scrap.get(pygame.SCRAP_TEXT)
-                if raw:
-                    try:
-                        return raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else str(raw)
-                    except Exception:
-                        return str(raw)
-        except Exception:
-            pass
-        # Windows fallback via PowerShell
-        try:
-            if sys.platform.startswith('win'):
-                import subprocess
-                out = subprocess.run(['powershell', '-command', 'Get-Clipboard'], capture_output=True, text=True, check=True)
-                return out.stdout.strip()
-        except Exception:
-            pass
-        return ""
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.clipboard.read_failed')
     
     def draw(self, surface):
         # Draw background
@@ -3044,8 +3033,6 @@ class LobbyScreen(BaseScreen):
                     for btn_rect, value in self.copy_buttons:
                         if btn_rect.collidepoint(pos):
                             text_to_copy = str(value)
-                            copied = False
-                            # Preferred: tkinter clipboard (works across OS)
                             try:
                                 import tkinter as _tk
                                 _r = _tk.Tk()
@@ -3054,31 +3041,10 @@ class LobbyScreen(BaseScreen):
                                 _r.clipboard_append(text_to_copy)
                                 _r.update()  # now it stays on the clipboard after the window is closed
                                 _r.destroy()
-                                copied = True
+                                self.status_message = f"Copiato: {text_to_copy}"
                             except Exception:
-                                pass
-                            # Pygame scrap fallback
-                            if not copied:
-                                try:
-                                    if hasattr(pygame, 'scrap'):
-                                        try:
-                                            pygame.scrap.init()
-                                        except Exception:
-                                            pass
-                                        pygame.scrap.put(pygame.SCRAP_TEXT, text_to_copy.encode('utf-8'))
-                                        copied = True
-                                except Exception:
-                                    pass
-                            # Windows fallback via subprocess (PowerShell)
-                            if not copied and sys.platform.startswith('win'):
-                                try:
-                                    import subprocess
-                                    subprocess.run(['powershell', '-command', f"Set-Clipboard -Value '{text_to_copy}'"], check=True)
-                                    copied = True
-                                except Exception:
-                                    pass
-                            # Final feedback
-                            self.status_message = f"Copiato: {text_to_copy}" if copied else "Copia negli appunti non riuscita"
+                                from utils.fallback import notify_fallback
+                                notify_fallback('gui.clipboard.write_failed')
                             return
                 # Handle seat swap clicks (left/right arrows)
                 if hasattr(self, 'seat_controls') and self.app.network:
@@ -4501,10 +4467,10 @@ class GameScreen(BaseScreen):
                 by_y = sorted(self.players, key=lambda p: getattr(p, 'hand_rect', pygame.Rect(0,0,0,0)).centery)
                 right_player = by_x[-1]   # rightmost hand
                 top_player   = by_y[0]    # topmost hand
-                # Sanity fallback to visual positions if degenerate
+                # No fallback: invalid geometry must be fixed upstream
                 if right_player is None or top_player is None or right_player == top_player:
-                    right_player = next(p for p in self.players if self.get_visual_position(p.player_id) == 1)
-                    top_player   = next(p for p in self.players if self.get_visual_position(p.player_id) == 2)
+                    from utils.fallback import notify_fallback
+                    notify_fallback('gui.message_log.invalid_geometry_players')
 
                 right_hand = getattr(right_player, 'hand_rect', pygame.Rect(0, 0, 0, 0))
                 top_hand   = getattr(top_player,   'hand_rect', pygame.Rect(0, 0, 0, 0))
@@ -4528,18 +4494,14 @@ class GameScreen(BaseScreen):
                 y = max(margin, min(raw_y, height - msg_h - margin))
                 # Debug removed
 
-                # If clamped to the far left (x == margin), prefer top-right fallback to avoid appearing on the left
+                # If clamped to the far left (x == margin), treat as layout error
                 if x == margin:
-                    x = width - msg_w - int(width * 0.08)
+                    from utils.fallback import notify_fallback
+                    notify_fallback('gui.message_log.clamped_left_layout')
                 self.message_log_rect = pygame.Rect(x, y, msg_w, msg_h)
             except StopIteration:
-                # Fallback to top-right if players not initialized
-                self.message_log_rect = pygame.Rect(
-                    width - msg_w - int(width * 0.02),
-                    int(height * 0.05),
-                    msg_w,
-                    msg_h,
-                )
+                from utils.fallback import notify_fallback
+                notify_fallback('gui.message_log.players_not_initialized')
         else:
             # Default: top right corner
             self.message_log_rect = pygame.Rect(
@@ -6342,13 +6304,8 @@ class GameScreen(BaseScreen):
                                             })
                                             print(f"CLIENT: queued move from host {self.queued_client_moves[-1]}")
                                     except Exception:
-                                        # Fallback: queue move if any error in suppression logic
-                                        self.queued_client_moves.append({
-                                            'player': lm.get('player'),
-                                            'card_played': lm.get('card_played'),
-                                            'cards_captured': lm.get('cards_captured') or [],
-                                            'table': list(old_state.get('table', [])) if isinstance(old_state, dict) else []
-                                        })
+                                        from utils.fallback import notify_fallback
+                                        notify_fallback('gui.queue_move.suppression_logic_error')
                             except Exception:
                                 pass
                         self.waiting_for_other_player = False
@@ -8578,10 +8535,11 @@ class GameScreen(BaseScreen):
             return
                 
         gs = getattr(self.env, 'game_state', {}) if self.env else {}
-        # Safely read captured squads; fallback to two empty lists if missing
+        # Strict: captured squads must be present and well-formed
         captured = gs.get("captured_squads")
         if not isinstance(captured, (list, tuple)) or len(captured) != 2:
-            captured = [[], []]
+            from utils.fallback import notify_fallback
+            notify_fallback('gui.score_panel.invalid_captured_squads')
         width = self.app.window_width
         height = self.app.window_height
         
@@ -9091,7 +9049,7 @@ class GameScreen(BaseScreen):
         panel_h = int(height * 0.08)
         margin = max(6, int(min(width, height) * 0.01))
 
-        # Prefer to the right of avatar; fallback left if needed
+        # Prefer to the right of avatar; strict layout required
         x = anchor.right + margin
         y = anchor.top
         if x + panel_w > width - margin:

@@ -45,10 +45,10 @@ def resolve_seed(seed: int) -> int:
         s = int.from_bytes(rb, byteorder='little', signed=False) & 0x7fffffff
     except Exception:
         try:
+            base = int(time.time() * 1e6) ^ int(os.getpid())
+        except Exception:
             from utils.fallback import notify_fallback
             notify_fallback('seed.resolve_seed.time_pid_fallback')
-        except Exception:
-            pass
         s = (int(time.time() * 1000) ^ os.getpid()) & 0x7fffffff
     try:
         print(f"[seed] Using randomly generated seed: {s}")

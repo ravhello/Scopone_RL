@@ -53,9 +53,10 @@ class League:
         return items[-1]
 
     def sample_pair(self, temp: float = 1.0) -> Tuple[str, str]:
-        """Ritorna (partner_ckpt, opponent_ckpt) dal pool via softmax su Elo. Fallback a None se vuoto."""
+        """Ritorna (partner_ckpt, opponent_ckpt) dal pool via softmax su Elo. Nessun fallback consentito."""
         if not self.history:
-            return None, None
+            from utils.fallback import notify_fallback
+            notify_fallback('selfplay.league.empty_history')
         partner = self._softmax_sample(self.history, temp)
         opponent = self._softmax_sample(self.history, temp)
         return partner, opponent

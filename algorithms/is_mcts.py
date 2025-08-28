@@ -3,6 +3,7 @@ import random
 from typing import List, Tuple
 
 from environment import ScoponeEnvMA
+from utils.fallback import notify_fallback
 import os
 import torch
 from utils.device import get_compute_device
@@ -83,9 +84,8 @@ def run_is_mcts(env: ScoponeEnvMA,
     try:
         priors = policy_fn(obs, legals)
     except NameError:
-        # Fallback: prior uniforme (compat con test che definisce policy_fn con np non risolto)
-        import numpy as _np
-        priors = _np.ones(len(legals), dtype=_np.float32) / max(1, len(legals))
+        # Nessun fallback consentito
+        notify_fallback('is_mcts.prior_name_error')
     import numpy as _np
     if isinstance(priors, _np.ndarray):
         priors_len = len(priors)
@@ -295,45 +295,7 @@ def run_is_mcts(env: ScoponeEnvMA,
                 return best.action, p_vec
             return best.action
     except Exception:
-        # Fallback CPU/numpy
-        if root_temperature and root_temperature > 1e-6:
-            visits = _np.array([ch.N for ch in root.children], dtype=_np.float64)
-            logits = _np.power(visits + 1e-9, 1.0 / root_temperature)
-            probs = logits / logits.sum()
-            idx = _np.random.choice(len(root.children), p=probs)
-            if return_stats:
-                # Aggrega probabilità per chiave azione root
-                ch_keys = [action_key(ch.action) for ch in root.children]
-                agg = {}
-                for k, p in zip(ch_keys, probs):
-                    agg[k] = float(agg.get(k, 0.0) + float(p))
-                if ak_order:
-                    p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
-                    s = float(p_vec.sum())
-                    if s > 0:
-                        p_vec = p_vec / s
-                else:
-                    p_vec = probs
-                return root.children[idx].action, p_vec
-            return root.children[idx].action
-        else:
-            best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
-            if return_stats:
-                visits = _np.array([ch.N for ch in root.children], dtype=_np.float64)
-                denom = float(visits.sum())
-                probs = visits / max(1.0, denom)
-                ch_keys = [action_key(ch.action) for ch in root.children]
-                agg = {}
-                for k, p in zip(ch_keys, probs):
-                    agg[k] = float(agg.get(k, 0.0) + float(p))
-                if ak_order:
-                    p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
-                    s = float(p_vec.sum())
-                    if s > 0:
-                        p_vec = p_vec / s
-                else:
-                    p_vec = probs
-                return best.action, p_vec
-            return best.action
+        # Nessun fallback CPU/numpy consentito
+        notify_fallback('is_mcts.final_selection_cpu_fallback')
 
 

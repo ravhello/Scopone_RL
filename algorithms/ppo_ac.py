@@ -34,15 +34,14 @@ class ActionConditionedPPO:
         self.critic = CentralValueNet(obs_dim, state_encoder=shared_enc)
 
         # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) outside no_grad/inference
-        try:
-            with torch.enable_grad():
-                _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
-                _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device, requires_grad=True)
-                # Initialize encoder path shared by actor/critic
+        with torch.enable_grad():
+            _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
+            _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device, requires_grad=True)
+            # Initialize encoder path shared by actor/critic under autocast to avoid dtype mismatch
+            cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
+            with cm:
                 _ = self.actor.compute_state_proj(_obs_w, _seat_w)
                 _ = self.critic(_obs_w, _seat_w)
-        except Exception:
-            pass
 
         # Unified compile: wrap modules and hotspots if enabled via utils.compile
         self.actor = maybe_compile_module(self.actor, name='ActionConditionedActor')
@@ -51,17 +50,20 @@ class ActionConditionedPPO:
         try:
             self.actor.compute_state_proj = maybe_compile_function(self.actor.compute_state_proj, name='ActionConditionedActor.compute_state_proj')
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('ppo.init.compile_compute_state_proj_failed')
         # Hot functions in profiler: compute_loss and select_action
         try:
             self.compute_loss = maybe_compile_function(self.compute_loss, name='ActionConditionedPPO.compute_loss')
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('ppo.init.compile_compute_loss_failed')
         # compile the pure compute core of select_action (I/O wrapper remains eager)
         try:
             self._select_action_core = maybe_compile_function(self._select_action_core, name='ActionConditionedPPO._select_action_core')
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('ppo.init.compile_select_action_core_failed')
 
         # Optimizers with fused/foreach when available to reduce kernel launches
         try:
@@ -104,7 +106,8 @@ class ActionConditionedPPO:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.set_float32_matmul_precision('high')
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('ppo.init.set_matmul_precision_failed')
 
         # AMP GradScaler su CUDA; disabilitato su CPU
         self.scaler = None
@@ -124,9 +127,8 @@ class ActionConditionedPPO:
             # seat_team_vec is expected to be length 6 (one-hot seats + team flags)
             self._seat_cpu_pinned = torch.empty((1, 6), dtype=torch.float32, pin_memory=True)
         except Exception:
-            # Fallback if pin_memory not available (e.g., CPU-only builds)
-            self._obs_cpu_pinned = None
-            self._seat_cpu_pinned = None
+            # Nessun fallback: pin_memory deve essere disponibile o configurazione errata
+            notify_fallback('ppo.init.pin_memory_unavailable')
         self._actions_cpu_pinned = None
         self._actions_cpu_capacity = 0
 
@@ -138,9 +140,7 @@ class ActionConditionedPPO:
                 self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32, pin_memory=True)
                 self._actions_cpu_capacity = new_cap
             except Exception:
-                # Fallback without pinning
-                self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32)
-                self._actions_cpu_capacity = new_cap
+                notify_fallback('ppo.ensure_actions_pinned_capacity.pin_memory_unavailable')
 
     def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
@@ -155,7 +155,11 @@ class ActionConditionedPPO:
             self._obs_cpu_pinned[0].copy_(obs_cpu, non_blocking=True)
             obs_t = self._obs_cpu_pinned.to(device=device, non_blocking=True)
         else:
-            obs_t = obs_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+            # pin_memory must be available; no fallback
+            try:
+                obs_t = obs_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+            except Exception:
+                notify_fallback('ppo.select_action.obs_pin_memory_failed')
 
         # Stack legal actions on CPU and copy into (or allocate) pinned buffer once
         if torch.is_tensor(legal_actions):
@@ -172,7 +176,10 @@ class ActionConditionedPPO:
             self._actions_cpu_pinned[:A].copy_(actions_cpu, non_blocking=True)
             actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
         else:
-            actions_t = actions_cpu.pin_memory().to(device=device, non_blocking=True)
+            try:
+                actions_t = actions_cpu.pin_memory().to(device=device, non_blocking=True)
+            except Exception:
+                notify_fallback('ppo.select_action.actions_pin_memory_failed')
 
         st = None
         if seat_team_vec is not None:
@@ -184,7 +191,10 @@ class ActionConditionedPPO:
                 self._seat_cpu_pinned[0].copy_(st_cpu, non_blocking=True)
                 st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
             else:
-                st = st_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                try:
+                    st = st_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                except Exception:
+                    notify_fallback('ppo.select_action.seat_pin_memory_failed')
         # belief handled internally by the actor
 
         with torch.no_grad():
@@ -204,12 +214,9 @@ class ActionConditionedPPO:
             # Precompute logits carta una volta (keep inside autocast for dtype alignment)
             card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t()).squeeze(0)  # (40)
         played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
-        # logp carta solo sulle carte presenti nei legali, deduplicando gli ID
-        # per evitare il costo del masking a 40 elementi ad ogni chiamata
-        unique_ids, inverse_idx = torch.unique(played_ids_all, sorted=False, return_inverse=True)
-        allowed_logits_unique = card_logits_all[unique_ids]  # (U)
-        logp_cards_unique = torch.log_softmax(allowed_logits_unique, dim=0)  # (U)
-        logp_cards_per_legal = logp_cards_unique[inverse_idx]  # (A)
+        # Evita torch.unique: computa logp su tutte le 40 carte una volta e indicizza
+        logp_cards_all = torch.log_softmax(card_logits_all, dim=0)  # (40)
+        logp_cards_per_legal = logp_cards_all[played_ids_all]       # (A)
         # capture logits per-legal via action embedding (usa tabella cachata in inference)
         try:
             # Usa tabella cache nella variante richiesta per evitare cast ricorrenti
@@ -223,8 +230,6 @@ class ActionConditionedPPO:
             a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
         except Exception:
             notify_fallback('ppo.select_action.a_emb_table_failed')
-            a_emb = self.actor.action_enc(actions_t)
-            a_emb = a_emb.to(dtype=state_proj.dtype)
         cap_logits = torch.matmul(a_emb, state_proj.squeeze(0).to(dtype=a_emb.dtype))  # (A)
         # log-softmax within group (card)
         group_ids = played_ids_all  # (A)
@@ -234,9 +239,6 @@ class ActionConditionedPPO:
             group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
         except Exception:
             notify_fallback('ppo.select_action.scatter_reduce_failed')
-            tmp = torch.zeros_like(group_max)
-            tmp.index_copy_(0, group_ids, cap_logits)
-            group_max = torch.maximum(group_max, tmp)
         gmax_per_legal = group_max[group_ids]
         # Ensure dtype consistency under autocast (exp may return float32)
         exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
@@ -254,19 +256,14 @@ class ActionConditionedPPO:
         s = probs.sum()
         if not torch.isfinite(s) or s <= 0:
             A = probs.numel()
-            try:
-                s_val = float(s.detach().item())
-            except Exception:
-                s_val = float('nan')
+            s_val = float(s.detach().item()) if torch.is_tensor(s) else float('nan')
             notify_fallback('ppo.select_action.uniform_probs', f'sum={s_val}, A={int(A)}')
-            probs = torch.full_like(probs, 1.0 / max(1, A))
         else:
             probs = probs / s
         try:
             idx_t = torch.multinomial(probs, num_samples=1).squeeze(0)
         except Exception:
             notify_fallback('ppo.select_action.multinomial_failed')
-            idx_t = torch.argmax(probs)
         logp_total = logp_totals[idx_t].detach()
         chosen_act = actions_t[idx_t].detach()
         return chosen_act, logp_total, idx_t
@@ -286,20 +283,32 @@ class ActionConditionedPPO:
         """
         def to_f32(x):
             if torch.is_tensor(x):
-                # Evita copie inutili: se è già su device e fp32, restituisci conversione non_blocking
-                return x.to(device=device, dtype=torch.float32, non_blocking=True)
+                # Evita copie inutili se già su device e dtype corretto
+                if (x.device.type == device.type) and (x.dtype == torch.float32):
+                    return x
+                # Se è già su device ma dtype diverso, cambia solo dtype
+                if x.device.type == device.type:
+                    return x.to(dtype=torch.float32, non_blocking=True)
+                # Altrimenti porta su CPU con dtype corretto (pin in to_cuda_nb se serve)
+                return x.detach().to('cpu', dtype=torch.float32)
             return torch.as_tensor(x, dtype=torch.float32, device=device)
         def to_long(x):
             if torch.is_tensor(x):
-                return x.to(device=device, dtype=torch.long, non_blocking=True)
+                if (x.device.type == device.type) and (x.dtype == torch.long):
+                    return x
+                if x.device.type == device.type:
+                    return x.to(dtype=torch.long, non_blocking=True)
+                return x.detach().to('cpu', dtype=torch.long)
             return torch.as_tensor(x, dtype=torch.long, device=device)
 
         # Accept CPU inputs; move to CUDA once in a pinned, non_blocking way
         def to_cuda_nb(x, dtype):
-            # Se il tensore è già su device, non riportarlo su CPU
+            # Se il tensore è già su device/dtype corretti, restituisci direttamente
             if torch.is_tensor(x):
+                if (x.device.type == device.type) and (x.dtype == dtype):
+                    return x
                 if x.device.type == device.type:
-                    return x.to(device=device, dtype=dtype, non_blocking=True)
+                    return x.to(dtype=dtype, non_blocking=True)
                 x_cpu = x.detach().to('cpu', dtype=dtype)
             else:
                 x_cpu = torch.as_tensor(x, dtype=dtype, device='cpu')
@@ -308,7 +317,8 @@ class ActionConditionedPPO:
                 if (hasattr(torch, '_dynamo') and getattr(torch._dynamo, 'is_compiling', lambda: False)()) or (x_cpu.numel() == 0):
                     return x_cpu.to(device=device, dtype=dtype, non_blocking=True)
             except Exception:
-                pass
+                from utils.fallback import notify_fallback
+                notify_fallback('ppo.compute.to_cuda_nb.compile_check_failed')
             return x_cpu.pin_memory().to(device=device, dtype=dtype, non_blocking=True)
 
         obs = to_cuda_nb(batch['obs'], torch.float32)
@@ -402,7 +412,6 @@ class ActionConditionedPPO:
                         a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
                     except Exception:
                         notify_fallback('ppo.compute_loss.a_emb_table_failed')
-                        a_emb_mb = self.actor.action_enc(legals_mb)           # fallback (M_mb,64)
             cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
             # segment logsumexp per gruppo (sample, card)
             group_ids = sample_idx_per_legal * 40 + played_ids_mb
@@ -411,11 +420,7 @@ class ActionConditionedPPO:
             try:
                 group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
             except Exception:
-                # fallback semplice
                 notify_fallback('ppo.compute_loss.scatter_reduce_failed')
-                tmp = torch.zeros_like(group_max)
-                tmp.index_copy_(0, group_ids, cap_logits)
-                group_max = torch.maximum(group_max, tmp)
             gmax_per_legal = group_max[group_ids]
             # Ensure dtype consistency under autocast (exp may return float32)
             exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
@@ -644,7 +649,8 @@ class ActionConditionedPPO:
                     try:
                         self.actor.invalidate_action_cache()
                     except Exception:
-                        pass
+                        from utils.fallback import notify_fallback
+                        notify_fallback('ppo.update.invalidate_action_cache_failed')
                 else:
                     loss, info = self.compute_loss(mini)
                     loss.backward()
@@ -658,7 +664,8 @@ class ActionConditionedPPO:
                     try:
                         self.actor.invalidate_action_cache()
                     except Exception:
-                        pass
+                        from utils.fallback import notify_fallback
+                        notify_fallback('ppo.update.invalidate_action_cache_failed')
                 last_info = info
                 self.update_steps += 1
                 avg_kl_acc += info.get('approx_kl', torch.tensor(0.0, device=device))
@@ -685,7 +692,8 @@ class ActionConditionedPPO:
                 try:
                     self.entropy_coef = float(self._entropy_schedule(self.update_steps))
                 except Exception:
-                    pass
+                    from utils.fallback import notify_fallback
+                    notify_fallback('ppo.update.entropy_schedule_failed')
             if early_stop:
                 break
         # riduzione LR automatica quando KL alto ripetuto
@@ -727,8 +735,7 @@ class ActionConditionedPPO:
             self.opt_actor.load_state_dict(ckpt['opt_actor'])
             self.opt_critic.load_state_dict(ckpt['opt_critic'])
         except Exception:
-            pass
+            from utils.fallback import notify_fallback
+            notify_fallback('ppo.load.optim_state_load_failed')
         self.run_config = ckpt.get('run_config', self.run_config)
         self.update_steps = ckpt.get('update_steps', 0)
-
-

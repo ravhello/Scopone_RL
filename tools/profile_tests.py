@@ -197,7 +197,7 @@ def main():
                 if argnames is not None:
                     argnames = list(getattr(pyfuncitem._fixtureinfo, "argnames", []) or [])
                 else:
-                    # Fallback: introspect the function signature
+                    # Heuristic: introspect the function signature
                     sig = inspect.signature(func)
                     argnames = [p.name for p in sig.parameters.values() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
                 all_kwargs = getattr(pyfuncitem, "funcargs", {}) or {}

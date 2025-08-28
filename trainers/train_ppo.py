@@ -261,7 +261,8 @@ def _env_worker(worker_id: int,
                 root_temp_dyn = float(mcts_root_temp) if float(mcts_root_temp) > 0 else float(max(0.0, 1.0 - alpha))
 
                 if sims_scaled <= 0:
-                    # Fallback: usa selezione dal master (GPU) come nel ramo non-MCTS
+                    from utils.fallback import notify_fallback
+                    notify_fallback('trainer.mcts_worker.invalid_sims_scaled')
                     if send_legals:
                         leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
                     else:
@@ -363,8 +364,8 @@ def _env_worker(worker_id: int,
             if send_legals:
                 legals_list.extend([torch.as_tensor(x, dtype=torch.float32) for x in legal])
             else:
-                # Fallback: store only chosen action as the single legal to keep API compatible
-                legals_list.append(act_t.clone().detach().to('cpu', dtype=torch.float32))
+                from utils.fallback import notify_fallback
+                notify_fallback('trainer.collect_trajectory.legals_missing_for_store')
             chosen_index_list.append(int(idx))
             # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
             try:
@@ -440,11 +441,9 @@ def _env_worker(worker_id: int,
         try:
             episode_q.put(payload, timeout=float(os.environ.get('SCOPONE_EP_PUT_TIMEOUT_S', '15')))
         except Exception:
-            # Best-effort fallback: try once more blocking briefly; otherwise drop to avoid total stall
-            try:
-                episode_q.put(payload, timeout=1.0)
-            except Exception:
-                pass
+            # Strict: no fallback retries
+            from utils.fallback import notify_fallback
+            notify_fallback('trainer.episode_queue.put_failed')
     # Signal completion to master
     try:
         episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
@@ -1055,14 +1054,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                         if sum(caps) != n:
                             caps[2] = max(0, n - caps[0] - caps[1])
                             if sum(caps) != n:
-                                # fallback uniforme
                                 from utils.fallback import notify_fallback
                                 notify_fallback('trainer.worker.belief_sampler.uniform_caps')
-                                base = n // 3
-                                rem = n - 3 * base
-                                caps = [base, base, base]
-                                for i in range(rem):
-                                    caps[i] += 1
                         # Costi = -log p con piccolo rumore per diversità
                         noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
                         costs = []  # shape (n,3)
@@ -1105,10 +1098,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                                             dp[t+1][a][b] = cur + c2
                                             bk[t+1][a][b] = 2
                         if dp[n][cap0][cap1] >= INF:
-                            # fallback: ritorna None per triggerare greedy di backup
                             from utils.fallback import notify_fallback
-                            notify_fallback('trainer.belief_sampler.dp_infeasible_returns_none')
-                            return None
+                            notify_fallback('trainer.belief_sampler.dp_infeasible')
                         # Ricostruisci percorso
                         det = {pid: [] for pid in others}
                         a, b = cap0, cap1
@@ -1265,25 +1256,11 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                         target[i] = mask
                     others_hands_targets.append(target)
                 else:
-                    # fallback lento su struttura game_state
-                    hands = env.game_state.get('hands', None)
-                    if hands is not None:
-                        target = torch.zeros((3,40), dtype=torch.float32)
-                        suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                        for i, pid in enumerate(others):
-                            cards = hands[pid]
-                            for c in cards:
-                                if isinstance(c, int):
-                                    cid = int(c)
-                                else:
-                                    r, s = c
-                                    cid = int((int(r) - 1) * 4 + suit_to_int[s])
-                                target[i, cid] = 1.0
-                        others_hands_targets.append(target)
-                    else:
-                        others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
+                    from utils.fallback import notify_fallback
+                    notify_fallback('trainer.others_hands_targets.slow_game_state_path')
             except Exception:
-                others_hands_targets.append(torch.zeros((3,40), dtype=torch.float32))
+                from utils.fallback import notify_fallback
+                notify_fallback('trainer.others_hands_targets.compute_failed')
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
             is_partner_seat = (cp in [0, 2] and (main_seats == [1, 3])) or (cp in [1, 3] and (main_seats == [0, 2]))
@@ -1541,10 +1518,10 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     batch = {
         'obs': obs_cpu,
         'act': act_cpu,
-        # lascia tensori chiave su CUDA quando presenti
-        'old_logp': old_logp_t.detach(),
-        'ret': ret_t.detach(),
-        'adv': adv_t.detach(),
+        # lascia tensori chiave su CUDA quando presenti ma evita copie inutili se già device-correct
+        'old_logp': (old_logp_t if (torch.is_tensor(old_logp_t) and old_logp_t.device.type == device.type) else old_logp_t.detach()),
+        'ret': (ret_t if (torch.is_tensor(ret_t) and ret_t.device.type == device.type) else ret_t.detach()),
+        'adv': (adv_t if (torch.is_tensor(adv_t) and adv_t.device.type == device.type) else adv_t.detach()),
         'rew': rew_t,
         'done': done_t,
         'seat_team': seat_team_cpu,

@@ -1029,7 +1029,7 @@ def test_policy_prefers_optimal_ace_king_sequence_with_checkpoint():
             os.path.join('checkpoints', 'ppo_ac.pth'),           # poi ultimo checkpoint standard
         ]
         ckpt_path = next((p for p in candidates if os.path.isfile(p)), None)
-        # fallback: cerca l'ultimo .pth in checkpoints/
+        # heuristic: cerca l'ultimo .pth in checkpoints/
         if ckpt_path is None:
             try:
                 import glob

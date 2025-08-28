@@ -120,6 +120,10 @@ def main():
     parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
     parser.add_argument('--num-envs', type=int, default=None, help='Number of parallel environments (default: 17 with --line, 1 without)')
+    parser.add_argument('--cprofile', action='store_true', default=False, help='Use Python cProfile instead of torch or line-profiler')
+    parser.add_argument('--cprofile-out', type=str, default=os.path.abspath('ppo_profile.prof'), help='Output path for cProfile stats file (.prof)')
+    parser.add_argument('--snakeviz', dest='snakeviz', action='store_true', default=True, help='Open SnakeViz on the generated .prof (default: on)')
+    parser.add_argument('--no-snakeviz', dest='snakeviz', action='store_false', help='Do not open SnakeViz after profiling')
     args = parser.parse_args()
     # Default to random seed for profiling runs; allow override via env/CLI passthrough
     try:
@@ -136,6 +140,61 @@ def main():
         torch.set_float32_matmul_precision('high')
     except Exception:
         pass
+
+    # cProfile mode takes precedence over line/torch profiler
+    if getattr(args, 'cprofile', False):
+        try:
+            import cProfile
+            import pstats
+            import subprocess
+            import shlex
+        except Exception as e:
+            print(f"cProfile unavailable: {e}")
+            return
+
+        prof = cProfile.Profile()
+        # Keep run short to avoid OOM without scheduler
+        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
+
+        def _run():
+            train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
+
+        prof.enable()
+        try:
+            _run()
+        finally:
+            prof.disable()
+
+        out_path = args.cprofile_out if getattr(args, 'cprofile_out', None) else os.path.abspath('ppo_profile.prof')
+        try:
+            prof.dump_stats(out_path)
+            print(f"\ncProfile stats written to: {out_path}")
+        except Exception as e:
+            print(f"Failed to write cProfile stats: {e}")
+
+        # Print concise summaries (top by cumulative and self time)
+        try:
+            import io as _io
+            s1 = _io.StringIO()
+            ps = pstats.Stats(prof, stream=s1).sort_stats('cumtime')
+            ps.print_stats(30)
+            print("\nTop functions by cumulative time (cumtime):\n" + s1.getvalue())
+
+            s2 = _io.StringIO()
+            pstats.Stats(prof, stream=s2).sort_stats('tottime').print_stats(30)
+            print("\nTop functions by self time (tottime):\n" + s2.getvalue())
+        except Exception as e:
+            print(f"Failed to print cProfile summary: {e}")
+
+        # Optionally launch SnakeViz
+        if getattr(args, 'snakeviz', False):
+            try:
+                # Prefer python -m snakeviz to avoid PATH issues
+                subprocess.Popen([sys.executable, '-m', 'snakeviz', out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("Launched SnakeViz in background. If not opening, run: snakeviz " + out_path)
+            except Exception as e:
+                print(f"Could not launch SnakeViz automatically: {e}\nInstall with: pip install snakeviz\nThen run: snakeviz {out_path}")
+        return
 
     if args.line:
         # Lightweight line-by-line profiling for Python code with file:line output
@@ -330,7 +389,7 @@ def main():
             try:
                 if project_root in abs_path:
                     return True
-                # Fallback: contains repo folder name
+                # Heuristic: contains repo folder name
                 return os.sep + os.path.basename(project_root) + os.sep in abs_path
             except Exception:
                 return False

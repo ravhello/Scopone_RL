@@ -9,17 +9,13 @@ class FallbackUsedError(RuntimeError):
 
 
 def _should_raise() -> bool:
-    # Prefer explicit raise toggle
-    if os.environ.get('SCOPONE_FALLBACK_RAISE', '1') == '1':
-        return True
-    # Back-compat / generic strict flag
-    if os.environ.get('SCOPONE_FALLBACK_STRICT', '1') == '1':
-        return True
-    return False
+    # Always raise: strict mode enforced globally
+    return True
 
 
 def _should_trace() -> bool:
-    return os.environ.get('SCOPONE_FALLBACK_TRACE', '1') == '1'
+    # Keep stack traces enabled unless explicitly disabled
+    return os.environ.get('SCOPONE_FALLBACK_TRACE', '1') != '0'
 
 
 def notify_fallback(key: str, details: Optional[str] = None, *, raise_error: Optional[bool] = None) -> None:
@@ -29,7 +25,8 @@ def notify_fallback(key: str, details: Optional[str] = None, *, raise_error: Opt
     details: optional human-readable extra info
     raise_error: override raising behavior for this call
     """
-    mode_raise = _should_raise() if raise_error is None else bool(raise_error)
+    # Enforce raising regardless of caller-provided override
+    mode_raise = True
     msg = f"[FALLBACK] {key}"
     if details:
         msg = f"{msg}: {details}"
