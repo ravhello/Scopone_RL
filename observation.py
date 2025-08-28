@@ -29,6 +29,27 @@ IDS_CUDA = torch.arange(40, device=OBS_DEVICE, dtype=torch.int64)
 IS_DENARI_MASK_40 = (SUITCOL_OF_ID.to(torch.long) == 0)
 PRIMIERA_PER_ID = PRIMIERA_VAL_T[RANK_OF_ID.to(torch.long)]  # (40,)
 
+def set_obs_device(device: torch.device) -> None:
+    """Rebuild observation constant tensors on the requested device.
+    Call this when the environment/device changes to avoid CPU/CUDA mismatches.
+    """
+    global OBS_DEVICE, RANK_OF_ID, SUITCOL_OF_ID, PRIMIERA_VAL_T, IDS_CUDA, IS_DENARI_MASK_40, PRIMIERA_PER_ID, ONE_HOT_PLAYERS
+    if device == OBS_DEVICE:
+        return
+    OBS_DEVICE = torch.device(device)
+    RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
+    SUITCOL_OF_ID = torch.tensor([i % 4 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
+    PRIMIERA_VAL_T = torch.tensor([0, 16, 12, 13, 14, 15, 18, 21, 10, 10, 10], dtype=torch.float32, device=OBS_DEVICE)
+    IDS_CUDA = torch.arange(40, device=OBS_DEVICE, dtype=torch.int64)
+    IS_DENARI_MASK_40 = (SUITCOL_OF_ID.to(torch.long) == 0)
+    PRIMIERA_PER_ID = PRIMIERA_VAL_T[RANK_OF_ID.to(torch.long)]
+    ONE_HOT_PLAYERS = {
+        0: torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=OBS_DEVICE),
+        1: torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float32, device=OBS_DEVICE),
+        2: torch.tensor([0.0, 0.0, 1.0, 0.0], dtype=torch.float32, device=OBS_DEVICE),
+        3: torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32, device=OBS_DEVICE),
+    }
+
 def bitset_popcount(x: int) -> int:
     return int(x.bit_count()) if hasattr(int, 'bit_count') else bin(x).count('1')
 
@@ -48,7 +69,7 @@ def bitset_table_sum(bits: int) -> int:
     bits_t = torch.tensor(int(bits), dtype=torch.int64, device=OBS_DEVICE)
     active = ((bits_t >> ids) & 1).to(torch.float32)
     ranks = RANK_OF_ID.to(torch.float32)
-    return int(torch.sum(active * ranks).item())
+    return int((active * ranks).sum().detach().cpu().item())
 
 # ----- OTTIMIZZAZIONE: CACHE PER FUNZIONI COSTOSE -----
 
@@ -235,7 +256,7 @@ def compute_inferred_probabilities(game_state, player_id):
             if lst:
                 vis[torch.as_tensor(lst, dtype=torch.long, device=OBS_DEVICE)] = True
     invisible = ~vis
-    total_unknown = int(invisible.sum().item())
+    total_unknown = int(invisible.sum().detach().cpu().item())
     probs = []
     other_players = [p for p in range(4) if p != player_id]
     for p in other_players:
@@ -346,8 +367,8 @@ def compute_denari_count(game_state):
     
     cs0 = torch.as_tensor(game_state["captured_squads"][0] or [], dtype=torch.long, device=OBS_DEVICE)
     cs1 = torch.as_tensor(game_state["captured_squads"][1] or [], dtype=torch.long, device=OBS_DEVICE)
-    den0 = (cs0.numel() > 0) and (SUITCOL_OF_ID[cs0] == 0).sum().item() or 0
-    den1 = (cs1.numel() > 0) and (SUITCOL_OF_ID[cs1] == 0).sum().item() or 0
+    den0 = (cs0.numel() > 0) and int((SUITCOL_OF_ID[cs0] == 0).sum().detach().cpu().item()) or 0
+    den1 = (cs1.numel() > 0) and int((SUITCOL_OF_ID[cs1] == 0).sum().detach().cpu().item()) or 0
     result = torch.tensor([den0 / 10.0, den1 / 10.0], dtype=torch.float32, device=OBS_DEVICE)
     
     # Salva in cache
@@ -448,8 +469,8 @@ def compute_current_score_estimate(game_state):
     
     # Primiera (calcolo semplificato)
     primiera_status = compute_primiera_status(game_state)
-    team0_prim_sum = float(torch.sum(primiera_status[:4]).item() * 21.0)  # Denormalizza
-    team1_prim_sum = float(torch.sum(primiera_status[4:]).item() * 21.0)  # Denormalizza
+    team0_prim_sum = float(primiera_status[:4].sum().detach().cpu().item() * 21.0)  # Denormalizza
+    team1_prim_sum = float(primiera_status[4:].sum().detach().cpu().item() * 21.0)  # Denormalizza
     pt_p0, pt_p1 = (1, 0) if team0_prim_sum > team1_prim_sum else (0, 1) if team1_prim_sum > team0_prim_sum else (0, 0)
     
     # Punteggio totale
@@ -490,7 +511,7 @@ def compute_table_sum(game_state):
             suit_to_idx = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
             ids_py = [int((r - 1) * 4 + suit_to_idx[s]) for (r, s) in tbl]
             ids = torch.as_tensor(ids_py, dtype=torch.long, device=OBS_DEVICE)
-        table_sum = int(RANK_OF_ID[ids].to(torch.int64).sum().item())
+        table_sum = int(RANK_OF_ID[ids].to(torch.int64).sum().detach().cpu().item())
     else:
         table_sum = 0
     result = torch.tensor([table_sum / 30.0], dtype=torch.float32, device=OBS_DEVICE)
@@ -541,9 +562,11 @@ def compute_table_possible_sums(game_state):
     masks = torch.arange(1, 1 << n, device=OBS_DEVICE, dtype=torch.long)
     sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
     sums = (sel * ranks.unsqueeze(0)).sum(dim=1)
-    for r in range(1, 11):
-        hit = bool((sums == r).any().item())
-        possible[r-1] = 1.0 if hit else 0.0
+    # Booleana per tutti i rank 1..10 in un colpo solo
+    ranks_10 = torch.arange(1, 11, device=OBS_DEVICE, dtype=sums.dtype)  # (10)
+    # Confronto broadcasting: (M,1) vs (1,10) -> (M,10)
+    any_per_rank = (sums.unsqueeze(1) == ranks_10.unsqueeze(0)).any(dim=0)
+    possible = any_per_rank.to(torch.float32)
     table_possible_sums_cache[table_key] = possible.clone()
     # Limita cache
     if len(table_possible_sums_cache) > 100:
@@ -646,9 +669,9 @@ def compute_next_player_scopa_probabilities(game_state, player_id, rank_probabil
                     sel = ((masks.unsqueeze(1) >> pos) & 1).to(torch.long)
                     sums = (sel * table_ranks.unsqueeze(0)).sum(dim=1)
                     good = (sums == current_rank)
-                    if bool(good.any().item()):
+                    if bool(good.any().detach().cpu().item()):
                         # if a subset sums, simulate remove that subset
-                        gi = int(torch.nonzero(good, as_tuple=False)[0].item())
+                        gi = int(torch.nonzero(good, as_tuple=False)[0].detach().cpu().item())
                         remaining = table_ranks[((masks[gi].unsqueeze(0) >> pos) & 1) == 0]
                     else:
                         remaining = torch.cat([table_ranks, torch.tensor([current_rank], device=OBS_DEVICE)])
@@ -660,18 +683,18 @@ def compute_next_player_scopa_probabilities(game_state, player_id, rank_probabil
             p_has = (1.0 - rank_probabilities[next_player_idx, 0, :].sum()).clamp_(0.0, 1.0)
             scopa_probs[current_rank-1] = p_has
             continue
-        total_sum = int(remaining.sum().item()) if remaining.numel() > 0 else 0
+        total_sum = int(remaining.sum().detach().cpu().item()) if remaining.numel() > 0 else 0
         for next_rank in range(1, 11):
             can_capture_all = False
             if remaining.numel() > 0:
-                if bool((remaining == next_rank).all().item()):
+                if bool((remaining == next_rank).all().detach().cpu().item()):
                     can_capture_all = True
                 elif total_sum == next_rank:
                     can_capture_all = True
             if can_capture_all:
                 p_zero = rank_probabilities[next_player_idx, 0, next_rank-1]
                 scopa_probs[current_rank-1] += (1.0 - p_zero)
-        scopa_probs[current_rank-1] = min(1.0, float(scopa_probs[current_rank-1].item()))
+        scopa_probs[current_rank-1] = min(1.0, float(scopa_probs[current_rank-1].detach().cpu().item()))
     
     # Salva in cache
     scopa_probs_cache[cache_key] = scopa_probs.clone()
@@ -750,7 +773,7 @@ def compute_rank_probabilities_by_player(game_state, player_id):
         visible_rank_counts += _acc_counts(game_state["table"]) + _acc_counts(game_state["hands"][player_id])
         for team_cards in game_state["captured_squads"].values():
             visible_rank_counts += _acc_counts(team_cards)
-    total_invisible = 40 - int(visible_rank_counts.sum().item())
+    total_invisible = 40 - int(visible_rank_counts.sum().detach().cpu().item())
     for i, p in enumerate(other_players):
         played_rank_counts = torch.zeros(10, dtype=torch.float32, device=OBS_DEVICE)
         for move in game_state.get("history", []):
@@ -766,8 +789,8 @@ def compute_rank_probabilities_by_player(game_state, player_id):
         total_rank = 4
         for rank in range(1, 11):
             rank_idx = rank - 1
-            invisible_rank = total_rank - int(visible_rank_counts[rank_idx].item())
-            played_rank = int(played_rank_counts[rank_idx].item())
+            invisible_rank = total_rank - int(visible_rank_counts[rank_idx].detach().cpu().item())
+            played_rank = int(played_rank_counts[rank_idx].detach().cpu().item())
             remaining_rank = total_rank - played_rank
             possible_rank = min(max(remaining_rank, 0), max(invisible_rank, 0))
             if possible_rank < 0:

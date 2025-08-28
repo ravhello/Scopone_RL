@@ -34,13 +34,15 @@ def get_compute_device() -> torch.device:
 
 def get_env_device() -> torch.device:
     """
-    Select the device for the environment internals. Defaults to CPU to avoid
-    GPU micro-kernels and unnecessary H2D/D2H traffic. Can be overridden with
-    ENV_DEVICE env var.
+    Select the device for the environment internals.
+    Best-performance default: match compute device (CUDA when available).
+    Override with ENV_DEVICE if explicitly set.
     """
-    env_dev = os.environ.get('ENV_DEVICE', 'cpu')
-    # Even if CUDA is available, prefer CPU unless explicitly overridden
-    return _safe_make_device(env_dev)
+    env_dev = os.environ.get('ENV_DEVICE')
+    if env_dev:
+        return _safe_make_device(env_dev)
+    # Default to compute device for end-to-end GPU pipeline
+    return get_compute_device()
 
 
 def get_amp_dtype() -> torch.dtype:

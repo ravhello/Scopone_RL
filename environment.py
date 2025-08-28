@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 from state import initialize_game
 from actions import decode_action_ids
+from observation import set_obs_device
 
 # Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU.
 # Può essere forzato impostando ENV_DEVICE, ma di default resta CPU.
@@ -115,6 +116,11 @@ class ScoponeEnvMA(gym.Env):
         self._step_time = 0
         self._step_count = 0
         
+        # Ensure observation constants are on the same device as env internals
+        try:
+            set_obs_device(device)
+        except Exception:
+            pass
         self.reset()
     def _rebuild_id_caches(self):
         if not self._use_id_cache:
@@ -167,7 +173,11 @@ class ScoponeEnvMA(gym.Env):
         return cloned
 
     def get_valid_actions(self):
-        """Calcola azioni valide su CPU usando bitset; evita micro-kernel su GPU."""
+        """Calcola azioni valide e restituisce un tensore (A,80) su device (GPU quando disponibile).
+        Implementazione vettorizzata: evita loop Python per carta/azione.
+        Regole replicate: presa diretta (pari-rank) prioritaria su somme; in assenza, somme; altrimenti scarto.
+        Varianti AP (asso_piglia_tutto / posabile) rispettate.
+        """
         start_time = time.time()
         # RANK_OF_ID è definito per CUDA; per CPU calcoliamo al volo
         # Usa la variante tensor-native (device-agnostica) per codificare le azioni
@@ -188,162 +198,125 @@ class ScoponeEnvMA(gym.Env):
             if cached is not None:
                 self._cache_hits += 1
                 self._get_valid_actions_time += time.time() - start_time
-                # Ritorna una copia superficiale per evitare side-effect sulla lista
-                return list(cached)
+                return cached
         except Exception:
             state_key = None
 
-        # Estrai ID in mano e sul tavolo da bitset tensor (CPU tensors)
+        # Estrai ID mano e tavolo da bitset mirror
         ids = self._id_range
         hand_mask = ((self._hands_bits_t[self.current_player] >> ids) & 1).bool()
         table_mask = ((self._table_bits_t >> ids) & 1).bool()
-        hand_ids_t = ids[hand_mask]
-        table_ids_t = ids[table_mask]
-
-        valid_actions = []
+        hand_ids_t = ids[hand_mask]  # (H)
+        table_ids_t = ids[table_mask]  # (n)
 
         if hand_ids_t.numel() == 0:
             self._get_valid_actions_time += time.time() - start_time
-            return valid_actions
+            return torch.zeros((0, 80), dtype=torch.float32, device=device)
 
-        # Hoist invariants out of per-hand loop
-        encode_fn = encode_action_from_ids
         # Precompute invariants for this table state
-        if table_ids_t.numel() > 0:
-            try:
-                tbl_bits_key = int(self._table_bits_t.item())
-            except Exception:
-                tbl_bits_key = None
-            inv = self._table_invariants_cache.get(tbl_bits_key, None) if tbl_bits_key is not None else None
-            if inv is not None:
-                table_ids_t = inv['ids']
-                table_ranks = inv['ranks']
-                masks_all = inv['masks']
-                pos = inv['pos']
+        n = int(table_ids_t.numel())
+        table_ranks = (table_ids_t // 4 + 1).to(torch.int64) if n > 0 else torch.empty(0, dtype=torch.int64, device=device)
+        # Masks for all non-empty subsets of table
+        if n > 0:
+            mp = self._subset_masks_cache.get(n)
+            if mp is None:
+                pos = torch.arange(n, dtype=torch.long, device=device)
+                masks_all = torch.arange(1, 1 << n, dtype=torch.long, device=device)
+                self._subset_masks_cache[n] = (masks_all, pos)
             else:
-                table_ranks = (table_ids_t // 4 + 1).to(torch.int64)
-                n = int(table_ids_t.numel())
-                mp = self._subset_masks_cache.get(n)
-                if mp is None:
-                    pos = torch.arange(n, dtype=torch.long, device=device)
-                    masks_all = torch.arange(1, 1 << n, dtype=torch.long, device=device)
-                    self._subset_masks_cache[n] = (masks_all, pos)
-                else:
-                    masks_all, pos = mp
-                if tbl_bits_key is not None:
-                    self._table_invariants_cache[tbl_bits_key] = {
-                        'ids': table_ids_t,
-                        'ranks': table_ranks,
-                        'masks': masks_all,
-                        'pos': pos,
-                    }
+                masks_all, pos = mp
+            sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.float32)  # (M,n)
+            sums = (sel * table_ranks.unsqueeze(0).to(sel.dtype)).sum(dim=1).to(torch.int64)  # (M)
+            # Map table positions -> one-hot over 40 ids
+            table_one_hot = torch.zeros((n, 40), dtype=torch.float32, device=device)
+            table_one_hot[torch.arange(n, device=device), table_ids_t] = 1.0
+            # Multi-hot for all subset masks (M,40)
+            capture_hot_by_mask = sel @ table_one_hot
         else:
-            table_ranks = None
-            masks_all, pos = None, None
+            masks_all = torch.empty(0, dtype=torch.long, device=device)
+            sel = torch.empty(0, 0, dtype=torch.float32, device=device)
+            sums = torch.empty(0, dtype=torch.int64, device=device)
+            capture_hot_by_mask = torch.empty(0, 40, dtype=torch.float32, device=device)
 
-        for pid_t in hand_ids_t:
-            prank_t = (pid_t // 4 + 1).to(torch.int64)
-            per_pid_actions = []
+        hand_ranks = (hand_ids_t // 4 + 1).to(torch.int64)  # (H)
 
-            # Pari-rank sul tavolo (use hoisted table_ranks if available)
-            if table_ranks is not None:
-                direct_sel = (table_ranks == prank_t)
-                direct_ids_t = table_ids_t[direct_sel]
+        # Direct captures matrix: (H,n) True when table rank == hand rank
+        direct_mat = (hand_ranks.unsqueeze(1) == (table_ranks.unsqueeze(0) if n>0 else torch.empty((1,0), dtype=torch.int64, device=device)))
+        has_direct = direct_mat.any(dim=1) if n>0 else torch.zeros_like(hand_ranks, dtype=torch.bool)
+        # Pairs for direct singles
+        if n > 0 and bool(direct_mat.any()):
+            h_idx_d, tpos_idx = direct_mat.nonzero(as_tuple=True)
+            pid_rows_direct = hand_ids_t[h_idx_d]
+            cap_ids_direct = table_ids_t[tpos_idx]
+            captured_hot_direct = torch.zeros((pid_rows_direct.numel(), 40), dtype=torch.float32, device=device)
+            captured_hot_direct[torch.arange(pid_rows_direct.numel(), device=device), cap_ids_direct] = 1.0
+        else:
+            pid_rows_direct = torch.empty((0,), dtype=torch.long, device=device)
+            captured_hot_direct = torch.empty((0,40), dtype=torch.float32, device=device)
+
+        # Subset-sum captures where no direct exists
+        if n > 0 and masks_all.numel() > 0:
+            good_by_p = (sums.unsqueeze(0) == hand_ranks.unsqueeze(1))  # (H,M)
+            use_mask = (~has_direct).unsqueeze(1) & good_by_p
+            if bool(use_mask.any()):
+                h_idx_s, m_idx = use_mask.nonzero(as_tuple=True)
+                pid_rows_sum = hand_ids_t[h_idx_s]
+                captured_hot_sum = capture_hot_by_mask[m_idx]
             else:
-                direct_ids_t = torch.empty(0, dtype=torch.int64, device=device)
+                pid_rows_sum = torch.empty((0,), dtype=torch.long, device=device)
+                captured_hot_sum = torch.empty((0,40), dtype=torch.float32, device=device)
+        else:
+            pid_rows_sum = torch.empty((0,), dtype=torch.long, device=device)
+            captured_hot_sum = torch.empty((0,40), dtype=torch.float32, device=device)
 
-            if direct_ids_t.numel() > 0:
-                for i in range(int(direct_ids_t.numel())):
-                    per_pid_actions.append(encode_fn(pid_t, direct_ids_t[i:i+1]))
-            else:
-                # Somma: trova subset con somma pari a prank (DP su somma-rank, n piccolo, rank<=10)
-                n = int(table_ids_t.numel())
-                if n > 0:
-                    table_ids = table_ids_t.tolist()
-                    target = int(prank_t.item())
-                    # Cache per (table_bits, target)
-                    try:
-                        subset_key = (int(self._table_bits_t.item()), target)
-                    except Exception:
-                        subset_key = None
-                    masks_list = None
-                    if subset_key is not None:
-                        masks_list = self._subset_sum_cache.get(subset_key)
-                    if masks_list is None:
-                        # Vectorized subset search using precomputed masks_all/pos
-                        if masks_all is not None and pos is not None:
-                            sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.long)
-                            sums = (sel * table_ranks.unsqueeze(0)).sum(dim=1)
-                            good = (sums == prank_t).nonzero(as_tuple=False).flatten()
-                            if good.numel() > 0:
-                                masks_list = [int(masks_all[gi].item()) for gi in good]
-                            else:
-                                masks_list = []
-                        else:
-                            masks_list = []
-                        if subset_key is not None:
-                            self._subset_sum_cache[subset_key] = masks_list
-                    if masks_list:
-                        for bm in masks_list:
-                            sel_ids = [table_ids[j] for j in range(n) if ((bm >> j) & 1) == 1]
-                            cap_ids_t = torch.as_tensor(sel_ids, dtype=torch.long, device=device)
-                            per_pid_actions.append(encode_fn(pid_t, cap_ids_t))
-                    else:
-                        # Scarto (nessuna combinazione valida)
-                        per_pid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
-                else:
-                    # Tavolo vuoto: solo scarto
-                    per_pid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
+        # Empty discard when neither direct nor subset exists
+        need_empty = (~has_direct)
+        if n > 0 and masks_all.numel() > 0:
+            any_subset = (sums.unsqueeze(0) == hand_ranks.unsqueeze(1)).any(dim=1)
+            need_empty = need_empty & (~any_subset)
+        empty_idx = need_empty.nonzero(as_tuple=True)[0]
+        pid_rows_empty = hand_ids_t[empty_idx]
+        captured_hot_empty = torch.zeros((pid_rows_empty.numel(), 40), dtype=torch.float32, device=device)
 
-            # Variante: Asso piglia tutto (aggiungi cattura completa)
-            if self.rules.get("asso_piglia_tutto", False) and table_ids_t.numel() > 0 and int(prank_t.item()) == 1:
-                per_pid_actions.append(encode_fn(pid_t, table_ids_t))
-            # Ace place action if allowed
-            ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
-            ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-            if int(prank_t.item()) == 1 and ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0):
-                per_pid_actions.append(encode_fn(pid_t, torch.empty(0, dtype=torch.long, device=device)))
-
-            # Append tutte le azioni per la carta corrente in un colpo solo
-            if per_pid_actions:
-                valid_actions.extend(per_pid_actions)
-
-        # Post-filtri AP: rimuovi posa asso non consentita solo se AP è attivo
+        # AP: asso piglia tutto (aggiungi cattura completa per tutte le A in mano)
         ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
         ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
         ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-        if ap_enabled and not (ap_posabile and (not ap_only_empty or table_ids_t.numel() == 0)) and table_ids_t.numel() > 0:
-            filtered = []
-            for v in valid_actions:
-                try:
-                    played = v[:40].reshape(10, 4)
-                    captured = v[40:]
-                    is_ace_play = bool(played[0, :].any().item())
-                    is_no_capture = not bool(captured.any().item())
-                    if is_ace_play and is_no_capture:
-                        continue
-                except Exception:
-                    pass
-                filtered.append(v)
-            valid_actions = filtered
+        is_ace = (hand_ranks == 1)
+        pid_rows_ap = torch.empty((0,), dtype=torch.long, device=device)
+        captured_hot_ap = torch.empty((0,40), dtype=torch.float32, device=device)
+        if ap_enabled and n > 0 and bool(is_ace.any()):
+            num_ace = int(is_ace.sum().item())
+            if num_ace > 0:
+                pid_rows_ap = hand_ids_t[is_ace]
+                captured_hot_ap = torch.zeros((num_ace, 40), dtype=torch.float32, device=device)
+                captured_hot_ap[:, table_ids_t] = 1.0
+
+        # Assemble all actions (played one-hot + captured multi-hot)
+        pid_all = torch.cat([pid_rows_direct, pid_rows_sum, pid_rows_empty, pid_rows_ap], dim=0)
+        cap_hot_all = torch.cat([captured_hot_direct, captured_hot_sum, captured_hot_empty, captured_hot_ap], dim=0)
+        A = int(pid_all.numel())
+        if A == 0:
+            actions = torch.zeros((0, 80), dtype=torch.float32, device=device)
+        else:
+            actions = torch.zeros((A, 80), dtype=torch.float32, device=device)
+            actions[torch.arange(A, device=device), pid_all] = 1.0
+            actions[:, 40:] = (cap_hot_all > 0).to(torch.float32)
+
+        # AP filter: se AP attivo ma posa asso non è consentita (e tavolo non vuoto), rimuovi azioni "asso + no capture"
+        if ap_enabled and n > 0 and not (ap_posabile and (not ap_only_empty or n == 0)) and A > 0:
+            played_ids = torch.argmax(actions[:, :40], dim=1)
+            played_is_ace = ((played_ids // 4 + 1) == 1)
+            empty_capture = (actions[:, 40:].sum(dim=1) == 0)
+            keep = ~(played_is_ace & empty_capture)
+            actions = actions[keep]
 
         # In condizioni corrette, se il giocatore ha carte in mano, deve esistere almeno un'azione valida
-        if hand_ids_t.numel() > 0 and len(valid_actions) == 0:
+        if hand_ids_t.numel() > 0 and actions.size(0) == 0:
             raise RuntimeError(f"No valid actions for player {self.current_player} (hand_ids={hand_ids_t.tolist()}, table_ids={table_ids_t.tolist()}, rules={self.rules})")
 
-        # Aggiorna cache LRU
-        try:
-            if state_key is not None:
-                self._cache_misses += 1
-                self._valid_actions_cache[state_key] = tuple(valid_actions)
-                self._valid_actions_cache.move_to_end(state_key)
-                while len(self._valid_actions_cache) > self._cache_capacity:
-                    self._valid_actions_cache.popitem(last=False)
-        except Exception:
-            pass
-
         self._get_valid_actions_time += time.time() - start_time
-        return valid_actions
+        return actions
     
     def step(self, action_vec):
         """
@@ -696,13 +669,8 @@ class ScoponeEnvMA(gym.Env):
                 self.game_state['current_player'] = self.current_player
             result = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
             
-            # Salva in cache (LRU)
-            try:
-                # Ensure observations returned on CPU to avoid GPU micro-kernels in env
-                result_cpu = result.detach().to('cpu') if torch.is_tensor(result) else result
-            except Exception:
-                result_cpu = result
-            self._observation_cache[cache_key] = result_cpu
+            # Salva in cache (LRU) senza forzare CPU: lascia il tensore sul suo device
+            self._observation_cache[cache_key] = result
             self._observation_cache.move_to_end(cache_key)
             while len(self._observation_cache) > self._cache_capacity:
                 self._observation_cache.popitem(last=False)
@@ -710,11 +678,8 @@ class ScoponeEnvMA(gym.Env):
         # Aggiorna il tempo di esecuzione
         self._get_obs_time += time.time() - start_time
         
-        # Always return CPU tensor
-        try:
-            return result.detach().to('cpu') if torch.is_tensor(result) else result
-        except Exception:
-            return result
+        # Ritorna direttamente il tensore sul suo device
+        return result
     
     def reset(self, starting_player=None):
         """Versione ottimizzata di reset"""

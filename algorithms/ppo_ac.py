@@ -145,56 +145,40 @@ class ActionConditionedPPO:
     def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
-        # Prepare CPU-pinned → CUDA non_blocking transfers for per-step inference, reusing pinned buffers
-        if torch.is_tensor(obs):
-            obs_cpu = obs.detach().to(device='cpu', dtype=torch.float32)
+        # Fast path: if obs is already a tensor on device, use it directly
+        if torch.is_tensor(obs) and (obs.device.type == device.type):
+            obs_t = obs.to(dtype=torch.float32)
+            if obs_t.dim() == 1:
+                obs_t = obs_t.unsqueeze(0)
         else:
-            obs_cpu = torch.as_tensor(obs, dtype=torch.float32, device='cpu')
-        if (self._obs_cpu_pinned is not None) and (obs_cpu.numel() == self._obs_cpu_pinned.size(1)):
-            # Copy into pre-pinned buffer to avoid new pinned allocations
-            self._obs_cpu_pinned[0].copy_(obs_cpu, non_blocking=True)
-            obs_t = self._obs_cpu_pinned.to(device=device, non_blocking=True)
-        else:
-            # pin_memory must be available; no fallback
-            try:
-                obs_t = obs_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-            except Exception:
-                notify_fallback('ppo.select_action.obs_pin_memory_failed')
+            # Accept CPU obs only if env device is CPU; otherwise enforce GPU-only pipeline
+            raise RuntimeError('select_action expects obs tensor on compute device')
 
-        # Stack legal actions on CPU and copy into (or allocate) pinned buffer once
-        if torch.is_tensor(legal_actions):
-            actions_cpu = legal_actions.detach().to(device='cpu', dtype=torch.float32)
-        elif len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]):
-            actions_cpu = torch.stack(legal_actions).detach().to(device='cpu', dtype=torch.float32)
+        # Fast path for legal_actions tensor already on device
+        if torch.is_tensor(legal_actions) and (legal_actions.device.type == device.type):
+            actions_t = legal_actions.to(dtype=torch.float32)
+        elif len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]) and (legal_actions[0].device.type == device.type):
+            # Stack directly on device without CPU hop
+            actions_t = torch.stack(legal_actions).to(dtype=torch.float32)
         else:
-            actions_cpu = torch.stack([
-                (x.detach().to(device='cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device='cpu'))
-            for x in legal_actions], dim=0)
-        A = actions_cpu.size(0)
-        if self._actions_cpu_pinned is not None:
-            self._ensure_actions_pinned_capacity(A)
-            self._actions_cpu_pinned[:A].copy_(actions_cpu, non_blocking=True)
-            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-        else:
-            try:
-                actions_t = actions_cpu.pin_memory().to(device=device, non_blocking=True)
-            except Exception:
-                notify_fallback('ppo.select_action.actions_pin_memory_failed')
+            raise RuntimeError('select_action expects legal_actions on compute device')
 
         st = None
         if seat_team_vec is not None:
-            if torch.is_tensor(seat_team_vec):
-                st_cpu = seat_team_vec.detach().to('cpu', dtype=torch.float32)
+            if torch.is_tensor(seat_team_vec) and (seat_team_vec.device.type == device.type):
+                st = seat_team_vec.to(dtype=torch.float32)
+                if st.dim() == 1:
+                    st = st.unsqueeze(0)
             else:
-                st_cpu = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
-            if (self._seat_cpu_pinned is not None) and (st_cpu.numel() == self._seat_cpu_pinned.size(1)):
-                self._seat_cpu_pinned[0].copy_(st_cpu, non_blocking=True)
-                st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
-            else:
-                try:
-                    st = st_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                except Exception:
-                    notify_fallback('ppo.select_action.seat_pin_memory_failed')
+                if torch.is_tensor(seat_team_vec):
+                    st_cpu = seat_team_vec.detach().to('cpu', dtype=torch.float32)
+                else:
+                    st_cpu = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
+                if (self._seat_cpu_pinned is not None) and (st_cpu.numel() == self._seat_cpu_pinned.size(1)):
+                    self._seat_cpu_pinned[0].copy_(st_cpu, non_blocking=True)
+                    st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
+                else:
+                    raise RuntimeError('select_action expects seat_team_vec on compute device or as CUDA-ready tensor')
         # belief handled internally by the actor
 
         # inference_mode disables autograd and some dispatcher overhead vs no_grad

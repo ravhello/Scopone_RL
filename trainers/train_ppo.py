@@ -880,7 +880,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         obs = env._get_observation(env.current_player)
         # Fast-path: get_valid_actions already caches by state; avoid recomputing identical lists
         legal = env.get_valid_actions()
-        if not legal:
+        if torch.is_tensor(legal) and (legal.size(0) == 0):
             if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
                 try:
                     cp = env.current_player
@@ -1341,21 +1341,16 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     next_val_t = None
     if len(next_obs_list) > 0:
         with torch.no_grad():
-            next_obs_t = torch.stack([no if torch.is_tensor(no) else torch.as_tensor(no, dtype=torch.float32) for no in next_obs_list], dim=0).pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
-            s_all = torch.stack(seat_team_list, dim=0).pin_memory().to(device=device, non_blocking=True)
+            next_obs_t = torch.stack([no if torch.is_tensor(no) else torch.as_tensor(no, dtype=torch.float32, device=device) for no in next_obs_list], dim=0).to(device=device, dtype=torch.float32)
+            s_all = torch.stack(seat_team_list, dim=0).to(device=device)
             # others_hands per-step (CTDE)
             if len(others_hands_targets) > 0:
-                oh_all = torch.stack(others_hands_targets, dim=0).pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
-                # build next others_hands by shifting within sequence; zeros at episode ends
-                oh_next = torch.zeros_like(oh_all)
-                if oh_all.size(0) > 1:
-                    oh_next[:-1] = oh_all[1:]
+                oh_all = torch.stack(others_hands_targets, dim=0).to(device=device, dtype=torch.float32)
             else:
                 oh_all = torch.zeros((0,3,40), dtype=torch.float32, device=device)
-                oh_next = torch.zeros_like(oh_all)
             done_mask_bool = torch.as_tensor([bool(d) for d in done_list], dtype=torch.bool, device=device)
             # CTDE: passa others_hands del prossimo stato (zero su terminali)
-            next_val_t = agent.critic(next_obs_t, s_all, oh_next)
+            next_val_t = agent.critic(next_obs_t, s_all, oh_all)
             next_val_t = torch.where(done_mask_bool, torch.zeros_like(next_val_t), next_val_t)
 
     # Compute V(obs) in batch su GPU e GAE
@@ -1393,11 +1388,11 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if T>0 else torch.zeros((0,), dtype=torch.float32, device=device)
     if T > 0:
         with torch.no_grad():
-            o_all = torch.stack([o if torch.is_tensor(o) else torch.as_tensor(o, dtype=torch.float32) for o in obs_list], dim=0).pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
-            s_all = torch.stack(seat_team_list, dim=0).pin_memory().to(device=device, non_blocking=True)
+            o_all = torch.stack([o if torch.is_tensor(o) else torch.as_tensor(o, dtype=torch.float32, device=device) for o in obs_list], dim=0).to(device=device, dtype=torch.float32)
+            s_all = torch.stack(seat_team_list, dim=0).to(device=device)
             # others_hands per-step (CTDE)
             if len(others_hands_targets) > 0:
-                oh_all = torch.stack(others_hands_targets, dim=0).pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
+                oh_all = torch.stack(others_hands_targets, dim=0).to(device=device, dtype=torch.float32)
             else:
                 oh_all = torch.zeros((0,3,40), dtype=torch.float32, device=device)
             val_t = agent.critic(o_all, s_all, oh_all)
@@ -1863,8 +1858,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if len(done_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
     if len(rew_list) > 0:
         with torch.no_grad():
-            o_all = obs_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
-            s_all = seat_cpu_t.pin_memory().to(device=device, non_blocking=True)
+            o_all = torch.stack([o if torch.is_tensor(o) else torch.as_tensor(o, dtype=torch.float32, device=device) for o in obs_list], dim=0).to(device=device, dtype=torch.float32)
+            s_all = torch.stack(seat_team_list, dim=0).to(device=device)
             # others_hands per-step (CTDE): se raccolti dagli env worker, usa quelli
             if others_hands_t.numel() > 0 and others_hands_t.size(0) == o_all.size(0):
                 oh_all = others_hands_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
