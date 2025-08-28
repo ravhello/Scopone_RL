@@ -33,7 +33,6 @@ os.environ.setdefault('SCOPONE_MP_START', 'fork')
 _SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
 if _SILENCE_ABSL:
     try:
-        _ORIG_STDERR = sys.stderr
         _SUPPRESS_SUBSTRINGS = (
             "All log messages before absl::InitializeLog() is called are written to STDERR",
             "Unable to register cuDNN factory",
@@ -42,46 +41,41 @@ if _SILENCE_ABSL:
             "cuda_blas.cc",
         )
 
-        class _FilteredStderr:
-            def __init__(self, stream, suppressed):
-                self._stream = stream
-                self._suppressed = suppressed
-                self._buffer = ""
+        # Install OS-level fd2 filter like main.py so native C++ logs are filtered
+        import threading  # local import to avoid changing global import order
+        _orig_fd2 = os.dup(2)
+        _r_fd, _w_fd = os.pipe()
+        os.dup2(_w_fd, 2)
 
-            def write(self, text):
-                try:
-                    self._buffer += str(text)
-                    while "\n" in self._buffer:
-                        line, self._buffer = self._buffer.split("\n", 1)
-                        if not any(s in line for s in self._suppressed):
-                            self._stream.write(line + "\n")
-                except Exception:
-                    try:
-                        self._stream.write(text)
-                    except Exception:
-                        pass
+        def _stderr_reader(r_fd, orig_fd, suppressed):
+            try:
+                with os.fdopen(r_fd, 'rb', buffering=0) as r:
+                    buffer = b""
+                    while True:
+                        chunk = r.read(1024)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            try:
+                                txt = line.decode('utf-8', errors='ignore')
+                            except Exception:
+                                txt = ''
+                            if not any(s in txt for s in suppressed):
+                                os.write(orig_fd, line + b"\n")
+                    if buffer:
+                        try:
+                            txt = buffer.decode('utf-8', errors='ignore')
+                        except Exception:
+                            txt = ''
+                        if not any(s in txt for s in suppressed):
+                            os.write(orig_fd, buffer)
+            except Exception:
+                pass
 
-            def flush(self):
-                try:
-                    if self._buffer:
-                        if not any(s in self._buffer for s in self._suppressed):
-                            self._stream.write(self._buffer)
-                        self._buffer = ""
-                    if hasattr(self._stream, "flush"):
-                        self._stream.flush()
-                except Exception:
-                    pass
-
-            def isatty(self):
-                try:
-                    return self._stream.isatty()
-                except Exception:
-                    return False
-
-            def fileno(self):
-                return self._stream.fileno()
-
-        sys.stderr = _FilteredStderr(_ORIG_STDERR, _SUPPRESS_SUBSTRINGS)
+        _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
+        _t.start()
     except Exception:
         pass
 

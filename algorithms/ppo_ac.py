@@ -217,9 +217,8 @@ class ActionConditionedPPO:
         # Evita torch.unique: computa logp su tutte le 40 carte una volta e indicizza
         logp_cards_all = torch.log_softmax(card_logits_all, dim=0)  # (40)
         logp_cards_per_legal = logp_cards_all[played_ids_all]       # (A)
-        # capture logits per-legal via action embedding (usa tabella cachata in inference)
-        # Usa tabella cache nella variante richiesta per evitare cast ricorrenti
-        a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)
+        # Use cached action embedding table to embed all legals in one matmul
+        a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)  # (80,64)
         a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
         cap_logits = torch.matmul(a_emb, state_proj.squeeze(0).to(dtype=a_emb.dtype))  # (A)
         # log-softmax within group (card)
@@ -241,20 +240,22 @@ class ActionConditionedPPO:
         # logp totale per legal = logp(card played) + logp(capture|card)
         logp_totals = logp_cards_per_legal + logp_cap_per_legal  # (A)
         probs = torch.softmax(logp_totals, dim=0)
-        # Sanitize before sampling: clamp negatives/NaN, renormalize; fallback to uniform
+        # Sanitize before sampling: clamp negatives/NaN, renormalize; invalid sums error
         probs = probs.nan_to_num(0.0)
         probs = torch.clamp(probs, min=0.0)
         s = probs.sum()
-        if not torch.isfinite(s) or s <= 0:
-            A = probs.numel()
-            s_val = float(s.detach().item()) if torch.is_tensor(s) else float('nan')
-            notify_fallback('ppo.select_action.uniform_probs', f'sum={s_val}, A={int(A)}')
-        else:
-            probs = probs / s
-        try:
-            idx_t = torch.multinomial(probs, num_samples=1).squeeze(0)
-        except Exception:
-            notify_fallback('ppo.select_action.multinomial_failed')
+        if (not torch.isfinite(s)) or (s <= 0):
+            A = int(probs.numel())
+            raise RuntimeError(f"Invalid probability distribution: sum={float(s.item())}, A={A}")
+        probs = probs / s
+        # Fast sampling via cumulative sum + searchsorted with safe bounds
+        cdf = torch.cumsum(probs, dim=0)
+        last = cdf[-1]
+        if (not torch.isfinite(last)) or (last <= 0):
+            raise RuntimeError(f"Invalid CDF for sampling: last={float(last.item())}")
+        u = torch.rand((), device=probs.device, dtype=probs.dtype) * last
+        idx_t = torch.searchsorted(cdf, u, right=True)
+        idx_t = torch.clamp(idx_t, max=cdf.numel() - 1)
         logp_total = logp_totals[idx_t].detach()
         chosen_act = actions_t[idx_t].detach()
         return chosen_act, logp_total, idx_t

@@ -165,6 +165,36 @@ class StateEncoderCompact(nn.Module):
                 out = o
         return out
 
+    def _mha_masked_mean(self, mha: nn.Module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                          q_present: torch.Tensor, k_present: torch.Tensor) -> torch.Tensor:
+        """Compute MHA and return masked mean over query tokens. Supports efficient path for B==1 by
+        compressing sequences to present tokens only (avoids key_padding work on 40-length sequences).
+        Returns shape (B, E)."""
+        B, Tq, E = q.shape
+        if B == 1:
+            q_mask = q_present[0]
+            k_mask = k_present[0]
+            if not bool(q_mask.any()) or not bool(k_mask.any()):
+                return torch.zeros((1, E), dtype=q.dtype, device=q.device)
+            q_comp = q[:, q_mask, :]
+            k_comp = k[:, k_mask, :]
+            v_comp = v[:, k_mask, :]
+            with self._attn_ctx():
+                o, _ = mha(query=q_comp, key=k_comp, value=v_comp, need_weights=False)
+            if o.dtype != q.dtype:
+                o = o.to(dtype=q.dtype)
+            return o.mean(dim=1)
+        # B > 1: use key_padding_mask path and compute masked mean
+        kpm = (~k_present)
+        with self._attn_ctx():
+            o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
+        if o.dtype != q.dtype:
+            o = o.to(dtype=q.dtype)
+        m = q_present.unsqueeze(-1).to(o.dtype)
+        summed = (o * m).sum(dim=1)
+        denom = m.sum(dim=1).clamp_min(1.0)
+        return summed / denom
+
     def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         import torch.nn.functional as F
         if not torch.is_tensor(obs):
@@ -236,15 +266,10 @@ class StateEncoderCompact(nn.Module):
             hand_kpm = (~hand_present)
             table_kpm = (~table_present)
             # Safe MHA wrapper batched + SDPA
-            h2t = self._safe_mha(self.cross_attn_h2t, hand_seq, table_seq, table_seq, table_kpm)
-            t2h = self._safe_mha(self.cross_attn_t2h, table_seq, hand_seq, hand_seq, hand_kpm)
-            def masked_mean(x: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
-                m = present.unsqueeze(-1).to(x.dtype)
-                summed = (x * m).sum(dim=1)
-                denom = m.sum(dim=1).clamp_min(1.0)
-                return summed / denom
-            hand_attn_feat = masked_mean(h2t, hand_present)         # (B,32)
-            table_attn_feat = masked_mean(t2h, table_present)       # (B,32)
+            hand_attn_feat = self._mha_masked_mean(self.cross_attn_h2t, hand_seq, table_seq, table_seq,
+                                                   hand_present, table_present)  # (B,32)
+            table_attn_feat = self._mha_masked_mean(self.cross_attn_t2h, table_seq, hand_seq, hand_seq,
+                                                    table_present, hand_present)  # (B,32)
 
             # captured
             cap0_mask = captured[:, :40]
@@ -444,8 +469,10 @@ class ActionConditionedActor(torch.nn.Module):
             if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
-        # Unconditionally align to BeliefNet parameter dtype
-        state_feat = state_feat.to(dtype=self.belief_net.fc_in.weight.dtype)
+        # Ensure BeliefNet receives its parameter dtype (avoids Half/Float mismatch outside autocast)
+        bn_dtype = self.belief_net.fc_in.weight.dtype
+        if state_feat.dtype != bn_dtype:
+            state_feat = state_feat.to(dtype=bn_dtype)
         # belief neurale interno con maschera carte visibili
         visible_mask = self._visible_mask_from_obs(x_obs)
         belief_logits = self.belief_net(state_feat)        # (B,120)
@@ -460,7 +487,14 @@ class ActionConditionedActor(torch.nn.Module):
         og = self.opp_gate(state_feat)
         partner_feat = partner_feat * pg
         opp_feat = opp_feat * og
-        state_ctx = self.merge(torch.cat([state_feat, belief_feat, partner_feat, opp_feat], dim=1))  # (B,256)
+        B_ctx = state_feat.size(0)
+        ctx_in = torch.empty((B_ctx, 256 + 64 + 32 + 32), dtype=state_feat.dtype, device=state_feat.device)
+        p = 0
+        ctx_in[:, p:p+256] = state_feat; p += 256
+        ctx_in[:, p:p+64] = belief_feat; p += 64
+        ctx_in[:, p:p+32] = partner_feat; p += 32
+        ctx_in[:, p:p+32] = opp_feat; p += 32
+        state_ctx = self.merge(ctx_in)  # (B,256)
         state_proj = self.state_to_action(state_ctx)  # (B,64)
         return state_proj
 
@@ -525,8 +559,9 @@ class ActionConditionedActor(torch.nn.Module):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         # belief neurale interno con maschera carte visibili
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
-        # Unconditionally align to BeliefNet parameter dtype
-        state_feat = state_feat.to(dtype=self.belief_net.fc_in.weight.dtype)
+        bn_dtype = self.belief_net.fc_in.weight.dtype
+        if state_feat.dtype != bn_dtype:
+            state_feat = state_feat.to(dtype=bn_dtype)
         visible_mask = self._visible_mask_from_obs(x_obs)
         belief_logits = self.belief_net(state_feat)
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
@@ -542,7 +577,14 @@ class ActionConditionedActor(torch.nn.Module):
         og = self.opp_gate(state_feat)
         partner_feat = partner_feat * pg
         opp_feat = opp_feat * og
-        state_ctx = self.merge(torch.cat([state_feat, belief_feat, partner_feat, opp_feat], dim=1))  # (B,256)
+        B_ctx2 = state_feat.size(0)
+        ctx2_in = torch.empty((B_ctx2, 256 + 64 + 32 + 32), dtype=state_feat.dtype, device=state_feat.device)
+        p2 = 0
+        ctx2_in[:, p2:p2+256] = state_feat; p2 += 256
+        ctx2_in[:, p2:p2+64] = belief_feat; p2 += 64
+        ctx2_in[:, p2:p2+32] = partner_feat; p2 += 32
+        ctx2_in[:, p2:p2+32] = opp_feat; p2 += 32
+        state_ctx = self.merge(ctx2_in)  # (B,256)
         state_proj = self.state_to_action(state_ctx)  # (B,64)
 
         if legals is None:
@@ -621,8 +663,9 @@ class CentralValueNet(torch.nn.Module):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         # Belief neurale interno (ignora belief_summary esterno)
         state_feat = self.state_enc(x_obs, seat_team_vec)
-        # Unconditionally align to BeliefNet parameter dtype
-        state_feat = state_feat.to(dtype=self.belief_net.fc_in.weight.dtype)
+        bn_dtype = self.belief_net.fc_in.weight.dtype
+        if state_feat.dtype != bn_dtype:
+            state_feat = state_feat.to(dtype=bn_dtype)
         # CTDE FiLM gating se others_hands è disponibile (training centralizzato)
         if others_hands is not None:
             oh = others_hands
@@ -661,7 +704,14 @@ class CentralValueNet(torch.nn.Module):
         og = self.opp_gate(state_feat)
         partner_feat = partner_feat * pg
         opp_feat = opp_feat * og
-        out = self.head(torch.cat([state_feat, belief_feat, partner_feat, opp_feat], dim=1))
+        B_head = state_feat.size(0)
+        head_in = torch.empty((B_head, 256 + 64 + 32 + 32), dtype=state_feat.dtype, device=state_feat.device)
+        hp = 0
+        head_in[:, hp:hp+256] = state_feat; hp += 256
+        head_in[:, hp:hp+64] = belief_feat; hp += 64
+        head_in[:, hp:hp+32] = partner_feat; hp += 32
+        head_in[:, hp:hp+32] = opp_feat; hp += 32
+        out = self.head(head_in)
         return out.squeeze(-1)
 
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
