@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import os
 from contextlib import nullcontext
+from typing import Dict, Tuple, Optional
 from utils.device import get_compute_device, get_amp_dtype
 from utils.fallback import notify_fallback
 try:
@@ -138,6 +139,31 @@ class StateEncoderCompact(nn.Module):
         # deleghiamo a self.stats_processor (LazyLinear) l'adattamento alla nuova dimensione.
         self.combiner = nn.Sequential(nn.Linear(224, 256), nn.ReLU())
         self.to(device)
+        # Pre-create positional ids for up to 40 steps to avoid per-forward arange
+        self.register_buffer('_hist_pos_ids', torch.arange(40, dtype=torch.long, device=device))
+
+    def _attn_ctx(self):
+        if device.type == 'cuda':
+            if _sdpa_kernel_ctx is not None and _SDPBackend is not None:
+                return _sdpa_kernel_ctx([_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION])
+            return torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
+        return nullcontext()
+
+    def _safe_mha(self, mha: nn.Module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
+        """Run MHA with key padding mask safely; returns zeros where all tokens are masked.
+        Expects batch-first (B, T, E)."""
+        out = torch.zeros_like(q)
+        if kpm.dim() == 2:
+            all_masked = kpm.all(dim=1)
+            if bool((~all_masked).any()):
+                with self._attn_ctx():
+                    o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
+                if o.dtype != out.dtype:
+                    o = o.to(dtype=out.dtype)
+                if bool(all_masked.any()):
+                    o[all_masked] = 0
+                out = o
+        return out
 
     def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         import torch.nn.functional as F
@@ -210,28 +236,8 @@ class StateEncoderCompact(nn.Module):
             hand_kpm = (~hand_present)
             table_kpm = (~table_present)
             # Safe MHA wrapper batched + SDPA
-            def _safe_mha(mha: nn.Module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
-                out = torch.zeros_like(q)
-                if kpm.dim() == 2:
-                    all_masked = kpm.all(dim=1)
-                    if bool((~all_masked).any()):
-                        if device.type == 'cuda':
-                            if _sdpa_kernel_ctx is not None and _SDPBackend is not None:
-                                sdp_ctx = _sdpa_kernel_ctx([_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION])
-                            else:
-                                sdp_ctx = torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
-                        else:
-                            sdp_ctx = nullcontext()
-                        with sdp_ctx:
-                            o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
-                        if o.dtype != out.dtype:
-                            o = o.to(dtype=out.dtype)
-                        if bool(all_masked.any()):
-                            o[all_masked] = 0
-                        out = o
-                return out
-            h2t = _safe_mha(self.cross_attn_h2t, hand_seq, table_seq, table_seq, table_kpm)
-            t2h = _safe_mha(self.cross_attn_t2h, table_seq, hand_seq, hand_seq, hand_kpm)
+            h2t = self._safe_mha(self.cross_attn_h2t, hand_seq, table_seq, table_seq, table_kpm)
+            t2h = self._safe_mha(self.cross_attn_t2h, table_seq, hand_seq, hand_seq, hand_kpm)
             def masked_mean(x: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
                 m = present.unsqueeze(-1).to(x.dtype)
                 summed = (x * m).sum(dim=1)
@@ -265,7 +271,8 @@ class StateEncoderCompact(nn.Module):
             if k > 0:
                 hist_reshaped = history.view(B, k, 61)               # (B,k,61)
                 hproj = self.hist_proj(hist_reshaped)                # (B,k,64)
-                pos_idx = torch.arange(k, device=obs.device, dtype=torch.long).unsqueeze(0).expand(B, k)
+                # Use precomputed position ids buffer (max 40)
+                pos_idx = self._hist_pos_ids[:k].unsqueeze(0).expand(B, k)
                 hpos = self.hist_pos_emb(pos_idx)
                 hseq = hproj + hpos
                 henc = self.hist_encoder(hseq)                       # (B,k,64)
@@ -400,8 +407,9 @@ class ActionConditionedActor(torch.nn.Module):
         self.card_emb_play = nn.Parameter(torch.randn(40, 64) * 0.02)
         # Cache di tutte le azioni one-hot (80 x 80) per calcolare logits pieni
         self.register_buffer('all_actions_eye', torch.eye(action_dim, dtype=torch.float32))
-        # Cache embedding azioni (solo per inference)
-        self._cached_action_emb = None
+        # Cache embedding azioni per device/dtype (solo per inference)
+        self._cached_action_emb = None  # legacy single-cache for backward compat
+        self._cached_action_emb_variants: Dict[Tuple[str, torch.dtype], torch.Tensor] = {}
         self.to(device)
 
     @staticmethod
@@ -459,26 +467,36 @@ class ActionConditionedActor(torch.nn.Module):
     def invalidate_action_cache(self) -> None:
         """Invalida la cache degli embedding delle azioni (usata in inference)."""
         self._cached_action_emb = None
+        self._cached_action_emb_variants.clear()
 
-    def get_action_emb_table_cached(self) -> torch.Tensor:
-        """Ritorna la tabella (80,64) degli embedding azione usando la cache in inference.
-        Viene ricalcolata on-demand quando assente o invalidata. Non traccia gradiente.
+    def get_action_emb_table_cached(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        """Ritorna la tabella (80,64) degli embedding azione.
+        Mantiene una cache per (device,dtype) per evitare copie .to ripetute.
+        Se device/dtype non sono specificati, usa il device del modulo e float32.
         """
-        if self._cached_action_emb is not None:
-            return self._cached_action_emb
+        target_device = device or next(self.action_enc.parameters()).device
+        target_dtype = dtype or next(self.action_enc.parameters()).dtype
+        key = (str(target_device), target_dtype)
+        cached = self._cached_action_emb_variants.get(key, None)
+        if cached is not None:
+            return cached
         # Evita cattura in cudagraph/compile: calcola in eager e clona storage
-        return self._compute_action_emb_table_eager()
+        tbl = self._compute_action_emb_table_eager(device=target_device, dtype=target_dtype)
+        self._cached_action_emb_variants[key] = tbl
+        return tbl
 
     @_dynamo_disable
-    def _compute_action_emb_table_eager(self) -> torch.Tensor:
+    def _compute_action_emb_table_eager(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         with torch.no_grad():
+            target_device = device or next(self.action_enc.parameters()).device
+            base_dtype = next(self.action_enc.parameters()).dtype
             # Clona l'input per assicurare storage indipendente
-            eye = self.all_actions_eye.to(device=device, dtype=torch.float32).clone()
-            tbl = self.action_enc(eye).detach().clone()
-            # Materializza su device predefinito e contiguo
-            tbl = tbl.to(device=device, dtype=torch.float32).contiguous()
-            self._cached_action_emb = tbl
-            return self._cached_action_emb
+            eye = self.all_actions_eye.to(device=target_device, dtype=torch.float32).clone()
+            tbl = self.action_enc(eye).detach().clone()  # computed in module dtype
+            desired_dtype = dtype or base_dtype
+            # Materializza su device/dtype specificati e contiguo
+            tbl = tbl.to(device=target_device, dtype=desired_dtype).contiguous()
+            return tbl
 
     def forward(self, obs: torch.Tensor, legals: torch.Tensor = None,
                 seat_team_vec: torch.Tensor = None) -> torch.Tensor:
@@ -531,11 +549,7 @@ class ActionConditionedActor(torch.nn.Module):
             # Calcola logits per tutte le 80 azioni: (B,64) @ (64,80) -> (B,80)
             all_actions = self.all_actions_eye
             # usa cache embedding azioni se disponibile
-            try:
-                action_emb = self.get_action_emb_table_cached()
-            except Exception:
-                from utils.fallback import notify_fallback
-                notify_fallback('models.actor.action_emb_table_failed')
+            action_emb = self.get_action_emb_table_cached(device=state_proj.device, dtype=state_proj.dtype)
             logits = torch.matmul(state_proj, action_emb.t())  # (B,80)
             return logits if logits.size(0) > 1 else logits.squeeze(0)
         # legals: (A,80). Calcola score per azioni legali via prodotto scalare
@@ -548,12 +562,8 @@ class ActionConditionedActor(torch.nn.Module):
         if self.training:
             a_emb = self.action_enc(legals_t)
         else:
-            try:
-                a_tbl = self.get_action_emb_table_cached().to(dtype=state_proj.dtype, device=legals_t.device)
-                a_emb = torch.matmul(legals_t, a_tbl)
-            except Exception:
-                from utils.fallback import notify_fallback
-                notify_fallback('models.actor.action_emb_table_failed.legals')
+            a_tbl = self.get_action_emb_table_cached(device=legals_t.device, dtype=state_proj.dtype)
+            a_emb = torch.matmul(legals_t, a_tbl)
         if state_proj.size(0) == 1:
             scores = torch.matmul(a_emb, state_proj.squeeze(0))  # (A)
         else:
@@ -657,4 +667,6 @@ class CentralValueNet(torch.nn.Module):
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
         _ = strict  # keep arg for external callers; force non-strict loading
         return super().load_state_dict(state_dict, strict=False)
+
+
 

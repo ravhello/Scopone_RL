@@ -218,18 +218,9 @@ class ActionConditionedPPO:
         logp_cards_all = torch.log_softmax(card_logits_all, dim=0)  # (40)
         logp_cards_per_legal = logp_cards_all[played_ids_all]       # (A)
         # capture logits per-legal via action embedding (usa tabella cachata in inference)
-        try:
-            # Usa tabella cache nella variante richiesta per evitare cast ricorrenti
-            try:
-                a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)
-            except TypeError:
-                # Compatibilità con versioni senza keyword
-                a_tbl = self.actor.get_action_emb_table_cached()
-                if a_tbl.device != actions_t.device or a_tbl.dtype != state_proj.dtype:
-                    a_tbl = a_tbl.to(device=actions_t.device, dtype=state_proj.dtype).contiguous()
-            a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
-        except Exception:
-            notify_fallback('ppo.select_action.a_emb_table_failed')
+        # Usa tabella cache nella variante richiesta per evitare cast ricorrenti
+        a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)
+        a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
         cap_logits = torch.matmul(a_emb, state_proj.squeeze(0).to(dtype=a_emb.dtype))  # (A)
         # log-softmax within group (card)
         group_ids = played_ids_all  # (A)
@@ -402,16 +393,8 @@ class ActionConditionedPPO:
                 if self.actor.training:
                     a_emb_mb = self.actor.action_enc(legals_mb)
                 else:
-                    try:
-                        try:
-                            a_tbl = self.actor.get_action_emb_table_cached(device=legals_mb.device, dtype=state_proj.dtype)
-                        except TypeError:
-                            a_tbl = self.actor.get_action_emb_table_cached()
-                            if a_tbl.device != legals_mb.device or a_tbl.dtype != state_proj.dtype:
-                                a_tbl = a_tbl.to(device=legals_mb.device, dtype=state_proj.dtype).contiguous()
-                        a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
-                    except Exception:
-                        notify_fallback('ppo.compute_loss.a_emb_table_failed')
+                    a_tbl = self.actor.get_action_emb_table_cached(device=legals_mb.device, dtype=state_proj.dtype)
+                    a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
             cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
             # segment logsumexp per gruppo (sample, card)
             group_ids = sample_idx_per_legal * 40 + played_ids_mb
