@@ -972,12 +972,8 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     if OBS_INCLUDE_DEALER:
         current_player = int(game_state.get('current_player', -1))
         hlen = len(game_state.get('history', []))
-        if current_player >= 0:
-            starting_seat = (current_player - (hlen % 4)) % 4
-            dealer_seat = (starting_seat - 1) % 4
-        else:
-            from utils.fallback import notify_fallback
-            notify_fallback('observation.dealer_seat.missing_current_player')
+        starting_seat = (current_player - (hlen % 4)) % 4
+        dealer_seat = (starting_seat - 1) % 4
         dealer_vec = torch.zeros(4, dtype=torch.float32, device=device)
         if 0 <= dealer_seat <= 3:
             dealer_vec[dealer_seat] = 1.0
@@ -1025,9 +1021,7 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
               captured_bits_t.device if torch.is_tensor(captured_bits_t) else
               OBS_DEVICE)
     if hands_bits_t is None or table_bits_t is None or captured_bits_t is None:
-        from utils.fallback import notify_fallback
-        # Strict: fast-path requires bitsets provided by env
-        notify_fallback('observation.fast_path_missing_bitsets')
+        raise ValueError('encode_state_compact_for_player_fast requires bitset mirrors (_hands_bits_t, _table_bits_t, _captured_bits_t)')
 
     # 1) Mani (43): 40 one-hot + 3 conteggi altri giocatori
     hand_vec = (((hands_bits_t[player_id] >> IDS_CUDA) & 1).to(torch.float32))  # (40,)
@@ -1065,11 +1059,15 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     def _primiera_from_bits(bits_t):
         present = (((bits_t >> IDS_CUDA) & 1).to(torch.bool))           # (40)
         vals = PRIMIERA_PER_ID.to(torch.float32)                        # (40)
-        suits = SUITCOL_OF_ID.to(torch.long)                            # (40)
-        suits_oh = (suits.unsqueeze(0) == torch.arange(4, device=device, dtype=torch.long).unsqueeze(1))  # (4,40)
+        # Lazy global cache for suits one-hot (4,40)
+        suits_oh = globals().get('OBS_SUITS_OH_4x40', None)
+        if suits_oh is None or suits_oh.device != device:
+            suits = SUITCOL_OF_ID.to(torch.long)
+            suits_oh = (suits.unsqueeze(0) == torch.arange(4, device=device, dtype=torch.long).unsqueeze(1))  # (4,40)
+            globals()['OBS_SUITS_OH_4x40'] = suits_oh
         mask = present.unsqueeze(0) & suits_oh                          # (4,40)
-        masked = torch.where(mask, vals.unsqueeze(0), torch.zeros((4, vals.numel()), dtype=torch.float32, device=device))
-        prim = masked.max(dim=1).values / 21.0
+        masked_vals = vals.unsqueeze(0) * mask.to(vals.dtype)
+        prim = masked_vals.max(dim=1).values / 21.0
         return prim
     primiera_status = torch.cat([_primiera_from_bits(captured_bits_t[0]), _primiera_from_bits(captured_bits_t[1])])
 
@@ -1108,7 +1106,27 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     scopa_counts = compute_scopa_counts(game_state)
 
     # 15) Table possible sums (10)
-    table_possible_sums = compute_table_possible_sums(game_state)
+    # Fast table possible sums (10) via subset sums from bitset, avoiding Python loops
+    present_tbl = (((table_bits_t >> IDS_CUDA) & 1).to(torch.bool))
+    if bool(present_tbl.any()):
+        tbl_ids = IDS_CUDA[present_tbl]
+        ranks = (RANK_OF_ID.to(torch.int64)[tbl_ids]).to(torch.int64)
+        n_local = int(ranks.numel())
+        if n_local > 0:
+            pos = torch.arange(n_local, device=device, dtype=torch.long)
+            masks_all = torch.arange(1, 1 << n_local, device=device, dtype=torch.long)
+            sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.float32)
+            sums_loc = (sel @ ranks.to(torch.float32).unsqueeze(1)).squeeze(1)
+            valid = (sums_loc >= 1) & (sums_loc <= 10)
+            sums_idx = sums_loc[valid].to(torch.long)
+            tps = torch.zeros(10, dtype=torch.float32, device=device)
+            if sums_idx.numel() > 0:
+                tps.index_fill_(0, sums_idx - 1, 1.0)
+            table_possible_sums = tps
+        else:
+            table_possible_sums = torch.zeros(10, dtype=torch.float32, device=device)
+    else:
+        table_possible_sums = torch.zeros(10, dtype=torch.float32, device=device)
     # 16) Progress (1)
     progress = torch.tensor([min(1.0, float(len(game_state.get("history", [])))/40.0)], dtype=torch.float32, device=device)
     # 17) Last capturing team (2)

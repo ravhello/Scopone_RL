@@ -93,14 +93,15 @@ def decode_action_ids(action_vec):
     """
     Decodifica un vettore azione 80-dim in (played_id, [captured_ids]) con card IDs 0..39.
     """
+    # Esegui sempre la decodifica su CPU per evitare micro-kernel/copy su CUDA
     if torch.is_tensor(action_vec):
-        vec_t = action_vec.to(device=device, dtype=torch.float32).reshape(-1)
+        vec_t = action_vec.detach().to('cpu', dtype=torch.float32).reshape(-1)
     else:
         # supporta list o numpy array
         try:
-            vec_t = torch.as_tensor(action_vec, dtype=torch.float32, device=device).reshape(-1)
+            vec_t = torch.as_tensor(action_vec, dtype=torch.float32, device='cpu').reshape(-1)
         except Exception:
-            vec_t = torch.tensor(list(action_vec), dtype=torch.float32, device=device).reshape(-1)
+            vec_t = torch.tensor(list(action_vec), dtype=torch.float32, device='cpu').reshape(-1)
     return _decode_ids(vec_t)
 
 # ----- FAST PATH: subset-sum su ID con numba -----

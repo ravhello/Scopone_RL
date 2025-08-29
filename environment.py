@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from state import initialize_game
 from actions import decode_action_ids
-from observation import set_obs_device, encode_state_compact_for_player_fast as _encode_state_compact_for_player_fast
+from observation import set_obs_device, encode_state_compact_for_player_fast as _encode_state_compact_for_player_fast, RANK_OF_ID
 from utils.compile import maybe_compile_function
 import torch.nn.functional as F
 
@@ -204,8 +204,8 @@ class ScoponeEnvMA(gym.Env):
 
         # Precompute invariants for this table state
         n = int(table_ids_t.numel())
-        table_ranks = (table_ids_t // 4 + 1).to(torch.int64) if n > 0 else torch.empty(0, dtype=torch.int64, device=device)
-        # Masks for all non-empty subsets of table
+        table_ranks = (RANK_OF_ID.to(device=table_ids_t.device, dtype=torch.int16)[table_ids_t].to(torch.int64) if n > 0 else torch.empty(0, dtype=torch.int64, device=device))
+        # Masks and per-table invariants cached by table bitset
         if n > 0:
             mp = self._subset_masks_cache.get(n)
             if mp is None:
@@ -214,21 +214,31 @@ class ScoponeEnvMA(gym.Env):
                 self._subset_masks_cache[n] = (masks_all, pos)
             else:
                 masks_all, pos = mp
-            sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.float32)  # (M,n)
-            # matmul più efficiente del prodotto elemento per elemento + sum
-            sums = sel @ table_ranks.unsqueeze(1).to(torch.float32)
-            sums = sums.squeeze(1).to(torch.int64)  # (M)
-            # Map table positions -> one-hot over 40 ids
-            table_one_hot = F.one_hot(table_ids_t, num_classes=40).to(torch.float32)
-            # Multi-hot for all subset masks (M,40)
-            capture_hot_by_mask = sel @ table_one_hot
+            sel = None
+            sums = None
+            table_one_hot = None
+            capture_hot_by_mask = None
+            tbl_bits_key = int(self._table_bits_t.item())
+            inv = self._table_invariants_cache.get(tbl_bits_key)
+            if inv is not None and inv.get('n', 0) == n:
+                sel = inv.get('sel', None)
+                sums = inv.get('sums', None)
+                table_one_hot = inv.get('table_one_hot', None)
+                capture_hot_by_mask = inv.get('capture_hot_by_mask', None)
+            if sel is None:
+                sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.float32)  # (M,n)
+            if sums is None:
+                sums = (sel @ table_ranks.unsqueeze(1).to(torch.float32)).squeeze(1).to(torch.int64)
+            if table_one_hot is None:
+                table_one_hot = F.one_hot(table_ids_t, num_classes=40).to(torch.float32)
+            # Nota: capture_hot_by_mask calcolato lazy solo se necessario (vedi sotto)
         else:
             masks_all = torch.empty(0, dtype=torch.long, device=device)
             sel = torch.empty(0, 0, dtype=torch.float32, device=device)
             sums = torch.empty(0, dtype=torch.int64, device=device)
             capture_hot_by_mask = torch.empty(0, 40, dtype=torch.float32, device=device)
 
-        hand_ranks = (hand_ids_t // 4 + 1).to(torch.int64)  # (H)
+        hand_ranks = RANK_OF_ID.to(device=hand_ids_t.device, dtype=torch.int16)[hand_ids_t].to(torch.int64)  # (H)
 
         # Direct captures matrix: (H,n) True when table rank == hand rank
         direct_mat = (hand_ranks.unsqueeze(1) == (table_ranks.unsqueeze(0) if n>0 else torch.empty((1,0), dtype=torch.int64, device=device)))
@@ -251,7 +261,22 @@ class ScoponeEnvMA(gym.Env):
             if bool(use_mask.any()):
                 h_idx_s, m_idx = use_mask.nonzero(as_tuple=True)
                 pid_rows_sum = hand_ids_t[h_idx_s]
-                captured_hot_sum = capture_hot_by_mask[m_idx]
+                # Calcola capture_hot_by_mask solo per i mask necessari
+                if 'capture_hot_by_mask' in locals() and capture_hot_by_mask is not None:
+                    captured_hot_sum = capture_hot_by_mask[m_idx]
+                else:
+                    captured_hot_sum = sel[m_idx].to(torch.float32) @ table_one_hot
+                # Aggiorna cache invarianti per questo tavolo
+                try:
+                    self._table_invariants_cache[tbl_bits_key] = {
+                        'n': n,
+                        'sel': sel,
+                        'sums': sums,
+                        'table_one_hot': table_one_hot,
+                        'capture_hot_by_mask': capture_hot_by_mask if capture_hot_by_mask is not None else (sel.to(torch.float32) @ table_one_hot)
+                    }
+                except Exception:
+                    pass
             else:
                 pid_rows_sum = torch.empty((0,), dtype=torch.long, device=device)
                 captured_hot_sum = torch.empty((0,40), dtype=torch.float32, device=device)
@@ -330,7 +355,7 @@ class ScoponeEnvMA(gym.Env):
         if act_len != 80:
             raise ValueError(f"Formato vettore azione non valido: atteso 80, ricevuto {act_len}")
 
-        # Decodifica l'azione in ID
+        # Decodifica l'azione in ID (sempre su CPU per evitare micro-copie GPU)
         pid, cap_ids = decode_action_ids(action_vec)
         
         # Verifica validità (come prima)
@@ -375,8 +400,8 @@ class ScoponeEnvMA(gym.Env):
         # Usa solo strutture CPU per evitare kernel micro e sync
         try:
             table_ids_list = list(self._table_ids) if self._use_id_cache else [_card_to_id(c) for c in table]
-        except Exception:
-            table_ids_list = [_card_to_id(c) for c in table]
+        except Exception as e:
+            raise
         same_rank_ids = [i for i in table_ids_list if (i // 4 + 1) == int(rank)]
         if same_rank_ids:
             # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta

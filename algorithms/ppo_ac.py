@@ -185,7 +185,7 @@ class ActionConditionedPPO:
         with torch.inference_mode():
             chosen_act_d, logp_total_d, idx_t_d = self._select_action_core(obs_t, actions_t, st)
         # Move chosen action and metadata back to CPU for env.step
-        chosen_act = chosen_act_d.detach().to('cpu', non_blocking=False)
+        chosen_act = chosen_act_d.detach().to('cpu', non_blocking=True)
         return chosen_act, logp_total_d.detach().to('cpu'), idx_t_d.detach().to('cpu')
 
     def _select_action_core(self, obs_t: torch.Tensor, actions_t: torch.Tensor, seat_team_t: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -211,10 +211,7 @@ class ActionConditionedPPO:
         num_groups = 40
         # Allocate fresh buffers sized for this call
         group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=actions_t.device)
-        try:
-            group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-        except Exception:
-            notify_fallback('ppo.select_action.scatter_reduce_failed')
+        group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
         gmax_per_legal = group_max[group_ids]
         # Ensure dtype consistency under autocast (exp may return float32)
         exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
@@ -390,10 +387,7 @@ class ActionConditionedPPO:
             group_ids = sample_idx_per_legal * 40 + played_ids_mb
             num_groups = B * 40
             group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
-            try:
-                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-            except Exception:
-                notify_fallback('ppo.compute_loss.scatter_reduce_failed')
+            group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
             gmax_per_legal = group_max[group_ids]
             # Ensure dtype consistency under autocast (exp may return float32)
             exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)

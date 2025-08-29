@@ -63,6 +63,13 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 ## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
 # Abilita di default feature dell'osservazione
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+# Preferire env su GPU per eliminare copie H2D/D2H nell'interazione
+try:
+    import torch as _t
+    _env_def = 'cuda' if _t.cuda.is_available() else 'cpu'
+except Exception:
+    _env_def = 'cpu'
+os.environ.setdefault('ENV_DEVICE', os.environ.get('SCOPONE_DEVICE', _env_def))
 ## Imposta metodo mp sicuro per CUDA: forkserver (override con SCOPONE_MP_START)
 os.environ.setdefault('SCOPONE_MP_START', 'forkserver')
 

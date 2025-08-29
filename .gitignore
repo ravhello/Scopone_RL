@@ -32,3 +32,14 @@ events.out.tfevents.*
 .ruff_cache/
 # already present: .pytest_cache/ and __pycache__
 
+# Profiler outputs
+profiles/
+profiles/**
+# cProfile / line-profiler stats
+*.prof
+*.lprof
+*.pstats
+*.pstat
+# Scalene reports
+*scalene*.html
+*scalene*.json

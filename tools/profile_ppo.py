@@ -27,10 +27,17 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
 ## Abilita di default feature dell'osservazione (dealer one-hot)
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+## Mantieni ENV_DEVICE allineato a main.py per profili consistenti
+try:
+    import torch as _t
+    _env_def = 'cuda' if _t.cuda.is_available() else 'cpu'
+except Exception:
+    _env_def = 'cpu'
+os.environ.setdefault('ENV_DEVICE', os.environ.get('SCOPONE_DEVICE', _env_def))
 ## Forza metodo di start del multiprocessing a 'fork' di default su Linux/WSL per evitare hang
 os.environ.setdefault('SCOPONE_MP_START', 'fork')
 
-_SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
+_SILENCE_ABSL = (os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1') and (os.environ.get('SCALENE_RUNNING', '0') != '1')
 if _SILENCE_ABSL:
     _SUPPRESS_SUBSTRINGS = (
         "All log messages before absl::InitializeLog() is called are written to STDERR",
@@ -125,6 +132,13 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision('high')
 
+    # Ensure default profiles directory exists for profiler outputs
+    DEFAULT_PROFILES_DIR = os.path.abspath(os.path.join(ROOT, 'profiles'))
+    try:
+        os.makedirs(DEFAULT_PROFILES_DIR, exist_ok=True)
+    except Exception:
+        pass
+
     # If requested, re-exec this script under Scalene to produce an HTML report.
     if getattr(args, 'scalene', False) and not getattr(args, 'scalene_run', False):
         script_path = os.path.abspath(__file__)
@@ -136,8 +150,8 @@ def main():
             if val == 'html':
                 want_html = True
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                # Default directory: project root; default name: ppo_scalene_<timestamp>.html
-                html_path = os.path.abspath(os.path.join(ROOT, f'ppo_scalene_{ts}.html'))
+                # Default directory: profiles/; default name: ppo_scalene_<timestamp>.html
+                html_path = os.path.abspath(os.path.join(DEFAULT_PROFILES_DIR, f'ppo_scalene_{ts}.html'))
             elif val == 'cli':
                 want_html = False
             else:
@@ -146,9 +160,14 @@ def main():
                 if ext.lower() == '.html':
                     want_html = True
                     html_path = _raw
+        else:
+            # No explicit output provided: default to HTML in profiles/
+            want_html = True
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            html_path = os.path.abspath(os.path.join(DEFAULT_PROFILES_DIR, f'ppo_scalene_{ts}.html'))
         # Ensure directory exists for HTML output
         if want_html and html_path:
-            out_dir = os.path.dirname(html_path) or os.getcwd()
+            out_dir = os.path.dirname(html_path) or DEFAULT_PROFILES_DIR
             try:
                 os.makedirs(out_dir, exist_ok=True)
             except Exception:
@@ -179,6 +198,11 @@ def main():
         else:
             # CLI only; request CLI output explicitly
             scalene_cmd += ['--cli', '--cpu-percent-threshold', '0', '--malloc-threshold', '1000000000']
+        # Include all modules (not only the executed file's dir) and restrict to project root
+        try:
+            scalene_cmd += ['--profile-all', '--profile-only', ROOT]
+        except Exception:
+            pass
         scalene_cmd += [
             script_path,
             '--scalene-run',
@@ -192,16 +216,212 @@ def main():
         try:
             env = os.environ.copy()
             env['SCOPONE_SEED'] = str(seed)
-            # Always capture output to print CLI report; Scalene prints nothing to stdout in HTML-only mode
-            result = subprocess.run(scalene_cmd, check=False, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # Mark inner run so we can disable stderr filtering; allow live progress bars
+            env['SCALENE_RUNNING'] = '1'
+            env['SCOPONE_SILENCE_ABSL'] = '0'
+            env['TQDM_DISABLE'] = '0'
+            # Stream output live while capturing for summary at the end
+            proc = subprocess.Popen(scalene_cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            captured_lines = []
+            assert proc.stdout is not None
+            for _ln in proc.stdout:
+                try:
+                    print(_ln, end='', flush=True)
+                except Exception:
+                    sys.stdout.write(_ln)
+                    try:
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+                captured_lines.append(_ln)
+            proc.wait()
+            full_cli_output = ''.join(captured_lines)
         except FileNotFoundError:
             print("Scalene is not installed. Install with: pip install scalene")
         except Exception as e:
             print(f"Failed to run Scalene: {e}")
         else:
-            if result and result.stdout:
-                print("\n===== Scalene (CLI) report =====\n")
-                print(result.stdout)
+            if 'full_cli_output' in locals() and full_cli_output:
+                # Save full CLI output to file to avoid flooding terminal
+                try:
+                    ts_cli = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    cli_out_path = os.path.abspath(os.path.join(DEFAULT_PROFILES_DIR, f'ppo_scalene_{ts_cli}_cli.txt'))
+                    with open(cli_out_path, 'w', encoding='utf-8') as f:
+                        f.write(full_cli_output)
+                    print("\nScalene CLI saved to:", cli_out_path)
+                except Exception:
+                    cli_out_path = None
+
+                # Print compact, line-profiler-like summary at the bottom
+                print("\n===== Scalene — Compact summary (by file) =====")
+                try:
+                    import re as _re
+
+                    def _strip_ansi(txt: str) -> str:
+                        try:
+                            return _re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", txt)
+                        except Exception:
+                            return txt
+
+                    def _to_rel(pth: str) -> str:
+                        ap = os.path.abspath(pth)
+                        if ROOT in ap:
+                            return os.path.relpath(ap, ROOT)
+                        return ap
+
+                    def _parse_secs(s: str) -> float:
+                        try:
+                            s = s.strip()
+                            total = 0.0
+                            for m in _re.findall(r'(\d+(?:\.\d+)?)\s*([hms])', s):
+                                val = float(m[0])
+                                unit = m[1]
+                                if unit == 'h':
+                                    total += val * 3600.0
+                                elif unit == 'm':
+                                    total += val * 60.0
+                                else:
+                                    total += val
+                            if total == 0.0:
+                                mmss = _re.match(r'(?:(\d+)m:)?(\d+(?:\.\d+)?)s', s)
+                                if mmss:
+                                    mins = float(mmss.group(1) or '0')
+                                    secs = float(mmss.group(2))
+                                    total = mins * 60.0 + secs
+                            return total
+                        except Exception:
+                            return 0.0
+
+                    clean_output = _strip_ansi(full_cli_output)
+                    per_file = {}
+                    for line in clean_output.splitlines():
+                        if '.py: % of time' in line:
+                            try:
+                                before, after = line.split(': % of time', 1)
+                                file_abs = before.strip()
+                                # seconds may be absent in some builds
+                                m_pct = _re.search(r'=\s*([0-9]+(?:\.[0-9]+)?)%\s*(?:\(([^\)]*)\))?', after)
+                                if not m_pct:
+                                    continue
+                                pct = float(m_pct.group(1))
+                                secs = _parse_secs(m_pct.group(2)) if (m_pct.lastindex and m_pct.lastindex >= 2) else 0.0
+                                per_file[_to_rel(file_abs)] = {'seconds': secs, 'percent': pct}
+                            except Exception:
+                                continue
+
+                    if per_file:
+                        ranked = sorted(per_file.items(), key=lambda kv: kv[1]['seconds'], reverse=True)
+                        for i, (fn, s) in enumerate(ranked[:30], 1):
+                            print(f"{i:>2}. {fn}\n    Python: {s['seconds']:8.2f}s  ({s['percent']:5.1f}%)")
+                        # Top lines across files (approximate absolute time via per-file totals * per-line percentage)
+                        print("\n===== Scalene — Top lines (by total time) =====")
+                        per_site = {}
+                        current_file = None
+                        current_file_secs = 0.0
+                        for _line in clean_output.splitlines():
+                            m_file2 = _re.match(r"^\s*(/.*?\.py):\s*% of time\s*=\s*([0-9.]+)%\s*(?:\(([^)]*)\))?", _line)
+                            if m_file2:
+                                current_file = _to_rel(m_file2.group(1).strip())
+                                current_file_secs = _parse_secs(m_file2.group(3)) if (m_file2.lastindex and m_file2.lastindex >= 3) else 0.0
+                                continue
+                            if not current_file or current_file_secs <= 0.0:
+                                continue
+                            m_row = _re.match(r"^\s*(\d+)\s*[│|]\s*([^│|]*)[│|]([^│|]*)[│|]([^│|]*)[│|]", _line)
+                            if not m_row:
+                                continue
+                            try:
+                                ln_no = int(m_row.group(1))
+                            except Exception:
+                                continue
+                            def _pct_to_float(txt: str) -> float:
+                                try:
+                                    t = txt.strip()
+                                    m = _re.search(r"([0-9]+(?:\.[0-9]+)?)%", t)
+                                    return float(m.group(1)) if m else 0.0
+                                except Exception:
+                                    return 0.0
+                            py_pct = _pct_to_float(m_row.group(2))
+                            na_pct = _pct_to_float(m_row.group(3))
+                            sy_pct = _pct_to_float(m_row.group(4))
+                            total_pct = py_pct + na_pct + sy_pct
+                            if total_pct <= 0.0:
+                                continue
+                            secs = current_file_secs * (total_pct / 100.0)
+                            key = (current_file, ln_no)
+                            agg = per_site.get(key)
+                            if not agg:
+                                per_site[key] = {'seconds': 0.0, 'py_pct': 0.0, 'na_pct': 0.0, 'sy_pct': 0.0}
+                                agg = per_site[key]
+                            agg['seconds'] += secs
+                            agg['py_pct'] += py_pct
+                            agg['na_pct'] += na_pct
+                            agg['sy_pct'] += sy_pct
+                        if per_site:
+                            ranked_sites = sorted(per_site.items(), key=lambda kv: kv[1]['seconds'], reverse=True)
+                            for i, ((fn, ln_no), svals) in enumerate(ranked_sites[:30], 1):
+                                print(f"{i:>2}. {fn}:{ln_no}  total: {svals['seconds']:8.2f}s  (py {svals['py_pct']:5.1f}%, nat {svals['na_pct']:5.1f}%, sys {svals['sy_pct']:5.1f}%)")
+                        else:
+                            # Fallback: parse 'function summary' blocks and attribute function % to definition line
+                            per_site2 = {}
+                            last_file = None
+                            last_file_secs = 0.0
+                            in_func_summary = False
+                            for _line in clean_output.splitlines():
+                                mf = _re.match(r"^\s*(/.*?\.py):\s*% of time\s*=\s*([0-9.]+)%\s*(?:\(([^)]*)\))?", _line)
+                                if mf:
+                                    last_file = _to_rel(mf.group(1).strip())
+                                    last_file_secs = _parse_secs(mf.group(3)) if (mf.lastindex and mf.lastindex >= 3) else 0.0
+                                    in_func_summary = False
+                                    continue
+                                if 'function summary for' in _line:
+                                    in_func_summary = True
+                                    continue
+                                if in_func_summary:
+                                    mfr = _re.match(r"^\s*(\d+)\s*[│|]\s*([^│|]*)[│|]([^│|]*)[│|]([^│|]*)[│|]", _line)
+                                    if mfr and last_file and last_file_secs > 0.0:
+                                        try:
+                                            ln_no = int(mfr.group(1))
+                                        except Exception:
+                                            continue
+                                        def _pctf(txt: str) -> float:
+                                            mm = _re.search(r"([0-9]+(?:\.[0-9]+)?)%", txt.strip())
+                                            return float(mm.group(1)) if mm else 0.0
+                                        py = _pctf(mfr.group(2)); na = _pctf(mfr.group(3)); sy = _pctf(mfr.group(4))
+                                        tot = py + na + sy
+                                        if tot <= 0.0:
+                                            continue
+                                        secs = last_file_secs * (tot / 100.0)
+                                        key = (last_file, ln_no)
+                                        agg = per_site2.get(key)
+                                        if not agg:
+                                            per_site2[key] = {'seconds': 0.0, 'py_pct': 0.0, 'na_pct': 0.0, 'sy_pct': 0.0}
+                                            agg = per_site2[key]
+                                        agg['seconds'] += secs
+                                        agg['py_pct'] += py
+                                        agg['na_pct'] += na
+                                        agg['sy_pct'] += sy
+                                    else:
+                                        # Heuristic end of block
+                                        if _line.strip().startswith('=====') or '.py:' in _line:
+                                            in_func_summary = False
+                            if per_site2:
+                                ranked_sites = sorted(per_site2.items(), key=lambda kv: kv[1]['seconds'], reverse=True)
+                                for i, ((fn, ln_no), svals) in enumerate(ranked_sites[:30], 1):
+                                    print(f"{i:>2}. {fn}:{ln_no}  total: {svals['seconds']:8.2f}s  (py {svals['py_pct']:5.1f}%, nat {svals['na_pct']:5.1f}%, sys {svals['sy_pct']:5.1f}%)")
+                            else:
+                                print("(no per-line/function rows parsed; try increasing iters/horizon)")
+                    else:
+                        # Fallback: print last 80 lines of raw output
+                        tail = '\n'.join(clean_output.splitlines()[-80:])
+                        print(tail)
+                except Exception:
+                    # On parser error, still show the tail of cleaned output
+                    try:
+                        tail = '\n'.join(clean_output.splitlines()[-80:])
+                        print(tail)
+                    except Exception:
+                        pass
+
             if want_html and html_path:
                 print(f"\nScalene HTML report: {html_path}")
                 if getattr(args, 'scalene_open', True):
@@ -244,7 +464,7 @@ def main():
             out_path = args.cprofile_out
         else:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-            out_path = os.path.abspath(f'ppo_profile_{ts}.prof')
+            out_path = os.path.abspath(os.path.join(DEFAULT_PROFILES_DIR, f'ppo_profile_{ts}.prof'))
         try:
             prof.dump_stats(out_path)
             print(f"\ncProfile stats written to: {out_path}")
