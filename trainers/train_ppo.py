@@ -27,13 +27,10 @@ import torch.optim as optim
 
 device = get_compute_device()
 # Global perf flags
-try:
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.enabled = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision('high')
-except Exception:
-    pass
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.enabled = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 
 
 def _seat_vec_for(cp: int) -> torch.Tensor:
@@ -50,24 +47,12 @@ def _env_worker(worker_id: int,
                 action_q: mp.Queue,
                 episode_q: mp.Queue):
     # Limit CPU threads per worker to reduce contention on the host
-    try:
-        os.environ.setdefault('OMP_NUM_THREADS', '1')
-        os.environ.setdefault('MKL_NUM_THREADS', '1')
-        try:
-            torch.set_num_threads(1)
-        except Exception:
-            pass
-        try:
-            torch.set_num_interop_threads(1)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('MKL_NUM_THREADS', '1')
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
     # Ensure different RNG streams per worker for robustness
-    try:
-        set_global_seeds(int(cfg.get('seed', 0)) + int(worker_id))
-    except Exception:
-        pass
+    set_global_seeds(int(cfg.get('seed', 0)) + int(worker_id))
     env = ScoponeEnvMA(rules=cfg.get('rules', {'shape_scopa': False}),
                        use_compact_obs=cfg.get('use_compact_obs', True),
                        k_history=int(cfg.get('k_history', 39)))
@@ -615,11 +600,8 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
             # Card logits and mask per sample
             card_logits_all = torch.matmul(sp, agent.actor.card_emb_play.t())  # (Bp,40)
             played_ids_all = torch.argmax(legals_flat[:, :40], dim=1)  # (M_flat)
-            card_mask = torch.zeros((Bp, 40), dtype=torch.bool, device=device)
-            card_mask[sample_idx_per_legal, played_ids_all] = True
-            masked_card_logits = card_logits_all.masked_fill(~card_mask, float('-inf'))
-            logp_cards = torch.log_softmax(masked_card_logits, dim=1)  # (Bp,40)
-            logp_cards_per_legal = logp_cards[sample_idx_per_legal, played_ids_all]
+            logp_cards_all = torch.log_softmax(card_logits_all, dim=1)  # (Bp,40)
+            logp_cards_per_legal = logp_cards_all[sample_idx_per_legal, played_ids_all]
 
             # Capture logits per-legal
             a_emb_flat = agent.actor.action_enc(legals_flat)  # (M_flat,64)
@@ -1858,8 +1840,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if len(done_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
     if len(rew_list) > 0:
         with torch.no_grad():
-            o_all = torch.stack([o if torch.is_tensor(o) else torch.as_tensor(o, dtype=torch.float32, device=device) for o in obs_list], dim=0).to(device=device, dtype=torch.float32)
-            s_all = torch.stack(seat_team_list, dim=0).to(device=device)
+            o_all = obs_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
+            s_all = seat_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
             # others_hands per-step (CTDE): se raccolti dagli env worker, usa quelli
             if others_hands_t.numel() > 0 and others_hands_t.size(0) == o_all.size(0):
                 oh_all = others_hands_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)

@@ -185,3 +185,10 @@ Opzioni CLI e significato:
 - Output benchmark: file `.csv`, `.json`, `.txt`, `.xlsx` a seconda delle opzioni.
 
 
+Comandi comuni:
+python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --cprofile --iters 10 --horizon 2048
+python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --line --iters 10 --horizon 2048
+python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --scalene --scalene-out html --iters 10 --horizon 2048
+python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --pytorch --iters 10 --horizon 2048
+
+Analizza i profiling del mio codice e dimmi dove viene speso più tempo. Poi ottimizza il mio codice in modo da risolvere il problema partendo dalle cose che perdono più tempo. Non usare fallback per gli errori (piuttosto causano raise, ma meglio che fallback).

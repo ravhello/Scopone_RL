@@ -32,75 +32,57 @@ os.environ.setdefault('SCOPONE_MP_START', 'fork')
 
 _SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
 if _SILENCE_ABSL:
-    try:
-        _SUPPRESS_SUBSTRINGS = (
-            "All log messages before absl::InitializeLog() is called are written to STDERR",
-            "Unable to register cuDNN factory",
-            "Unable to register cuBLAS factory",
-            "cuda_dnn.cc",
-            "cuda_blas.cc",
-        )
+    _SUPPRESS_SUBSTRINGS = (
+        "All log messages before absl::InitializeLog() is called are written to STDERR",
+        "Unable to register cuDNN factory",
+        "Unable to register cuBLAS factory",
+        "cuda_dnn.cc",
+        "cuda_blas.cc",
+    )
+    # Install OS-level fd2 filter like main.py so native C++ logs are filtered
+    import threading  # local import to avoid changing global import order
+    _orig_fd2 = os.dup(2)
+    _r_fd, _w_fd = os.pipe()
+    os.dup2(_w_fd, 2)
 
-        # Install OS-level fd2 filter like main.py so native C++ logs are filtered
-        import threading  # local import to avoid changing global import order
-        _orig_fd2 = os.dup(2)
-        _r_fd, _w_fd = os.pipe()
-        os.dup2(_w_fd, 2)
+    def _stderr_reader(r_fd, orig_fd, suppressed):
+        with os.fdopen(r_fd, 'rb', buffering=0) as r:
+            buffer = b""
+            while True:
+                chunk = r.read(1024)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    txt = line.decode('utf-8', errors='ignore')
+                    if not any(s in txt for s in suppressed):
+                        os.write(orig_fd, line + b"\n")
+            if buffer:
+                txt = buffer.decode('utf-8', errors='ignore')
+                if not any(s in txt for s in suppressed):
+                    os.write(orig_fd, buffer)
 
-        def _stderr_reader(r_fd, orig_fd, suppressed):
-            try:
-                with os.fdopen(r_fd, 'rb', buffering=0) as r:
-                    buffer = b""
-                    while True:
-                        chunk = r.read(1024)
-                        if not chunk:
-                            break
-                        buffer += chunk
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            try:
-                                txt = line.decode('utf-8', errors='ignore')
-                            except Exception:
-                                txt = ''
-                            if not any(s in txt for s in suppressed):
-                                os.write(orig_fd, line + b"\n")
-                    if buffer:
-                        try:
-                            txt = buffer.decode('utf-8', errors='ignore')
-                        except Exception:
-                            txt = ''
-                        if not any(s in txt for s in suppressed):
-                            os.write(orig_fd, buffer)
-            except Exception:
-                pass
-
-        _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
-        _t.start()
-    except Exception:
-        pass
+    _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
+    _t.start()
 
 import threading
 import io
 import torch
 import subprocess
 import webbrowser
+from datetime import datetime
+import platform
 
 # Prefer GPU for models if available; never force CPU unless explicitly requested
 if os.environ.get('TESTS_FORCE_CPU') == '1':
-    try:
-        del os.environ['TESTS_FORCE_CPU']
-    except Exception:
-        pass
+    del os.environ['TESTS_FORCE_CPU']
 
 # Ensure device selection consistent with main
-try:
-    from utils.device import get_compute_device
-    _dev = get_compute_device()
-    # If CUDA is available but not selected, allow override
-    if torch.cuda.is_available() and str(_dev) != 'cuda':
-        os.environ.setdefault('SCOPONE_DEVICE', 'cuda')
-except Exception:
-    pass
+from utils.device import get_compute_device
+_dev = get_compute_device()
+if torch.cuda.is_available() and str(_dev) != 'cuda':
+    os.environ.setdefault('SCOPONE_DEVICE', 'cuda')
 
 from trainers.train_ppo import train_ppo
 from utils.seed import resolve_seed
@@ -110,54 +92,94 @@ def main():
     parser = argparse.ArgumentParser(description='Profile short PPO run (torch or line-level).')
     parser.add_argument('--iters', type=int, default=5, help='Iterations to run')
     parser.add_argument('--horizon', type=int, default=2048, help='Rollout horizon per iteration')
-    parser.add_argument('--line', dest='line', action='store_true', default=True, help='Enable line-by-line profiler with per-line timings (default: on)')
+    parser.add_argument('--line', dest='line', action='store_true', default=False, help='Enable line-by-line profiler with per-line timings (default: on)')
     parser.add_argument('--no-line', dest='line', action='store_false', help='Disable line-by-line profiler')
     parser.add_argument('--wrap-update', dest='wrap_update', action='store_true', default=True, help='Also profile ActionConditionedPPO.update (default: on; slower)')
     parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
-    parser.add_argument('--num-envs', type=int, default=None, help='Number of parallel environments (default: 17 with --line, 1 without)')
+    parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel environments (default: 17 with --line, 1 without)')
     parser.add_argument('--cprofile', action='store_true', default=False, help='Use Python cProfile instead of torch or line-profiler')
-    parser.add_argument('--cprofile-out', type=str, default=os.path.abspath('ppo_profile.prof'), help='Output path for cProfile stats file (.prof)')
+    parser.add_argument('--cprofile-out', type=str, default=None, help='Output path for cProfile stats file (.prof). Default: timestamped file')
     parser.add_argument('--snakeviz', dest='snakeviz', action='store_true', default=True, help='Open SnakeViz on the generated .prof (default: on)')
     parser.add_argument('--no-snakeviz', dest='snakeviz', action='store_false', help='Do not open SnakeViz after profiling')
-    parser.add_argument('--scalene', action='store_true', default=False, help='Run training under Scalene and generate an HTML report')
-    parser.add_argument('--scalene-out', type=str, default=os.path.abspath('ppo_scalene.html'), help='Output HTML path for Scalene report (.html)')
+    parser.add_argument('--scalene', action='store_true', default=False, help='Run training under Scalene (CLI by default)')
+    parser.add_argument('--scalene-out', type=str, default=None, help='Output path base for Scalene report. If ends with .html, generate HTML; else CLI only. Default: timestamped base')
     parser.add_argument('--scalene-open', dest='scalene_open', action='store_true', default=True, help='Open Scalene HTML report in a browser (default: on)')
     parser.add_argument('--no-scalene-open', dest='scalene_open', action='store_false', help='Do not open Scalene report after profiling')
-    parser.add_argument('--scalene-cpu-only', dest='scalene_cpu_only', action='store_true', default=False, help='Limit Scalene to CPU profiling only (default: off)')
+    parser.add_argument('--scalene-cli', dest='scalene_cli', action='store_true', default=True, help='Print Scalene text report to terminal (default: on)')
+    parser.add_argument('--no-scalene-cli', dest='scalene_cli', action='store_false', help='Do not print Scalene text report to terminal')
+    parser.add_argument('--scalene-cpu-only', dest='scalene_cpu_only', action='store_true', default=True, help='Limit Scalene to CPU profiling only (default: on)')
+    parser.add_argument('--no-scalene-cpu-only', dest='scalene_cpu_only', action='store_false', help='Include memory/GPU metrics (disables CPU-only)')
+    parser.add_argument('--scalene-gpu-modes', dest='scalene_gpu_modes', action='store_true', default=False, help='Attempt to enable per-process GPU accounting via scalene.set_nvidia_gpu_modes (default: off)')
+    parser.add_argument('--no-scalene-gpu-modes', dest='scalene_gpu_modes', action='store_false', help='Do not attempt to set NVIDIA GPU modes for Scalene')
     parser.add_argument('--scalene-run', action='store_true', default=False, help=argparse.SUPPRESS)
+    parser.add_argument('--torch-profiler', dest='torch_profiler', action='store_true', default=False, help='Use PyTorch profiler (no default)')
     args = parser.parse_args()
     # Default to random seed for profiling runs; allow override via env/CLI passthrough
-    try:
-        seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
-    except Exception:
-        seed_env = -1
+    seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
     seed = resolve_seed(seed_env)
 
     # Perf flags
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    try:
-        torch.set_float32_matmul_precision('high')
-    except Exception:
-        pass
+    torch.set_float32_matmul_precision('high')
 
     # If requested, re-exec this script under Scalene to produce an HTML report.
     if getattr(args, 'scalene', False) and not getattr(args, 'scalene_run', False):
         script_path = os.path.abspath(__file__)
-        out_path = args.scalene_out if getattr(args, 'scalene_out', None) else os.path.abspath('ppo_scalene.html')
+        # Determine output mode and HTML path based on --scalene-out
+        want_html = False
+        html_path = None
+        if getattr(args, 'scalene_out', None):
+            val = str(args.scalene_out).strip().lower()
+            if val == 'html':
+                want_html = True
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                # Default directory: project root; default name: ppo_scalene_<timestamp>.html
+                html_path = os.path.abspath(os.path.join(ROOT, f'ppo_scalene_{ts}.html'))
+            elif val == 'cli':
+                want_html = False
+            else:
+                _raw = os.path.abspath(args.scalene_out)
+                _, ext = os.path.splitext(_raw)
+                if ext.lower() == '.html':
+                    want_html = True
+                    html_path = _raw
+        # Ensure directory exists for HTML output
+        if want_html and html_path:
+            out_dir = os.path.dirname(html_path) or os.getcwd()
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except Exception:
+                pass
         try:
             ne = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
         except Exception:
             ne = 1
         scalene_cmd = [sys.executable, '-m', 'scalene']
-        if getattr(args, 'scalene_cpu_only', False):
+        if getattr(args, 'scalene_cpu_only', True):
             scalene_cmd.append('--cpu-only')
+        if getattr(args, 'scalene_gpu_modes', False):
+            try:
+                proc = subprocess.run([sys.executable, '-m', 'scalene.set_nvidia_gpu_modes'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if proc.returncode != 0:
+                    is_wsl = ('WSL_INTEROP' in os.environ) or ('microsoft' in platform.release().lower())
+                    if is_wsl:
+                        print('Scalene GPU modes not supported on WSL2; skipping.')
+                    else:
+                        print('Failed to set NVIDIA GPU modes for Scalene (non-zero exit). Try: sudo python -m scalene.set_nvidia_gpu_modes')
+            except FileNotFoundError:
+                print('Scalene GPU modes helper not found. Update scalene to a recent version.')
+            except Exception as e:
+                print(f'Failed to set NVIDIA GPU modes for Scalene: {e}')
+        # Decide HTML vs CLI
+        if want_html and html_path:
+            scalene_cmd += ['--html', '--reduced-profile', '--outfile', html_path]
+        else:
+            # CLI only; request CLI output explicitly
+            scalene_cmd += ['--cli', '--cpu-percent-threshold', '0', '--malloc-threshold', '1000000000']
         scalene_cmd += [
-            '--html',
-            '--reduced-profile',
-            '--outfile', out_path,
             script_path,
             '--scalene-run',
             '--no-line',
@@ -169,28 +191,24 @@ def main():
         print("Running under Scalene... this may add overhead.")
         try:
             env = os.environ.copy()
-            try:
-                env['SCOPONE_SEED'] = str(seed)
-            except Exception:
-                pass
-            subprocess.run(scalene_cmd, check=False, env=env)
+            env['SCOPONE_SEED'] = str(seed)
+            # Always capture output to print CLI report; Scalene prints nothing to stdout in HTML-only mode
+            result = subprocess.run(scalene_cmd, check=False, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         except FileNotFoundError:
             print("Scalene is not installed. Install with: pip install scalene")
         except Exception as e:
             print(f"Failed to run Scalene: {e}")
         else:
-            print(f"\nScalene HTML report: {out_path}")
-            if getattr(args, 'scalene_open', True):
-                try:
-                    url = 'file://' + out_path if not out_path.startswith('file://') else out_path
+            if result and result.stdout:
+                print("\n===== Scalene (CLI) report =====\n")
+                print(result.stdout)
+            if want_html and html_path:
+                print(f"\nScalene HTML report: {html_path}")
+                if getattr(args, 'scalene_open', True):
+                    url = 'file://' + html_path if not html_path.startswith('file://') else html_path
                     opened = webbrowser.open(url)
                     if not opened:
-                        try:
-                            subprocess.Popen(['xdg-open', out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print(f"Could not open report automatically: {e}")
+                        subprocess.Popen(['xdg-open', html_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print("If it didn't open, open the HTML file manually in your browser.")
         return
 
@@ -222,7 +240,11 @@ def main():
         finally:
             prof.disable()
 
-        out_path = args.cprofile_out if getattr(args, 'cprofile_out', None) else os.path.abspath('ppo_profile.prof')
+        if getattr(args, 'cprofile_out', None):
+            out_path = args.cprofile_out
+        else:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            out_path = os.path.abspath(f'ppo_profile_{ts}.prof')
         try:
             prof.dump_stats(out_path)
             print(f"\ncProfile stats written to: {out_path}")
@@ -255,11 +277,7 @@ def main():
 
     if args.line:
         # Lightweight line-by-line profiling for Python code with file:line output
-        try:
-            from profilers.line_profiler import profile as line_profile, global_profiler
-        except Exception as e:
-            print(f"Line profiler unavailable: {e}")
-            return
+        from profilers.line_profiler import profile as line_profile, global_profiler
 
         # Wrap hotspots and also enable global tracing fallback
         import trainers.train_ppo as train_mod
@@ -267,31 +285,22 @@ def main():
         train_fn = line_profile(train_mod.train_ppo)
 
         if args.wrap_update:
-            try:
-                import algorithms.ppo_ac as ppo_mod
-                ppo_mod.ActionConditionedPPO.update = line_profile(ppo_mod.ActionConditionedPPO.update)
-            except Exception:
-                pass
+            import algorithms.ppo_ac as ppo_mod
+            ppo_mod.ActionConditionedPPO.update = line_profile(ppo_mod.ActionConditionedPPO.update)
 
         # Shorter run for line profiler to keep overhead manageable
-        try:
-            # If profiler supports global tracing, register key functions
-            if hasattr(global_profiler, 'allowed_codes'):
-                # Register also methods we can't easily wrap (e.g., bound methods created at runtime)
-                global_profiler.allowed_codes.add(train_mod.collect_trajectory.__code__)
-                global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
-        except Exception:
-            pass
-        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 17
+        # If profiler supports global tracing, register key functions
+        if hasattr(global_profiler, 'allowed_codes'):
+            global_profiler.allowed_codes.add(train_mod.collect_trajectory.__code__)
+            global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
+        # Use the same default as other modes for apples-to-apples comparisons
+        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
         train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
 
         # Print per-function and per-line stats (includes line numbers and source)
-        try:
-            global_profiler.print_stats(sort_by='cpu')
-            if args.report:
-                print(global_profiler.generate_report(include_line_details=True))
-        except Exception:
-            pass
+        global_profiler.print_stats(sort_by='cpu')
+        if args.report:
+            print(global_profiler.generate_report(include_line_details=True))
 
         # Aggregate by file and by file:line from line-profiler results
         try:
@@ -300,13 +309,10 @@ def main():
 
             project_root = ROOT
             def relpath(p):
-                try:
-                    ap = os.path.abspath(p)
-                    if project_root in ap:
-                        return os.path.relpath(ap, project_root)
-                    return ap
-                except Exception:
-                    return str(p)
+                ap = os.path.abspath(p)
+                if project_root in ap:
+                    return os.path.relpath(ap, project_root)
+                return ap
 
             per_file = defaultdict(lambda: {'cpu_s': 0.0, 'gpu_s': 0.0, 'transfer_s': 0.0, 'hits': 0})
             per_site = defaultdict(lambda: {'hits': 0, 'cpu_s': 0.0, 'gpu_s': 0.0, 'transfer_s': 0.0})
@@ -315,10 +321,7 @@ def main():
                 func_obj = global_profiler.functions.get(func_name)
                 if func_obj is None:
                     continue
-                try:
-                    filename = inspect.getsourcefile(func_obj) or func_obj.__code__.co_filename
-                except Exception:
-                    filename = getattr(func_obj.__code__, 'co_filename', '<unknown>')
+                filename = inspect.getsourcefile(func_obj) or func_obj.__code__.co_filename
                 rfile = relpath(filename)
                 for line_no, (hits, cpu_time, gpu_time, transfer_time) in lines.items():
                     pf = per_file[rfile]
@@ -352,14 +355,19 @@ def main():
     #trace_path = os.path.abspath('profile_trace.json')
     #print(f"Profiling short PPO run... trace -> {trace_path}")
 
+    # Require explicit selection of torch profiler; otherwise error out
+    if not getattr(args, 'torch_profiler', False):
+        print("Error: no profiler selected. Use one of: --torch-profiler, --line, --cprofile, --scalene")
+        return
+
     # Keep run short to avoid OOM without scheduler
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ],
-        record_shapes=True,
-        profile_memory=True,
+        record_shapes=False,
+        profile_memory=False,
         with_stack=True,
         with_modules=True,
         #experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
@@ -378,13 +386,10 @@ def main():
     print(prof.key_averages(group_by_input_shape=True).table(sort_by="self_cpu_time_total", row_limit=25))
 
     # Stack-grouped tables (gives file:line attribution)
-    try:
-        print("\nTop by CUDA time (grouped by stack):")
-        print(prof.key_averages(group_by_stack_n=10).table(sort_by="self_cuda_time_total", row_limit=30))
-        print("\nTop by CPU time (grouped by stack):")
-        print(prof.key_averages(group_by_stack_n=10).table(sort_by="self_cpu_time_total", row_limit=30))
-    except Exception:
-        pass
+    print("\nTop by CUDA time (grouped by stack):")
+    print(prof.key_averages(group_by_stack_n=10).table(sort_by="self_cuda_time_total", row_limit=30))
+    print("\nTop by CPU time (grouped by stack):")
+    print(prof.key_averages(group_by_stack_n=10).table(sort_by="self_cpu_time_total", row_limit=30))
 
     # Aggregate by user source file (from Python stacks) and highlight H2D/D2H memcpys
     try:
@@ -395,34 +400,26 @@ def main():
         events = prof.events()
 
         def to_ms(us):
-            try:
-                return float(us) / 1000.0
-            except Exception:
-                return 0.0
+            return float(us) / 1000.0
 
         def frame_filename_and_line(frame_like):
             """Return (filename, line) from a frame-like object or string."""
-            try:
-                fn = getattr(frame_like, 'filename', None)
-                ln = getattr(frame_like, 'line', None)
-                if fn:
-                    return fn, ln if isinstance(ln, int) else None
-                s = str(frame_like)
-                m = re.search(r"(.*?\.py):(\d+)", s)
-                if not m:
-                    m = re.search(r"(.*?\.py)\((\d+)\)", s)
-                if m:
-                    fn = m.group(1)
-                    ln = int(m.group(2))
-                    return fn, ln
-                if '.py' in s:
-                    pre = s.split('.py', 1)[0] + '.py'
-                    ln_m = re.search(r":(\d+)", s)
-                    ln = int(ln_m.group(1)) if ln_m else None
-                    return pre, ln
-                return None, None
-            except Exception:
-                return None, None
+            fn = getattr(frame_like, 'filename', None)
+            ln = getattr(frame_like, 'line', None)
+            if fn:
+                return fn, ln if isinstance(ln, int) else None
+            s = str(frame_like)
+            m = re.search(r"(.*?\.py):(\d+)", s) or re.search(r"(.*?\.py)\((\d+)\)", s)
+            if m:
+                fn = m.group(1)
+                ln = int(m.group(2))
+                return fn, ln
+            if '.py' in s:
+                pre = s.split('.py', 1)[0] + '.py'
+                ln_m = re.search(r":(\d+)", s)
+                ln = int(ln_m.group(1)) if ln_m else None
+                return pre, ln
+            return None, None
 
         def iter_stack_frames(stack_obj):
             if not stack_obj:
@@ -443,13 +440,9 @@ def main():
             yield stack_obj
 
         def is_in_project(abs_path):
-            try:
-                if project_root in abs_path:
-                    return True
-                # Heuristic: contains repo folder name
-                return os.sep + os.path.basename(project_root) + os.sep in abs_path
-            except Exception:
-                return False
+            if project_root in abs_path:
+                return True
+            return os.sep + os.path.basename(project_root) + os.sep in abs_path
 
         def find_user_file(stack_obj):
             for fr in iter_stack_frames(stack_obj):
@@ -544,6 +537,7 @@ def main():
                 for i, (file_rel, s) in enumerate(ranked2[:30], 1):
                     print(fmt_row(i, file_rel, s))
             except Exception:
+                # If stack grouping fails, continue without aggregated section
                 pass
 
         if memcpy_sites:

@@ -225,8 +225,8 @@ def load_actor_critic(ckpt_path: str):
         else:
             from utils.fallback import notify_fallback
             notify_fallback('benchmark.load_actor_critic.no_weights_in_ckpt')
-    except Exception:
-        pass
+    except Exception as e:
+        raise
     return actor, critic
 
 

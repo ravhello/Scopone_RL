@@ -20,36 +20,27 @@ if _SILENCE_ABSL:
         os.dup2(_w_fd, 2)
 
         def _stderr_reader(r_fd, orig_fd, suppressed):
-            try:
-                with os.fdopen(r_fd, 'rb', buffering=0) as r:
-                    buffer = b""
-                    while True:
-                        chunk = r.read(1024)
-                        if not chunk:
-                            break
-                        buffer += chunk
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            try:
-                                txt = line.decode('utf-8', errors='ignore')
-                            except Exception:
-                                txt = ''
-                            if not any(s in txt for s in suppressed):
-                                os.write(orig_fd, line + b"\n")
-                    if buffer:
-                        try:
-                            txt = buffer.decode('utf-8', errors='ignore')
-                        except Exception:
-                            txt = ''
+            with os.fdopen(r_fd, 'rb', buffering=0) as r:
+                buffer = b""
+                while True:
+                    chunk = r.read(1024)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        txt = line.decode('utf-8', errors='ignore')
                         if not any(s in txt for s in suppressed):
-                            os.write(orig_fd, buffer)
-            except Exception:
-                pass
+                            os.write(orig_fd, line + b"\n")
+                if buffer:
+                    txt = buffer.decode('utf-8', errors='ignore')
+                    if not any(s in txt for s in suppressed):
+                        os.write(orig_fd, buffer)
 
         _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
         _t.start()
-    except Exception:
-        pass
+    except Exception as e:
+        raise
 
 # Silence TensorFlow/absl noise before any heavy imports
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # hide INFO/WARNING/ERROR from TF C++ logs
@@ -110,12 +101,8 @@ if __name__ == "__main__":
     device = get_compute_device()
     print(f"Using device: {device}")
     _maybe_launch_tensorboard()
-    # Seed policy: read SCOPONE_SEED env; if not set, use default 0; allow negative for random
-    try:
-        # Default to random seed for training runs (set -1); stable only if user sets it
-        seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
-    except Exception:
-        seed_env = -1
+    # Default to random seed for training runs (set -1); stable only if user sets it
+    seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
     # Note: train_ppo will resolve and announce the effective seed
     train_ppo(num_iterations=10, horizon=2048, use_compact_obs=True, k_history=39,
               num_envs=1,

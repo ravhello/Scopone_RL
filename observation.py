@@ -325,13 +325,7 @@ def compute_primiera_status(game_state):
         vals = PRIMIERA_VAL_T[ranks]
         out = torch.zeros(4, dtype=torch.float32, device=OBS_DEVICE)
         # scatter_reduce for max if available
-        try:
-            out.scatter_reduce_(0, suits, vals, reduce='amax', include_self=True)
-        except Exception:
-            for s in range(4):
-                mask = (suits == s)
-                if mask.any():
-                    out[s] = torch.max(vals[mask])
+        out.scatter_reduce_(0, suits, vals, reduce='amax', include_self=True)
         return out / 21.0
     team0_primiera = _max_per_suit(game_state["captured_squads"][0])
     team1_primiera = _max_per_suit(game_state["captured_squads"][1])
@@ -727,14 +721,9 @@ def compute_rank_probabilities_by_player(game_state, player_id):
     
     # Rappresentazione compatta della history (ID-safe)
     def _rank_of_played(pc):
-        try:
-            # se ID
-            if isinstance(pc, int):
-                return (pc // 4) + 1
-            # altrimenti tuple
-            return pc[0]
-        except Exception:
-            return -1
+        if isinstance(pc, int):
+            return (pc // 4) + 1
+        return pc[0]
     history_summary = tuple((m["player"], _rank_of_played(m.get("played_card"))) for m in game_state.get("history", []))
     
     cache_key = (player_id, player_hand, table, team0_cards, team1_cards, 
@@ -863,11 +852,8 @@ def encode_recent_history_k(game_state, k=12):
     moves = game_state.get("history", [])[-k:]
     parts = []
     for mv in moves:
-        try:
-            enc = encode_move(mv)
-            parts.append(enc)
-        except Exception:
-            parts.append(torch.zeros(61, dtype=torch.float32, device=OBS_DEVICE))
+        enc = encode_move(mv)
+        parts.append(enc)
     while len(parts) < k:
         parts.insert(0, torch.zeros(61, dtype=torch.float32, device=OBS_DEVICE))
     result = torch.cat(parts) if parts else torch.zeros(61*k, dtype=torch.float32, device=OBS_DEVICE)
@@ -908,7 +894,7 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     cache_key = (player_id, player_hand, table, team0_cards, team1_cards, history_len, k_history)
     if cache_key in state_compact_cache:
         _cached = state_compact_cache[cache_key]
-        return _cached.clone() if hasattr(_cached, 'clone') else _cached.copy()
+        return _cached.clone()
 
     device = OBS_DEVICE
     hands_enc = encode_hands(game_state["hands"], player_id)  # 43 (torch)
@@ -984,10 +970,7 @@ def encode_state_compact_for_player(game_state, player_id, k_history=12):
     ])
     # Dealer one-hot opzionale (4-d): derivabile da current_player e history
     if OBS_INCLUDE_DEALER:
-        try:
-            current_player = int(game_state.get('current_player', -1))
-        except Exception:
-            current_player = -1
+        current_player = int(game_state.get('current_player', -1))
         hlen = len(game_state.get('history', []))
         if current_player >= 0:
             starting_seat = (current_player - (hlen % 4)) % 4
@@ -1080,14 +1063,14 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
 
     # 7) Primiera status (8) via bitset (evita .item()/.any() sync)
     def _primiera_from_bits(bits_t):
-        present = (((bits_t >> IDS_CUDA) & 1).to(torch.bool))
-        vals = PRIMIERA_PER_ID.to(torch.float32)
-        prim = torch.zeros(4, dtype=torch.float32, device=device)
-        for s in range(4):
-            mask_s = (SUITCOL_OF_ID.to(torch.long) == s)
-            v = torch.where(mask_s & present, vals, torch.zeros_like(vals))
-            prim[s] = v.max()
-        return prim / 21.0
+        present = (((bits_t >> IDS_CUDA) & 1).to(torch.bool))           # (40)
+        vals = PRIMIERA_PER_ID.to(torch.float32)                        # (40)
+        suits = SUITCOL_OF_ID.to(torch.long)                            # (40)
+        suits_oh = (suits.unsqueeze(0) == torch.arange(4, device=device, dtype=torch.long).unsqueeze(1))  # (4,40)
+        mask = present.unsqueeze(0) & suits_oh                          # (4,40)
+        masked = torch.where(mask, vals.unsqueeze(0), torch.zeros((4, vals.numel()), dtype=torch.float32, device=device))
+        prim = masked.max(dim=1).values / 21.0
+        return prim
     primiera_status = torch.cat([_primiera_from_bits(captured_bits_t[0]), _primiera_from_bits(captured_bits_t[1])])
 
     # 8) Denari count (2)
@@ -1109,9 +1092,9 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     score_estimate = compute_current_score_estimate(game_state)
 
     # 11) Table sum (1) via bitset
-    table_sum = torch.tensor([
+    table_sum = (
         (RANK_OF_ID.to(torch.int64)[IDS_CUDA].to(torch.float32) * (((table_bits_t >> IDS_CUDA) & 1).to(torch.float32))).sum() / 30.0
-    ], dtype=torch.float32, device=device)
+    ).unsqueeze(0)
 
     # 12) Scopa probs next (10) - opzionale
     scopa_probs = (compute_next_player_scopa_probabilities(game_state, player_id)
@@ -1130,15 +1113,12 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     progress = torch.tensor([min(1.0, float(len(game_state.get("history", [])))/40.0)], dtype=torch.float32, device=device)
     # 17) Last capturing team (2)
     lct0, lct1 = 0.0, 0.0
-    try:
-        for mv in reversed(game_state.get("history", [])):
-            ct = mv.get("capture_type")
-            if ct in ("capture", "scopa"):
-                lct0 = 1.0 if (int(mv.get("player")) in [0,2]) else 0.0
-                lct1 = 1.0 - lct0
-                break
-    except Exception:
-        pass
+    for mv in reversed(game_state.get("history", [])):
+        ct = mv.get("capture_type")
+        if ct in ("capture", "scopa"):
+            lct0 = 1.0 if (int(mv.get("player")) in [0,2]) else 0.0
+            lct1 = 1.0 - lct0
+            break
     last_capturing_team = torch.tensor([lct0, lct1], dtype=torch.float32, device=device)
 
     # Prealloc result and write slices to reduce cat overhead
@@ -1149,10 +1129,14 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
                     + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if OBS_INCLUDE_DEALER else 0))
     result = torch.empty((expected_dim,), dtype=torch.float32, device=device)
     pos = 0
+    # Preallocate a small zero buffer for occasional zero fills to avoid creating many tiny tensors
+    zero_buf = torch.zeros((1,), dtype=torch.float32, device=device)
     def _w(t):
         nonlocal pos
+        if t.dtype != torch.float32 or t.device != device:
+            t = t.to(device=device, dtype=torch.float32)
         n = int(t.numel())
-        result[pos:pos+n] = t.reshape(-1).to(dtype=torch.float32, device=device)
+        result[pos:pos+n] = t.reshape(-1)
         pos += n
     _w(hands_enc)
     _w(table_enc)
@@ -1175,10 +1159,7 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     _w(progress)
     _w(last_capturing_team)
     if OBS_INCLUDE_DEALER:
-        try:
-            current_player = int(game_state.get('current_player', -1))
-        except Exception:
-            current_player = -1
+        current_player = int(game_state.get('current_player', -1))
         hlen = len(game_state.get('history', []))
         if current_player >= 0:
             starting_seat = (current_player - (hlen % 4)) % 4

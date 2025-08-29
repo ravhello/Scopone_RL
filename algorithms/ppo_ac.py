@@ -209,7 +209,7 @@ class ActionConditionedPPO:
         # log-softmax within group (card)
         group_ids = played_ids_all  # (A)
         num_groups = 40
-        # Preallocate in local scope to avoid Python new allocations where possible
+        # Allocate fresh buffers sized for this call
         group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=actions_t.device)
         try:
             group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
@@ -356,17 +356,12 @@ class ActionConditionedPPO:
             sample_idx_per_legal = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
             legals_mb = legals[abs_idx].contiguous()                   # (M_mb,80)
             played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)     # (M_mb)
-            # mask per carte consentite per sample
-            card_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
-            card_mask[sample_idx_per_legal, played_ids_mb] = True
-            masked_card_logits = card_logits_all.masked_fill(~card_mask, float('-inf'))
-            logp_cards = torch.log_softmax(masked_card_logits, dim=1)   # (B,40)
+            # card logp per-sample via log-softmax + gather
+            logp_cards_all = torch.log_softmax(card_logits_all, dim=1)  # (B,40)
             # chosen abs indices e played ids (evita pos_map grande)
             chosen_clamped = torch.minimum(chosen_idx, (cnts - 1).clamp_min(0))
             chosen_abs_idx = (offs + chosen_clamped)                                 # (B)
             # posizioni relative nella maschera (per-legal all'interno del proprio sample)
-            pos = torch.arange(max_cnt, device=device, dtype=torch.long)
-            rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
             pos_in_sample = rel_pos_2d[mask]                                         # (M_mb)
             chosen_abs_idx_per_legal = chosen_abs_idx[sample_idx_per_legal]          # (M_mb)
             match = (abs_idx == chosen_abs_idx_per_legal)                            # (M_mb)
@@ -378,7 +373,7 @@ class ActionConditionedPPO:
                 chosen_pos.index_copy_(0, chosen_pos_idx, chosen_pos_vals)
             played_ids_all = torch.argmax(legals[:, :40], dim=1)
             chosen_card_ids = played_ids_all[chosen_abs_idx]
-            logp_card = logp_cards[row_idx, chosen_card_ids]
+            logp_card = logp_cards_all[row_idx, chosen_card_ids]
             # capture logits per-legal via action embedding
             # Prefer precomputed global embeddings to avoid recomputation per minibatch
             if a_emb_global is not None:
@@ -412,7 +407,7 @@ class ActionConditionedPPO:
             need_entropy = (float(self.entropy_coef) > 0.0)
             if need_entropy:
                 # Entropia per-sample senza padding: H = -Σ p * log p
-                logp_total_per_legal = logp_cards[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
+                logp_total_per_legal = logp_cards_all[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
                 probs = torch.exp(logp_total_per_legal)
                 neg_p_logp = -(probs * logp_total_per_legal)
                 ent_per_row = torch.zeros((B,), dtype=neg_p_logp.dtype, device=device)
@@ -475,7 +470,7 @@ class ActionConditionedPPO:
             safe_log_t = torch.zeros_like(target)
             safe_log_t[mask_pos] = torch.log(torch.clamp(target[mask_pos], min=eps))
             # Costruisci sempre i log-prob totali per-legal paddati (usati dalla KL MCTS)
-            logp_total_per_legal = logp_cards[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
+            logp_total_per_legal = logp_cards_all[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
             logp_total_padded = torch.full((B, max_cnt), float('-inf'), dtype=cap_logits.dtype, device=device)
             logp_total_padded[mask] = logp_total_per_legal
             diff = safe_log_t - logp_total_padded

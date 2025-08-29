@@ -7,7 +7,9 @@ import time
 from collections import OrderedDict
 from state import initialize_game
 from actions import decode_action_ids
-from observation import set_obs_device
+from observation import set_obs_device, encode_state_compact_for_player_fast as _encode_state_compact_for_player_fast
+from utils.compile import maybe_compile_function
+import torch.nn.functional as F
 
 # Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU.
 # Può essere forzato impostando ENV_DEVICE, ma di default resta CPU.
@@ -117,10 +119,9 @@ class ScoponeEnvMA(gym.Env):
         self._step_count = 0
         
         # Ensure observation constants are on the same device as env internals
-        try:
-            set_obs_device(device)
-        except Exception:
-            pass
+        set_obs_device(device)
+        # Compile and bind the observation encoder once
+        self._encode_obs = maybe_compile_function(_encode_state_compact_for_player_fast, name='observation.encode_state_compact_for_player_fast')
         self.reset()
     def _rebuild_id_caches(self):
         if not self._use_id_cache:
@@ -129,24 +130,15 @@ class ScoponeEnvMA(gym.Env):
             ids = [_card_to_id(c) for c in self.game_state['hands'][p]]
             self._hands_ids[p] = ids
             self._hands_bits[p] = _ids_to_bitset(ids) if self._use_bitset else 0
-            # sync CUDA mirror
-            try:
-                self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
-            except Exception:
-                self._hands_bits_t[p] = torch.tensor(int(self._hands_bits[p]), dtype=torch.int64, device=device)
+            # sync CUDA mirror strictly
+            self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
         tids = [_card_to_id(c) for c in self.game_state['table']]
         self._table_ids = tids
         self._table_bits = _ids_to_bitset(tids) if self._use_bitset else 0
-        try:
-            self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
-        except Exception:
-            self._table_bits_t = torch.tensor(int(self._table_bits), dtype=torch.int64, device=device)
+        self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
         # captured squads mirror
-        try:
-            bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
-            bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
-        except Exception:
-            bits0, bits1 = 0, 0
+        bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
+        bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
         self._captured_bits_t[0] = torch.as_tensor(bits0, dtype=torch.int64, device=device)
         self._captured_bits_t[1] = torch.as_tensor(bits1, dtype=torch.int64, device=device)
 
@@ -184,23 +176,20 @@ class ScoponeEnvMA(gym.Env):
         from actions import encode_action_from_ids_tensor as encode_action_from_ids
 
         # Chiave di cache LRU basata su (giocatore, mano, tavolo, regole AP)
-        try:
-            ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
-            ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
-            ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
-            state_key = (
-                int(self.current_player),
-                int(self._hands_bits_t[self.current_player].item()),
-                int(self._table_bits_t.item()),
-                ap_enabled, ap_posabile, ap_only_empty,
-            )
-            cached = self._valid_actions_cache.get(state_key)
-            if cached is not None:
-                self._cache_hits += 1
-                self._get_valid_actions_time += time.time() - start_time
-                return cached
-        except Exception:
-            state_key = None
+        ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
+        ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
+        ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
+        state_key = (
+            int(self.current_player),
+            int(self._hands_bits_t[self.current_player].item()),
+            int(self._table_bits_t.item()),
+            ap_enabled, ap_posabile, ap_only_empty,
+        )
+        cached = self._valid_actions_cache.get(state_key)
+        if cached is not None:
+            self._cache_hits += 1
+            self._get_valid_actions_time += time.time() - start_time
+            return cached
 
         # Estrai ID mano e tavolo da bitset mirror
         ids = self._id_range
@@ -226,10 +215,11 @@ class ScoponeEnvMA(gym.Env):
             else:
                 masks_all, pos = mp
             sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.float32)  # (M,n)
-            sums = (sel * table_ranks.unsqueeze(0).to(sel.dtype)).sum(dim=1).to(torch.int64)  # (M)
+            # matmul più efficiente del prodotto elemento per elemento + sum
+            sums = sel @ table_ranks.unsqueeze(1).to(torch.float32)
+            sums = sums.squeeze(1).to(torch.int64)  # (M)
             # Map table positions -> one-hot over 40 ids
-            table_one_hot = torch.zeros((n, 40), dtype=torch.float32, device=device)
-            table_one_hot[torch.arange(n, device=device), table_ids_t] = 1.0
+            table_one_hot = F.one_hot(table_ids_t, num_classes=40).to(torch.float32)
             # Multi-hot for all subset masks (M,40)
             capture_hot_by_mask = sel @ table_one_hot
         else:
@@ -299,9 +289,8 @@ class ScoponeEnvMA(gym.Env):
         if A == 0:
             actions = torch.zeros((0, 80), dtype=torch.float32, device=device)
         else:
-            actions = torch.zeros((A, 80), dtype=torch.float32, device=device)
-            actions[torch.arange(A, device=device), pid_all] = 1.0
-            actions[:, 40:] = (cap_hot_all > 0).to(torch.float32)
+            played_oh = F.one_hot(pid_all, num_classes=40).to(torch.float32)
+            actions = torch.cat([played_oh, (cap_hot_all > 0).to(torch.float32)], dim=1)
 
         # AP filter: se AP attivo ma posa asso non è consentita (e tavolo non vuoto), rimuovi azioni "asso + no capture"
         if ap_enabled and n > 0 and not (ap_posabile and (not ap_only_empty or n == 0)) and A > 0:
@@ -354,14 +343,7 @@ class ScoponeEnvMA(gym.Env):
         
         # Verifica carte da catturare (ID) via bitset CPU (evita sync GPU)
         for cid in cap_ids:
-            try:
-                present = (self._table_bits >> int(cid)) & 1
-            except Exception:
-                try:
-                    table_id_set = {_card_to_id(c) for c in table}
-                except Exception:
-                    table_id_set = set()
-                present = 1 if int(cid) in table_id_set else 0
+            present = (self._table_bits >> int(cid)) & 1
             if present == 0:
                 raise ValueError(f"La carta {cid} non si trova sul tavolo; cattura non valida.")
 
@@ -455,10 +437,7 @@ class ScoponeEnvMA(gym.Env):
         elif cap_ids:
             # Cattura carte
             for cid in cap_ids:
-                try:
-                    table.remove(cid)
-                except Exception:
-                    pass
+                table.remove(cid)
                 if self._use_id_cache:
                     try:
                         self._table_ids.remove(cid)
@@ -667,7 +646,7 @@ class ScoponeEnvMA(gym.Env):
                 self.game_state['current_player'] = int(self.current_player)
             except Exception:
                 self.game_state['current_player'] = self.current_player
-            result = encode_state_compact_for_player_fast(self.game_state, player_id, k_history=self.k_history)
+            result = self._encode_obs(self.game_state, player_id, k_history=self.k_history)
             
             # Salva in cache (LRU) senza forzare CPU: lascia il tensore sul suo device
             self._observation_cache[cache_key] = result

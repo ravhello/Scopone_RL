@@ -5,6 +5,7 @@ import contextlib
 import sys
 import time
 import types
+import os
 
 # Try to import torch for GPU profiling
 try:
@@ -28,6 +29,10 @@ class LineProfiler:
         self.last_line = {}      # Last line executed per frame
         self.start_times = {}    # Timing information for active frames
         self.import_times = {}   # Import statement execution times
+        # Aggregate function-level GPU timings (seconds)
+        self.func_gpu_time = defaultdict(float)
+        # Control GPU timing granularity via env: none|function|line (default: function)
+        self.gpu_granularity = os.environ.get('SCOPONE_LINE_GPU', 'function').strip().lower()
         
         # GPU monitoring
         self.use_cuda = TORCH_AVAILABLE and torch.cuda.is_available()
@@ -54,16 +59,10 @@ class LineProfiler:
                 except Exception:
                     in_allowed = False
                 if in_allowed:
-                    func_start_time = time.time()
-                    gpu_start_time = 0
-                    if self.use_cuda:
-                        torch.cuda.synchronize()
-                        gpu_start_time = time.time()
+                    func_start_time = time.perf_counter()
                     self.start_times[id(frame)] = {
                         'cpu_time': func_start_time,
-                        'gpu_time': gpu_start_time if self.use_cuda else 0,
                         'line_start_time': func_start_time,
-                        'gpu_line_start': gpu_start_time if self.use_cuda else 0,
                         'last_line': None
                     }
                     frame.f_trace = tracefunc
@@ -88,17 +87,19 @@ class LineProfiler:
             
             try:
                 # Track start time for the entire function
-                func_start_time = time.time()
-                if self.use_cuda:
-                    torch.cuda.synchronize()
-                    gpu_start_time = time.time()
+                func_start_time = time.perf_counter()
+                # Optional function-level GPU timing using CUDA events (low overhead)
+                start_event = None
+                end_event = None
+                if self.use_cuda and self.gpu_granularity in ('function', 'func'):
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
                 
                 # Store timing info for the current frame
                 self.start_times[id(frame)] = {
                     'cpu_time': func_start_time,
-                    'gpu_time': gpu_start_time if self.use_cuda else 0,
                     'line_start_time': func_start_time,
-                    'gpu_line_start': gpu_start_time if self.use_cuda else 0,
                     'last_line': None
                 }
                 
@@ -118,6 +119,15 @@ class LineProfiler:
                     if self.start_times[frame_id]['last_line'] is not None:
                         # Clean up the timing info
                         del self.start_times[frame_id]
+                # Finalize optional function-level GPU timing
+                if self.use_cuda and self.gpu_granularity in ('function', 'func') and start_event is not None:
+                    try:
+                        end_event.record()
+                        end_event.synchronize()
+                        elapsed_s = start_event.elapsed_time(end_event) / 1000.0
+                        self.func_gpu_time[func.__name__] += float(elapsed_s)
+                    except Exception:
+                        pass
         
         return wrapper
     
@@ -144,20 +154,12 @@ class LineProfiler:
         # If we have a previous line, record its execution time
         if last_line is not None:
             # Current time
-            end_time = time.time()
-            
-            # GPU synchronization for accurate timing
-            gpu_end_time = 0
-            if self.use_cuda:
-                torch.cuda.synchronize()
-                gpu_end_time = time.time()
-            
+            end_time = time.perf_counter()
             # Calculate elapsed time
             cpu_elapsed = end_time - timing_info['line_start_time']
-            gpu_elapsed = (gpu_end_time - timing_info['gpu_line_start']) if self.use_cuda else 0
-            
-            # Estimate transfer time (rough approximation)
-            transfer_time = max(0, cpu_elapsed - gpu_elapsed) if self.use_cuda else 0
+            # No per-line GPU timing by default to avoid distortion
+            gpu_elapsed = 0.0
+            transfer_time = 0.0
             
             # Update results dictionary
             if last_line in self.results[func_name]:
@@ -170,11 +172,7 @@ class LineProfiler:
         
         # Update timing info for the current line
         timing_info['last_line'] = line_no
-        timing_info['line_start_time'] = time.time()
-        
-        if self.use_cuda:
-            torch.cuda.synchronize()
-            timing_info['gpu_line_start'] = time.time()
+        timing_info['line_start_time'] = time.perf_counter()
     
     def _trace_return(self, frame):
         """Handle function return while profiling."""
@@ -198,18 +196,11 @@ class LineProfiler:
         # Process the last executed line
         if last_line is not None:
             # Current time
-            end_time = time.time()
-            
-            # GPU synchronization for accurate timing
-            gpu_end_time = 0
-            if self.use_cuda:
-                torch.cuda.synchronize()
-                gpu_end_time = time.time()
-            
+            end_time = time.perf_counter()
             # Calculate elapsed time
             cpu_elapsed = end_time - timing_info['line_start_time']
-            gpu_elapsed = (gpu_end_time - timing_info['gpu_line_start']) if self.use_cuda else 0
-            transfer_time = max(0, cpu_elapsed - gpu_elapsed) if self.use_cuda else 0
+            gpu_elapsed = 0.0
+            transfer_time = 0.0
             
             # Update results
             if last_line in self.results[func_name]:
@@ -254,8 +245,11 @@ class LineProfiler:
             for line_no, (hits, cpu_time, gpu_time, transfer_time) in lines.items():
                 total_hits += hits
                 func_cpu_time += cpu_time
+                # Prefer function-level GPU timing if available
                 func_gpu_time += gpu_time
                 func_transfer_time += transfer_time
+            if self.use_cuda and self.gpu_granularity in ('function', 'func'):
+                func_gpu_time = max(func_gpu_time, self.func_gpu_time.get(func_name, 0.0))
             
             # Store function stats
             function_stats[func_name] = {
@@ -322,6 +316,7 @@ class LineProfiler:
             
             # Calculate percentages for this function
             func_cpu_time = stats['cpu_time']
+            func_gpu_time = stats['gpu_time']
             
             # Print header
             print(f"{'Line':<10} {'Hits':<10} {'CPU Time':<15} {'%':<10} {'GPU Time':<15} {'Transfer':<15} {'Per Hit (CPU)':<15}")
@@ -407,8 +402,15 @@ class LineProfiler:
         for func_name, lines in self.results.items():
             for line_no, (hits, cpu_time, gpu_time, transfer_time) in lines.items():
                 total_cpu_time += cpu_time
-                total_gpu_time += gpu_time
                 total_transfer_time += transfer_time
+                # Prefer function-level GPU totals if available
+                if self.use_cuda and self.gpu_granularity in ('function', 'func'):
+                    pass
+                else:
+                    total_gpu_time += gpu_time
+        if self.use_cuda and self.gpu_granularity in ('function', 'func'):
+            # Sum function-level GPU timings instead of per-line sums
+            total_gpu_time = sum(self.func_gpu_time.values())
         
         total_time = total_cpu_time  # Use CPU time as total
         
@@ -416,7 +418,11 @@ class LineProfiler:
         func_times = []
         for func_name, lines in self.results.items():
             func_cpu_time = sum(cpu_time for _, cpu_time, _, _ in lines.values())
-            func_gpu_time = sum(gpu_time for _, _, gpu_time, _ in lines.values())
+            # Prefer function-level GPU time if available
+            if self.use_cuda and self.gpu_granularity in ('function', 'func'):
+                func_gpu_time = self.func_gpu_time.get(func_name, 0.0)
+            else:
+                func_gpu_time = sum(gpu_time for _, _, gpu_time, _ in lines.values())
             func_transfer_time = sum(transfer_time for _, _, _, transfer_time in lines.values())
             func_times.append((func_name, func_cpu_time, func_gpu_time, func_transfer_time))
         
