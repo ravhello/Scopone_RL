@@ -581,6 +581,77 @@ def main():
         return
 
     # Keep run short to avoid OOM without scheduler
+    # Wrap selected hotspots with record_function via monkeypatch, without editing sources
+    from torch.profiler import record_function as _record_function
+    try:
+        # observation
+        import observation as _obs_mod
+        if hasattr(_obs_mod, 'encode_state_compact_for_player_fast'):
+            _orig_encode = _obs_mod.encode_state_compact_for_player_fast
+            def _wrap_encode(*a, **kw):
+                with _record_function('obs.encode_state_compact_for_player_fast'):
+                    return _orig_encode(*a, **kw)
+            _obs_mod.encode_state_compact_for_player_fast = _wrap_encode  # type: ignore
+    except Exception:
+        pass
+    try:
+        # environment
+        import environment as _env_mod
+        if hasattr(_env_mod.ScoponeEnvMA, 'get_valid_actions'):
+            _orig_gva = _env_mod.ScoponeEnvMA.get_valid_actions
+            def _wrap_gva(self, *a, **kw):
+                with _record_function('env.get_valid_actions'):
+                    return _orig_gva(self, *a, **kw)
+            _env_mod.ScoponeEnvMA.get_valid_actions = _wrap_gva  # type: ignore
+        if hasattr(_env_mod.ScoponeEnvMA, '_get_observation'):
+            _orig_go = _env_mod.ScoponeEnvMA._get_observation
+            def _wrap_go(self, *a, **kw):
+                with _record_function('env._get_observation'):
+                    return _orig_go(self, *a, **kw)
+            _env_mod.ScoponeEnvMA._get_observation = _wrap_go  # type: ignore
+        if hasattr(_env_mod.ScoponeEnvMA, 'step'):
+            _orig_step = _env_mod.ScoponeEnvMA.step
+            def _wrap_step(self, *a, **kw):
+                with _record_function('env.step'):
+                    return _orig_step(self, *a, **kw)
+            _env_mod.ScoponeEnvMA.step = _wrap_step  # type: ignore
+    except Exception:
+        pass
+    try:
+        # algorithms / actor
+        import algorithms.ppo_ac as _ppo_mod
+        if hasattr(_ppo_mod.ActionConditionedPPO, '_select_action_core'):
+            _orig_core = _ppo_mod.ActionConditionedPPO._select_action_core
+            def _wrap_core(self, *a, **kw):
+                with _record_function('algo._select_action_core'):
+                    return _orig_core(self, *a, **kw)
+            _ppo_mod.ActionConditionedPPO._select_action_core = _wrap_core  # type: ignore
+        if hasattr(_ppo_mod.ActionConditionedPPO, 'select_action'):
+            _orig_sel = _ppo_mod.ActionConditionedPPO.select_action
+            def _wrap_sel(self, *a, **kw):
+                with _record_function('algo.select_action'):
+                    return _orig_sel(self, *a, **kw)
+            _ppo_mod.ActionConditionedPPO.select_action = _wrap_sel  # type: ignore
+    except Exception:
+        pass
+    try:
+        # model internals
+        import models.action_conditioned as _ac_mod
+        if hasattr(_ac_mod.ActionConditionedActor, 'compute_state_proj'):
+            _orig_csp = _ac_mod.ActionConditionedActor.compute_state_proj
+            def _wrap_csp(self, *a, **kw):
+                with _record_function('model.compute_state_proj'):
+                    return _orig_csp(self, *a, **kw)
+            _ac_mod.ActionConditionedActor.compute_state_proj = _wrap_csp  # type: ignore
+        if hasattr(_ac_mod.ActionConditionedActor, '_mha_masked_mean'):
+            _orig_mmm = _ac_mod.ActionConditionedActor._mha_masked_mean
+            def _wrap_mmm(self, *a, **kw):
+                with _record_function('model._mha_masked_mean'):
+                    return _orig_mmm(self, *a, **kw)
+            _ac_mod.ActionConditionedActor._mha_masked_mean = _wrap_mmm  # type: ignore
+    except Exception:
+        pass
+
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -610,6 +681,38 @@ def main():
     print(prof.key_averages(group_by_stack_n=10).table(sort_by="self_cuda_time_total", row_limit=30))
     print("\nTop by CPU time (grouped by stack):")
     print(prof.key_averages(group_by_stack_n=10).table(sort_by="self_cpu_time_total", row_limit=30))
+
+    # Summarize record_function tags to make hotspots immediately visible
+    try:
+        from collections import defaultdict as _dd
+        tag_totals = _dd(lambda: { 'cpu_us': 0.0, 'cuda_us': 0.0, 'count': 0 })
+        for avg in prof.key_averages():
+            name = getattr(avg, 'key', '') or getattr(avg, 'name', '') or ''
+            if not isinstance(name, str):
+                continue
+            if not (name.startswith('env.') or name.startswith('algo.') or name.startswith('model.') or name.startswith('obs.')):
+                continue
+            cpu_us = getattr(avg, 'self_cpu_time_total', 0.0) or 0.0
+            cuda_us = getattr(avg, 'self_device_time_total', None)
+            if cuda_us is None:
+                cuda_us = getattr(avg, 'self_cuda_time_total', 0.0) or 0.0
+            tag_totals[name]['cpu_us'] += float(cpu_us)
+            tag_totals[name]['cuda_us'] += float(cuda_us)
+            tag_totals[name]['count'] += getattr(avg, 'count', 1) or 1
+
+        if tag_totals:
+            def _to_ms(us: float) -> float:
+                try:
+                    return float(us) / 1000.0
+                except Exception:
+                    return 0.0
+            print("\nTop by tag (record_function):")
+            ranked_tags = sorted(tag_totals.items(), key=lambda kv: (kv[1]['cuda_us'] + kv[1]['cpu_us']), reverse=True)
+            for i, (tag, s) in enumerate(ranked_tags[:20], 1):
+                total_ms = _to_ms(s['cpu_us'] + s['cuda_us'])
+                print(f"{i:>2}. {tag}\n    Total: {total_ms:8.2f} ms | CPU: {_to_ms(s['cpu_us']):8.2f} ms | CUDA: {_to_ms(s['cuda_us']):8.2f} ms | count: {int(s['count'])}")
+    except Exception:
+        pass
 
     # Aggregate by user source file (from Python stacks) and highlight H2D/D2H memcpys
     try:

@@ -71,7 +71,7 @@ class ScoponeEnvMA(gym.Env):
         
         # OTTIMIZZAZIONE: Cache per encode_state_for_player (LRU)
         self._observation_cache = OrderedDict()
-        self._cache_capacity = 128
+        self._cache_capacity = 2048
         # Cache DP per subset-sum sul tavolo (chiave: (table_bits, rank))
         self._subset_sum_cache = {}
         # Cache maschere per numero di carte sul tavolo: n -> (masks[1..(1<<n)-1], pos[0..n-1])
@@ -641,18 +641,17 @@ class ScoponeEnvMA(gym.Env):
         """
         start_time = time.time()
         
-        # OTTIMIZZAZIONE: Crea una chiave di cache efficiente
-        # Usa solo le informazioni rilevanti
-        cache_key = (
-            player_id,
-            self.current_player,
-            tuple(sorted(_card_to_id(c) for c in self.game_state["hands"][player_id])),
-            tuple(sorted(_card_to_id(c) for c in self.game_state["table"])),
-            len(self.game_state["history"]),
-            tuple(sorted(_card_to_id(c) for c in self.game_state["captured_squads"][0])),
-            tuple(sorted(_card_to_id(c) for c in self.game_state["captured_squads"][1])),
-            self.k_history
-        )
+        # OTTIMIZZAZIONE: Chiave cache basata su bitset mirror (O(1)) + history_len
+        try:
+            hb = int(self._hands_bits_t[player_id].item())
+            tb = int(self._table_bits_t.item())
+            cb0 = int(self._captured_bits_t[0].item())
+            cb1 = int(self._captured_bits_t[1].item())
+        except Exception:
+            # Fallback a chiave basata su ID in caso di mirror assenti
+            hb = tb = cb0 = cb1 = -1
+        hlen = len(self.game_state.get("history", []))
+        cache_key = (player_id, int(self.current_player), hb, tb, cb0, cb1, int(self.k_history), int(hlen))
         
         # Verifica la cache
         if cache_key in self._observation_cache:
