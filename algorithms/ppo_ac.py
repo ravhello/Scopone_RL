@@ -486,18 +486,9 @@ class ActionConditionedPPO:
         real_hands = batch.get('others_hands', None)  # shape (B,3,40) one-hot o multi-hot per altri giocatori
         if (belief_coef > 0.0) and (real_hands is not None):
             rh = to_cuda_nb(real_hands, torch.float32)
-            # calcola logits/probs dal BeliefNet dell'actor per il batch
-            with torch.no_grad():
-                state_feat_all = self.actor.state_enc(obs, seat)
-            logits_b = self.actor.belief_net(state_feat_all)  # (B,120)
-            # visible mask da obs per masking nella CE
-            hand_table = obs[:, :83]
-            hand_mask = hand_table[:, :40] > 0.5
-            table_mask = hand_table[:, 43:83] > 0.5
-            captured = obs[:, 83:165]
-            cap0_mask = captured[:, :40] > 0.5
-            cap1_mask = captured[:, 40:80] > 0.5
-            visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)  # (B,40)
+            # riusa state_feat già calcolato e la visible_mask_40 già costruita
+            logits_b = self.actor.belief_net(state_feat)  # (B,120)
+            visible_mask = visible_mask_40  # (B,40)
             Bsz = logits_b.size(0)
             logits_3x40 = logits_b.view(Bsz, 3, 40)
             # softmax over players dim

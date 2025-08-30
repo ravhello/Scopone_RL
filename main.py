@@ -64,8 +64,8 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 # Abilita di default feature dell'osservazione
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
 # Default to CPU unless overridden by user env
-os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
-os.environ.setdefault('ENV_DEVICE', 'cpu')
+os.environ.setdefault('SCOPONE_DEVICE', 'cpu') # puoi selezionare "cuda" se vuoi gpu
+os.environ.setdefault('ENV_DEVICE', 'cpu') # puoi selezionare "cuda" se vuoi gpu
 # Preferire default CPU per evitare uso GPU implicito; override via env se desiderato
 try:
     import torch as _t
@@ -110,11 +110,26 @@ def _maybe_launch_tensorboard():
 if __name__ == "__main__":
     device = get_compute_device()
     print(f"Using device: {device}")
+    # Configure CPU threads for training in the main process only
+    # Env workers keep their own setting (forced to 1 thread in trainers/train_ppo.py)
+    try:
+        _cores = int(os.cpu_count()*0.75 or 1)
+        _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', str(_cores)))
+        _n_interop_default = max(1, _cores // 6)
+        _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', str(_n_interop_default)))
+        torch.set_num_threads(_n_threads)
+        torch.set_num_interop_threads(_n_interop)
+        try:
+            print(f"Training threads: num_threads={_n_threads} interop={_n_interop}")
+        except Exception:
+            pass
+    except Exception:
+        pass
     _maybe_launch_tensorboard()
     # Default to random seed for training runs (set -1); stable only if user sets it
     seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
     # Note: train_ppo will resolve and announce the effective seed
-    train_ppo(num_iterations=10, horizon=2048, use_compact_obs=True, k_history=39,
+    train_ppo(num_iterations=10, horizon=16384, use_compact_obs=True, k_history=39,
               num_envs=1,
               mcts_sims=0,
               mcts_sims_eval=4,

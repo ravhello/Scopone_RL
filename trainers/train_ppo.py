@@ -91,7 +91,15 @@ def _env_worker(worker_id: int,
         while not done:
             obs = env._get_observation(env.current_player)
             legal = env.get_valid_actions()
-            if not legal:
+            # Avoid ambiguous truth-value on tensors; treat empty action sets explicitly
+            try:
+                is_empty = (int(legal.numel()) == 0)
+            except Exception:
+                try:
+                    is_empty = (len(legal) == 0)
+                except Exception:
+                    is_empty = False
+            if is_empty:
                 break
             cp = env.current_player
             seat_vec = _seat_vec_for(cp)
@@ -1452,11 +1460,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 sample_idx_per_legal = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
                 legals_mb = legals_t[abs_idx].contiguous()
                 played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)
-                # card logp masked per sample
-                card_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
-                card_mask[sample_idx_per_legal, played_ids_mb] = True
-                masked_card_logits = card_logits_all.masked_fill(~card_mask, float('-inf'))
-                logp_cards = torch.log_softmax(masked_card_logits, dim=1)
+                # card logp su tutte le 40 carte (coerente con compute_loss)
+                logp_cards_all = torch.log_softmax(card_logits_all, dim=1)
                 chosen_clamped = torch.minimum(chosen_index_t, (legals_count_t - 1).clamp_min(0))
                 chosen_abs = (legals_offset_t + chosen_clamped)
                 total_legals = legals_t.size(0)
@@ -1465,7 +1470,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 chosen_pos = pos_map[chosen_abs]
                 played_ids_all = torch.argmax(legals_t[:, :40], dim=1)
                 chosen_card_ids = played_ids_all[chosen_abs]
-                logp_card = logp_cards[torch.arange(B, device=device), chosen_card_ids]
+                logp_card = logp_cards_all[torch.arange(B, device=device), chosen_card_ids]
                 # capture
                 a_emb_mb = agent.actor.action_enc(legals_mb)
                 cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
@@ -1893,11 +1898,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
                 legals_mb = leg_t[abs_idx].contiguous()                   # (M_mb,80)
                 played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)    # (M_mb)
-                # Mask per-carta per sample
-                card_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
-                card_mask[sample_idx, played_ids_mb] = True
-                masked_card_logits = card_logits_all.masked_fill(~card_mask, float('-inf'))
-                logp_cards = torch.log_softmax(masked_card_logits, dim=1)  # (B,40)
+                # card logp su tutte le 40 carte (coerente con compute_loss)
+                logp_cards = torch.log_softmax(card_logits_all, dim=1)  # (B,40)
                 # Map chosen indices to absolute and card ids
                 chosen_clamped = torch.minimum(chosen_idx_t.pin_memory().to(device=device), (cnts - 1).clamp_min(0))
                 chosen_abs = (offs + chosen_clamped)

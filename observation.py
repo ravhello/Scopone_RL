@@ -1193,3 +1193,4 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     rpf = rpf if torch.is_tensor(rpf) else torch.as_tensor(rpf, dtype=torch.float32, device=device)
     _w(rpf)
     return result
+
