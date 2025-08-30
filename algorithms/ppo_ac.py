@@ -199,9 +199,9 @@ class ActionConditionedPPO:
             # Precompute logits carta una volta (keep inside autocast for dtype alignment)
             card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t()).squeeze(0)  # (40)
         played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
-        # Evita torch.unique: computa logp su tutte le 40 carte una volta e indicizza
-        logp_cards_all = torch.log_softmax(card_logits_all, dim=0)  # (40)
-        logp_cards_per_legal = logp_cards_all[played_ids_all]       # (A)
+        # Evita torch.unique: computa logsumexp una sola volta e indicizza
+        lse_cards = torch.logsumexp(card_logits_all, dim=0)  # scalar
+        logp_cards_per_legal = card_logits_all[played_ids_all] - lse_cards  # (A)
         # Use cached action embedding table to embed all legals in one matmul
         a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)  # (80,64)
         a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)

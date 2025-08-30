@@ -27,6 +27,9 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
 ## Abilita di default feature dell'osservazione (dealer one-hot)
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+## Default to CPU unless overridden by user env
+os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+os.environ.setdefault('ENV_DEVICE', 'cpu')
 ## Mantieni ENV_DEVICE allineato a main.py per profili consistenti
 try:
     import torch as _t
@@ -81,15 +84,7 @@ import webbrowser
 from datetime import datetime
 import platform
 
-# Prefer GPU for models if available; never force CPU unless explicitly requested
-if os.environ.get('TESTS_FORCE_CPU') == '1':
-    del os.environ['TESTS_FORCE_CPU']
-
-# Ensure device selection consistent with main
-from utils.device import get_compute_device
-_dev = get_compute_device()
-if torch.cuda.is_available() and str(_dev) != 'cuda':
-    os.environ.setdefault('SCOPONE_DEVICE', 'cuda')
+# Default CPU for profiling unless user sets GPU via env
 
 from trainers.train_ppo import train_ppo
 from utils.seed import resolve_seed

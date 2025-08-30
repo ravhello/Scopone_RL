@@ -440,13 +440,14 @@ class ActionConditionedActor(torch.nn.Module):
     @staticmethod
     def _visible_mask_from_obs(x_obs: torch.Tensor) -> torch.Tensor:
         hand_table = x_obs[:, :83]
-        hand_mask = hand_table[:, :40] > 0.5
-        table_mask = hand_table[:, 43:83] > 0.5
-        captured = x_obs[:, 83:165]
-        cap0_mask = captured[:, :40] > 0.5
-        cap1_mask = captured[:, 40:80] > 0.5
-        visible = hand_mask | table_mask | cap0_mask | cap1_mask
-        return visible
+        # Single threshold mask and slicing to avoid repeated > 0.5 ops
+        mask_all = hand_table > 0.5
+        hand_mask = mask_all[:, :40]
+        table_mask = mask_all[:, 43:83]
+        captured = x_obs[:, 83:165] > 0.5
+        cap0_mask = captured[:, :40]
+        cap1_mask = captured[:, 40:80]
+        return hand_mask | table_mask | cap0_mask | cap1_mask
 
     def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         if torch.is_tensor(obs):
