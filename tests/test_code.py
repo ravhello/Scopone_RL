@@ -241,9 +241,9 @@ def test_encode_action_decode_action():
 def test_decode_action_invalid_vector():
     """Verifica che decode_action sollevi ValueError quando la carta giocata non è specificata."""
     invalid_vec = torch.zeros(80, dtype=torch.float32)
-    # decode_action_ids su vettore vuoto restituisce played_id=0; il check di validità avviene in env.step
-    pid, caps = decode_action_ids(invalid_vec)
-    assert isinstance(pid, int)
+    import pytest
+    with pytest.raises(ValueError):
+        decode_action_ids(invalid_vec)
 
 
 def test_get_valid_actions_direct_capture(env_fixture):

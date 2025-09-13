@@ -1217,6 +1217,8 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     # rank_presence_from_inferred (30) always appended at end for fast-path coherence
     rpf = compute_rank_presence_probs_from_inferred(game_state, player_id)
     rpf = rpf if torch.is_tensor(rpf) else torch.as_tensor(rpf, dtype=torch.float32, device=device)
+    if not torch.isfinite(rpf).all():
+        raise RuntimeError("Observation rank_presence_from_inferred contains non-finite values")
     _w(rpf)
     return result
 

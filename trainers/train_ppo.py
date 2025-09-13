@@ -510,6 +510,10 @@ def _batched_select_indices(agent: ActionConditionedPPO,
     # Returns list of (wid, idx) per req
     if len(reqs) == 0:
         return []
+    # Basic validation
+    for r in reqs:
+        if 'obs' not in r or 'legals' not in r or 'wid' not in r:
+            raise KeyError("_batched_select_indices: missing 'obs'/'legals'/'wid' in request")
     # Stack CPU tensors then move once to CUDA
     obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
     seat_cpu = torch.stack([torch.as_tensor(r['seat'], dtype=torch.float32) for r in reqs], dim=0)
@@ -536,6 +540,10 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             o_t = obs_cpu
             s_t = seat_cpu
             leg_t = leg_cpu
+        # Validate legal encoding: exactly one played bit per row
+        ones = leg_t[:, :40].sum(dim=1)
+        if not torch.allclose(ones, torch.ones_like(ones)):
+            raise RuntimeError("_batched_select_indices: each legal must have one played bit in [:40]")
         state_proj = agent.actor.compute_state_proj(o_t, s_t)  # (B,64)
         a_emb_all = agent.actor.action_enc(leg_t)             # (M,64)
         B = o_t.size(0)
@@ -563,37 +571,15 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             if bool(valid_rows.any()):
                 pv = probs[valid_rows]
                 mv = mask[valid_rows]
-                # Sanitize probabilities: remove NaN/Inf and negatives
+                # Sanitize probabilities: remove NaN/Inf and negatives; strictly validate
                 pv = pv.nan_to_num(0.0)
                 pv = torch.clamp(pv, min=0.0)
-                # Row-wise fix for zero-sum rows: fall back to uniform over allowed
-                from utils.fallback import notify_fallback
                 rs = pv.sum(dim=1, keepdim=True)
                 bad_rows = (~torch.isfinite(rs)) | (rs <= 0)
                 if bool(bad_rows.any()):
-                    try:
-                        n_bad = int(bad_rows.sum().item())
-                    except Exception:
-                        n_bad = -1
-                    notify_fallback('trainer.batched_select.uniform_rows', f'rows={n_bad}')
-                    allowed = mv.to(pv.dtype)
-                    counts = allowed.sum(dim=1, keepdim=True).clamp_min(1.0)
-                    uniform = allowed / counts
-                    pv = torch.where(bad_rows, uniform, pv)
-                # Final guard: ensure strictly positive row sums
-                rs = pv.sum(dim=1, keepdim=True)
-                need_uniform = (rs <= 0)
-                if bool(need_uniform.any()):
-                    notify_fallback('trainer.batched_select.uniform_rows_final')
-                    allowed = mv.to(pv.dtype)
-                    counts = allowed.sum(dim=1, keepdim=True).clamp_min(1.0)
-                    pv = torch.where(need_uniform, allowed / counts, pv)
-                # Sample for exploration; fallback to argmax if still problematic
-                try:
-                    sub = torch.multinomial(pv, num_samples=1).squeeze(1)
-                except Exception:
-                    notify_fallback('trainer.batched_select.multinomial_failed')
-                    sub = torch.argmax(pv, dim=1)
+                    raise RuntimeError("_batched_select_indices: invalid probability rows (NaN/Inf or zero-sum)")
+                # Sample for exploration
+                sub = torch.multinomial(pv, num_samples=1).squeeze(1)
                 # Write back selections to full batch
                 sel[valid_rows] = sub
             # rows with no legal actions keep sel=0
@@ -690,8 +676,10 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
             logp_cap_per_legal = cap_logits - lse_per_legal
 
             logp_total_per_legal = logp_cards_per_legal + logp_cap_per_legal
+            if not torch.isfinite(logp_total_per_legal).all():
+                raise RuntimeError("_batched_service: non-finite log-probs for legals")
 
-            # Softmax over legals per sample
+            # Softmax over legals per sample (strict validation)
             if max_cnt > 0:
                 pos = torch.arange(max_cnt, device=device, dtype=torch.long)
                 rel_pos_2d = pos.unsqueeze(0).expand(Bp, max_cnt)
@@ -713,10 +701,10 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                         padded[j, :c] = logp_total_per_legal[start:start+c]
                         start += c
                 priors_padded = torch.softmax(padded, dim=1).nan_to_num(0.0)
-                # Clamp and renormalize per row
                 priors_padded = torch.clamp(priors_padded, min=0.0)
                 row_sums = priors_padded.sum(dim=1, keepdim=True)
-                row_sums = torch.where(row_sums > 0, row_sums, torch.ones_like(row_sums))
+                if bool(((row_sums <= 0) | (~torch.isfinite(row_sums))).any()):
+                    raise RuntimeError("_batched_service: invalid priors row (NaN/Inf or zero-sum)")
                 priors_padded = priors_padded / row_sums
                 # Scatter back to per-request lists
                 start = 0
@@ -894,6 +882,11 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         horizon = max(40, int(horizon))
     except Exception:
         horizon = 40
+    # Validate gamma/lam
+    if float(gamma) < 0 or float(gamma) > 1:
+        raise ValueError("collect_trajectory: gamma must be in [0,1]")
+    if float(lam) < 0 or float(lam) > 1:
+        raise ValueError("collect_trajectory: lam must be in [0,1]")
     obs_list, next_obs_list = [], []
     act_list = []
     rew_list, done_list = [], []
@@ -1049,7 +1042,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                         priors = torch.softmax(logp_total, dim=0).nan_to_num(0.0)
                         priors = torch.clamp(priors, min=0.0)
                         ssum = priors.sum()
-                        priors = (priors if (torch.isfinite(ssum) and ssum > 0) else torch.full_like(priors, 1.0 / max(1, priors.numel())))
+                        if (not torch.isfinite(ssum)) or (ssum <= 0):
+                            raise RuntimeError("collect_trajectory.policy_fn_mcts: invalid priors (NaN/Inf or zero-sum)")
                     return priors.detach().cpu().numpy()
                 # Value: usa il critic con belief neurale interno e others_hands predetto
                 def value_fn_mcts(_obs, _env):
@@ -1574,6 +1568,20 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     else:
         old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
 
+    # Validate batch structure sizes/coherence before returning
+    B = int(obs_cpu.size(0)) if torch.is_tensor(obs_cpu) else len(obs_cpu)
+    def _len(x):
+        return (int(x.size(0)) if torch.is_tensor(x) else len(x))
+    # next_obs length equals obs length by construction
+    if not (B == _len(act_cpu) == _len(done_t) == _len(seat_team_cpu)):
+        raise RuntimeError("collect_trajectory: per-step arrays length mismatch among obs/act/next_obs/done/seat")
+    if int(legals_count_cpu.sum().item()) != int(legals_cpu.size(0)):
+        raise RuntimeError("collect_trajectory: sum(legals_count) != len(legals)")
+    if (chosen_index_cpu < 0).any() or ((chosen_index_cpu >= legals_count_cpu) & (legals_count_cpu > 0)).any():
+        raise RuntimeError("collect_trajectory: chosen_index out of range for some rows")
+    if seat_team_cpu.size(1) != 6 or not (seat_team_cpu[:, :4].sum(dim=1) == 1).all():
+        raise RuntimeError("collect_trajectory: seat_team must be (B,6) with one-hot seat")
+
     # Mantieni batch già tensori CPU; l'update ora li mapperà tutti su CUDA in un solo passaggio
     batch = {
         'obs': obs_cpu,
@@ -1620,6 +1628,23 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                                 seed: int = 0,
                                 show_progress_env: bool = True,
                                 tqdm_base_pos: int = 2) -> Dict:
+    # Validate configuration invariants
+    if int(num_envs) <= 0:
+        raise ValueError("collect_trajectory_parallel: num_envs must be > 0")
+    if int(episodes_total_hint) <= 0:
+        raise ValueError("collect_trajectory_parallel: episodes_total_hint must be > 0")
+    if int(k_history) <= 0:
+        raise ValueError("collect_trajectory_parallel: k_history must be > 0")
+    if float(gamma) < 0 or float(gamma) > 1:
+        raise ValueError("collect_trajectory_parallel: gamma must be in [0,1]")
+    if float(lam) < 0 or float(lam) > 1:
+        raise ValueError("collect_trajectory_parallel: lam must be in [0,1]")
+    if float(mcts_prior_smooth_eps) < 0 or float(mcts_prior_smooth_eps) > 1:
+        raise ValueError("collect_trajectory_parallel: mcts_prior_smooth_eps must be in [0,1]")
+    if float(mcts_dirichlet_eps) < 0 or float(mcts_dirichlet_eps) > 1:
+        raise ValueError("collect_trajectory_parallel: mcts_dirichlet_eps must be in [0,1]")
+    if float(mcts_dirichlet_alpha) < 0:
+        raise ValueError("collect_trajectory_parallel: mcts_dirichlet_alpha must be >= 0")
     # Choose start method with env override and platform/device awareness.
     # - Windows: 'spawn'
     # - POSIX with CUDA or background threads: prefer 'forkserver' (avoid forking after CUDA/threads)
@@ -1754,7 +1779,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             try:
                 r0 = request_q.get(timeout=0.01)
                 reqs.append(r0)
-            except Exception:
+            except queue.Empty:
                 pass
         # 3) Process batch on GPU
         if len(reqs) > 0:
@@ -1898,6 +1923,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             # adjust offsets later after concat
             pass
 
+    # Validate per-episode structure coherence before stacking
+    if not (len(obs_cpu) == len(act_cpu) == len(next_obs_cpu) == len(done_list) == len(seat_cpu)):
+        raise RuntimeError("collector: per-step arrays length mismatch among obs/act/next_obs/done/seat")
     # Stack to tensors
     _obs_dim = int(episodes_payloads[0]['obs'][0].__len__()) if len(episodes_payloads) > 0 and len(episodes_payloads[0]['obs']) > 0 else 1
     obs_cpu_t = torch.stack(obs_cpu, dim=0) if len(obs_cpu) > 0 else torch.zeros((0, _obs_dim), dtype=torch.float32)
@@ -1935,7 +1963,24 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     mcts_weight_t = torch.as_tensor(mcts_weight, dtype=torch.float32) if len(mcts_weight)>0 else torch.zeros((0,), dtype=torch.float32)
     others_hands_t = torch.stack(others_hands, dim=0) if len(others_hands)>0 else torch.zeros((0,3,40), dtype=torch.float32)
 
-    # Compute values and advantages on GPU similar to collect_trajectory (CTDE coherente)
+    # Validate ragged legals structure before computing values
+    total_legals = len(legals_cpu)
+    if int(torch.as_tensor(leg_cnt, dtype=torch.long).sum().item()) != total_legals:
+        raise RuntimeError("collector: sum(legals_count) != len(legals)")
+    # chosen indices must be within per-row counts
+    for i, (off_i, cnt_i, ch_i) in enumerate(zip(leg_off, leg_cnt, chosen_idx)):
+        if cnt_i <= 0:
+            continue
+        if not (0 <= int(ch_i) < int(cnt_i)):
+            raise RuntimeError(f"collector: chosen_index out of range at row {i} (idx={int(ch_i)}, cnt={int(cnt_i)})")
+    # seat_team sanity: shape and one-hot seat
+    if len(seat_cpu) > 0:
+        seat_mat = torch.stack(seat_cpu, dim=0)
+        if seat_mat.size(1) != 6:
+            raise RuntimeError("collector: seat_team must have shape (B,6)")
+        if not (seat_mat[:, :4].sum(dim=1) == 1).all():
+            raise RuntimeError("collector: seat one-hot invalid (sum != 1)")
+    # Compute values and advantages on GPU similar to collect_trajectory (CTDE coerente)
     rew_t = torch.as_tensor(rew_list, dtype=torch.float32, device=device) if len(rew_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
     done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if len(done_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
     if len(rew_list) > 0:
@@ -2055,7 +2100,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
 
 def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 200, ckpt_path: str = 'checkpoints/ppo_ac.pth', k_history: int = 39, seed: int = 0,
               entropy_schedule_type: str = 'linear', eval_every: int = 0, eval_games: int = 10, belief_particles: int = 512, belief_ess_frac: float = 0.5,
-              mcts_in_eval: bool = True, mcts_sims: int = 128, mcts_sims_eval: Optional[int] = None, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
+              mcts_in_eval: bool = True, mcts_train: bool = True, mcts_sims: int = 128, mcts_sims_eval: Optional[int] = None, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
               mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25,
               num_envs: int = 32,
               on_iter_end: Optional[Callable[[int], None]] = None):
@@ -2185,9 +2230,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                       f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}", flush=True)
             except Exception:
                 pass
-            # Warmup: disattiva MCTS nelle prime iterazioni anche in parallelo
-            # Prefer default setting passed in; do not silently disable here
-            parallel_use_mcts = bool(use_mcts)
+            # Abilita/disabilita MCTS in parallelo in base al flag di training
+            parallel_use_mcts = bool(mcts_train)
             batch = collect_trajectory_parallel(agent,
                                                 num_envs=int(num_envs),
                                                 episodes_total_hint=episodes_hint,
@@ -2213,7 +2257,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             batch = collect_trajectory(env, agent, horizon=horizon, partner_actor=partner_actor, opponent_actor=opponent_actor, main_seats=main_seats,
                                        belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
                                        episodes=None, final_reward_only=True,
-                                       use_mcts=True,
+                                       use_mcts=bool(mcts_train),
                                        mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
                                        mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
                                        mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
@@ -2434,7 +2478,7 @@ if __name__ == '__main__':
               k_history=args.k_history, seed=args.seed,
               entropy_schedule_type=args.entropy_schedule, eval_every=args.eval_every, eval_games=args.eval_games,
               belief_particles=args.belief_particles, belief_ess_frac=args.belief_ess_frac,
-              mcts_in_eval=args.mcts_eval, mcts_sims=args.mcts_sims, mcts_sims_eval=args.mcts_sims_eval, mcts_dets=args.mcts_dets, mcts_c_puct=args.mcts_c_puct,
+              mcts_in_eval=args.mcts_eval, mcts_train=args.mcts_train, mcts_sims=args.mcts_sims, mcts_sims_eval=args.mcts_sims_eval, mcts_dets=args.mcts_dets, mcts_c_puct=args.mcts_c_puct,
               mcts_root_temp=args.mcts_root_temp, mcts_prior_smooth_eps=args.mcts_prior_smooth_eps,
               mcts_dirichlet_alpha=args.mcts_dirichlet_alpha, mcts_dirichlet_eps=args.mcts_dirichlet_eps,
               num_envs=args.num_envs)

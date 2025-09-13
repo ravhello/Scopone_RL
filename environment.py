@@ -69,7 +69,6 @@ class ScoponeEnvMA(gym.Env):
         
         # OTTIMIZZAZIONE: Migliore struttura dati per la cache delle azioni valide (LRU)
         self._valid_actions_cache = OrderedDict()
-        self._last_state_hash = None
         self._cache_hits = 0
         self._cache_misses = 0
         
@@ -158,7 +157,6 @@ class ScoponeEnvMA(gym.Env):
         # reset cache per sicurezza
         cloned._valid_actions_cache = OrderedDict()
         cloned._observation_cache = OrderedDict()
-        cloned._last_state_hash = None
         # Ricostruisci le cache ID/bitset per allinearle allo stato copiato
         try:
             cloned._rebuild_id_caches()
@@ -298,9 +296,6 @@ class ScoponeEnvMA(gym.Env):
         captured_hot_empty = torch.zeros((pid_rows_empty.numel(), 40), dtype=torch.float32, device=device)
 
         # AP: asso piglia tutto (aggiungi cattura completa per tutte le A in mano)
-        ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
-        ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
-        ap_only_empty = bool(self.rules.get("asso_piglia_tutto_posabile_only_empty", False))
         is_ace = (hand_ranks == 1)
         pid_rows_ap = torch.empty((0,), dtype=torch.long, device=device)
         captured_hot_ap = torch.empty((0,40), dtype=torch.float32, device=device)
@@ -333,6 +328,17 @@ class ScoponeEnvMA(gym.Env):
         if hand_ids_t.numel() > 0 and actions.size(0) == 0:
             raise RuntimeError(f"No valid actions for player {self.current_player} (hand_ids={hand_ids_t.tolist()}, table_ids={table_ids_t.tolist()}, rules={self.rules})")
 
+        # Aggiorna cache LRU e contatori
+        try:
+            # limita la dimensione della cache per evitare crescita non controllata
+            self._valid_actions_cache[state_key] = actions
+            self._valid_actions_cache.move_to_end(state_key)
+            # cap manuale: riusa _cache_capacity (stessa capacità delle osservazioni)
+            while len(self._valid_actions_cache) > self._cache_capacity:
+                self._valid_actions_cache.popitem(last=False)
+        except Exception:
+            pass
+        self._cache_misses += 1
         self._get_valid_actions_time += time.time() - start_time
         return actions
     
@@ -622,13 +628,12 @@ class ScoponeEnvMA(gym.Env):
             
             # Restituisci la ricompensa finale per il team del giocatore corrente
             current_team = 0 if current_player in [0, 2] else 1
-            return obs_final, final_reward[current_team], True, info
+            return obs_final, float(final_reward[current_team]), True, info
         else:
             # Passa al prossimo giocatore
             self.current_player = (self.current_player + 1) % 4
             
             # OTTIMIZZAZIONE: Invalida la cache delle azioni valide
-            self._last_state_hash = None
             
             # Ottieni la prossima osservazione
             next_obs = self._get_observation(self.current_player)
@@ -699,7 +704,6 @@ class ScoponeEnvMA(gym.Env):
         
         # Reset delle cache (LRU)
         self._valid_actions_cache = OrderedDict()
-        self._last_state_hash = None
         self._observation_cache = OrderedDict()
         # Ricostruisci cache ID/bitset
         try:
@@ -747,5 +751,6 @@ class ScoponeEnvMA(gym.Env):
             if total_cache > 0:
                 hit_rate = self._cache_hits / total_cache * 100
                 print(f"  Action cache hit rate: {hit_rate:.1f}% ({self._cache_hits}/{total_cache})")
+
 
 

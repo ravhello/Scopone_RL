@@ -61,6 +61,8 @@ class StateEncoder10823(nn.Module):
             obs = obs.unsqueeze(0)
         if obs.device != device:
             obs = obs.to(device)
+        if not torch.isfinite(obs).all():
+            raise RuntimeError("StateEncoderCompact.forward: obs contains non-finite values")
 
         cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
         with cm:
@@ -113,7 +115,11 @@ class StateEncoderCompact(nn.Module):
     def __init__(self):
         super().__init__()
         # Card embedding for permutation-invariant set encoding (40 card IDs)
-        self.card_emb = nn.Parameter(torch.randn(40, 32) * 0.02)
+        # Initialize deterministically and ensure finite values
+        torch.manual_seed(0)
+        ce = torch.randn(40, 32, device=device, dtype=torch.float32) * 0.02
+        ce = torch.nan_to_num(ce, nan=0.0, posinf=0.0, neginf=0.0)
+        self.card_emb = nn.Parameter(ce)
         # Small processors for counts and concatenations
         self.counts_head_hand = nn.Sequential(nn.Linear(3, 16), nn.ReLU())    # other hands sizes
         self.counts_head_cap = nn.Sequential(nn.Linear(2, 16), nn.ReLU())     # captured counts
@@ -139,6 +145,10 @@ class StateEncoderCompact(nn.Module):
         # deleghiamo a self.stats_processor (LazyLinear) l'adattamento alla nuova dimensione.
         self.combiner = nn.Sequential(nn.Linear(224, 256), nn.ReLU())
         self.to(device)
+        # Final guard after move to device
+        with torch.no_grad():
+            if not torch.isfinite(self.card_emb).all():
+                self.card_emb.copy_(torch.zeros_like(self.card_emb))
         # Pre-create positional ids for up to 40 steps to avoid per-forward arange
         self.register_buffer('_hist_pos_ids', torch.arange(40, dtype=torch.long, device=device))
 
@@ -273,10 +283,24 @@ class StateEncoderCompact(nn.Module):
             hand_mask = hand_table[:, :40]
             other_counts = hand_table[:, 40:43]
             table_mask = hand_table[:, 43:83]
+            # Validate inputs are finite and in [0,1]
+            for name, t in (('hand_mask', hand_mask), ('other_counts', other_counts), ('table_mask', table_mask)):
+                if not torch.isfinite(t).all():
+                    raise RuntimeError(f"StateEncoderCompact: {name} contains non-finite values")
+                if (t.min() < 0) or (t.max() > 1):
+                    raise RuntimeError(f"StateEncoderCompact: {name} out of [0,1] range")
             card_emb = self.card_emb
+            # Parameter sanity before use
+            if not torch.isfinite(card_emb).all():
+                raise RuntimeError("StateEncoderCompact: card_emb contains non-finite values")
+            w_cnt: nn.Linear = self.counts_head_hand[0]  # type: ignore
+            if (not torch.isfinite(w_cnt.weight).all()) or (not torch.isfinite(w_cnt.bias).all()):
+                raise RuntimeError("StateEncoderCompact: counts_head_hand weights contain non-finite values")
             hand_feat = torch.matmul(hand_mask, card_emb)           # (B,32)
             table_feat = torch.matmul(table_mask, card_emb)         # (B,32)
             other_cnt_feat = self.counts_head_hand(other_counts)    # (B,16)
+            if (not torch.isfinite(hand_feat).all()) or (not torch.isfinite(table_feat).all()) or (not torch.isfinite(other_cnt_feat).all()):
+                raise RuntimeError("StateEncoderCompact: non-finite set base features (hand/table/counts)")
             # Cross-attention mano↔tavolo
             hand_present = (hand_mask > 0.5)
             table_present = (table_mask > 0.5)
@@ -289,6 +313,8 @@ class StateEncoderCompact(nn.Module):
                                                    hand_present, table_present)  # (B,32)
             table_attn_feat = self._mha_masked_mean(self.cross_attn_t2h, table_seq, hand_seq, hand_seq,
                                                     table_present, hand_present)  # (B,32)
+            if (not torch.isfinite(hand_attn_feat).all()) or (not torch.isfinite(table_attn_feat).all()):
+                raise RuntimeError("StateEncoderCompact: non-finite attention features")
 
             # captured
             cap0_mask = captured[:, :40]
@@ -310,6 +336,8 @@ class StateEncoderCompact(nn.Module):
             set_merged[:, pos:pos+16] = other_cnt_feat; pos += 16
             set_merged[:, pos:pos+16] = cap_cnt_feat; pos += 16
             set_feat = self.set_merge_head(set_merged)               # (B,64)
+            if not torch.isfinite(set_feat).all():
+                raise RuntimeError("StateEncoderCompact: non-finite set_feat")
 
             # ----- History Transformer -----
             if k > 0:
@@ -323,14 +351,27 @@ class StateEncoderCompact(nn.Module):
                 hist_feat = henc.mean(dim=1)                         # (B,64)
             else:
                 hist_feat = torch.zeros((B, 64), dtype=obs.dtype, device=obs.device)
+            if not torch.isfinite(hist_feat).all():
+                raise RuntimeError("StateEncoderCompact: non-finite hist_feat")
 
             # Stats e seat/team
             stats_feat = self.stats_processor(stats)
+            if not torch.isfinite(stats_feat).all():
+                raise RuntimeError("StateEncoderCompact: non-finite stats_feat")
             if seat_team_vec is None:
                 seat_team_vec = torch.zeros((B, 6), dtype=torch.float32, device=obs.device)
             elif seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
+            # Validate seat/team vector: one-hot seat and flags in [0,1]
+            if seat_team_vec.size(-1) != 6:
+                raise ValueError("StateEncoderCompact: seat_team_vec must have shape (B,6)")
+            if not (seat_team_vec[:, :4].sum(dim=1) == 1).all():
+                raise RuntimeError("StateEncoderCompact: seat one-hot invalid (sum != 1)")
+            if ((seat_team_vec[:, 4:6] < 0) | (seat_team_vec[:, 4:6] > 1)).any():
+                raise RuntimeError("StateEncoderCompact: team flags out of [0,1]")
             seat_feat = F.relu(self.seat_head[0](seat_team_vec), inplace=True)
+            if not torch.isfinite(seat_feat).all():
+                raise RuntimeError("StateEncoderCompact: non-finite seat_feat")
 
             combined = torch.empty((B, 64+64+64+32), dtype=set_feat.dtype, device=set_feat.device)
             p2 = 0
@@ -339,6 +380,8 @@ class StateEncoderCompact(nn.Module):
             combined[:, p2:p2+64] = stats_feat; p2 += 64
             combined[:, p2:p2+32] = seat_feat; p2 += 32
             context = F.relu(self.combiner[0](combined), inplace=True)
+            if not torch.isfinite(context).all():
+                raise RuntimeError("StateEncoderCompact: non-finite context output")
         return context
 
 
@@ -359,6 +402,13 @@ class ActionEncoder80(nn.Module):
             actions = actions.unsqueeze(0)
         if (actions.device.type != device.type) or (actions.dtype != torch.float32):
             actions = actions.to(device=device, dtype=torch.float32)
+        # Validate last-dimension matches expected input features
+        try:
+            in_dim = int(self.net[0].in_features)  # type: ignore[attr-defined]
+        except Exception:
+            in_dim = 80
+        if actions.size(-1) != in_dim:
+            raise ValueError(f"ActionEncoder80: expected last-dim {in_dim}, got {int(actions.size(-1))}")
         return self.net(actions)
 
 
@@ -414,12 +464,17 @@ class BeliefNet(nn.Module):
         x = x / t
         # softmax per-carta (dim=1 sui 3 giocatori)
         probs = torch.softmax(x, dim=1)
+        if not torch.isfinite(probs).all():
+            raise RuntimeError("BeliefNet.probs: softmax produced non-finite probabilities")
         if visible_mask_40 is not None:
             if visible_mask_40.dim() == 1:
                 visible_mask_40 = visible_mask_40.unsqueeze(0)
             # azzera probabilità per carte visibili
             m = visible_mask_40.to(probs.dtype).unsqueeze(1)  # (B,1,40)
             probs = probs * (1.0 - m)
+        # Normalize across players for each card (avoid zero rows)
+        denom = probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        probs = probs / denom
         return probs.view(B, 120)
 
 
@@ -440,7 +495,7 @@ class ActionConditionedActor(torch.nn.Module):
         # BeliefNet neurale migliorata (state_feat 256 -> logits 120)
         self.belief_net = BeliefNet(in_dim=256, hidden_dim=512)
         # Partner-aware: embed per-carta (40→32) e gating separato partner/opps
-        self.belief_card_emb = nn.Parameter(torch.randn(40, 32) * 0.02)
+        self.belief_card_emb = nn.Parameter(torch.randn(40, 32, device=device, dtype=torch.float32) * 0.02)
         self.partner_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
         self.opp_gate = nn.Sequential(nn.Linear(256, 32), nn.Sigmoid())
         # Merge: stato 256 + belief_head 64 + partner 32 + opp 32 = 384
@@ -448,7 +503,7 @@ class ActionConditionedActor(torch.nn.Module):
         self.state_to_action = nn.Linear(256, 64)
         self.action_enc = ActionEncoder80(action_dim)
         # Embedding per la selezione carta (40 carte)
-        self.card_emb_play = nn.Parameter(torch.randn(40, 64) * 0.02)
+        self.card_emb_play = nn.Parameter(torch.randn(40, 64, device=device, dtype=torch.float32) * 0.02)
         # Cache di tutte le azioni one-hot (80 x 80) per calcolare logits pieni
         self.register_buffer('all_actions_eye', torch.eye(action_dim, dtype=torch.float32))
         # Cache embedding azioni per device/dtype (solo per inference)
@@ -717,6 +772,16 @@ class ActionConditionedActor(torch.nn.Module):
             legals_t = torch.as_tensor(legals, dtype=torch.float32, device=state_proj.device)
         else:
             legals_t = legals.to(state_proj.device, dtype=torch.float32)
+        # Validate legals shape and structure
+        if legals_t.dim() != 2 or legals_t.size(1) != 80:
+            raise ValueError(f"Actor.forward: legals must be (A,80), got {tuple(legals_t.shape)}")
+        ones = legals_t[:, :40].sum(dim=1)
+        if not torch.allclose(ones, torch.ones_like(ones)):
+            raise RuntimeError("Actor.forward: each legal must have exactly one played bit in [:40]")
+        cap = legals_t[:, 40:]
+        cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)
+        if bool(cap_bad.any().item() if torch.is_tensor(cap_bad) else cap_bad.any()):
+            raise RuntimeError("Actor.forward: captured section must be binary (0/1)")
         # B atteso = 1 in path di selezione
         # In training evita la tabella cache per mantenere gradiente
         if self.training:

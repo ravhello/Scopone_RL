@@ -26,7 +26,13 @@ def encode_action(card, cards_to_capture):
     else:
         rank, suit = card
         suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-        cid = (rank - 1) * 4 + suit_to_col[suit]
+        if suit not in suit_to_col:
+            raise ValueError(f"encode_action: invalid suit '{suit}'")
+        if not (1 <= int(rank) <= 10):
+            raise ValueError(f"encode_action: invalid rank {rank} (expected 1..10)")
+        cid = (int(rank) - 1) * 4 + suit_to_col[suit]
+    if not (0 <= cid <= 39):
+        raise ValueError(f"encode_action: played card id {cid} out of range 0..39")
     row = (cid // 4)
     col = (cid % 4)
     played_card_matrix[row, col] = 1.0
@@ -38,7 +44,13 @@ def encode_action(card, cards_to_capture):
         else:
             capt_rank, capt_suit = capt_card
             suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-            cid = (capt_rank - 1) * 4 + suit_to_col[capt_suit]
+            if capt_suit not in suit_to_col:
+                raise ValueError(f"encode_action: invalid captured suit '{capt_suit}'")
+            if not (1 <= int(capt_rank) <= 10):
+                raise ValueError(f"encode_action: invalid captured rank {capt_rank} (expected 1..10)")
+            cid = (int(capt_rank) - 1) * 4 + suit_to_col[capt_suit]
+        if not (0 <= cid <= 39):
+            raise ValueError(f"encode_action: captured card id {cid} out of range 0..39")
         capt_row = (cid // 4)
         capt_col = (cid % 4)
         captured_cards_matrix[capt_row, capt_col] = 1.0
@@ -82,6 +94,26 @@ def decode_action(action_vec):
 def _decode_ids(vec_t: torch.Tensor):
     if vec_t.dim() != 1 or vec_t.numel() != 80:
         raise ValueError("decode_action_ids richiede un vettore 80-dim")
+    if not torch.isfinite(vec_t).all():
+        raise RuntimeError("decode_action_ids: vettore azione contiene valori non-finiti")
+    # Valori ammessi in [0,1] con tolleranza numerica
+    vmin = float(vec_t.min().item())
+    vmax = float(vec_t.max().item())
+    if vmin < -1e-6 or vmax > 1.0 + 1e-6:
+        raise RuntimeError(f"decode_action_ids: valori fuori range [0,1] (min={vmin}, max={vmax})")
+    # Esattamente 1 bit per la carta giocata
+    played_sum = vec_t[:40].sum()
+    s_val = float(played_sum.item())
+    if s_val <= 0:
+        raise ValueError("decode_action_ids: nessuna carta giocata indicata (somma sezione 0..39 == 0)")
+    # Esattamente un bit a 1 nella sezione played (tolleranza numerica minima)
+    if abs(s_val - 1.0) > 1e-6:
+        raise RuntimeError(f"decode_action_ids: sezione played deve avere somma 1.0, trovata {s_val}")
+    # Sezione captured: consentiti solo 0/1 (entro tolleranza)
+    cap = vec_t[40:]
+    cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)
+    if bool(cap_bad.any().item() if torch.is_tensor(cap_bad) else cap_bad.any()):
+        raise RuntimeError("decode_action_ids: sezione captured deve essere binaria (0/1)")
     # Avoid per-element .item(); move once to CPU for indexing scalars
     played_idx = torch.argmax(vec_t[:40])
     captured_ids = torch.nonzero(vec_t[40:] > 0, as_tuple=False).flatten()
@@ -133,6 +165,11 @@ def get_valid_actions(game_state, current_player):
         return valid_actions
     if not isinstance(hand[0], int) or (len(table) > 0 and not isinstance(table[0], int)):
         raise TypeError("get_valid_actions richiede game_state in ID (int)")
+    # Validate IDs in range 0..39
+    if any((int(h) < 0 or int(h) > 39) for h in hand):
+        raise ValueError("get_valid_actions: hand contains IDs out of range 0..39")
+    if any((int(t) < 0 or int(t) > 39) for t in table):
+        raise ValueError("get_valid_actions: table contains IDs out of range 0..39")
     from observation import RANK_OF_ID as _RANK_OF_ID
     hand_ids_t = torch.as_tensor(hand, dtype=torch.long, device=device)
     table_ids_t = torch.as_tensor(table or [], dtype=torch.long, device=device)

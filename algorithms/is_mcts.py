@@ -47,6 +47,22 @@ def run_is_mcts(env: ScoponeEnvMA,
     - prior_smooth_eps: smoothing dei prior con (1-eps)*p + eps/|A|
     - root_temperature: softmax su N^(1/T) per la scelta finale (0 => argmax N)
     """
+    # Validate input hyperparameters
+    if int(num_simulations) < 0:
+        raise ValueError("IS-MCTS: num_simulations must be >= 0")
+    if int(num_determinization) <= 0:
+        raise ValueError("IS-MCTS: num_determinization must be >= 1")
+    if float(c_puct) < 0:
+        raise ValueError("IS-MCTS: c_puct must be >= 0")
+    if float(root_temperature) < 0:
+        raise ValueError("IS-MCTS: root_temperature must be >= 0")
+    if float(prior_smooth_eps) < 0 or float(prior_smooth_eps) > 1:
+        raise ValueError("IS-MCTS: prior_smooth_eps must be in [0,1]")
+    if float(root_dirichlet_eps) < 0 or float(root_dirichlet_eps) > 1:
+        raise ValueError("IS-MCTS: root_dirichlet_eps must be in [0,1]")
+    if float(root_dirichlet_alpha) < 0:
+        raise ValueError("IS-MCTS: root_dirichlet_alpha must be >= 0")
+
     root_env = env.clone()
     obs = root_env._get_observation(root_env.current_player)
     legals = root_env.get_valid_actions()
@@ -88,12 +104,15 @@ def run_is_mcts(env: ScoponeEnvMA,
     # Prior iniziali (supporta tensori torch su CUDA)
     try:
         priors = policy_fn(obs, legals)
-    except NameError:
-        # Nessun fallback consentito
-        notify_fallback('is_mcts.prior_name_error')
+    except Exception as e:
+        raise RuntimeError("IS-MCTS: policy_fn failed to produce priors") from e
     import numpy as _np
     if isinstance(priors, _np.ndarray):
         priors_len = len(priors)
+        if priors_len != len(legals):
+            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals)}")
+        if not _np.isfinite(priors).all():
+            raise RuntimeError("IS-MCTS: priors contain non-finite values")
         if prior_smooth_eps > 0 and priors_len > 1:
             priors = (1 - prior_smooth_eps) * priors + prior_smooth_eps * (1.0 / priors_len)
         if root_dirichlet_eps > 0 and priors_len > 1 and root_dirichlet_alpha > 0:
@@ -106,6 +125,10 @@ def run_is_mcts(env: ScoponeEnvMA,
             priors = torch.as_tensor(priors, dtype=torch.float32, device=torch.device(_os.environ.get('SCOPONE_DEVICE', 'cpu')))
         device = priors.device
         priors_len = int(priors.numel())
+        if priors_len != len(legals):
+            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals)}")
+        if not torch.isfinite(priors).all():
+            raise RuntimeError("IS-MCTS: priors contain non-finite values")
         if prior_smooth_eps > 0 and priors_len > 1:
             priors = (1.0 - prior_smooth_eps) * priors + prior_smooth_eps * (1.0 / priors_len)
         if root_dirichlet_eps > 0 and priors_len > 1 and root_dirichlet_alpha > 0:
@@ -179,8 +202,8 @@ def run_is_mcts(env: ScoponeEnvMA,
                 if has_legals_s:
                     try:
                         priors_s = policy_fn(obs_s, legals_s)
-                    except NameError:
-                        priors_s = _np.ones(len(legals_s), dtype=_np.float32) / max(1, len(legals_s))
+                    except Exception as e:
+                        raise RuntimeError("IS-MCTS: policy_fn failed during expansion priors") from e
                     if isinstance(priors_s, _np.ndarray):
                         if prior_smooth_eps > 0 and len(priors_s) > 1:
                             priors_s = (1 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / len(priors_s))
@@ -253,7 +276,7 @@ def run_is_mcts(env: ScoponeEnvMA,
             probs_t = torch.clamp(probs_t, min=0.0)
             s = probs_t.sum()
             if not torch.isfinite(s) or s <= 0:
-                probs_t = torch.full_like(probs_t, 1.0 / max(1, probs_t.numel()))
+                raise RuntimeError("IS-MCTS: invalid root selection probabilities (NaN/Inf or zero-sum)")
             else:
                 probs_t = probs_t / s
             try:
@@ -298,7 +321,7 @@ def run_is_mcts(env: ScoponeEnvMA,
                 return best.action, p_vec
             return best.action
     except Exception:
-        # Nessun fallback CPU/numpy consentito
-        notify_fallback('is_mcts.final_selection_cpu_fallback')
+        # Nessun fallback consentito: propaga l'errore per diagnosi
+        raise
 
 

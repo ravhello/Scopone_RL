@@ -36,7 +36,10 @@ class ActionConditionedPPO:
         # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) outside no_grad/inference
         with torch.enable_grad():
             _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
-            _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device, requires_grad=True)
+            # Build valid seat/team vectors (one-hot seat + team flags)
+            _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device)
+            _seat_w[0, 0] = 1.0; _seat_w[0, 4] = 1.0  # seat 0, team0 flag
+            _seat_w[1, 1] = 1.0; _seat_w[1, 5] = 1.0  # seat 1, team1 flag
             # Initialize encoder path shared by actor/critic under autocast to avoid dtype mismatch
             cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
             with cm:
@@ -65,15 +68,18 @@ class ActionConditionedPPO:
             from utils.fallback import notify_fallback
             notify_fallback('ppo.init.compile_select_action_core_failed')
 
-        # Optimizers with fused/foreach when available to reduce kernel launches
+        # Optimizers with deduplicated shared encoder params to avoid double updates
+        shared_ids = {id(p) for p in self.actor.state_enc.parameters()}
+        actor_params = list(self.actor.parameters())
+        critic_params = [p for p in self.critic.parameters() if id(p) not in shared_ids]
         try:
-            self.opt_actor = optim.Adam(self.actor.parameters(), lr=lr, fused=True)
+            self.opt_actor = optim.Adam(actor_params, lr=lr, fused=True)
         except TypeError:
-            self.opt_actor = optim.Adam(self.actor.parameters(), lr=lr, foreach=True)
+            self.opt_actor = optim.Adam(actor_params, lr=lr, foreach=True)
         try:
-            self.opt_critic = optim.Adam(self.critic.parameters(), lr=lr, fused=True)
+            self.opt_critic = optim.Adam(critic_params, lr=lr, fused=True)
         except TypeError:
-            self.opt_critic = optim.Adam(self.critic.parameters(), lr=lr, foreach=True)
+            self.opt_critic = optim.Adam(critic_params, lr=lr, foreach=True)
         self.clip_ratio = clip_ratio
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
@@ -145,23 +151,142 @@ class ActionConditionedPPO:
     def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
-        # Fast path: if obs is already a tensor on device, use it directly
-        if torch.is_tensor(obs) and (obs.device.type == device.type):
-            obs_t = obs.to(dtype=torch.float32)
-            if obs_t.dim() == 1:
-                obs_t = obs_t.unsqueeze(0)
+        # Validate legal actions dimensionality (accept list of (80,) or tensor (A,80))
+        if torch.is_tensor(legal_actions):
+            if legal_actions.dim() != 2 or legal_actions.size(1) != self.run_config['action_dim']:
+                raise ValueError(f"legal actions tensor must be shape (A, 80), got {tuple(legal_actions.shape)}")
+            # Validate binary structure of action encoding
+            la = legal_actions
+            if (la.size(0) > 0) and (not torch.allclose(la[:, :40].sum(dim=1), torch.ones((la.size(0),), dtype=la.dtype, device=la.device))):
+                raise RuntimeError("select_action: each legal action must have exactly one played bit in [:40]")
+            cap = la[:, 40:]
+            if bool((((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)).any().item() if torch.is_tensor(cap) else False):
+                raise RuntimeError("select_action: captured section must be binary (0/1)")
+        elif isinstance(legal_actions, list) and len(legal_actions) > 0:
+            la0 = legal_actions[0]
+            if torch.is_tensor(la0):
+                if la0.dim() != 1 or la0.numel() != self.run_config['action_dim']:
+                    raise ValueError(f"each legal action vector must be shape (80,), got {tuple(la0.shape)}")
+                # Single-sample check for structure; full check done in core
+                if not torch.allclose(la0[:40].sum(), torch.tensor(1.0, dtype=la0.dtype, device=la0.device)):
+                    raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
+            else:
+                import numpy as _np
+                a0 = _np.asarray(la0)
+                if a0.ndim != 1 or a0.shape[0] != self.run_config['action_dim']:
+                    raise ValueError(f"each legal action vector must be shape (80,), got {a0.shape}")
+                s = float(a0[:40].sum())
+                if abs(s - 1.0) > 1e-6:
+                    raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
+        # Accept obs on CPU by staging through pinned memory when needed
+        if torch.is_tensor(obs):
+            if obs.device.type == device.type:
+                obs_t = obs.to(dtype=torch.float32)
+                if obs_t.dim() == 1:
+                    obs_t = obs_t.unsqueeze(0)
+            elif obs.device.type == 'cpu':
+                o_cpu = obs.detach().to('cpu', dtype=torch.float32)
+                if o_cpu.dim() == 1:
+                    o_cpu = o_cpu.unsqueeze(0)
+                # Use preallocated pinned buffer when shape matches
+                if getattr(self, '_obs_cpu_pinned', None) is not None and self._obs_cpu_pinned.shape == o_cpu.shape:
+                    try:
+                        self._obs_cpu_pinned.copy_(o_cpu, non_blocking=True)
+                        obs_t = self._obs_cpu_pinned.to(device=device, non_blocking=True)
+                    except Exception:
+                        obs_t = o_cpu.pin_memory().to(device=device, non_blocking=True)
+                else:
+                    try:
+                        obs_t = o_cpu.pin_memory().to(device=device, non_blocking=True)
+                    except Exception:
+                        obs_t = o_cpu.to(device=device)
+            else:
+                raise RuntimeError('select_action expects obs tensor on compute device or CPU tensor')
         else:
-            # Accept CPU obs only if env device is CPU; otherwise enforce GPU-only pipeline
-            raise RuntimeError('select_action expects obs tensor on compute device')
+            import numpy as _np
+            o_cpu = torch.as_tensor(obs, dtype=torch.float32, device='cpu')
+            if o_cpu.dim() == 1:
+                o_cpu = o_cpu.unsqueeze(0)
+            try:
+                obs_t = o_cpu.pin_memory().to(device=device, non_blocking=True)
+            except Exception:
+                obs_t = o_cpu.to(device=device)
 
-        # Fast path for legal_actions tensor already on device
-        if torch.is_tensor(legal_actions) and (legal_actions.device.type == device.type):
-            actions_t = legal_actions.to(dtype=torch.float32)
-        elif len(legal_actions) > 0 and torch.is_tensor(legal_actions[0]) and (legal_actions[0].device.type == device.type):
-            # Stack directly on device without CPU hop
-            actions_t = torch.stack(legal_actions).to(dtype=torch.float32)
+        # Legal actions: accept CPU and list inputs, stage via pinned memory when needed
+        if torch.is_tensor(legal_actions):
+            if legal_actions.device.type == device.type:
+                actions_t = legal_actions.to(dtype=torch.float32)
+            elif legal_actions.device.type == 'cpu':
+                la_cpu = legal_actions.detach().to('cpu', dtype=torch.float32)
+                # Use/grow preallocated pinned actions buffer
+                try:
+                    A = int(la_cpu.size(0))
+                except Exception:
+                    A = 0
+                if A > 0:
+                    try:
+                        self._ensure_actions_pinned_capacity(A)
+                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
+                    except Exception:
+                        try:
+                            actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                        except Exception:
+                            actions_t = la_cpu.to(device=device)
+                else:
+                    actions_t = la_cpu.to(device=device)
+            else:
+                raise RuntimeError('select_action expects legal_actions tensor on compute device or CPU tensor')
+        elif isinstance(legal_actions, list) and len(legal_actions) > 0:
+            if torch.is_tensor(legal_actions[0]):
+                # Stack on CPU then transfer via preallocated pinned buffer
+                la_cpu = torch.stack([x.detach().to('cpu', dtype=torch.float32) for x in legal_actions], dim=0)
+                try:
+                    A = int(la_cpu.size(0))
+                except Exception:
+                    A = 0
+                if A > 0:
+                    try:
+                        self._ensure_actions_pinned_capacity(A)
+                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
+                    except Exception:
+                        try:
+                            actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                        except Exception:
+                            actions_t = la_cpu.to(device=device)
+                else:
+                    actions_t = la_cpu.to(device=device)
+            else:
+                import numpy as _np
+                la_cpu = torch.as_tensor(_np.asarray(legal_actions, dtype=_np.float32), dtype=torch.float32, device='cpu')
+                try:
+                    A = int(la_cpu.size(0))
+                except Exception:
+                    A = 0
+                if A > 0:
+                    try:
+                        self._ensure_actions_pinned_capacity(A)
+                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
+                    except Exception:
+                        try:
+                            actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                        except Exception:
+                            actions_t = la_cpu.to(device=device)
+                else:
+                    actions_t = la_cpu.to(device=device)
         else:
-            raise RuntimeError('select_action expects legal_actions on compute device')
+            raise RuntimeError('select_action expects non-empty legal_actions')
+        # Validate each legal row has exactly one played bit
+        ones_per_row = actions_t[:, :40].sum(dim=1)
+        if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
+            raise RuntimeError("select_action: each legal action must have exactly one played bit in [:40]")
+        # Validate captured is binary
+        cap = actions_t[:, 40:]
+        cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)
+        if bool(cap_bad.any().item() if torch.is_tensor(cap_bad) else cap_bad.any()):
+            raise RuntimeError("select_action: captured section must be binary (0/1)")
 
         st = None
         if seat_team_vec is not None:
@@ -179,6 +304,14 @@ class ActionConditionedPPO:
                     st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
                 else:
                     raise RuntimeError('select_action expects seat_team_vec on compute device or as CUDA-ready tensor')
+            # Validate seat one-hot + team flags (after staging)
+            if st is not None:
+                if st.size(1) != 6:
+                    raise ValueError("select_action: seat_team_vec must have shape (B,6)")
+                if not (st[:, :4].sum(dim=1) == 1).all():
+                    raise RuntimeError("select_action: seat one-hot invalid (sum != 1)")
+                if ((st[:, 4:6] < 0) | (st[:, 4:6] > 1)).any():
+                    raise RuntimeError("select_action: team flags out of [0,1]")
         # belief handled internally by the actor
 
         # inference_mode disables autograd and some dispatcher overhead vs no_grad
@@ -192,6 +325,13 @@ class ActionConditionedPPO:
         """Pure compute core for select_action. Expects inputs already on device.
         Returns (chosen_action_tensor_on_device, logp_total_on_device, idx_on_device).
         """
+        # Strict shape/device checks
+        if obs_t.dim() != 2 or obs_t.size(0) != 1:
+            raise ValueError(f"_select_action_core expects obs_t with shape (1, D), got {tuple(obs_t.shape)}")
+        if actions_t.dim() != 2 or actions_t.size(1) != self.run_config['action_dim']:
+            raise ValueError(f"_select_action_core expects actions_t with shape (A, {self.run_config['action_dim']}), got {tuple(actions_t.shape)}")
+        if seat_team_t is not None and (seat_team_t.dim() != 2 or seat_team_t.size(1) != 6):
+            raise ValueError(f"_select_action_core expects seat_team_t with shape (1, 6), got {None if seat_team_t is None else tuple(seat_team_t.shape)}")
         cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
         with cm:
             # Scoring simultaneo di tutte le azioni legali via fattorizzazione
@@ -328,6 +468,10 @@ class ActionConditionedPPO:
                 notify_fallback('ppo.compute.to_cuda_nb.compile_check_failed')
             return x_cpu.pin_memory().to(device=device, dtype=dtype, non_blocking=True)
 
+        # Required keys validation
+        for key in ('obs','act','old_logp','ret','adv','legals','legals_offset','legals_count','chosen_index','seat_team'):
+            if key not in batch:
+                raise KeyError(f"compute_loss: missing batch key '{key}'")
         obs = to_cuda_nb(batch['obs'], torch.float32)
         seat = to_cuda_nb(batch['seat_team'], torch.float32)
         act = to_cuda_nb(batch['act'], torch.float32)
@@ -338,6 +482,11 @@ class ActionConditionedPPO:
         offs = to_cuda_nb(batch['legals_offset'], torch.long)
         cnts = to_cuda_nb(batch['legals_count'], torch.long)
         chosen_idx = to_cuda_nb(batch['chosen_index'], torch.long)
+        # Sanity on ragged indices
+        if obs.size(0) != seat.size(0) or obs.size(0) != act.size(0):
+            raise RuntimeError("compute_loss: batch size mismatch among obs/seat/act")
+        if obs.size(0) != offs.size(0) or obs.size(0) != cnts.size(0) or obs.size(0) != chosen_idx.size(0):
+            raise RuntimeError("compute_loss: ragged indices sizes mismatch with batch size")
         # Optional precomputed global action embeddings to avoid recomputation per minibatch
         a_emb_global = batch.get('a_emb_global', None)
         # distillazione MCTS (targets raggruppati per sample): policy piatta e peso per-sample
@@ -362,6 +511,13 @@ class ActionConditionedPPO:
         B = obs.size(0)
         # Prepara indici legal per minibatch usando offs/cnts contro legals globali
         max_cnt = int(cnts.max().item()) if B > 0 else 0
+        # Validate ragged structure before use
+        if (offs < 0).any() or (cnts < 0).any():
+            raise RuntimeError("compute_loss: negative offsets or counts in legals structure")
+        if int(offs[-1].item() + cnts[-1].item()) > int(legals.size(0)) if (B > 0 and legals.size(0) > 0) else False:
+            raise RuntimeError("compute_loss: last window exceeds legals length")
+        if (chosen_idx < 0).any() or ((chosen_idx >= cnts) & (cnts > 0)).any():
+            raise RuntimeError("compute_loss: chosen_index out of range for some rows")
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # Compute state features once; reuse for actor and critic
         state_feat = self.actor.compute_state_features(obs, seat)  # (B,256)
@@ -445,7 +601,11 @@ class ActionConditionedPPO:
             logp_new = torch.zeros((B,), device=device, dtype=state_proj.dtype)
             entropy = torch.tensor(0.0, device=device)
 
-        ratio = torch.exp(logp_new - old_logp)
+        # Stabilize ratio: clamp old_logp to avoid infs; use expm1 for small diffs if needed
+        logp_new_s = torch.nan_to_num(logp_new, nan=0.0, posinf=0.0, neginf=0.0)
+        old_logp_s = torch.nan_to_num(old_logp, nan=0.0, posinf=0.0, neginf=0.0)
+        ratio = torch.exp(logp_new_s - old_logp_s)
+        ratio = torch.nan_to_num(ratio, nan=1.0, posinf=1e6, neginf=0.0)
         clipped = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv
         # Maschera off-policy per step MCTS: quando presente mcts_weight>0, escludi la loss di policy
         mcts_w = batch.get('mcts_weight', None)
@@ -465,6 +625,10 @@ class ActionConditionedPPO:
             loss_pi = -(ppo_term.sum() / denom)
         else:
             loss_pi = -(torch.min(ratio * adv, clipped)).mean()
+        # Guard against non-finite intermediates spilling into the loss
+        for name, tensor in (("ratio", ratio), ("adv", adv), ("ret", ret)):
+            if not torch.isfinite(tensor).all():
+                raise RuntimeError(f"compute_loss: non-finite {name}")
 
         # Passa others_hands (se disponibile) al critico per percorso CTDE opzionale
         v = self.critic.forward_from_state(state_feat, obs, batch.get('others_hands', None), visible_mask_40=visible_mask_40)
@@ -500,6 +664,8 @@ class ActionConditionedPPO:
             logp_total_padded = torch.full((B, max_cnt), float('-inf'), dtype=cap_logits.dtype, device=device)
             logp_total_padded[mask] = logp_total_per_legal
             diff = safe_log_t - logp_total_padded
+            # Avoid 0 * inf -> NaN: only accumulate where target > 0
+            diff = torch.where(mask_pos, diff, torch.zeros_like(diff))
             kl_per_row = (target * diff).sum(dim=1)
             # Peso per incertezza calcolato sulle posizioni valide
             ent_row = torch.zeros_like(kl_per_row)
@@ -534,6 +700,16 @@ class ActionConditionedPPO:
 
         loss = loss_pi + self.value_coef * loss_v - self.entropy_coef * entropy + coef * distill_loss + belief_coef * belief_aux
         approx_kl = (old_logp - logp_new).mean()
+        # Finite checks on core scalars
+        for name, tensor in (
+            ('loss', loss),
+            ('loss_pi', loss_pi),
+            ('loss_v', loss_v),
+            ('entropy', entropy),
+            ('approx_kl', approx_kl),
+        ):
+            if not torch.isfinite(tensor).all():
+                raise RuntimeError(f"compute_loss: non-finite {name}")
         # clip fraction reale: frazione di sample con |ratio-1| > clip_ratio
         if B > 0:
             clip_frac = (torch.abs(ratio - 1.0) > self.clip_ratio).float().mean()
@@ -626,6 +802,11 @@ class ActionConditionedPPO:
                     # Unscale prima del grad clip
                     self.scaler.unscale_(self.opt_actor)
                     self.scaler.unscale_(self.opt_critic)
+                    # Check gradients finiti prima dello step
+                    for group in (self.actor.parameters(), self.critic.parameters()):
+                        for p in group:
+                            if p.grad is not None and (not torch.isfinite(p.grad).all()):
+                                raise RuntimeError("update: non-finite gradients detected")
                     # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
                     gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                     gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
@@ -635,6 +816,13 @@ class ActionConditionedPPO:
                     self.scaler.step(self.opt_actor)
                     self.scaler.step(self.opt_critic)
                     self.scaler.update()
+                    # Post-step: parametri finiti (cattura divergenze immediate)
+                    try:
+                        if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
+                            if not torch.isfinite(self.actor.state_enc.card_emb).all():
+                                raise RuntimeError("update: state_enc.card_emb became non-finite after step")
+                    except Exception:
+                        raise
                     # invalidate any inference caches after params changed
                     try:
                         self.actor.invalidate_action_cache()
@@ -644,6 +832,11 @@ class ActionConditionedPPO:
                 else:
                     loss, info = self.compute_loss(mini)
                     loss.backward()
+                    # Check gradients finiti prima dello step
+                    for group in (self.actor.parameters(), self.critic.parameters()):
+                        for p in group:
+                            if p.grad is not None and (not torch.isfinite(p.grad).all()):
+                                raise RuntimeError("update: non-finite gradients detected")
                     # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
                     gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                     gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
@@ -651,6 +844,13 @@ class ActionConditionedPPO:
                     gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
                     self.opt_actor.step()
                     self.opt_critic.step()
+                    # Post-step: parametri finiti
+                    try:
+                        if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
+                            if not torch.isfinite(self.actor.state_enc.card_emb).all():
+                                raise RuntimeError("update: state_enc.card_emb became non-finite after step")
+                    except Exception:
+                        raise
                     try:
                         self.actor.invalidate_action_cache()
                     except Exception:
