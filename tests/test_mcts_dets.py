@@ -4,7 +4,7 @@ from utils.seed import set_global_seeds
 import numpy as np
 
 def test_mcts_multiple_dets_runs():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=8)
+    env = ScoponeEnvMA(k_history=8)
     obs = env._get_observation(env.current_player)
     legals = env.get_valid_actions()
     assert len(legals) > 0
@@ -19,7 +19,7 @@ def test_mcts_multiple_dets_runs():
 
 def test_mcts_robust_vs_maxq_and_noise():
     set_global_seeds(123)
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env = ScoponeEnvMA(k_history=4)
     def policy_fn(o, leg):
         return np.ones(len(leg), dtype=np.float32) / len(leg)
     def value_fn(o, _env=None):
@@ -39,7 +39,7 @@ def test_mcts_robust_vs_maxq_and_noise():
 
 def test_mcts_temperature_effect_on_entropy():
     set_global_seeds(321)
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env = ScoponeEnvMA(k_history=4)
     def policy_fn(o, leg):
         return np.ones(len(leg), dtype=np.float32) / len(leg)
     def value_fn(o, _env=None):

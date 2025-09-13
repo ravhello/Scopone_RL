@@ -190,6 +190,12 @@ class StateEncoderCompact(nn.Module):
             o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
         if o.dtype != q.dtype:
             o = o.to(dtype=q.dtype)
+        # Safety: zero-out rows where queries or keys are entirely absent to avoid NaNs propagating
+        q_any = q_present.any(dim=1)
+        k_any = k_present.any(dim=1)
+        invalid_rows = (~q_any) | (~k_any)
+        if bool(invalid_rows.any()):
+            o[invalid_rows] = 0
         m = q_present.unsqueeze(-1).to(o.dtype)
         summed = (o * m).sum(dim=1)
         denom = m.sum(dim=1).clamp_min(1.0)
@@ -249,6 +255,19 @@ class StateEncoderCompact(nn.Module):
             hist_end = 165 + 61 * k
             history = obs[:, hist_start:hist_end]
             stats = obs[:, hist_end:]
+            # Align stats dimension to the LazyLinear in_features once materialized to avoid 99↔103 issues
+            try:
+                lin: nn.LazyLinear = self.stats_processor[0]  # type: ignore
+                in_feat = getattr(lin, 'in_features', None)
+                if in_feat is not None:
+                    Dcur = stats.size(1)
+                    if Dcur < in_feat:
+                        pad = torch.zeros((B, int(in_feat - Dcur)), dtype=stats.dtype, device=stats.device)
+                        stats = torch.cat([stats, pad], dim=1)
+                    elif Dcur > in_feat:
+                        stats = stats[:, :int(in_feat)]
+            except Exception:
+                pass
 
             # ----- Set encoders -----
             hand_mask = hand_table[:, :40]
@@ -449,7 +468,7 @@ class ActionConditionedActor(torch.nn.Module):
         cap1_mask = captured[:, 40:80]
         return hand_mask | table_mask | cap0_mask | cap1_mask
 
-    def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
+    def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
         if torch.is_tensor(obs):
             if (obs.device.type == device.type) and (obs.dtype == torch.float32):
                 x_obs = obs
@@ -462,7 +481,7 @@ class ActionConditionedActor(torch.nn.Module):
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
-            notify_fallback('models.actor.compute_state_proj.seat_team_missing')
+            raise ValueError("seat_team_vec is required (B,6)")
         else:
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
             if seat_team_vec.dim() == 1:
@@ -470,6 +489,12 @@ class ActionConditionedActor(torch.nn.Module):
             if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
+        if not torch.isfinite(state_feat).all():
+            bad = state_feat[~torch.isfinite(state_feat)]
+            raise RuntimeError(f"state_enc produced non-finite features (count={int(bad.numel())})")
+        if not torch.isfinite(state_feat).all():
+            bad = state_feat[~torch.isfinite(state_feat)]
+            raise RuntimeError(f"state_enc produced non-finite features (count={int(bad.numel())})")
         # Ensure BeliefNet receives its parameter dtype (avoids Half/Float mismatch outside autocast)
         bn_dtype = self.belief_net.fc_in.weight.dtype
         if state_feat.dtype != bn_dtype:
@@ -477,7 +502,16 @@ class ActionConditionedActor(torch.nn.Module):
         # belief neurale interno con maschera carte visibili
         visible_mask = self._visible_mask_from_obs(x_obs)
         belief_logits = self.belief_net(state_feat)        # (B,120)
+        # Safety clamp before softmax to avoid NaNs from extreme values
+        belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
+        if not torch.isfinite(belief_logits).all():
+            bad = belief_logits[~torch.isfinite(belief_logits)]
+            raise RuntimeError(f"BeliefNet produced non-finite logits (count={int(bad.numel())})")
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
+        belief_probs_flat = torch.nan_to_num(belief_probs_flat, nan=0.0, posinf=0.0, neginf=0.0)
+        if not torch.isfinite(belief_probs_flat).all():
+            bad = belief_probs_flat[~torch.isfinite(belief_probs_flat)]
+            raise RuntimeError(f"BeliefNet.probs produced non-finite probabilities (count={int(bad.numel())})")
         belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
         partner_slice = belief_probs_flat[:, 40:80]
         opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
@@ -496,10 +530,16 @@ class ActionConditionedActor(torch.nn.Module):
         ctx_in[:, p:p+32] = partner_feat; p += 32
         ctx_in[:, p:p+32] = opp_feat; p += 32
         state_ctx = self.merge(ctx_in)  # (B,256)
+        if not torch.isfinite(state_ctx).all():
+            bad = state_ctx[~torch.isfinite(state_ctx)]
+            raise RuntimeError(f"merge produced non-finite state_ctx (count={int(bad.numel())})")
         state_proj = self.state_to_action(state_ctx)  # (B,64)
+        if not torch.isfinite(state_proj).all():
+            bad = state_proj[~torch.isfinite(state_proj)]
+            raise RuntimeError(f"state_to_action produced non-finite state_proj (count={int(bad.numel())})")
         return state_proj
 
-    def compute_state_features(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
+    def compute_state_features(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
         """Calcola solo le feature di stato (256) dal pair (obs, seat)."""
         if torch.is_tensor(obs):
             if (obs.device.type == device.type) and (obs.dtype == torch.float32):
@@ -513,15 +553,18 @@ class ActionConditionedActor(torch.nn.Module):
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
-            notify_fallback('models.actor.compute_state_features.seat_team_missing')
-            seat_team_vec = torch.zeros((x_obs.size(0), 6), dtype=torch.float32, device=x_obs.device)
+            raise ValueError("seat_team_vec is required (B,6)")
         else:
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
             if seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
             if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
-        return self.state_enc(x_obs, seat_team_vec)  # (B,256)
+        sf = self.state_enc(x_obs, seat_team_vec)  # (B,256)
+        if not torch.isfinite(sf).all():
+            bad = sf[~torch.isfinite(sf)]
+            raise RuntimeError(f"state_enc produced non-finite features (count={int(bad.numel())})")
+        return sf
 
     def compute_state_proj_from_state(self, state_feat: torch.Tensor, x_obs: torch.Tensor, visible_mask_40: torch.Tensor = None) -> torch.Tensor:
         """Proietta feature di stato (256) in spazio azione (64) usando belief/gating dell'actor.
@@ -531,7 +574,15 @@ class ActionConditionedActor(torch.nn.Module):
             x_obs = x_obs.unsqueeze(0)
         visible_mask = (visible_mask_40 if visible_mask_40 is not None else self._visible_mask_from_obs(x_obs))
         belief_logits = self.belief_net(state_feat)        # (B,120)
+        belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
+        if not torch.isfinite(belief_logits).all():
+            bad = belief_logits[~torch.isfinite(belief_logits)]
+            raise RuntimeError(f"BeliefNet produced non-finite logits (count={int(bad.numel())})")
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
+        belief_probs_flat = torch.nan_to_num(belief_probs_flat, nan=0.0, posinf=0.0, neginf=0.0)
+        if not torch.isfinite(belief_probs_flat).all():
+            bad = belief_probs_flat[~torch.isfinite(belief_probs_flat)]
+            raise RuntimeError(f"BeliefNet.probs produced non-finite probabilities (count={int(bad.numel())})")
         belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
         partner_slice = belief_probs_flat[:, 40:80]
         opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
@@ -550,6 +601,9 @@ class ActionConditionedActor(torch.nn.Module):
         ctx_in[:, p:p+32] = partner_feat; p += 32
         ctx_in[:, p:p+32] = opp_feat; p += 32
         state_ctx = self.merge(ctx_in)  # (B,256)
+        if not torch.isfinite(state_ctx).all():
+            bad = state_ctx[~torch.isfinite(state_ctx)]
+            raise RuntimeError(f"merge produced non-finite state_ctx (count={int(bad.numel())})")
         return self.state_to_action(state_ctx)
 
     def invalidate_action_cache(self) -> None:
@@ -600,11 +654,8 @@ class ActionConditionedActor(torch.nn.Module):
             x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
-        # Seat/team: opzionale
         if seat_team_vec is None:
-            from utils.fallback import notify_fallback
-            notify_fallback('models.critic.forward.seat_team_missing')
-            seat_team_vec = torch.zeros((x_obs.size(0), 6), dtype=torch.float32, device=x_obs.device)
+            raise ValueError("seat_team_vec is required (B,6)")
         else:
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
             if seat_team_vec.dim() == 1:
@@ -618,7 +669,14 @@ class ActionConditionedActor(torch.nn.Module):
             state_feat = state_feat.to(dtype=bn_dtype)
         visible_mask = self._visible_mask_from_obs(x_obs)
         belief_logits = self.belief_net(state_feat)
+        belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
+        if not torch.isfinite(belief_logits).all():
+            bad = belief_logits[~torch.isfinite(belief_logits)]
+            raise RuntimeError(f"BeliefNet produced non-finite logits (count={int(bad.numel())})")
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
+        if not torch.isfinite(belief_probs_flat).all():
+            bad = belief_probs_flat[~torch.isfinite(belief_probs_flat)]
+            raise RuntimeError(f"BeliefNet.probs produced non-finite probabilities (count={int(bad.numel())})")
         belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
         # Partner index fisso nel nostro belief: slice centrale [40:80]
         partner_slice = belief_probs_flat[:, 40:80]
@@ -639,7 +697,13 @@ class ActionConditionedActor(torch.nn.Module):
         ctx2_in[:, p2:p2+32] = partner_feat; p2 += 32
         ctx2_in[:, p2:p2+32] = opp_feat; p2 += 32
         state_ctx = self.merge(ctx2_in)  # (B,256)
+        if not torch.isfinite(state_ctx).all():
+            bad = state_ctx[~torch.isfinite(state_ctx)]
+            raise RuntimeError(f"merge produced non-finite state_ctx (count={int(bad.numel())})")
         state_proj = self.state_to_action(state_ctx)  # (B,64)
+        if not torch.isfinite(state_proj).all():
+            bad = state_proj[~torch.isfinite(state_proj)]
+            raise RuntimeError(f"state_to_action produced non-finite state_proj (count={int(bad.numel())})")
 
         if legals is None:
             # Calcola logits per tutte le 80 azioni: (B,64) @ (64,80) -> (B,80)
@@ -746,6 +810,7 @@ class CentralValueNet(torch.nn.Module):
         cap1_mask = captured[:, 40:80] > 0.5
         visible_mask = hand_mask | table_mask | cap0_mask | cap1_mask
         b_logits = self.belief_net(state_feat)
+        b_logits = torch.nan_to_num(b_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
         b_probs_flat = self.belief_net.probs(b_logits, visible_mask)
         belief_feat = self.belief_head(b_probs_flat)
         # Partner/opponent channel split con gating
@@ -803,7 +868,9 @@ class CentralValueNet(torch.nn.Module):
         visible_mask_local = hand_mask | table_mask | cap0_mask | cap1_mask
         visible_mask = (visible_mask_40 if visible_mask_40 is not None else visible_mask_local)
         b_logits = self.belief_net(sf)
+        b_logits = torch.nan_to_num(b_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
         b_probs_flat = self.belief_net.probs(b_logits, visible_mask)
+        b_probs_flat = torch.nan_to_num(b_probs_flat, nan=0.0, posinf=0.0, neginf=0.0)
         belief_feat = self.belief_head(b_probs_flat)
         partner_slice = b_probs_flat[:, 40:80]
         opps_slice = b_probs_flat[:, 0:40] + b_probs_flat[:, 80:120]

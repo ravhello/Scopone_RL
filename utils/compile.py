@@ -11,8 +11,8 @@ def _env_enabled() -> bool:
     """Return True if global torch.compile is requested via unified or legacy env vars.
     Defaults to enabled.
     """
-    # Unified flag (default ON)
-    if os.environ.get('SCOPONE_TORCH_COMPILE', '1') == '1':
+    # Unified flag (default OFF; opt-in to avoid backend failures by default)
+    if os.environ.get('SCOPONE_TORCH_COMPILE', '0') == '1':
         return True
     # Back-compat: legacy flags
     if os.environ.get('TORCH_COMPILE', '0') == '1':

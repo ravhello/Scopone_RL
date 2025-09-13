@@ -89,19 +89,14 @@ def _decode_ids(vec_t: torch.Tensor):
     captured_cpu = captured_ids.tolist()
     return played_idx_cpu, captured_cpu
 
-def decode_action_ids(action_vec):
+def decode_action_ids(action_vec: torch.Tensor):
     """
     Decodifica un vettore azione 80-dim in (played_id, [captured_ids]) con card IDs 0..39.
+    Accetta solo torch.Tensor per API coerente nel core.
     """
-    # Esegui sempre la decodifica su CPU per evitare micro-kernel/copy su CUDA
-    if torch.is_tensor(action_vec):
-        vec_t = action_vec.detach().to('cpu', dtype=torch.float32).reshape(-1)
-    else:
-        # supporta list o numpy array
-        try:
-            vec_t = torch.as_tensor(action_vec, dtype=torch.float32, device='cpu').reshape(-1)
-        except Exception:
-            vec_t = torch.tensor(list(action_vec), dtype=torch.float32, device='cpu').reshape(-1)
+    if not torch.is_tensor(action_vec):
+        raise TypeError("decode_action_ids expects a torch.Tensor of shape (80,)")
+    vec_t = action_vec.detach().to('cpu', dtype=torch.float32).reshape(-1)
     return _decode_ids(vec_t)
 
 # ----- FAST PATH: subset-sum su ID con numba -----

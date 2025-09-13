@@ -5,7 +5,12 @@ from trainers.train_ppo import _compute_per_seat_diagnostics
 
 
 def test_compute_per_seat_diagnostics_shapes():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    import os
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     # create a tiny batch via collect_trajectory
     from trainers.train_ppo import collect_trajectory

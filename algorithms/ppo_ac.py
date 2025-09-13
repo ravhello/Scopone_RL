@@ -198,14 +198,31 @@ class ActionConditionedPPO:
             state_proj = self.actor.compute_state_proj(obs_t, seat_team_t)  # (1,64)
             # Precompute logits carta una volta (keep inside autocast for dtype alignment)
             card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t()).squeeze(0)  # (40)
+        # Early diagnostics on non-finite values
+        if not torch.isfinite(state_proj).all():
+            bad = state_proj[~torch.isfinite(state_proj)]
+            raise RuntimeError(f"Actor state_proj contains non-finite values (count={int(bad.numel())})")
+        if not torch.isfinite(card_logits_all).all():
+            bad = card_logits_all[~torch.isfinite(card_logits_all)]
+            raise RuntimeError(f"Actor card_logits_all contains non-finite values (count={int(bad.numel())})")
         played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
         # Evita torch.unique: computa logsumexp una sola volta e indicizza
         lse_cards = torch.logsumexp(card_logits_all, dim=0)  # scalar
         logp_cards_per_legal = card_logits_all[played_ids_all] - lse_cards  # (A)
+        # Validate legal actions have exactly one played bit per row
+        ones_per_row = actions_t[:, :40].sum(dim=1)
+        if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
+            raise RuntimeError(f"Invalid legal actions: expected exactly one played card per row, got sums={ones_per_row.tolist()}")
         # Use cached action embedding table to embed all legals in one matmul
         a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)  # (80,64)
         a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
+        if not torch.isfinite(a_emb).all():
+            bad = a_emb[~torch.isfinite(a_emb)]
+            raise RuntimeError(f"Action embeddings contain non-finite values (count={int(bad.numel())})")
         cap_logits = torch.matmul(a_emb, state_proj.squeeze(0).to(dtype=a_emb.dtype))  # (A)
+        if not torch.isfinite(cap_logits).all():
+            bad = cap_logits[~torch.isfinite(cap_logits)]
+            raise RuntimeError(f"Capture logits contain non-finite values (count={int(bad.numel())})")
         # log-softmax within group (card)
         group_ids = played_ids_all  # (A)
         num_groups = 40
@@ -223,13 +240,28 @@ class ActionConditionedPPO:
         # logp totale per legal = logp(card played) + logp(capture|card)
         logp_totals = logp_cards_per_legal + logp_cap_per_legal  # (A)
         probs = torch.softmax(logp_totals, dim=0)
-        # Sanitize before sampling: clamp negatives/NaN, renormalize; invalid sums error
+        # Sanitize before sampling: clamp negatives/NaN, then strictly validate
         probs = probs.nan_to_num(0.0)
         probs = torch.clamp(probs, min=0.0)
         s = probs.sum()
         if (not torch.isfinite(s)) or (s <= 0):
-            A = int(probs.numel())
-            raise RuntimeError(f"Invalid probability distribution: sum={float(s.item())}, A={A}")
+            def _stats(t: torch.Tensor):
+                try:
+                    return {
+                        'min': float(torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0).min().item()),
+                        'max': float(torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0).max().item()),
+                        'nan': bool(torch.isnan(t).any().item()),
+                        'inf': bool(torch.isinf(t).any().item()),
+                    }
+                except Exception:
+                    return {'min': None, 'max': None, 'nan': None, 'inf': None}
+            a = int(probs.numel())
+            sval = float(s.item()) if torch.is_tensor(s) else float(s)
+            raise RuntimeError(
+                f"Invalid probability distribution: sum={sval}, num_actions={a}; "
+                f"card_logits_all={_stats(card_logits_all)}, cap_logits={_stats(cap_logits)}, "
+                f"logp_cards={_stats(logp_cards_per_legal)}, logp_cap={_stats(logp_cap_per_legal)}"
+            )
         probs = probs / s
         # Fast sampling via cumulative sum + searchsorted with safe bounds
         cdf = torch.cumsum(probs, dim=0)
@@ -558,8 +590,8 @@ class ActionConditionedPPO:
             if not self.actor.training:
                 try:
                     batch_cuda['a_emb_global'] = self.actor.action_enc(batch_cuda['legals']).detach()
-                except Exception:
-                    batch_cuda['a_emb_global'] = None
+                except Exception as e:
+                    raise RuntimeError("Failed to precompute global action embeddings (a_emb_global)") from e
             else:
                 batch_cuda['a_emb_global'] = None
 

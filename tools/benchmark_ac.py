@@ -49,7 +49,7 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
 
     # Build nets with correct obs_dim from env
     # Create a temp env to read obs_dim
-    tmp_env = ScoponeEnvMA(use_compact_obs=compact, k_history=k_history)
+    tmp_env = ScoponeEnvMA(k_history=k_history)
     obs_dim = tmp_env.observation_space.shape[0]
     del tmp_env
     actor = ActionConditionedActor(obs_dim=obs_dim)
@@ -73,37 +73,36 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
         ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
     ))
     for g in range(games):
-        env = ScoponeEnvMA(use_compact_obs=compact, k_history=k_history)
+        env = ScoponeEnvMA(k_history=k_history)
         done = False
         info = {}
         while not done:
             obs = env._get_observation(env.current_player)
             legals = env.get_valid_actions()
-            if not legals:
+            # legals è sempre un Tensor (A,80)
+            if legals.numel() == 0:
                 break
             if use_mcts:
                 def policy_fn(o, leg):
                     o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
-                    if len(leg) > 0 and torch.is_tensor(leg[0]):
-                        leg_t = torch.stack(leg).to(device=device, dtype=torch.float32)
-                    else:
-                        leg_t = torch.stack([
-                            x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
-                        for x in leg], dim=0)
+                    # leg è sempre Tensor (A,80)
+                    leg_t = leg if leg.dim() == 2 else leg.unsqueeze(0)
+                    leg_t = leg_t.to(device=device, dtype=torch.float32)
+                    cp = getattr(env, 'current_player', 0)
+                    seat = torch.zeros((1,6), dtype=torch.float32, device=device)
+                    seat[0, cp] = 1.0
+                    seat[0, 4] = 1.0 if cp in [0,2] else 0.0
+                    seat[0, 5] = 1.0 if cp in [1,3] else 0.0
                     with torch.no_grad():
-                        logits = actor(o_t.unsqueeze(0), leg_t)
+                        logits = actor(o_t.unsqueeze(0), leg_t, seat)
                     return torch.softmax(logits, dim=0)
                 def value_fn(o, _env=None):
                     o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
-                    # build seat vector
-                    if _env is not None:
-                        cp = _env.current_player
-                        s = torch.zeros(6, dtype=torch.float32, device=device)
-                        s[cp] = 1.0
-                        s[4] = 1.0 if cp in [0, 2] else 0.0
-                        s[5] = 1.0 if cp in [1, 3] else 0.0
-                    else:
-                        s = torch.zeros(6, dtype=torch.float32, device=device)
+                    cp = _env.current_player if _env is not None else 0
+                    s = torch.zeros(6, dtype=torch.float32, device=device)
+                    s[cp] = 1.0
+                    s[4] = 1.0 if cp in [0, 2] else 0.0
+                    s[5] = 1.0 if cp in [1, 3] else 0.0
                     with torch.no_grad():
                         return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
                 # belief sampler neurale per determinizzazione
@@ -160,13 +159,15 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
             else:
                 with torch.no_grad():
                     o_t = obs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(obs) else torch.tensor(obs, dtype=torch.float32, device=device)
-                    if len(legals) > 0 and torch.is_tensor(legals[0]):
-                        leg_t = torch.stack(legals).to(device=device, dtype=torch.float32)
-                    else:
-                        leg_t = torch.stack([
-                            x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
-                        for x in legals], dim=0)
-                    logits = actor(o_t.unsqueeze(0), leg_t)
+                    # legals è sempre Tensor (A,80)
+                    leg_t = legals if legals.dim() == 2 else legals.unsqueeze(0)
+                    leg_t = leg_t.to(device=device, dtype=torch.float32)
+                    cp = getattr(env, 'current_player', 0)
+                    seat = torch.zeros((1,6), dtype=torch.float32, device=device)
+                    seat[0, cp] = 1.0
+                    seat[0, 4] = 1.0 if cp in [0,2] else 0.0
+                    seat[0, 5] = 1.0 if cp in [1,3] else 0.0
+                    logits = actor(o_t.unsqueeze(0), leg_t, seat)
                     idx = torch.argmax(logits).item()
                 action = legals[idx]
             _, _, done, info = env.step(action)

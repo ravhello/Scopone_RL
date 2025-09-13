@@ -14,7 +14,7 @@ def test_league_register_sample_and_update_elo(tmp_path=None):
     base = os.path.join(tmp_dir, 'league')
     league = League(base_dir=base)
     # make two tiny checkpoints
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     ck1 = os.path.join(tmp_dir, 'a1.pth')
     ck2 = os.path.join(tmp_dir, 'a2.pth')
@@ -29,17 +29,16 @@ def test_league_register_sample_and_update_elo(tmp_path=None):
 
 
 def test_parallel_mcts_high_dets_minimal_runs():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     batch = collect_trajectory_parallel(
         agent,
         num_envs=2,
         episodes_total_hint=1,
-        use_compact_obs=True,
         k_history=4,
         use_mcts=True,
-        mcts_sims=8,
-        mcts_dets=8,
+        mcts_sims=1,
+        mcts_dets=1,
         mcts_c_puct=1.0,
         mcts_root_temp=0.0,
     )

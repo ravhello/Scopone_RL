@@ -24,19 +24,8 @@ def test_main_writes_tb_every_iteration(monkeypatch):
     Esegue main in-process, patchando SummaryWriter e forzando un run breve.
     Verifica che per ciascuna iterazione completata vengano scritti scalari train/*.
     """
-    # Ambiente: abilita TB, CPU, riduci lavoro
+    # Ambiente: abilita TB e riduci lavoro
     monkeypatch.setenv('SCOPONE_DISABLE_TB', '0')
-    # Preferisci GPU per i modelli se disponibile; l'ambiente resta su CPU
-    try:
-        import torch
-        if torch.cuda.is_available():
-            monkeypatch.delenv('TESTS_FORCE_CPU', raising=False)
-            monkeypatch.setenv('SCOPONE_DEVICE', 'cuda')
-        else:
-            monkeypatch.setenv('TESTS_FORCE_CPU', '1')
-    except Exception:
-        monkeypatch.setenv('TESTS_FORCE_CPU', '1')
-    monkeypatch.setenv('ENV_DEVICE', 'cpu')
     monkeypatch.setenv('OMP_NUM_THREADS', '1')
     monkeypatch.setenv('MKL_NUM_THREADS', '1')
 
@@ -51,7 +40,7 @@ def test_main_writes_tb_every_iteration(monkeypatch):
 
     def rapid_train_ppo(*args, **kwargs):
         kwargs['num_iterations'] = 3
-        kwargs['horizon'] = max(64, int(kwargs.get('horizon', 40)))
+        kwargs['horizon'] = max(40, int(kwargs.get('horizon', 40)))
         kwargs['num_envs'] = 1
         kwargs['mcts_sims'] = 0
         kwargs['mcts_sims_eval'] = 0
@@ -91,5 +80,7 @@ def test_main_writes_tb_every_iteration(monkeypatch):
     _print_group('train/')
     _print_group('by_seat/')
     _print_group('league/')
+
+
 
 

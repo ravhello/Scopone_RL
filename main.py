@@ -61,8 +61,12 @@ os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
 ## Alza il limite del cache di Dynamo per ridurre recompilazioni
 os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 ## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
-# Abilita di default feature dell'osservazione
+# Abilita e blocca i flag dell'osservazione all'avvio (usati da observation/environment al load)
+# Se l'utente li ha già impostati nel proprio run, li rispettiamo (setdefault)
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
+os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
+os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
 # Default to CPU unless overridden by user env
 os.environ.setdefault('SCOPONE_DEVICE', 'cpu') # puoi selezionare "cuda" se vuoi gpu
 os.environ.setdefault('ENV_DEVICE', 'cpu') # puoi selezionare "cuda" se vuoi gpu
@@ -110,6 +114,7 @@ def _maybe_launch_tensorboard():
 if __name__ == "__main__":
     device = get_compute_device()
     print(f"Using device: {device}")
+    """
     # Configure CPU threads for training in the main process only
     # Env workers keep their own setting (forced to 1 thread in trainers/train_ppo.py)
     try:
@@ -125,16 +130,17 @@ if __name__ == "__main__":
             pass
     except Exception:
         pass
+    """
     _maybe_launch_tensorboard()
     # Default to random seed for training runs (set -1); stable only if user sets it
     seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
     # Note: train_ppo will resolve and announce the effective seed
-    train_ppo(num_iterations=10, horizon=16384, use_compact_obs=True, k_history=39,
+    train_ppo(num_iterations=10, horizon=16384, k_history=39,
               num_envs=1,
               mcts_sims=0,
-              mcts_sims_eval=4,
+              mcts_sims_eval=0,
               eval_every=0,
-              mcts_in_eval=True,
+              mcts_in_eval=False,
               seed=seed_env)
 
 

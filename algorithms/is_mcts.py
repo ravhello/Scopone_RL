@@ -50,7 +50,12 @@ def run_is_mcts(env: ScoponeEnvMA,
     root_env = env.clone()
     obs = root_env._get_observation(root_env.current_player)
     legals = root_env.get_valid_actions()
-    if not legals:
+    # Support both Tensor (A,80) and list outputs without ambiguous truthiness
+    try:
+        is_empty = (hasattr(legals, 'numel') and legals.numel() == 0) or (hasattr(legals, '__len__') and len(legals) == 0)
+    except Exception:
+        is_empty = False
+    if is_empty:
         raise ValueError("No legal actions for IS-MCTS")
 
     # Helpers per chiavi
@@ -95,12 +100,10 @@ def run_is_mcts(env: ScoponeEnvMA,
             noise = _np.random.dirichlet([root_dirichlet_alpha] * priors_len)
             priors = (1 - root_dirichlet_eps) * priors + root_dirichlet_eps * noise
     else:
-        # Assume torch.Tensor su CUDA
-        import torch, os
+        # Assume torch.Tensor path
+        import os as _os
         if not torch.is_tensor(priors):
-            priors = torch.as_tensor(priors, dtype=torch.float32, device=torch.device(os.environ.get(
-                'SCOPONE_DEVICE', 'cpu'
-            )))
+            priors = torch.as_tensor(priors, dtype=torch.float32, device=torch.device(_os.environ.get('SCOPONE_DEVICE', 'cpu')))
         device = priors.device
         priors_len = int(priors.numel())
         if prior_smooth_eps > 0 and priors_len > 1:
@@ -172,7 +175,8 @@ def run_is_mcts(env: ScoponeEnvMA,
             if not sim_env.done:
                 obs_s = sim_env._get_observation(sim_env.current_player)
                 legals_s = sim_env.get_valid_actions()
-                if legals_s:
+                has_legals_s = (hasattr(legals_s, 'numel') and legals_s.numel() > 0) or (hasattr(legals_s, '__len__') and len(legals_s) > 0)
+                if has_legals_s:
                     try:
                         priors_s = policy_fn(obs_s, legals_s)
                     except NameError:
@@ -187,9 +191,8 @@ def run_is_mcts(env: ScoponeEnvMA,
                         legals_sel = [legals_s[i] for i in top_idx]
                         priors_sel = priors_s[top_idx]
                     else:
-                        import torch, os
                         if not torch.is_tensor(priors_s):
-                            priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=torch.device(os.environ.get('SCOPONE_DEVICE', 'cpu')))
+                            priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=torch.device(_os.environ.get('SCOPONE_DEVICE', 'cpu')))
                         if prior_smooth_eps > 0 and priors_s.numel() > 1:
                             priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
                         visits_here = max(1, node.N)

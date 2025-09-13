@@ -5,7 +5,11 @@ from algorithms.ppo_ac import ActionConditionedPPO
 
 
 def test_agent_save_and_load_roundtrip(tmp_path=None):
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     # do one tiny update to change weights
     from trainers.train_ppo import collect_trajectory
@@ -26,8 +30,8 @@ def test_agent_save_and_load_roundtrip(tmp_path=None):
     o = batch['obs'][:2].to(torch.float32)
     s = batch['seat_team'][:2].to(torch.float32)
     with torch.no_grad():
-        v1 = agent.critic(o.to('cuda'), s.to('cuda'))
-        v2 = agent2.critic(o.to('cuda'), s.to('cuda'))
+        v1 = agent.critic(o, s)
+        v2 = agent2.critic(o, s)
     assert v1.shape == v2.shape
 
 

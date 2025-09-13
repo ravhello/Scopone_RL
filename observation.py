@@ -1,6 +1,13 @@
 # observation.py - Versione Torch CUDA (no NumPy)
 import os
 import torch
+import torch.nn.functional as F
+try:
+    import torch._dynamo as _dynamo  # type: ignore
+    _dynamo_disable = _dynamo.disable  # type: ignore[attr-defined]
+except Exception:
+    def _dynamo_disable(fn):  # type: ignore
+        return fn
 
 SUITS = ['denari', 'coppe', 'spade', 'bastoni']
 RANKS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -18,7 +25,7 @@ OBS_DEVICE = torch.device(_os.environ.get('OBS_DEVICE', _os.environ.get('SCOPONE
 OBS_INCLUDE_INFERRED = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
 OBS_INCLUDE_RANK_PROBS = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
 OBS_INCLUDE_SCOPA_PROBS = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
-OBS_INCLUDE_DEALER = os.environ.get('OBS_INCLUDE_DEALER', '0') == '1'
+OBS_INCLUDE_DEALER = os.environ.get('OBS_INCLUDE_DEALER', '1') == '1'
 
 # ===== ID/Bitset helpers (device = OBS_DEVICE) =====
 RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
@@ -79,9 +86,11 @@ def encode_cards_as_matrix(cards):
         return torch.zeros(40, dtype=torch.float32, device=OBS_DEVICE)
     if not isinstance(cards[0], int):
         raise TypeError("encode_cards_as_matrix expects card IDs (int)")
-    idx = torch.as_tensor(cards, dtype=torch.long, device=OBS_DEVICE).clamp_(0, 39)
-    vec = torch.zeros(40, dtype=torch.float32, device=OBS_DEVICE)
-    vec[idx] = 1.0
+    idx = torch.as_tensor(cards, dtype=torch.long, device=OBS_DEVICE).clamp(0, 39)
+    one_hot = F.one_hot(idx, num_classes=40).to(torch.float32)
+    vec = one_hot.sum(dim=0)
+    # Mantieni semantica originale: presenza (0/1), non conteggio
+    vec = (vec > 0).to(torch.float32)
     return vec
 
 def encode_hands(hands, player_id):
@@ -141,12 +150,13 @@ def encode_current_player(cp):
     """
     return ONE_HOT_PLAYERS[cp].clone()  # Copia per evitare modifiche esterne
 
+@_dynamo_disable
 def encode_move(move):
     """
     Codifica una mossa. Versione ottimizzata con risultati identici.
     """
-    player_vec = torch.zeros(4, dtype=torch.float32, device=OBS_DEVICE)
-    player_vec[move["player"]] = 1.0
+    player_idx = int(move["player"])
+    player_vec = F.one_hot(torch.tensor(player_idx, dtype=torch.long, device=OBS_DEVICE), num_classes=4).to(torch.float32)
     
     # Carta giocata (14 dim)
     played = move["played_card"]
@@ -158,16 +168,14 @@ def encode_move(move):
         rank, suit = played
         suit_idx = suit_to_col[suit]
     
-    rank_vec = torch.zeros(10, dtype=torch.float32, device=OBS_DEVICE)
-    rank_vec[rank-1] = 1.0
+    rank_idx = max(0, min(9, int(rank) - 1))
+    rank_vec = F.one_hot(torch.tensor(rank_idx, dtype=torch.long, device=OBS_DEVICE), num_classes=10).to(torch.float32)
     
-    suit_vec = torch.zeros(4, dtype=torch.float32, device=OBS_DEVICE)
-    suit_vec[suit_idx] = 1.0
+    suit_vec = F.one_hot(torch.tensor(int(suit_idx), dtype=torch.long, device=OBS_DEVICE), num_classes=4).to(torch.float32)
     
-    capture_vec = torch.zeros(3, dtype=torch.float32, device=OBS_DEVICE)
     capture_map = {"no_capture": 0, "capture": 1, "scopa": 2}
-    ctype_idx = capture_map.get(move["capture_type"], 0)
-    capture_vec[ctype_idx] = 1.0
+    ctype_idx = int(capture_map.get(move["capture_type"], 0))
+    capture_vec = F.one_hot(torch.tensor(ctype_idx, dtype=torch.long, device=OBS_DEVICE), num_classes=3).to(torch.float32)
     
     captured_cards = move["captured_cards"]
     captured_vec = encode_cards_as_matrix(captured_cards)
@@ -788,16 +796,24 @@ def compute_rank_probabilities_by_player(game_state, player_id):
             # k from 0..min(4, hand_size)
             k_max = min(possible_rank, hand_size, 4)
             k = torch.arange(k_max + 1, device=OBS_DEVICE, dtype=torch.float32)
+            # Cast to float scalars on device
             N = torch.tensor(float(total_invisible), device=OBS_DEVICE)
             K = torch.tensor(float(invisible_rank), device=OBS_DEVICE)
             n = torch.tensor(float(hand_size), device=OBS_DEVICE)
-            # log comb using lgamma
-            def log_comb(a, b):
-                return torch.lgamma(a + 1.0) - torch.lgamma(b + 1.0) - torch.lgamma(a - b + 1.0)
-            log_num = log_comb(K, k) + log_comb(N - K, n - k)
-            log_den = log_comb(N, n)
-            probs_k = torch.exp(log_num - log_den)
-            all_probs[i, :k.numel(), rank_idx] = probs_k
+            # Validity mask for hypergeometric terms: 0 <= k <= K and 0 <= n-k <= N-K and N,K,n >= 0
+            valid = (k >= 0) & (k <= K) & ((n - k) >= 0) & ((n - k) <= (N - K)) & (N >= 0) & (K >= 0) & (n >= 0)
+            probs_k = torch.zeros_like(k)
+            if bool(valid.any().detach().cpu().item()):
+                kv = k[valid]
+                # log comb using lgamma only on valid entries
+                def log_comb(a, b):
+                    return torch.lgamma(a + 1.0) - torch.lgamma(b + 1.0) - torch.lgamma(a - b + 1.0)
+                log_num = log_comb(K, kv) + log_comb(N - K, n - kv)
+                log_den = log_comb(N, n)
+                pv = torch.exp(log_num - log_den)
+                probs_k[valid] = pv
+            # Assign; remaining invalid stay 0
+            all_probs[i, :k.numel(), rank_idx] = torch.nan_to_num(probs_k, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Salva in cache
     rank_prob_cache[cache_key] = all_probs.clone()
@@ -1025,6 +1041,8 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
 
     # 1) Mani (43): 40 one-hot + 3 conteggi altri giocatori
     hand_vec = (((hands_bits_t[player_id] >> IDS_CUDA) & 1).to(torch.float32))  # (40,)
+    if not torch.isfinite(hand_vec).all():
+        raise RuntimeError("Observation hand_vec contains non-finite values")
     other_counts = []
     for p in range(4):
         if p == player_id:
@@ -1036,6 +1054,8 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
 
     # 2) Tavolo (40)
     table_enc = (((table_bits_t >> IDS_CUDA) & 1).to(torch.float32))
+    if not torch.isfinite(table_enc).all():
+        raise RuntimeError("Observation table_enc contains non-finite values")
 
     # 3) Catture squadre (82): 40 + 40 + 2
     team0_vec = (((captured_bits_t[0] >> IDS_CUDA) & 1).to(torch.float32))
@@ -1043,13 +1063,19 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12):
     team0_count = torch.tensor([team0_vec.sum() / 40.0], dtype=torch.float32, device=device)
     team1_count = torch.tensor([team1_vec.sum() / 40.0], dtype=torch.float32, device=device)
     captured_enc = torch.cat([team0_vec, team1_vec, team0_count, team1_count], dim=0)
+    if not torch.isfinite(captured_enc).all():
+        raise RuntimeError("Observation captured_enc contains non-finite values")
 
     # 4) History compatta (61*k)
     hist_k = encode_recent_history_k(game_state, k=k_history)
+    if not torch.isfinite(hist_k).all():
+        raise RuntimeError("Observation history encoding contains non-finite values")
 
     # 5) Missing cards (40): inverti visibilità (mano osservatore + tavolo + captured)
     visible_bits = hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
     missing_vec = (1 - (((visible_bits >> IDS_CUDA) & 1).to(torch.float32)))
+    if not torch.isfinite(missing_vec).all():
+        raise RuntimeError("Observation missing_vec contains non-finite values")
 
     # 6) Inferred probs (120) - opzionale
     inferred_probs = (compute_inferred_probabilities(game_state, player_id)

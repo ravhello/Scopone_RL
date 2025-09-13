@@ -13,12 +13,16 @@ def _seat_vec_for(cp: int) -> torch.Tensor:
 
 
 def test_batched_select_indices_basic():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     obs = env._get_observation(env.current_player)
     legals = env.get_valid_actions()
-    assert len(legals) > 0
-    legals_small = legals[: min(3, len(legals))]
+    # Normalizza a lista
+    if torch.is_tensor(legals):
+        legals_small = [legals[i] for i in range(min(3, legals.size(0)))]
+    else:
+        legals_small = legals[: min(3, len(legals))]
+    assert len(legals_small) > 0
     cp = env.current_player
     seat = _seat_vec_for(cp)
     reqs = [
@@ -46,12 +50,15 @@ def test_batched_select_indices_basic():
 
 
 def test_batched_service_policy_value_belief():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     obs = env._get_observation(env.current_player)
     legals = env.get_valid_actions()
-    assert len(legals) > 0
-    legals_small = legals[: min(3, len(legals))]
+    if torch.is_tensor(legals):
+        legals_small = [legals[i] for i in range(min(3, legals.size(0)))]
+    else:
+        legals_small = legals[: min(3, len(legals))]
+    assert len(legals_small) > 0
     cp = env.current_player
     seat = _seat_vec_for(cp)
     reqs = [

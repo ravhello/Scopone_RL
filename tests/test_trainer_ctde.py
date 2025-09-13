@@ -1,17 +1,26 @@
+import os
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
 from trainers.train_ppo import collect_trajectory
 
 
 def test_collect_trajectory_with_belief_summary():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     batch = collect_trajectory(env, agent, horizon=8, use_mcts=False)
     assert 'belief_summary' in batch and batch['belief_summary'].shape[0] == batch['obs'].shape[0]
 
 
 def test_next_value_ctde_inputs_present():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     batch = collect_trajectory(env, agent, horizon=8, use_mcts=False)
     assert 'seat_team' in batch and batch['seat_team'].shape[0] == batch['obs'].shape[0]
@@ -24,7 +33,11 @@ def test_next_value_ctde_inputs_present():
 
 
 def test_partner_opponent_routing_basic():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     # frozen actors (random weights but eval mode)
     batch = collect_trajectory(env, agent, horizon=8, use_mcts=False)

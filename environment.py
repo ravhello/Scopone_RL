@@ -7,7 +7,15 @@ import time
 from collections import OrderedDict
 from state import initialize_game
 from actions import decode_action_ids
-from observation import set_obs_device, encode_state_compact_for_player_fast as _encode_state_compact_for_player_fast, RANK_OF_ID
+from observation import (
+    set_obs_device,
+    encode_state_compact_for_player_fast as _encode_state_compact_for_player_fast,
+    RANK_OF_ID,
+    OBS_INCLUDE_INFERRED,
+    OBS_INCLUDE_RANK_PROBS,
+    OBS_INCLUDE_SCOPA_PROBS,
+    OBS_INCLUDE_DEALER,
+)
 from utils.compile import maybe_compile_function
 import torch.nn.functional as F
 
@@ -37,23 +45,19 @@ def _ids_to_bitset(ids):
     return bits
 
 class ScoponeEnvMA(gym.Env):
-    def __init__(self, rules=None, use_compact_obs: bool = False, k_history: int = 39):
+    def __init__(self, rules=None, k_history: int = 39):
         super().__init__()
-        
-        # Config osservazione (solo compatta)
-        # Forza sempre la modalità compatta; il flag use_compact_obs è ignorato e mantenuto solo per compatibilità API
-        self.use_compact_obs = True
         self.k_history = int(k_history)
-        # Dimensione compatta dinamica in base ai flag OBS_INCLUDE_*:
+        # Dimensione compatta dinamica in base ai flag OBS_INCLUDE_* (single source from observation.py)
         # Base fisse: 43 (mani) + 40 (tavolo) + 82 (catture) + 61*k (history) + 40 (missing)
         #            + 120 (inferred) + 8 (primiera) + 2 (denari) + 1 (settebello) + 2 (score)
         #            + 1 (table sum) + 10 (table possible sums) + 2 (scopa counts)
         #            + 30 (rank_presence_from_inferred) + 1 (progress) + 2 (last capturing team)
-        include_rank = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
-        include_scopa = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
-        include_inferred = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
-        include_dealer = os.environ.get('OBS_INCLUDE_DEALER', '0') == '1'
-        # Part fisse comuni (senza inferred): 43+40+82 + 61*k + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+        include_rank = bool(OBS_INCLUDE_RANK_PROBS)
+        include_scopa = bool(OBS_INCLUDE_SCOPA_PROBS)
+        include_inferred = bool(OBS_INCLUDE_INFERRED)
+        include_dealer = bool(OBS_INCLUDE_DEALER)
+        # Parti fisse comuni (senza inferred): 43+40+82 + 61*k + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
         fixed = 43 + 40 + 82 + 61 * self.k_history + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
         base = fixed + (120 if include_inferred else 0)
         obs_dim = base + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if include_dealer else 0)
@@ -146,7 +150,7 @@ class ScoponeEnvMA(gym.Env):
     def clone(self):
         """Crea una copia profonda dell'ambiente per simulazione/ricerca."""
         import copy
-        cloned = ScoponeEnvMA(rules=copy.deepcopy(self.rules), use_compact_obs=True, k_history=self.k_history)
+        cloned = ScoponeEnvMA(rules=copy.deepcopy(self.rules), k_history=self.k_history)
         cloned.game_state = copy.deepcopy(self.game_state)
         cloned.done = self.done
         cloned.current_player = self.current_player

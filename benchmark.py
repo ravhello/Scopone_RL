@@ -244,7 +244,7 @@ def main_cli():
     # Placeholder for agent loading and running a quick game
     actor, critic = load_actor_critic(args.ckpt) if args.ckpt else (ActionConditionedActor(), CentralValueNet())
     for g in range(args.games):
-        env = ScoponeEnvMA(use_compact_obs=args.compact, k_history=args.k_history)
+        env = ScoponeEnvMA(k_history=args.k_history)
         done = False
         while not done:
             obs = env._get_observation(env.current_player)
@@ -338,9 +338,8 @@ def find_checkpoints(checkpoint_dir, pattern="*team0*ep*.pth"):
     try:
         checkpoint_files.sort(key=lambda x: int(x.split('_ep')[1].split('.pth')[0]) 
                              if '_ep' in x else float('inf'))
-    except:
-        # If sorting by episode fails, sort by modification time
-        checkpoint_files.sort(key=os.path.getmtime)
+    except Exception as e:
+        raise RuntimeError('Failed to sort checkpoint files by episode number') from e
     
     return checkpoint_files
 

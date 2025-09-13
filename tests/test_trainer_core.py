@@ -1,10 +1,15 @@
+import os
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
 from trainers.train_ppo import collect_trajectory, train_ppo
 
 
 def test_collect_trajectory_without_mcts_fallback_runs():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     # Force MCTS off via factor=0.0 to exercise fallback action selection
     batch = collect_trajectory(
@@ -15,7 +20,6 @@ def test_collect_trajectory_without_mcts_fallback_runs():
         mcts_sims=8,
         mcts_dets=1,
         mcts_c_puct=1.0,
-        mcts_train_factor=0.0,
         mcts_min_sims=0,
         train_both_teams=False,
     )
@@ -24,6 +28,10 @@ def test_collect_trajectory_without_mcts_fallback_runs():
 
 
 def test_train_ppo_single_env_one_iter_smoke():
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
     # Verify one iteration completes in single-env mode (exercise non-parallel path)
     ran = {'called': False}
 
@@ -33,7 +41,6 @@ def test_train_ppo_single_env_one_iter_smoke():
     train_ppo(
         num_iterations=1,
         horizon=40,
-        use_compact_obs=True,
         k_history=4,
         num_envs=1,
         mcts_sims=8,

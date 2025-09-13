@@ -30,16 +30,7 @@ def _run_short_training(monkeypatch, num_iterations=3):
     """
     # Ensure TB is enabled and execution is fast and deterministic enough for tests
     monkeypatch.setenv('SCOPONE_DISABLE_TB', '0')
-    try:
-        import torch
-        if torch.cuda.is_available():
-            monkeypatch.delenv('TESTS_FORCE_CPU', raising=False)
-            monkeypatch.setenv('SCOPONE_DEVICE', 'cuda')
-        else:
-            monkeypatch.setenv('TESTS_FORCE_CPU', '1')
-    except Exception:
-        monkeypatch.setenv('TESTS_FORCE_CPU', '1')
-    monkeypatch.setenv('ENV_DEVICE', 'cpu')
+    # Keep device default; TB logging is independent
     monkeypatch.setenv('OMP_NUM_THREADS', '1')
     monkeypatch.setenv('MKL_NUM_THREADS', '1')
 
@@ -57,7 +48,6 @@ def _run_short_training(monkeypatch, num_iterations=3):
     train_ppo(
         num_iterations=num_iterations,
         horizon=40,
-        use_compact_obs=True,
         k_history=12,
         num_envs=1,
         mcts_sims=0,
@@ -133,7 +123,6 @@ def test_tb_behavior_when_collect_trajectory_errors(monkeypatch):
         train_mod.train_ppo(
             num_iterations=3,
             horizon=40,
-            use_compact_obs=True,
             k_history=12,
             num_envs=1,
             mcts_sims=0,
@@ -155,6 +144,9 @@ def test_tb_behavior_when_collect_trajectory_errors(monkeypatch):
         f"Expected only first iteration to be logged due to injected error. Logged steps: {logged_steps};\n"
         f"All scalars: {writer.scalars}; Ended steps: {ended_steps}; Error raised: {error_raised}"
     )
+
+
+
 
 
 

@@ -1,11 +1,18 @@
+import os
 from environment import ScoponeEnvMA
 from algorithms.is_mcts import run_is_mcts
 import numpy as np
 
 def test_is_mcts_runs():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    # Stabilize device/compile
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     obs = env._get_observation(env.current_player)
     legals = env.get_valid_actions()
+    # after conftest monkeypatch, legals is a list
     assert len(legals) > 0
 
     def policy_fn(o, leg):
@@ -19,7 +26,11 @@ def test_is_mcts_runs():
     assert action is not None
 
 def test_is_mcts_selection_and_noise_flags():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     def policy_fn(o, leg):
         return np.ones(len(leg), dtype=np.float32) / len(leg)
     def value_fn(o, _env=None):
@@ -33,7 +44,11 @@ def test_is_mcts_selection_and_noise_flags():
     assert a2 is not None
 
 def test_is_mcts_with_belief_and_flags():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
     def policy_fn(o, leg):
         return np.ones(len(leg), dtype=np.float32) / max(1, len(leg))
     def value_fn(o, _env=None):

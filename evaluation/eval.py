@@ -24,7 +24,7 @@ try:
 except Exception:
     pass
 
-def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs: bool = True, k_history: int = 12) -> Tuple[float, dict]:
+def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int = 12) -> Tuple[float, dict]:
     """
     Gioca N partite e ritorna win-rate team0 e breakdown medio dei punteggi.
     agent_fn_*: callable(env) -> action (usa env.get_valid_actions())
@@ -37,7 +37,7 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, use_compact_obs:
     breakdown_sum = {0: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0},
                      1: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0}}
     for _ in tqdm(range(games), desc='Eval matches'):
-        env = ScoponeEnvMA(use_compact_obs=use_compact_obs, k_history=k_history)
+        env = ScoponeEnvMA(k_history=k_history)
         done = False
         info = {}
         while not done:
@@ -80,7 +80,7 @@ def series_to_points(win_func, target_points=11):
     return 0 if s0 >= target_points else 1
 
 
-def eval_vs_baseline(games=50, use_compact_obs=True, k_history=12, log_tb=False):
+def eval_vs_baseline(games=50, k_history=12, log_tb=False):
     writer = None
     if log_tb and TB_AVAILABLE and os.environ.get('SCOPONE_DISABLE_TB', '0') != '1':
         try:
@@ -92,7 +92,7 @@ def eval_vs_baseline(games=50, use_compact_obs=True, k_history=12, log_tb=False)
         return pick_action_heuristic(env.get_valid_actions())
     def agent_fn_team1(env):
         return pick_action_heuristic(env.get_valid_actions())
-    wr, bd = play_match(agent_fn_team0, agent_fn_team1, games, use_compact_obs, k_history)
+    wr, bd = play_match(agent_fn_team0, agent_fn_team1, games, k_history)
     if writer is not None:
         writer.add_scalar('eval/win_rate_team0', wr, 0)
         writer.close()
@@ -100,7 +100,7 @@ def eval_vs_baseline(games=50, use_compact_obs=True, k_history=12, log_tb=False)
 
 
 def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
-                         use_compact_obs: bool = True, k_history: int = 12,
+                         k_history: int = 12,
                          mcts: dict = None,
                          belief_particles: int = 0, belief_ess_frac: float = 0.5):
     """
@@ -109,7 +109,7 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
     - belief_particles>0 abilita belief a particelle per prior MCTS.
     """
     # Primo env per determinare obs_dim
-    env0 = ScoponeEnvMA(use_compact_obs=use_compact_obs, k_history=k_history)
+    env0 = ScoponeEnvMA(k_history=k_history)
     obs_dim = env0.observation_space.shape[0]
     del env0
     # Carica attori
@@ -238,7 +238,7 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
 
     agent_fn_team0 = make_agent_fn(actor_a)
     agent_fn_team1 = make_agent_fn(actor_b)
-    wr, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, use_compact_obs=use_compact_obs, k_history=k_history)
+    wr, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, k_history=k_history)
     return wr, bd
 
 
@@ -249,7 +249,7 @@ def league_eval_and_update(league_dir='checkpoints/league', games=20, target_poi
         return
     a, b = league.history[-2], league.history[-1]
     # Usa serie di partite per stimare il win-rate di A contro B
-    wr_ab, _ = evaluate_pair_actors(a, b, games=games, use_compact_obs=True, k_history=12, mcts=None)
+    wr_ab, _ = evaluate_pair_actors(a, b, games=games, k_history=12, mcts=None)
     # Aggiorna Elo usando il win-rate medio come risultato fra [0,1]
     league.update_elo(a, b, wr_ab)
     return league.elo

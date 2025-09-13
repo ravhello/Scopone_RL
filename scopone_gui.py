@@ -120,8 +120,8 @@ def get_local_ip():
         local_ip = s.getsockname()[0]
         s.close()
         return local_ip
-    except:
-        return "127.0.0.1"  # Fallback su localhost
+    except Exception as e:
+        raise RuntimeError("Failed to obtain local IP address") from e
 
 class LoadingAnimation:
     """Animazione di caricamento per quando si caricano i bot AI"""
@@ -397,27 +397,7 @@ class ResourceManager:
             self.card_backs[1] = pygame.transform.smoothscale(retro, (CARD_WIDTH, CARD_HEIGHT))
             #print("Caricato retro.jpg per dorso carte")
         except Exception as e:
-            print(f"Errore caricamento retro.jpg: {e}")
-            # If retro.jpg not found, try team-specific backs
-            try:
-                back_blue = pygame.image.load(os.path.join(folder, "card_back_blue.jpg"))
-                back_red = pygame.image.load(os.path.join(folder, "card_back_red.jpg"))
-                self.original_card_backs[0] = back_blue
-                self.original_card_backs[1] = back_red
-                self.card_backs[0] = pygame.transform.smoothscale(back_blue, (CARD_WIDTH, CARD_HEIGHT))
-                self.card_backs[1] = pygame.transform.smoothscale(back_red, (CARD_WIDTH, CARD_HEIGHT))
-                print("Caricati card_back_blue.jpg e card_back_red.jpg per dorso carte")
-            except:
-                # Create default card backs if images not found
-                back_blue = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
-                back_blue.fill(LIGHT_BLUE)
-                back_red = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
-                back_red.fill(HIGHLIGHT_RED)
-                self.original_card_backs[0] = back_blue
-                self.original_card_backs[1] = back_red
-                self.card_backs[0] = back_blue
-                self.card_backs[1] = back_red
-                print("Creati dorsi default per le carte")
+            raise RuntimeError("Failed to load retro.jpg for card backs") from e
         
         # Load all card images
         for r in possible_ranks:
@@ -430,26 +410,8 @@ class ResourceManager:
                     img = pygame.image.load(filename)
                     self.original_card_images[key] = img
                     self.card_images[key] = pygame.transform.smoothscale(img, (CARD_WIDTH, CARD_HEIGHT))
-                except:
-                    # Create a placeholder if image not found
-                    card_img = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
-                    card_img.fill(WHITE)
-                    pygame.draw.rect(card_img, BLACK, (0, 0, CARD_WIDTH, CARD_HEIGHT), 2)
-                    
-                    # Draw rank and suit
-                    font = pygame.font.SysFont(None, 24)
-                    rank_text = str(r) if r > 1 else "A"
-                    suit_symbol = SUIT_SYMBOLS[s]
-                    
-                    rank_surf = font.render(rank_text, True, BLACK)
-                    suit_surf = font.render(suit_symbol, True, 
-                                        HIGHLIGHT_RED if s in ['denari', 'coppe'] else BLACK)
-                    
-                    card_img.blit(rank_surf, (5, 5))
-                    card_img.blit(suit_surf, (CARD_WIDTH - 20, 5))
-                    
-                    self.original_card_images[key] = card_img.copy()
-                    self.card_images[key] = card_img
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load card image: {filename}") from e
 
     def load_backgrounds(self, folder="assets"):
         """Load background images and textures"""
@@ -457,23 +419,15 @@ class ResourceManager:
             bg = pygame.image.load(os.path.join(folder, "background.jpg"))
             self.original_background = bg  # Store the original unscaled image
             self.background = pygame.transform.smoothscale(bg, (SCREEN_WIDTH, SCREEN_HEIGHT))
-        except:
-            # Create a default background if image not found
-            self.original_background = pygame.Surface((1024, 768))
-            self.original_background.fill(DARK_BLUE)
-            self.background = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-            self.background.fill(DARK_BLUE)
+        except Exception as e:
+            raise RuntimeError("Failed to load background image") from e
         
         try:
             table = pygame.image.load(os.path.join(folder, "table_texture.jpg"))
             self.original_table_texture = table
             self.table_texture = pygame.transform.smoothscale(table, (750, 450))
-        except:
-            # Create a default table texture if image not found
-            self.original_table_texture = pygame.Surface((750, 450))
-            self.original_table_texture.fill(TABLE_GREEN)
-            self.table_texture = pygame.Surface((750, 450))
-            self.table_texture.fill(TABLE_GREEN)
+        except Exception as e:
+            raise RuntimeError("Failed to load table texture") from e
     
     def load_ui_elements(self, folder="assets"):
         """Load UI elements like icons and decorative graphics"""
@@ -483,10 +437,8 @@ class ResourceManager:
             try:
                 img = pygame.image.load(os.path.join(folder, f"{element}.png"))
                 self.ui_elements[element] = img
-            except:
-                # Create placeholder UI elements
-                self.ui_elements[element] = pygame.Surface((32, 32))
-                self.ui_elements[element].fill(LIGHT_GRAY)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load UI element: {element}") from e
     
     def try_load_sounds(self, folder="assets"):
         """Try to load game sounds - gracefully fails if no audio device"""
@@ -507,9 +459,8 @@ class ResourceManager:
             for sound_name, filename in sound_files.items():
                 try:
                     self.sounds[sound_name] = pygame.mixer.Sound(os.path.join(folder, filename))
-                except:
-                    # Create silent sound if file not found
-                    self.sounds[sound_name] = None
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load sound: {sound_name}") from e
         except Exception as e:
             print(f"Sound disabled: {e}")
             self.sound_enabled = False
@@ -5519,9 +5470,9 @@ class GameScreen(BaseScreen):
                                     # Schedule 1s pacing for next auto turn
                                     self.autoplay_delay_until = time.time() + 1.0
             except Exception as e:
-                # Non bloccare il gioco in caso di errore nell'auto-play
-                if str(e) != "autoplay_pacing_delay":
-                    print(f"Auto-play error: {e}")
+                if str(e) == "autoplay_pacing_delay":
+                    raise RuntimeError("Autoplay pacing delay") from e
+                raise
 
             # Handle AI turns (solo il server lo fa in modalità online)
             self.handle_ai_turns()

@@ -9,4 +9,3 @@ if ROOT not in sys.path:
 # Suppress DeprecationWarning from pygame.pkgdata (pytest noise)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r".*pygame\.pkgdata")
 
-

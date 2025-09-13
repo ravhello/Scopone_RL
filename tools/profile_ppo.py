@@ -430,7 +430,7 @@ def main():
     # Inner run invoked by Scalene: execute training without additional profilers.
     if getattr(args, 'scalene_run', False):
         num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
+        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
         return
 
     # cProfile mode takes precedence over line/torch profiler
@@ -447,7 +447,7 @@ def main():
         num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
 
         def _run():
-            train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
+            train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
 
         prof.enable()
         try:
@@ -510,7 +510,7 @@ def main():
             global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         # Use the same default as other modes for apples-to-apples comparisons
         num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
+        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
 
         # Print per-function and per-line stats (includes line numbers and source)
         global_profiler.print_stats(sort_by='cpu')
@@ -660,7 +660,7 @@ def main():
     ) as prof:
         # Short run for signal; adjust if needed
         num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), use_compact_obs=True, k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
+        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
 
     # Export chrome trace
     #prof.export_chrome_trace(trace_path)

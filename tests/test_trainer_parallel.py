@@ -4,13 +4,12 @@ from environment import ScoponeEnvMA
 
 
 def test_collect_trajectory_parallel_minimal_runs():
-    env = ScoponeEnvMA(use_compact_obs=True, k_history=4)
+    env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     batch = collect_trajectory_parallel(
         agent,
         num_envs=2,
         episodes_total_hint=1,
-        use_compact_obs=True,
         k_history=4,
         use_mcts=True,
         mcts_sims=8,
@@ -25,5 +24,6 @@ def test_collect_trajectory_parallel_minimal_runs():
     assert batch['obs'].shape[0] > 0
     assert 'chosen_index' in batch
     assert batch['chosen_index'].shape[0] == batch['obs'].shape[0]
+
 
 
