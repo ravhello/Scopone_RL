@@ -326,7 +326,8 @@ class ScoponeEnvMA(gym.Env):
         if A == 0:
             actions = torch.zeros((0, 80), dtype=torch.float32, device=device)
         else:
-            played_oh = F.one_hot(pid_all, num_classes=40).to(torch.float32)
+            # Replace one_hot with equality against cached id range to avoid kernel overhead
+            played_oh = (self._id_range.unsqueeze(0) == pid_all.unsqueeze(1)).to(torch.float32)
             actions = torch.cat([played_oh, (cap_hot_all > 0).to(torch.float32)], dim=1)
 
         # AP filter: se AP attivo ma posa asso non è consentita (e tavolo non vuoto), rimuovi azioni "asso + no capture"

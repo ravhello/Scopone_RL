@@ -2,14 +2,6 @@ import os
 import sys
 import threading
 import io
-import warnings as _warnings
-
-# Suppress noisy third-party deprecation warning from IPEX importing pkg_resources
-_warnings.filterwarnings(
-    'ignore',
-    message=r'pkg_resources is deprecated as an API.*',
-    category=UserWarning,
-)
 
 # Targeted FD-level stderr filter to drop absl/TF CUDA registration warnings from C++
 _SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
@@ -54,10 +46,9 @@ os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # disable oneDNN custom ops
 # Abilita TensorBoard di default (override con SCOPONE_DISABLE_TB=1 per disattivarlo)
 os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
 ## Abilita torch.compile di default per l'intero progetto (override via env)
-os.environ.setdefault('SCOPONE_TORCH_COMPILE', '1')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'ipex')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_FULLGRAPH', '1')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
 ## Autotune controllabile: di default ON su CPU beneficia di fusioni; può essere disattivato via env
 os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')

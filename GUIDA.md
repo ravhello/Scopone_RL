@@ -9,7 +9,7 @@ Questa guida spiega come installare, allenare, fare benchmark e profilare l'agen
 pip install -r requirements.txt
 ```
 
-In alternativa, con i target del `Makefile` (richiede l'ambiente conda `pt_ipex` già creato):
+In alternativa, con i target del `Makefile` (richiede l'ambiente conda `gym_tf` già creato):
 ```bash
 make install
 ```

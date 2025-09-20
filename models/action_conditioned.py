@@ -398,8 +398,6 @@ class ActionEncoder80(nn.Module):
         if actions.size(-1) != in_dim:
             raise ValueError(f"ActionEncoder80: expected last-dim {in_dim}, got {int(actions.size(-1))}")
         out = self.net(actions)
-        # Sanitize to keep compile path robust
-        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
         # Keep checks only in STRICT mode
         if STRICT:
             torch._assert(torch.isfinite(out).all(), "ActionEncoder80.forward: non-finite output embedding")
@@ -550,8 +548,6 @@ class ActionConditionedActor(torch.nn.Module):
             if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
-        # Sanitize to keep graph free of data-dependent asserts
-        state_feat = torch.nan_to_num(state_feat, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
         if STRICT:
             torch._assert(torch.isfinite(state_feat).all(), "state_enc produced non-finite features")
             if state_feat.numel() > 0:
@@ -649,8 +645,6 @@ class ActionConditionedActor(torch.nn.Module):
             if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         sf = self.state_enc(x_obs, seat_team_vec)  # (B,256)
-        # Sanitize to keep compile graph free of data-dependent asserts
-        sf = torch.nan_to_num(sf, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
         if STRICT:
             if not torch.isfinite(sf).all():
                 bad = sf[~torch.isfinite(sf)]
@@ -694,7 +688,6 @@ class ActionConditionedActor(torch.nn.Module):
         ctx_in[:, p:p+32] = partner_feat; p += 32
         ctx_in[:, p:p+32] = opp_feat; p += 32
         state_ctx = self.merge(ctx_in)  # (B,256)
-        state_ctx = torch.nan_to_num(state_ctx, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
         if STRICT:
             if not torch.isfinite(state_ctx).all():
                 bad = state_ctx[~torch.isfinite(state_ctx)]
@@ -704,7 +697,6 @@ class ActionConditionedActor(torch.nn.Module):
                 max_abs_ctx = state_ctx.abs().amax()
                 torch._assert((max_abs_ctx <= 1e6), "merge produced extremely large state_ctx (>1e6)")
         sp = self.state_to_action(state_ctx)
-        sp = torch.nan_to_num(sp, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
         if STRICT:
             if not torch.isfinite(sp).all():
                 bad = sp[~torch.isfinite(sp)]
@@ -879,8 +871,7 @@ class ActionConditionedActor(torch.nn.Module):
         B = int(card_logits_all.size(0))
         allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device_local)
         allowed_mask[sample_idx_per_legal, played_ids_mb] = True
-        # Prefer additive mask over torch.where for IPEX CPU stability
-        masked_logits = card_logits_all + (~allowed_mask).to(card_logits_all.dtype) * (-1e9)
+        masked_logits = torch.where(allowed_mask, card_logits_all, torch.full_like(card_logits_all, float('-inf')))
         max_allowed = torch.amax(masked_logits, dim=1)
         # Avoid in-place ops on tensors needed for gradient; keep computation out-of-place
         exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)

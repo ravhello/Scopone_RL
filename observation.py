@@ -808,25 +808,18 @@ def encode_recent_history_k(game_state, k=12):
     start = (T - n).to(torch.long)
     mask = idx >= start  # True per posizioni riempite
     # Seleziona e rimappa in coda
-    # Evita boolean indexing dinamico: costruisci direttamente l'output a forma fissa (k_int, 61)
-    sel = hb  # (T,61)
+    # Copy last n moves to the tail in-place-like without allocating an extra full tensor
+    sel = hb  # avoid clone
+    out = sel * 0
+    out[mask] = sel[mask]
+    # Prendi solo gli ultimi k da coda
     take = min(k_int, T)
-    copy_len = torch.minimum(n, torch.tensor(take, device=device, dtype=n.dtype)).to(torch.long)
-    # Costruisci maschera di validità per le ultime copy_len posizioni
-    idx_k = torch.arange(k_int, device=device, dtype=torch.long)
-    tail_start = (torch.tensor(k_int, device=device, dtype=torch.long) - copy_len)
-    valid_mask = idx_k >= tail_start  # (k_int,)
-    # Indici sorgente in hb per ciascuna riga di out_k
-    relative = idx_k - tail_start  # (k_int,), può essere < 0
-    relative = torch.clamp(relative, min=0)
-    src_base = torch.clamp(torch.tensor(T, device=device, dtype=torch.long) - copy_len, min=0, max=max(0, T - 1))
-    src_idx = src_base + relative
-    if T > 0:
-        src_idx = torch.clamp(src_idx, min=0, max=T - 1)
-        gathered = sel.index_select(0, src_idx)  # (k_int,61)
+    out_tail = out[T - take:T]  # (take,61)
+    if take < k_int:
+        pad = torch.zeros((k_int - take, 61), dtype=out.dtype, device=device)
+        out_k = torch.cat([pad, out_tail], dim=0)
     else:
-        gathered = torch.zeros((k_int, 61), dtype=sel.dtype, device=device)
-    out_k = gathered * valid_mask.to(sel.dtype).unsqueeze(1)
+        out_k = out_tail
     return out_k.reshape(-1)
  
 
@@ -976,15 +969,16 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     for ri in range(10):
         r = r_vals[ri]
         c = counts[ri]
-        # Apply up to four updates, masking each step to avoid Python data-dependent branching
-        upd = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        bitset = torch.where(c > 0, upd, bitset)
-        upd = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        bitset = torch.where(c > 1, upd, bitset)
-        upd = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        bitset = torch.where(c > 2, upd, bitset)
-        upd = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        bitset = torch.where(c > 3, upd, bitset)
+        # Repeat-add r up to four times without per-iter where allocations
+        # Each iteration: bitset = (bitset | (bitset << r)) & mask_bits if c > t
+        if bool((c > 0).item()):
+            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
+        if bool((c > 1).item()):
+            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
+        if bool((c > 2).item()):
+            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
+        if bool((c > 3).item()):
+            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
     # Estrai bit 1..10
     sums_bits = bitset
     idx = _get_idx_1_10(device)

@@ -544,7 +544,7 @@ class ActionConditionedPPO:
                 raise RuntimeError("compute_loss: chosen_index out of range for some rows")
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # Compute state features once; reuse for actor and critic
-        state_feat = self._fn_state_features(obs, seat)  # (B,256)
+        state_feat = self.actor.compute_state_features(obs, seat)  # (B,256)
         if STRICT_CHECKS and (not torch.isfinite(state_feat).all()):
             bad = state_feat[~torch.isfinite(state_feat)]
             raise RuntimeError(f"compute_loss: state_feat non-finite (count={int(bad.numel())})")
@@ -557,7 +557,7 @@ class ActionConditionedPPO:
         cap1_mask = captured[:, 40:80] > 0.5
         visible_mask_40 = (hand_mask | table_mask | cap0_mask | cap1_mask)
         # State projection e logits per carta
-        state_proj = self._fn_state_proj_from_state(state_feat, obs, visible_mask_40=visible_mask_40)  # (B,64)
+        state_proj = self.actor.compute_state_proj_from_state(state_feat, obs, visible_mask_40=visible_mask_40)  # (B,64)
         if STRICT_CHECKS and (not torch.isfinite(state_proj).all()):
             bad = state_proj[~torch.isfinite(state_proj)]
             raise RuntimeError(f"compute_loss: state_proj non-finite (count={int(bad.numel())})")

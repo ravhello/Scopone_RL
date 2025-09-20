@@ -593,8 +593,8 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             padded[mask] = legal_scores
             logits = padded
             probs = torch.softmax(logits, dim=1)
-            # Keep only legal positions; prefer additive mask to avoid IPEX where issues
-            probs = probs * mask.to(probs.dtype)
+            # Keep only legal positions; set others to zero
+            probs = torch.where(mask, probs, torch.zeros_like(probs))
             # Select only rows with at least one legal action for sampling
             valid_rows = (cnts_t > 0)
             sel = torch.zeros((B,), dtype=torch.long, device=device)
@@ -1638,7 +1638,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
                 allowed_mask[sample_idx_per_legal, played_ids_mb] = True
                 neg_inf = torch.full_like(card_logits_all, float('-inf'))
-                masked_logits = card_logits_all + (~allowed_mask).to(card_logits_all.dtype) * (-1e9)
+                masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
                 max_allowed = torch.amax(masked_logits, dim=1)
                 exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
                 sum_allowed = exp_shift_allowed.sum(dim=1)
@@ -2204,7 +2204,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
                 allowed_mask[sample_idx, played_ids_mb] = True
                 neg_inf = torch.full_like(card_logits_all, float('-inf'))
-                masked_logits = card_logits_all + (~allowed_mask).to(card_logits_all.dtype) * (-1e9)
+                masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
                 max_allowed = torch.amax(masked_logits, dim=1)
                 exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
                 sum_allowed = exp_shift_allowed.sum(dim=1)
