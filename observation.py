@@ -175,14 +175,20 @@ def encode_move(move):
             rank_idx_t = torch.as_tensor(0 if r_py < 1 else 9 if r_py > 10 else (r_py - 1), dtype=torch.long, device=OBS_DEVICE)
             suit_idx_t = torch.as_tensor(int(suit_to_col.get(s_py, 0)), dtype=torch.long, device=OBS_DEVICE)
     # Replace one_hot with equality against small ranges to avoid launching kernels
-    rank_vec = (torch.arange(10, device=OBS_DEVICE, dtype=torch.long) == rank_idx_t).to(torch.float32)
-    suit_vec = (torch.arange(4, device=OBS_DEVICE, dtype=torch.long) == suit_idx_t).to(torch.float32)
+    # Cached EYE tensors to avoid per-call arange
+    global _EYE10, _EYE4, _EYE3
+    if '_EYE10' not in globals() or _EYE10.device != OBS_DEVICE:
+        _EYE10 = torch.eye(10, dtype=torch.float32, device=OBS_DEVICE)
+        _EYE4 = torch.eye(4, dtype=torch.float32, device=OBS_DEVICE)
+        _EYE3 = torch.eye(3, dtype=torch.float32, device=OBS_DEVICE)
+    rank_vec = _EYE10[rank_idx_t.clamp_(0, 9)]
+    suit_vec = _EYE4[suit_idx_t.clamp_(0, 3)]
 
     # Capture type (3)
     capture_map = {"no_capture": 0, "capture": 1, "scopa": 2}
     ctype_idx_py = int(capture_map.get(move.get("capture_type"), 0))
     ctype_idx_t = torch.as_tensor(ctype_idx_py, dtype=torch.long, device=OBS_DEVICE)
-    capture_vec = (torch.arange(3, device=OBS_DEVICE, dtype=torch.long) == ctype_idx_t).to(torch.float32)
+    capture_vec = _EYE3[ctype_idx_t.clamp_(0, 2)]
 
     # Carte catturate (40) – presenza 0/1
     captured_cards = move.get("captured_cards") or []
@@ -793,34 +799,32 @@ def clear_all_caches():
 
 def encode_recent_history_k(game_state, k=12):
     """
-    Restituisce una codifica compatta delle ultime k mosse (61*k).
-    Preferisce i mirror tensoriali forniti dall'ambiente per rimanere nel grafo; altrimenti calcola in eager.
+    Restituisce una codifica compatta delle ultime k mosse (61*k) leggendo direttamente
+    dal ring buffer senza copie intermedie e senza torch.roll, usando head/len.
     """
-    # Fast path: ring buffer tensoriale della history
     hb = game_state.get('_hist_buf_t', None)
     hlen_t = game_state.get('_history_len_t', None)
+    head_t = game_state.get('_hist_head_t', None)
     device = hb.device
     k_int = int(k)
-    T = int(hb.size(0))  # capacità (k_history)
-    n = torch.clamp(hlen_t.to(torch.long), min=0, max=T)
-    # Costruisci maschera posizione per ultimi n
-    idx = torch.arange(T, device=device, dtype=torch.long)
-    start = (T - n).to(torch.long)
-    mask = idx >= start  # True per posizioni riempite
-    # Seleziona e rimappa in coda
-    # Copy last n moves to the tail in-place-like without allocating an extra full tensor
-    sel = hb  # avoid clone
-    out = sel * 0
-    out[mask] = sel[mask]
-    # Prendi solo gli ultimi k da coda
-    take = min(k_int, T)
-    out_tail = out[T - take:T]  # (take,61)
-    if take < k_int:
-        pad = torch.zeros((k_int - take, 61), dtype=out.dtype, device=device)
-        out_k = torch.cat([pad, out_tail], dim=0)
+    T = int(hb.size(0))
+    n = int(torch.clamp(hlen_t.to(torch.long), min=0, max=T).item())
+    if n <= 0:
+        return torch.zeros(61 * k_int, dtype=hb.dtype, device=device)
+    head = int(head_t.item()) if torch.is_tensor(head_t) else n % T
+    take = min(k_int, n)
+    # calcola start index circolare degli ultimi `take`
+    start = (head - take) % T
+    if start + take <= T:
+        seg = hb[start:start+take]
     else:
-        out_k = out_tail
-    return out_k.reshape(-1)
+        first = hb[start:]
+        second = hb[:(start + take) % T]
+        seg = torch.cat([first, second], dim=0)
+    if take < k_int:
+        pad = torch.zeros((k_int - take, 61), dtype=hb.dtype, device=device)
+        seg = torch.cat([pad, seg], dim=0)
+    return seg.reshape(-1)
  
 
 def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, out: torch.Tensor = None):
@@ -1005,8 +1009,7 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     zero_buf = torch.zeros((1,), dtype=torch.float32, device=device)
     def _w(t):
         nonlocal pos
-        if t.dtype != torch.float32 or t.device != device:
-            t = t.to(device=device, dtype=torch.float32)
+        # Assume all tensors are already float32 on correct device to avoid per-slice conversions
         n = int(t.numel())
         result[pos:pos+n] = t.reshape(-1)
         pos += n

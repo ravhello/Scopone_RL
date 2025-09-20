@@ -107,9 +107,13 @@ class ScoponeEnvMA(gym.Env):
         # History mirrors (tensor ring buffer of moves encoded 61-dim)
         self._hist_buf_t = torch.zeros(self.k_history, 61, dtype=torch.float32, device=device)
         self._history_len_t = torch.zeros((), dtype=torch.long, device=device)
+        # Ring buffer head index (next write position)
+        self._hist_head_t = torch.zeros((), dtype=torch.long, device=device)
         # Aggregates mirrors
         self._played_bits_by_player_t = torch.zeros(4, dtype=torch.int64, device=device)
         self._scopa_counts_t = torch.zeros(2, dtype=torch.float32, device=device)
+        # Track consecutive scope per team to avoid scanning history each step
+        self._consec_scopa_team_t = torch.zeros(2, dtype=torch.int32, device=device)
         # Optional mirrors for probabilistic features (populated eagerly when enabled)
         self._inferred_probs_t = torch.zeros(120, dtype=torch.float32, device=device)
         self._rank_probs_by_player_t = torch.zeros(150, dtype=torch.float32, device=device)
@@ -553,16 +557,15 @@ class ScoponeEnvMA(gym.Env):
                 l1 = 1.0 - l0
                 break
         self._last_capturing_team_t = torch.tensor([l0, l1], dtype=torch.float32, device=device)
-        # update history mirrors (ring buffer): encode move to 61-d
+        # update history mirrors (ring buffer): encode move to 61-d without torch.roll
         from observation import encode_move
         enc = encode_move(move_info).to(device=device, dtype=torch.float32)
-        # shift left and append (small k, cpu-friendly)
-        if int(self._hist_buf_t.size(0)) > 1:
-            self._hist_buf_t = torch.roll(self._hist_buf_t, shifts=-1, dims=0)
-        self._hist_buf_t[-1] = enc
-        # increment length up to capacity
-        cap = int(self._hist_buf_t.size(0))
-        self._history_len_t = torch.clamp(self._history_len_t + 1, max=cap)
+        H = int(self._hist_buf_t.size(0))
+        head = int(self._hist_head_t.item())
+        self._hist_buf_t[head] = enc
+        # advance head and bump length up to capacity
+        self._hist_head_t = (self._hist_head_t + 1) % H
+        self._history_len_t = torch.clamp(self._history_len_t + 1, max=H)
         # update aggregates mirrors: played bits and scopa counts
         pc = move_info.get("played_card")
         if isinstance(pc, int):
@@ -577,6 +580,12 @@ class ScoponeEnvMA(gym.Env):
         if move_info.get("capture_type") == "scopa":
             team_id = 0 if current_player in [0, 2] else 1
             self._scopa_counts_t[team_id] = self._scopa_counts_t[team_id] + 1.0
+            # update consecutive scopa streak for the acting team
+            self._consec_scopa_team_t[team_id] = self._consec_scopa_team_t[team_id] + 1
+        else:
+            # reset acting team streak on non-scopa move
+            team_id = 0 if current_player in [0, 2] else 1
+            self._consec_scopa_team_t[team_id] = torch.zeros((), dtype=torch.int32, device=device)
         
         # OTTIMIZZAZIONE: Invalida la cache delle osservazioni (LRU)
         self._observation_cache = OrderedDict()
@@ -787,6 +796,7 @@ class ScoponeEnvMA(gym.Env):
             if total_cache > 0:
                 hit_rate = self._cache_hits / total_cache * 100
                 print(f"  Action cache hit rate: {hit_rate:.1f}% ({self._cache_hits}/{total_cache})")
+
 
 
 

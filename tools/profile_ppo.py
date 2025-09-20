@@ -7,30 +7,41 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# Align environment/device behavior with main.py BEFORE importing training code
-# Silence TF/absl noise and enable TB by default
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
-os.environ.setdefault('ABSL_LOGGING_MIN_LOG_LEVEL', '3')
-os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+# Silence TensorFlow/absl noise before any heavy imports
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # hide INFO/WARNING/ERROR from TF C++ logs
+os.environ.setdefault('ABSL_LOGGING_MIN_LOG_LEVEL', '3')  # absl logs: only FATAL
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # disable oneDNN custom ops info spam
+# Abilita TensorBoard di default (override con SCOPONE_DISABLE_TB=1 per disattivarlo)
 os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
-## Abilita torch.compile di default anche nel profiler (override via env)
+## Abilita torch.compile di default per l'intero progetto (override via env)
 os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
-## Disabilita max_autotune_gemm di Inductor per evitare warning su GPU con poche SM
+## Autotune controllabile: di default ON su CPU beneficia di fusioni; può essere disattivato via env
+os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
 ## Evita graph break su .item() catturando scalari nei grafi
 os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
-os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
-## Non forzare TORCH_LOGS ad un valore non valido; lascia default
 ## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
-os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
-## Abilita di default feature dell'osservazione (dealer one-hot)
+os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '0')
+## Alza il limite del cache di Dynamo per ridurre recompilazioni
+os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
+## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
+# Abilita e blocca i flag dell'osservazione all'avvio (usati da observation/environment al load)
+# Se l'utente li ha già impostati nel proprio run, li rispettiamo (setdefault)
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
+os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
+os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
+# Imposta ENV_DEVICE una sola volta coerente con SCOPONE_DEVICE o disponibilità CUDA
+os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+os.environ.setdefault('ENV_DEVICE', 'cpu')
+# Training compute device (models stay on CPU during env collection; moved only inside update)
+os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cuda')
+# Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
-## Default to CPU unless overridden by user env
-os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
 ## Mantieni ENV_DEVICE allineato a main.py per profili consistenti
 try:
     import torch as _t

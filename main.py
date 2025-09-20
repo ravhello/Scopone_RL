@@ -1,7 +1,48 @@
 import os
-import sys
 import threading
-import io
+
+# Silence TensorFlow/absl noise before any heavy imports
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # hide INFO/WARNING/ERROR from TF C++ logs
+os.environ.setdefault('ABSL_LOGGING_MIN_LOG_LEVEL', '3')  # absl logs: only FATAL
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # disable oneDNN custom ops info spam
+# Abilita TensorBoard di default (override con SCOPONE_DISABLE_TB=1 per disattivarlo)
+os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
+## Abilita torch.compile di default per l'intero progetto (override via env)
+os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
+os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
+## Autotune controllabile: di default ON su CPU beneficia di fusioni; può essere disattivato via env
+os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
+os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
+## Evita graph break su .item() catturando scalari nei grafi
+os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
+## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
+os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '0')
+## Alza il limite del cache di Dynamo per ridurre recompilazioni
+os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
+## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
+# Abilita e blocca i flag dell'osservazione all'avvio (usati da observation/environment al load)
+# Se l'utente li ha già impostati nel proprio run, li rispettiamo (setdefault)
+os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
+os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
+os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
+# Imposta ENV_DEVICE una sola volta coerente con SCOPONE_DEVICE o disponibilità CUDA
+os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+os.environ.setdefault('ENV_DEVICE', 'cpu')
+# Training compute device (models stay on CPU during env collection; moved only inside update)
+os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cuda')
+# Enable approximate GELU and gate all runtime checks via a single flag
+os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
+os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
+os.environ.setdefault('SCOPONE_PAR_PROFILE', '1')
+# Default to random seed for training runs (set -1); stable only if user sets it
+seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
+# Allow configuring iterations/horizon/num_envs via env; sensible defaults
+iters = int(os.environ.get('SCOPONE_ITERS', '3'))
+horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '8'))
 
 # Targeted FD-level stderr filter to drop absl/TF CUDA registration warnings from C++
 _SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
@@ -39,39 +80,6 @@ if _SILENCE_ABSL:
     _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
     _t.start()
 
-# Silence TensorFlow/absl noise before any heavy imports
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # hide INFO/WARNING/ERROR from TF C++ logs
-os.environ.setdefault('ABSL_LOGGING_MIN_LOG_LEVEL', '3')  # absl logs: only FATAL
-os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # disable oneDNN custom ops info spam
-# Abilita TensorBoard di default (override con SCOPONE_DISABLE_TB=1 per disattivarlo)
-os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
-## Abilita torch.compile di default per l'intero progetto (override via env)
-os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
-os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
-## Autotune controllabile: di default ON su CPU beneficia di fusioni; può essere disattivato via env
-os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
-os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
-## Evita graph break su .item() catturando scalari nei grafi
-os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
-## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
-os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '0')
-## Alza il limite del cache di Dynamo per ridurre recompilazioni
-os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
-## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
-# Abilita e blocca i flag dell'osservazione all'avvio (usati da observation/environment al load)
-# Se l'utente li ha già impostati nel proprio run, li rispettiamo (setdefault)
-os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
-os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
-os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
-os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
-# Imposta ENV_DEVICE una sola volta coerente con SCOPONE_DEVICE o disponibilità CUDA
-os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
-os.environ.setdefault('ENV_DEVICE', 'cpu')
-# Enable approximate GELU and gate all runtime checks via a single flag
-os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
-os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
 try:
     import torch as _t
     _env_def = 'cuda' if _t.cuda.is_available() else 'cpu'
@@ -115,24 +123,32 @@ def _maybe_launch_tensorboard():
 if __name__ == "__main__":
     device = get_compute_device()
     print(f"Using device: {device}")
-    """
-    # Configure CPU threads for training in the main process only (workers set to 1 in trainers/train_ppo.py)
-    if device.type == 'cpu':
+    print(f"Training compute device: {os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')}")
+    #"""
+    # Configure CPU threads for training in the main process only (workers handled in trainers/train_ppo.py)
+    # On GPU training, keep minimal CPU threads to reduce host contention
+    import torch as _torch
+    _train_dev = os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')
+    if (_train_dev.startswith('cuda') and _torch.cuda.is_available()):
+        _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', '2'))
+        _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', '1'))
+    else:
         _cores = int(max(1, (os.cpu_count() or 1)))
-        _target = max(1, int(_cores * 0.75))
+        _target = max(1, int(_cores * 0.60))
         _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', str(_target)))
-        _n_interop_default = max(1, _n_threads // 6)
+        _n_interop_default = max(1, _n_threads // 8)
         _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', str(_n_interop_default)))
-        torch.set_num_threads(_n_threads)
-        torch.set_num_interop_threads(_n_interop)
-        print(f"Training threads: num_threads={_n_threads} interop={_n_interop}")
-    """
+    torch.set_num_threads(_n_threads)
+    torch.set_num_interop_threads(_n_interop)
+    print(f"Training threads: num_threads={_n_threads} interop={_n_interop}")
+    #"""
     _maybe_launch_tensorboard()
-    # Default to random seed for training runs (set -1); stable only if user sets it
-    seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
-    # Note: train_ppo will resolve and announce the effective seed
-    train_ppo(num_iterations=10, horizon=16384, k_history=39,
-              num_envs=1,
+
+    print(f"Parallel envs: {num_envs}  (SCOPONE_PAR_PROFILE={os.environ.get('SCOPONE_PAR_PROFILE','0')})")
+    # Enable optional GPU for heavy training compute while env remains on CPU.
+    # Use env SCOPONE_TRAIN_DEVICE=cuda to turn it on; default is CPU.
+    train_ppo(num_iterations=iters, horizon=horizon, k_history=39,
+              num_envs=num_envs,
               mcts_sims=0,
               mcts_sims_eval=0,
               eval_every=0,

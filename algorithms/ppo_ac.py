@@ -123,18 +123,18 @@ class ActionConditionedPPO:
         except Exception as e:
             raise RuntimeError('ppo.init.set_matmul_precision_failed') from e
 
-        # AMP GradScaler su CUDA; disabilitato su CPU
+        # Training device override: keep models on CPU for env/collection, move to GPU only in update if requested
+        train_dev_str = _os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu').strip().lower()
+        if train_dev_str.startswith('cuda') and (not torch.cuda.is_available()):
+            train_dev_str = 'cpu'
+        self.train_device = torch.device(train_dev_str)
+        # AMP GradScaler only when training on CUDA
         self.scaler = None
-        if device.type == 'cuda':
+        if self.train_device.type == 'cuda':
             try:
-                # Prefer the unified AMP GradScaler API with explicit device
                 self.scaler = torch.amp.GradScaler(device='cuda')
             except Exception:
-                try:
-                    # Fallback to legacy CUDA-specific GradScaler
-                    self.scaler = torch.cuda.amp.GradScaler()
-                except Exception:
-                    self.scaler = None
+                self.scaler = torch.cuda.amp.GradScaler()
 
         # Pre-allocate pinned CPU buffers to cut repeated pin_memory/allocations in select_action
         # These are sized for single-step inference (batch size 1) and dynamic actions buffer
@@ -165,6 +165,16 @@ class ActionConditionedPPO:
             except Exception as e:
                 raise RuntimeError('ppo.ensure_actions_pinned_capacity.pin_memory_unavailable') from e
 
+    def _ensure_actions_cpu_capacity(self, capacity: int):
+        # Allocate or grow a CPU tensor (A,80) buffer for legal actions on CPU path
+        if not hasattr(self, '_actions_cpu_buf_capacity'):
+            self._actions_cpu_buf_capacity = 0
+            self._actions_cpu_buf = None
+        if (self._actions_cpu_buf is None) or (capacity > self._actions_cpu_buf_capacity):
+            new_cap = max(capacity, int(self._actions_cpu_buf_capacity * 2) if self._actions_cpu_buf_capacity > 0 else 64)
+            self._actions_cpu_buf = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32)
+            self._actions_cpu_buf_capacity = new_cap
+
     def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
@@ -172,29 +182,30 @@ class ActionConditionedPPO:
         if torch.is_tensor(legal_actions):
             if legal_actions.dim() != 2 or legal_actions.size(1) != self.run_config['action_dim']:
                 raise ValueError(f"legal actions tensor must be shape (A, 80), got {tuple(legal_actions.shape)}")
-            # Validate binary structure of action encoding
-            la = legal_actions
-            if (la.size(0) > 0) and (not torch.allclose(la[:, :40].sum(dim=1), torch.ones((la.size(0),), dtype=la.dtype, device=la.device))):
-                raise RuntimeError("select_action: each legal action must have exactly one played bit in [:40]")
-            cap = la[:, 40:]
-            if bool((((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)).any().item() if torch.is_tensor(cap) else False):
-                raise RuntimeError("select_action: captured section must be binary (0/1)")
+            if STRICT_CHECKS:
+                # Validate binary structure of action encoding (hot-path disabled unless STRICT)
+                la = legal_actions
+                if (la.size(0) > 0) and (not torch.allclose(la[:, :40].sum(dim=1), torch.ones((la.size(0),), dtype=la.dtype, device=la.device))):
+                    raise RuntimeError("select_action: each legal action must have exactly one played bit in [:40]")
+                cap = la[:, 40:]
+                if bool((((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)).any().item() if torch.is_tensor(cap) else False):
+                    raise RuntimeError("select_action: captured section must be binary (0/1)")
         elif isinstance(legal_actions, list) and len(legal_actions) > 0:
             la0 = legal_actions[0]
-            if torch.is_tensor(la0):
-                if la0.dim() != 1 or la0.numel() != self.run_config['action_dim']:
-                    raise ValueError(f"each legal action vector must be shape (80,), got {tuple(la0.shape)}")
-                # Single-sample check for structure; full check done in core
-                if not torch.allclose(la0[:40].sum(), torch.tensor(1.0, dtype=la0.dtype, device=la0.device)):
-                    raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
-            else:
-                import numpy as _np
-                a0 = _np.asarray(la0)
-                if a0.ndim != 1 or a0.shape[0] != self.run_config['action_dim']:
-                    raise ValueError(f"each legal action vector must be shape (80,), got {a0.shape}")
-                s = float(a0[:40].sum())
-                if abs(s - 1.0) > 1e-6:
-                    raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
+            if STRICT_CHECKS:
+                if torch.is_tensor(la0):
+                    if la0.dim() != 1 or la0.numel() != self.run_config['action_dim']:
+                        raise ValueError(f"each legal action vector must be shape (80,), got {tuple(la0.shape)}")
+                    if not torch.allclose(la0[:40].sum(), torch.tensor(1.0, dtype=la0.dtype, device=la0.device)):
+                        raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
+                else:
+                    import numpy as _np
+                    a0 = _np.asarray(la0)
+                    if a0.ndim != 1 or a0.shape[0] != self.run_config['action_dim']:
+                        raise ValueError(f"each legal action vector must be shape (80,), got {a0.shape}")
+                    s = float(a0[:40].sum())
+                    if abs(s - 1.0) > 1e-6:
+                        raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
         # Accept obs on CPU by staging through pinned memory when needed
         if torch.is_tensor(obs):
             if obs.device.type == device.type:
@@ -245,11 +256,12 @@ class ActionConditionedPPO:
                 raise RuntimeError('select_action expects legal_actions tensor on compute device or CPU tensor')
         elif isinstance(legal_actions, list) and len(legal_actions) > 0:
             if torch.is_tensor(legal_actions[0]):
-                # Stack on CPU then transfer via preallocated pinned buffer
-                la_cpu = torch.stack([x.detach().to('cpu', dtype=torch.float32) for x in legal_actions], dim=0)
-                A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
-                if A > 0:
-                    if device.type == 'cuda':
+                # Prefer buffer reuse on CPU to avoid per-step stack allocations
+                if device.type == 'cuda':
+                    # GPU path: keep existing pinned+stack pipeline
+                    la_cpu = torch.stack([x.detach().to('cpu', dtype=torch.float32) for x in legal_actions], dim=0)
+                    A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
+                    if A > 0:
                         try:
                             self._ensure_actions_pinned_capacity(A)
                             self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
@@ -260,9 +272,15 @@ class ActionConditionedPPO:
                             except Exception:
                                 actions_t = la_cpu.to(device=device)
                     else:
-                        actions_t = la_cpu
+                        actions_t = la_cpu.to(device=device)
                 else:
-                    actions_t = la_cpu.to(device=device)
+                    # CPU path: copy into reusable CPU buffer directly
+                    A = len(legal_actions)
+                    self._ensure_actions_cpu_capacity(A)
+                    buf = self._actions_cpu_buf[:A]
+                    for i, a in enumerate(legal_actions):
+                        buf[i].copy_(a.detach().to('cpu', dtype=torch.float32))
+                    actions_t = buf
             else:
                 import numpy as _np
                 la_cpu = torch.as_tensor(_np.asarray(legal_actions, dtype=_np.float32), dtype=torch.float32, device='cpu')
@@ -289,11 +307,12 @@ class ActionConditionedPPO:
         if STRICT_CHECKS:
             if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
                 raise RuntimeError("select_action: each legal action must have exactly one played bit in [:40]")
-        # Validate captured is binary
-        cap = actions_t[:, 40:]
-        cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)
-        if bool(cap_bad.any().item() if torch.is_tensor(cap_bad) else cap_bad.any()):
-            raise RuntimeError("select_action: captured section must be binary (0/1)")
+        # Validate captured is binary only in STRICT mode
+        if STRICT_CHECKS:
+            cap = actions_t[:, 40:]
+            cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)
+            if bool(cap_bad.any().item() if torch.is_tensor(cap_bad) else cap_bad.any()):
+                raise RuntimeError("select_action: captured section must be binary (0/1)")
 
         st = None
         if seat_team_vec is not None:
@@ -449,6 +468,9 @@ class ActionConditionedPPO:
             return torch.as_tensor(x, dtype=torch.long, device=device)
 
         # Accept CPU inputs; move to CUDA once in a pinned, non_blocking way
+        # Route all compute in this function to the training device (can be CUDA while env stays on CPU)
+        device = self.train_device
+
         def to_cuda_nb(x, dtype):
             # Se il tensore è già su device/dtype corretti, restituisci direttamente
             if torch.is_tensor(x):
@@ -478,9 +500,10 @@ class ActionConditionedPPO:
         obs = to_cuda_nb(batch['obs'], torch.float32)
         seat = to_cuda_nb(batch['seat_team'], torch.float32)
         act = to_cuda_nb(batch['act'], torch.float32)
-        old_logp = to_f32(batch['old_logp'])
-        ret = to_f32(batch['ret'])
-        adv = to_f32(batch['adv'])
+        # Move core scalars to training device to avoid CPU↔CUDA mismatches
+        old_logp = to_cuda_nb(batch['old_logp'], torch.float32)
+        ret = to_cuda_nb(batch['ret'], torch.float32)
+        adv = to_cuda_nb(batch['adv'], torch.float32)
         legals = to_cuda_nb(batch['legals'], torch.float32)
         offs = to_cuda_nb(batch['legals_offset'], torch.long)
         cnts = to_cuda_nb(batch['legals_count'], torch.long)
@@ -820,6 +843,11 @@ class ActionConditionedPPO:
         Esegue update PPO con più epoche e minibatch sul batch corrente.
         Le azioni legali restano passate come array globale (ragged via offset/len per sample).
         """
+        # Move models to training device (GPU for big compute if requested) just for the update
+        models_were_cpu = (next(self.actor.parameters()).device.type == 'cpu') and (self.train_device.type != 'cpu')
+        if models_were_cpu:
+            self.actor.to(self.train_device)
+            self.critic.to(self.train_device)
         num_samples = len(batch['obs'])
         last_info = {}
         avg_kl_acc, avg_clip_acc, count_mb = 0.0, 0.0, 0
@@ -933,7 +961,7 @@ class ActionConditionedPPO:
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
                 if self.scaler is not None:
-                    with torch.autocast(device_type=autocast_device, dtype=autocast_dtype):
+                    with torch.autocast(device_type=self.train_device.type, dtype=autocast_dtype):
                         loss, info = self.compute_loss(mini)
                     self.scaler.scale(loss).backward()
                     # Unscale prima del grad clip
@@ -1026,6 +1054,10 @@ class ActionConditionedPPO:
             last_info['avg_kl'] = (avg_kl_acc / count_mb).detach()
             last_info['avg_clip_frac'] = (avg_clip_acc / count_mb).detach()
             last_info['early_stop'] = torch.tensor(1.0 if early_stop else 0.0, device=device)
+        # Move back to CPU for collection if we temporarily moved to CUDA
+        if models_were_cpu:
+            self.actor.to('cpu')
+            self.critic.to('cpu')
         return last_info
 
     def add_lr_schedulers(self, actor_scheduler, critic_scheduler):

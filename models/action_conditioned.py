@@ -142,12 +142,14 @@ class StateEncoderCompact(nn.Module):
 
     def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         import torch.nn.functional as F
+        # Use the module's parameter device as the target to avoid CPU/GPU mismatches after .to(...)
+        target_device = self.card_emb.device
         if not torch.is_tensor(obs):
-            obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            obs = torch.as_tensor(obs, dtype=torch.float32, device=target_device)
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
-        if obs.device != device:
-            obs = obs.to(device)
+        if (obs.device != target_device) or (obs.dtype != torch.float32):
+            obs = obs.to(device=target_device, dtype=torch.float32)
 
         B = obs.size(0)
         D = obs.size(1)
@@ -198,7 +200,7 @@ class StateEncoderCompact(nn.Module):
                         break
 
         # Autocast per tutto il compute del forward compatto
-        cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
+        cm = torch.autocast(device_type=target_device.type, dtype=autocast_dtype) if target_device.type == 'cuda' else nullcontext()
         with cm:
             # Sezioni
             hand_table = obs[:, :83]
@@ -384,12 +386,13 @@ class ActionEncoder80(nn.Module):
         self.to(device)
 
     def forward(self, actions: torch.Tensor) -> torch.Tensor:
+        target_device = next(self.parameters()).device
         if not torch.is_tensor(actions):
-            actions = torch.as_tensor(actions, dtype=torch.float32, device=device)
+            actions = torch.as_tensor(actions, dtype=torch.float32, device=target_device)
         if actions.dim() == 1:
             actions = actions.unsqueeze(0)
-        if (actions.device.type != device.type) or (actions.dtype != torch.float32):
-            actions = actions.to(device=device, dtype=torch.float32)
+        if (actions.device != target_device) or (actions.dtype != torch.float32):
+            actions = actions.to(device=target_device, dtype=torch.float32)
         # Validate last-dimension matches expected input features
         try:
             in_dim = int(self.net[0].in_features)  # type: ignore[attr-defined]
@@ -528,15 +531,16 @@ class ActionConditionedActor(torch.nn.Module):
         return hand_mask | table_mask | cap0_mask | cap1_mask
 
     def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
+        target_device = next(self.parameters()).device
         if torch.is_tensor(obs):
-            if (obs.device.type == device.type) and (obs.dtype == torch.float32):
+            if (obs.device == target_device) and (obs.dtype == torch.float32):
                 x_obs = obs
-            elif obs.device.type == device.type:
+            elif obs.device == target_device:
                 x_obs = obs.to(dtype=torch.float32)
             else:
-                x_obs = obs.to(device=device, dtype=torch.float32)
+                x_obs = obs.to(device=target_device, dtype=torch.float32)
         else:
-            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=target_device)
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
@@ -545,7 +549,7 @@ class ActionConditionedActor(torch.nn.Module):
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
             if seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
-            if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
+            if (seat_team_vec.device != x_obs.device) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
         if STRICT:
@@ -625,15 +629,16 @@ class ActionConditionedActor(torch.nn.Module):
 
     def compute_state_features(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
         """Calcola solo le feature di stato (256) dal pair (obs, seat)."""
+        target_device = next(self.parameters()).device
         if torch.is_tensor(obs):
-            if (obs.device.type == device.type) and (obs.dtype == torch.float32):
+            if (obs.device == target_device) and (obs.dtype == torch.float32):
                 x_obs = obs
-            elif obs.device.type == device.type:
+            elif obs.device == target_device:
                 x_obs = obs.to(dtype=torch.float32)
             else:
-                x_obs = obs.to(device=device, dtype=torch.float32)
+                x_obs = obs.to(device=target_device, dtype=torch.float32)
         else:
-            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=target_device)
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
@@ -642,7 +647,7 @@ class ActionConditionedActor(torch.nn.Module):
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
             if seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
-            if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
+            if (seat_team_vec.device != x_obs.device) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         sf = self.state_enc(x_obs, seat_team_vec)  # (B,256)
         if STRICT:
@@ -655,8 +660,13 @@ class ActionConditionedActor(torch.nn.Module):
         """Proietta feature di stato (256) in spazio azione (64) usando belief/gating dell'actor.
         Richiede l'osservazione per calcolare la maschera carte visibili.
         """
+        target_device = next(self.parameters()).device
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
+        if x_obs.device != target_device:
+            x_obs = x_obs.to(device=target_device)
+        if state_feat.device != target_device:
+            state_feat = state_feat.to(device=target_device)
         visible_mask = (visible_mask_40 if visible_mask_40 is not None else self._visible_mask_from_obs(x_obs))
         belief_logits = self.belief_net(state_feat)        # (B,120)
         belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
@@ -733,15 +743,16 @@ class ActionConditionedActor(torch.nn.Module):
     def forward(self, obs: torch.Tensor, legals: torch.Tensor = None,
                 seat_team_vec: torch.Tensor = None) -> torch.Tensor:
         # Stato: (B, D)
+        target_device = next(self.parameters()).device
         if torch.is_tensor(obs):
-            if (obs.device.type == device.type) and (obs.dtype == torch.float32):
+            if (obs.device == target_device) and (obs.dtype == torch.float32):
                 x_obs = obs
-            elif obs.device.type == device.type:
+            elif obs.device == target_device:
                 x_obs = obs.to(dtype=torch.float32)
             else:
-                x_obs = obs.to(device=device, dtype=torch.float32)
+                x_obs = obs.to(device=target_device, dtype=torch.float32)
         else:
-            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=target_device)
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
@@ -750,7 +761,7 @@ class ActionConditionedActor(torch.nn.Module):
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
             if seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
-            if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
+            if (seat_team_vec.device != x_obs.device) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         # belief neurale interno con maschera carte visibili
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
@@ -929,15 +940,16 @@ class CentralValueNet(torch.nn.Module):
         self.to(device)
 
     def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None, others_hands: torch.Tensor = None) -> torch.Tensor:
+        target_device = next(self.parameters()).device
         if torch.is_tensor(obs):
-            if (obs.device.type == device.type) and (obs.dtype == torch.float32):
+            if (obs.device == target_device) and (obs.dtype == torch.float32):
                 x_obs = obs
-            elif obs.device.type == device.type:
+            elif obs.device == target_device:
                 x_obs = obs.to(dtype=torch.float32)
             else:
-                x_obs = obs.to(device=device, dtype=torch.float32)
+                x_obs = obs.to(device=target_device, dtype=torch.float32)
         else:
-            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            x_obs = torch.as_tensor(obs, dtype=torch.float32, device=target_device)
         if x_obs.dim() == 1:
             x_obs = x_obs.unsqueeze(0)
         if seat_team_vec is None:
@@ -946,7 +958,7 @@ class CentralValueNet(torch.nn.Module):
             seat_team_vec = (seat_team_vec if torch.is_tensor(seat_team_vec) else torch.as_tensor(seat_team_vec, dtype=torch.float32))
             if seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
-            if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
+            if (seat_team_vec.device != x_obs.device) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         # Belief neurale interno (ignora belief_summary esterno)
         state_feat = self.state_enc(x_obs, seat_team_vec)

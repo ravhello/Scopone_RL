@@ -33,6 +33,9 @@ torch.backends.cudnn.enabled = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
 
+# Lightweight parallel timing instrumentation flag
+_PAR_TIMING = (os.environ.get('SCOPONE_PAR_PROFILE', '0') == '1')
+
 # One-time run flags
 _HORIZON_ADJUST_LOGGED = False
 
@@ -51,9 +54,10 @@ def _env_worker(worker_id: int,
                 action_q: mp.Queue,
                 episode_q: mp.Queue):
     # Limit CPU threads per worker to reduce contention on the host
-    os.environ.setdefault('OMP_NUM_THREADS', '1')
-    os.environ.setdefault('MKL_NUM_THREADS', '1')
-    torch.set_num_threads(1)
+    wt = int(os.environ.get('SCOPONE_WORKER_THREADS', '1'))
+    os.environ['OMP_NUM_THREADS'] = str(wt)
+    os.environ['MKL_NUM_THREADS'] = str(wt)
+    torch.set_num_threads(wt)
     torch.set_num_interop_threads(1)
     # Ensure different RNG streams per worker for robustness
     set_global_seeds(int(cfg.get('seed', 0)) + int(worker_id))
@@ -76,8 +80,10 @@ def _env_worker(worker_id: int,
     mcts_progress_full = float(cfg.get('mcts_progress_full', 0.75))
     mcts_min_sims = int(cfg.get('mcts_min_sims', 0))
 
+    t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
+    t0_glob = time.time()
     for ep in range(episodes_per_env):
-        env.reset()
+        t0 = time.time(); env.reset(); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
         obs_list, next_obs_list = [], []
         act_list = []
         rew_list, done_list = [], []
@@ -92,8 +98,8 @@ def _env_worker(worker_id: int,
         done = False
         info = {}
         while not done:
-            obs = env._get_observation(env.current_player)
-            legal = env.get_valid_actions()
+            t0 = time.time(); obs = env._get_observation(env.current_player); t_get_obs += (time.time() - t0) if _PAR_TIMING else 0.0
+            t0 = time.time(); legal = env.get_valid_actions(); t_get_legals += (time.time() - t0) if _PAR_TIMING else 0.0
             if torch.is_tensor(legal) and (legal.size(0) == 0):
                 raise RuntimeError(f"collect_trajectory_parallel: worker {worker_id} got 0 legal actions (player={env.current_player})")
             # Avoid ambiguous truth-value on tensors; treat empty action sets explicitly
@@ -109,7 +115,8 @@ def _env_worker(worker_id: int,
             cp = env.current_player
             seat_vec = _seat_vec_for(cp)
             is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
-            if is_main and use_mcts and len(legal) > 0:
+            # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
+            if is_main and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
                 # Build helper RPCs to master for batched scoring
                 if send_legals:
                     leg_serial = [ (x.tolist() if torch.is_tensor(x) else list(x)) for x in legal ]
@@ -119,6 +126,7 @@ def _env_worker(worker_id: int,
                     # Invia tensori CPU direttamente (no conversione a liste) per ridurre overhead IPC
                     o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
                     leg_cpu = torch.stack([ (y.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
+                    t1 = time.time()
                     request_q.put({
                         'type': 'score_policy',
                         'wid': worker_id,
@@ -130,6 +138,8 @@ def _env_worker(worker_id: int,
                         resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_policy priors") from e
+                    t_rpc_local = (time.time() - t1)
+                    t_rpc += t_rpc_local if _PAR_TIMING else 0.0
                     pri = resp.get('priors', None)
                     import numpy as _np
                     if pri is None or (len(pri) != len(_legals)):
@@ -262,8 +272,9 @@ def _env_worker(worker_id: int,
                 root_temp_dyn = float(mcts_root_temp) if float(mcts_root_temp) > 0 else float(max(0.0, 1.0 - alpha))
 
                 if sims_scaled <= 0:
-                    from utils.fallback import notify_fallback
-                    notify_fallback('trainer.mcts_worker.invalid_sims_scaled')
+                    # Sims ended up <= 0 despite mcts_sims > 0 — log, optionally raise for debug, then fall back to master step
+                    if os.environ.get('SCOPONE_RAISE_ON_INVALID_SIMS', '0') == '1':
+                        raise RuntimeError(f"invalid sims_scaled: sims_scaled={sims_scaled} mcts_sims={mcts_sims} progress_start={mcts_progress_start} progress_full={mcts_progress_full} history_len={len(env.game_state.get('history', [])) if isinstance(env.game_state.get('history', []), list) else 'n/a'} alpha={alpha}")
                     if send_legals:
                         leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
                     else:
@@ -289,7 +300,7 @@ def _env_worker(worker_id: int,
                 else:
                     from algorithms.is_mcts import run_is_mcts
                     # Dynamic defaults for smoothing and root Dirichlet based on context
-                    priors_probe = policy_fn_mcts(obs, legal)
+                    t1 = time.time(); priors_probe = policy_fn_mcts(obs, legal); t_mcts += (time.time() - t1) if _PAR_TIMING else 0.0
                     pri_t = (priors_probe if torch.is_tensor(priors_probe) else torch.as_tensor(priors_probe, dtype=torch.float32))
                     peak = float(pri_t.max().item()) if pri_t.numel() > 0 else (1.0 / max(1, len(legal)))
                     A = int(len(legal))
@@ -334,7 +345,7 @@ def _env_worker(worker_id: int,
                         except Exception:
                             continue
                     act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                    next_obs, rew, done, info = env.step(act_t)
+                    t1 = time.time(); next_obs, rew, done, info = env.step(act_t); t_step += (time.time() - t1) if _PAR_TIMING else 0.0
                     # Distillation targets
                     try:
                         mcts_probs = torch.as_tensor(mcts_visits, dtype=torch.float32)
@@ -351,7 +362,7 @@ def _env_worker(worker_id: int,
                     leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
                 else:
                     leg_serial = torch.zeros((0,80), dtype=torch.float32)
-                request_q.put({
+                t1 = time.time(); request_q.put({
                     'type': 'step',
                     'wid': worker_id,
                     'obs': (obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)),
@@ -363,9 +374,10 @@ def _env_worker(worker_id: int,
                     idx = int(resp.get('idx', 0))
                 except queue.Empty as e:
                     raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (main path)") from e
+                t_rpc += (time.time() - t1) if _PAR_TIMING else 0.0
                 idx = max(0, min(idx, len(legal) - 1))
                 act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                next_obs, rew, done, info = env.step(act_t)
+                t1 = time.time(); next_obs, rew, done, info = env.step(act_t); t_step += (time.time() - t1) if _PAR_TIMING else 0.0
                 # No distillation target
                 mcts_policy_list.extend([0.0] * len(legal))
                 mcts_weight_list.append(0.0)
@@ -461,27 +473,27 @@ def _env_worker(worker_id: int,
         # Episode payload back to master using NumPy arrays (avoid Torch resource_sharer FDs entirely)
         import numpy as _np
         if len(obs_list) > 0:
-            obs_t = torch.stack(obs_list, dim=0).to('cpu', dtype=torch.float32).numpy()
+            t1 = time.time(); obs_t = torch.stack(obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             obs_t = _np.zeros((0, 1), dtype=_np.float32)
         if len(next_obs_list) > 0:
-            next_obs_t = torch.stack(next_obs_list, dim=0).to('cpu', dtype=torch.float32).numpy()
+            t1 = time.time(); next_obs_t = torch.stack(next_obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             next_obs_t = _np.zeros((0, 1), dtype=_np.float32)
         if len(act_list) > 0:
-            act_t = torch.stack(act_list, dim=0).to('cpu', dtype=torch.float32).numpy()
+            t1 = time.time(); act_t = torch.stack(act_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             act_t = _np.zeros((0, 80), dtype=_np.float32)
         if len(seat_team_list) > 0:
-            seat_t = torch.stack(seat_team_list, dim=0).to('cpu', dtype=torch.float32).numpy()
+            t1 = time.time(); seat_t = torch.stack(seat_team_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             seat_t = _np.zeros((0, 6), dtype=_np.float32)
         if len(belief_sum_list) > 0:
-            belief_t = torch.stack(belief_sum_list, dim=0).to('cpu', dtype=torch.float32).numpy()
+            t1 = time.time(); belief_t = torch.stack(belief_sum_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             belief_t = _np.zeros((0, 120), dtype=_np.float32)
         if len(legals_list) > 0:
-            legals_t = torch.stack(legals_list, dim=0).to('cpu', dtype=torch.float32).numpy()
+            t1 = time.time(); legals_t = torch.stack(legals_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             legals_t = _np.zeros((0, 80), dtype=_np.float32)
         leg_off_t = _np.asarray(legals_offset, dtype=_np.int64)
@@ -490,7 +502,7 @@ def _env_worker(worker_id: int,
         mcts_policy_t = _np.asarray(mcts_policy_list, dtype=_np.float32) if len(mcts_policy_list) > 0 else _np.zeros((0,), dtype=_np.float32)
         mcts_weight_t = _np.asarray(mcts_weight_list, dtype=_np.float32) if len(mcts_weight_list) > 0 else _np.zeros((0,), dtype=_np.float32)
         if len(others_hands_list) > 0:
-            others_hands_t = torch.stack(others_hands_list, dim=0).to('cpu', dtype=torch.float32).numpy()
+            t1 = time.time(); others_hands_t = torch.stack(others_hands_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             others_hands_t = _np.zeros((0, 3, 40), dtype=_np.float32)
 
@@ -527,6 +539,17 @@ def _env_worker(worker_id: int,
             episode_q.put({'wid': worker_id, 'type': 'done'})
         except Exception:
             pass
+    if _PAR_TIMING:
+        total = time.time() - t0_glob
+        episode_q.put({'wid': worker_id, 'type': 'timing',
+                       't_env_reset': t_env_reset,
+                       't_get_obs': t_get_obs,
+                       't_get_legals': t_get_legals,
+                       't_mcts': t_mcts,
+                       't_rpc': t_rpc,
+                       't_step': t_step,
+                       't_pack': t_pack,
+                       't_total': total})
 
 
 def _batched_select_indices(agent: ActionConditionedPPO,
@@ -1852,6 +1875,10 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     episodes_received = 0
     episodes_payloads = []
     produced_count = [0 for _ in range(num_envs)]
+    # Optional timing buffers
+    timing_from_workers = [] if _PAR_TIMING else None
+    t_drain = 0.0; t_get_reqs = 0.0; t_batch_select = 0.0; t_batch_service = 0.0; t_dispatch = 0.0
+    t_master_start = time.time() if _PAR_TIMING else 0.0
     # Optional per-env progress bars
     env_pbars = []
     try:
@@ -1873,6 +1900,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     while episodes_received < _expected_total:
         # 1) Drain any completed episodes first to free episode_q
         drained_any = False
+        t0_drain = time.time() if _PAR_TIMING else 0.0
         while True:
             try:
                 ep = episode_q.get_nowait()
@@ -1883,6 +1911,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                         _done_flags[wid] = True
                         if produced_count[wid] == 0:
                             raise RuntimeError(f"collector: worker wid={wid} signaled done without producing any episode")
+                    drained_any = True
+                elif _PAR_TIMING and isinstance(ep, dict) and ep.get('type') == 'timing':
+                    timing_from_workers.append(ep)
                     drained_any = True
                 else:
                     # validate episode payload
@@ -1909,10 +1940,13 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 break
         if drained_any:
             _last_activity_ts = time.time()
+        if _PAR_TIMING:
+            t_drain += (time.time() - t0_drain)
 
         # 2) Gather a micro-batch of requests without blocking
         reqs = []
         batch_target = max(4 * num_envs, 64)
+        t0_get = time.time() if _PAR_TIMING else 0.0
         for _ in range(batch_target):
             try:
                 r = request_q.get_nowait()
@@ -1926,26 +1960,40 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 reqs.append(r0)
             except queue.Empty:
                 pass
+        if _PAR_TIMING:
+            t_get_reqs += (time.time() - t0_get)
         # 3) Process batch on GPU
         if len(reqs) > 0:
             _last_activity_ts = time.time()
             step_reqs = [r for r in reqs if r.get('type') == 'step']
             other_reqs = [r for r in reqs if r.get('type') != 'step']
             if len(step_reqs) > 0:
+                _t0 = time.time() if _PAR_TIMING else 0.0
                 sel = _batched_select_indices(agent, step_reqs)
+                if _PAR_TIMING:
+                    t_batch_select += (time.time() - _t0)
+                _t0d = time.time() if _PAR_TIMING else 0.0
                 for (wid, idx) in sel:
                     try:
                         action_queues[wid].put({'idx': int(idx)}, block=False)
                     except Exception:
                         action_queues[wid].put({'idx': int(idx)})
+                if _PAR_TIMING:
+                    t_dispatch += (time.time() - _t0d)
             if len(other_reqs) > 0:
+                _t0 = time.time() if _PAR_TIMING else 0.0
                 outs = _batched_service(agent, other_reqs)
+                if _PAR_TIMING:
+                    t_batch_service += (time.time() - _t0)
+                _t0d = time.time() if _PAR_TIMING else 0.0
                 for r, out in zip(other_reqs, outs):
                     wid = int(r.get('wid', 0))
                     try:
                         action_queues[wid].put(out, block=False)
                     except Exception:
                         action_queues[wid].put(out)
+                if _PAR_TIMING:
+                    t_dispatch += (time.time() - _t0d)
 
         # 4) Detect worker crashes and stale state
         for _wid, _p in enumerate(workers):
@@ -2021,6 +2069,28 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             f"collector: episodes produced {episodes} != requested {int(episodes_total_hint)} (num_envs={num_envs}, "
             f"episodes_per_env_list={episodes_per_env_list}, produced_per_worker={produced_count})"
         )
+    # Print timing after validation
+    if _PAR_TIMING:
+        master_total = (time.time() - t_master_start)
+        try:
+            import numpy as _np
+            if timing_from_workers is not None and len(timing_from_workers) > 0:
+                def _agg(key):
+                    arr = _np.asarray([x.get(key, 0.0) for x in timing_from_workers], dtype=_np.float64)
+                    return float(arr.sum()), float(arr.mean()), float(arr.max())
+                s_env, m_env, M_env = _agg('t_env_reset')
+                s_obs, m_obs, M_obs = _agg('t_get_obs')
+                s_leg, m_leg, M_leg = _agg('t_get_legals')
+                s_mcts, m_mcts, M_mcts = _agg('t_mcts')
+                s_rpc, m_rpc, M_rpc = _agg('t_rpc')
+                s_step, m_step, M_step = _agg('t_step')
+                s_pack, m_pack, M_pack = _agg('t_pack')
+                s_tot, m_tot, M_tot = _agg('t_total')
+                print(f"[par-timing] workers={num_envs} workers_total={s_tot:.3f}s (avg={m_tot:.3f}, max={M_tot:.3f})\n"
+                      f"  env.reset={s_env:.3f} get_obs={s_obs:.3f} get_legals={s_leg:.3f} rpc_wait={s_rpc:.3f} mcts={s_mcts:.3f} env.step={s_step:.3f} pack={s_pack:.3f}", flush=True)
+            print(f"[par-timing-master] total={master_total:.3f}s drain={t_drain:.3f} get_reqs={t_get_reqs:.3f} batch_select={t_batch_select:.3f} batch_service={t_batch_service:.3f} dispatch={t_dispatch:.3f}", flush=True)
+        except Exception:
+            pass
 
     # Build batch CPU tensors from payloads
     obs_cpu = []
@@ -2306,15 +2376,19 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
               on_iter_end: Optional[Callable[[int], None]] = None):
     # Enforce minimum horizon of 40 and align horizon to minibatch size
     horizon = max(40, int(horizon))
-    # Read minibatch size once and reuse
+    # Read minibatch size once and align horizon to LCM(minibatch_size, per-episode useful transitions)
     import os as _os
+    import math as _math
     minibatch_size = 4096
     _mb_env = int(_os.environ.get('SCOPONE_MINIBATCH', str(minibatch_size)))
     if _mb_env > 0:
         minibatch_size = _mb_env
-    if minibatch_size > 0 and (horizon % minibatch_size) != 0:
-        horizon = ((horizon + minibatch_size - 1) // minibatch_size) * minibatch_size
-        print(f"[horizon] adjusted to multiple of minibatch_size: {horizon} (mb={minibatch_size})")
+    _per_ep_util = (40 if bool(train_both_teams) else 20)
+    lcm_mb_ep = (abs(minibatch_size * _per_ep_util) // _math.gcd(minibatch_size, _per_ep_util)) if (minibatch_size > 0 and _per_ep_util > 0) else max(minibatch_size, _per_ep_util)
+    if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
+        new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
+        print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={_per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+        horizon = new_h
     # Resolve and announce final seed (seed<0 => random per run)
     seed = resolve_seed(seed)
     set_global_seeds(seed)
@@ -2324,6 +2398,9 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     obs_dim = env.observation_space.shape[0]
     # Passa k_history al modello per evitare inferenze fragili di k
     agent = ActionConditionedPPO(obs_dim=obs_dim, k_history=k_history)
+    # Allow big-compute-on-GPU during update while env/collection stays on CPU.
+    # Controlled by env var SCOPONE_TRAIN_DEVICE (cpu|cuda[:id]). Defaults to cpu.
+    # Models live on CPU for collection; moved to train device inside agent.update.
 
     # Cosine annealing LR schedulers
     actor_sched = optim.lr_scheduler.CosineAnnealingLR(agent.opt_actor, T_max=max(1, num_iterations))
@@ -2425,7 +2502,15 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         except Exception:
             pass
         if use_parallel:
+            # Mirror single-env logic: choose episodes so that batch B is a multiple of minibatch_size
             per_ep_util = (40 if train_both_teams else 20)
+            # Compute LCM(mb, per_ep_util) and derive episodes from aligned horizon
+            import math as _math
+            lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
+            if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
+                new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
+                print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+                horizon = new_h
             episodes_hint = max(1, horizon // per_ep_util)
             # Debug: mostra hint e distribuzione per-env
             try:
