@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 
 from environment import ScoponeEnvMA
-from actions import encode_action, decode_action_ids
+from actions import decode_action_ids, encode_action_from_ids_tensor
 from rewards import compute_final_score_breakdown
 
 
@@ -55,7 +55,8 @@ def test_step_raises_when_capturing_card_not_on_table():
     env._rebuild_id_caches()
 
     # Prova a catturare una carta non presente sul tavolo
-    bad_action = encode_action(tid((7, 'denari')), [tid((2, 'coppe'))])
+    import torch
+    bad_action = encode_action_from_ids_tensor(torch.tensor(tid((7, 'denari')), dtype=torch.long), torch.tensor([tid((2, 'coppe'))], dtype=torch.long))
     with pytest.raises(ValueError):
         env.step(bad_action)
 
@@ -156,7 +157,7 @@ def test_forced_ace_capture_on_empty_table_counts_scopa():
     env.game_state["table"] = []
     env._rebuild_id_caches()
 
-    act = encode_action(tid((1, 'denari')), [])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((1, 'denari')), dtype=torch.long), torch.tensor([], dtype=torch.long))
     _, _, done, info = env.step(act)
     assert not done
     assert info["last_move"]["capture_type"] == "scopa", "Su tavolo vuoto e AP non posabile, l'asso conta come scopa"
@@ -186,7 +187,8 @@ def test_cannot_capture_two_same_rank_cards():
     env._rebuild_id_caches()
 
     # Tentare di catturare due carte pari-rank deve sollevare errore
-    bad = encode_action(tid((7, 'denari')), [tid((7, 'coppe')), tid((7, 'spade'))])
+    import torch
+    bad = encode_action_from_ids_tensor(torch.tensor(tid((7, 'denari')), dtype=torch.long), torch.tensor([tid((7, 'coppe')), tid((7, 'spade'))], dtype=torch.long))
     with pytest.raises(ValueError):
         env.step(bad)
 
@@ -205,7 +207,7 @@ def test_scopa_shaped_reward_applies():
     env.game_state["history"] = []
     env._rebuild_id_caches()
 
-    act = encode_action(tid((7, 'denari')), [tid((3, 'bastoni')), tid((4, 'denari'))])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((7, 'denari')), dtype=torch.long), torch.tensor([tid((3, 'bastoni')), tid((4, 'denari'))], dtype=torch.long))
     _, r, done, info = env.step(act)
     assert done is False
     assert info["last_move"]["capture_type"] == "scopa"
@@ -249,7 +251,7 @@ def test_ap_take_all_demotes_scopa_when_disabled():
     env.game_state["hands"][3] = []
     env.game_state["table"] = [tid((2, 'spade')), tid((3, 'bastoni'))]
     env._rebuild_id_caches()
-    act = encode_action(tid((1, 'denari')), [])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((1, 'denari')), dtype=torch.long), torch.tensor([], dtype=torch.long))
     _, _, done, info = env.step(act)
     assert not done
     assert info["last_move"]["capture_type"] == "capture"
@@ -266,7 +268,7 @@ def test_force_ace_self_capture_on_empty_once_flag():
     env.game_state["hands"][3] = []
     env.game_state["table"] = []
     env._rebuild_id_caches()
-    act = encode_action(tid((1, 'denari')), [])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((1, 'denari')), dtype=torch.long), torch.tensor([], dtype=torch.long))
     _, _, done, info = env.step(act)
     assert not done
     assert info["last_move"]["capture_type"] == "scopa"
@@ -285,7 +287,7 @@ def test_scopa_on_last_capture_toggle_with_forced_empty():
     env.game_state["hands"][3] = []
     env.game_state["table"] = [tid((1, 'spade')), tid((2, 'coppe'))]
     env._rebuild_id_caches()
-    act = encode_action(tid((3, 'denari')), [tid((1, 'spade')), tid((2, 'coppe'))])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((3, 'denari')), dtype=torch.long), torch.tensor([tid((1, 'spade')), tid((2, 'coppe'))], dtype=torch.long))
     _, _, done, info = env.step(act)
     assert done
     assert env.game_state["history"][-1]["capture_type"] == "capture"
@@ -299,7 +301,7 @@ def test_scopa_on_last_capture_toggle_with_forced_empty():
     env2.game_state["hands"][3] = []
     env2.game_state["table"] = [tid((1, 'spade')), tid((2, 'coppe'))]
     env2._rebuild_id_caches()
-    act2 = encode_action(tid((3, 'denari')), [tid((1, 'spade')), tid((2, 'coppe'))])
+    act2 = encode_action_from_ids_tensor(torch.tensor(tid((3, 'denari')), dtype=torch.long), torch.tensor([tid((1, 'spade')), tid((2, 'coppe'))], dtype=torch.long))
     _, _, done2, info2 = env2.step(act2)
     assert done2
     assert env2.game_state["history"][-1]["capture_type"] == "scopa"
@@ -319,7 +321,7 @@ def test_scopa_limit_resets_on_team_change():
     env.game_state["hands"][3] = [tid((2, 'denari'))]  # evita ultima presa
     env.game_state["table"] = [tid((3, 'spade')), tid((4, 'bastoni'))]
     env._rebuild_id_caches()
-    act = encode_action(tid((7, 'denari')), [tid((3, 'spade')), tid((4, 'bastoni'))])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((7, 'denari')), dtype=torch.long), torch.tensor([tid((3, 'spade')), tid((4, 'bastoni'))], dtype=torch.long))
     _, _, done, info = env.step(act)
     assert env.game_state["history"][-1]["capture_type"] == "scopa"
 
@@ -340,7 +342,7 @@ def test_scopa_limit_ignores_opponent_moves():
     env.game_state["hands"][3] = []
     env.game_state["table"] = [tid((3, 'spade')), tid((4, 'bastoni'))]
     env._rebuild_id_caches()
-    act = encode_action(tid((7, 'coppe')), [tid((3, 'spade')), tid((4, 'bastoni'))])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((7, 'coppe')), dtype=torch.long), torch.tensor([tid((3, 'spade')), tid((4, 'bastoni'))], dtype=torch.long))
     _, _, done, info = env.step(act)
     # Dato max=1 e la precedente scopa del team0, anche se c'è stata una mossa avversaria in mezzo,
     # questa seconda scopa della stessa squadra deve essere demota a capture
@@ -363,7 +365,7 @@ def test_scopa_limit_resets_on_same_team_non_scopa():
     env.game_state["hands"][3] = [tid((2, 'denari'))]  # evita ultima presa
     env.game_state["table"] = [tid((3, 'spade')), tid((4, 'bastoni'))]
     env._rebuild_id_caches()
-    act = encode_action(tid((7, 'coppe')), [tid((3, 'spade')), tid((4, 'bastoni'))])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((7, 'coppe')), dtype=torch.long), torch.tensor([tid((3, 'spade')), tid((4, 'bastoni'))], dtype=torch.long))
     _, _, done, info = env.step(act)
     # La serie è stata interrotta da una giocata della stessa squadra senza scopa,
     # quindi questa scopa deve rimanere scopa
@@ -380,7 +382,7 @@ def test_raise_if_hand_ends_with_no_captures():
     env.game_state["captured_squads"] = {0: [], 1: []}
     env.game_state["history"] = []
     env._rebuild_id_caches()
-    act = encode_action(tid((5, 'denari')), [])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((5, 'denari')), dtype=torch.long), torch.tensor([], dtype=torch.long))
     with pytest.raises(ValueError):
         env.step(act)
 
@@ -470,7 +472,7 @@ def test_max_consecutive_scopa_limit_two():
     env.game_state["hands"][3] = []
     env.game_state["table"] = [tid((3,'spade')), tid((4,'bastoni'))]
     env._rebuild_id_caches()
-    act = encode_action(tid((7,'coppe')), [tid((3,'spade')), tid((4,'bastoni'))])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((7,'coppe')), dtype=torch.long), torch.tensor([tid((3,'spade')), tid((4,'bastoni'))], dtype=torch.long))
     _, _, done, info = env.step(act)
     assert env.game_state["history"][-1]["capture_type"] == "capture"
 
@@ -572,7 +574,7 @@ def test_ap_forced_empty_last_capture_toggle():
     env.game_state["hands"] = {0: [tid((1,'denari'))], 1: [], 2: [], 3: []}
     env.game_state["table"] = []
     env._rebuild_id_caches()
-    act = encode_action(tid((1,'denari')), [])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((1,'denari')), dtype=torch.long), torch.tensor([], dtype=torch.long))
     _, _, done, info = env.step(act)
     assert done
     assert env.game_state["history"][-1]["capture_type"] == "capture"
@@ -584,7 +586,7 @@ def test_ap_forced_empty_last_capture_toggle():
     env2.game_state["hands"] = {0: [tid((1,'denari'))], 1: [], 2: [], 3: []}
     env2.game_state["table"] = []
     env2._rebuild_id_caches()
-    act2 = encode_action(tid((1,'denari')), [])
+    act2 = encode_action_from_ids_tensor(torch.tensor(tid((1,'denari')), dtype=torch.long), torch.tensor([], dtype=torch.long))
     _, _, done2, info2 = env2.step(act2)
     assert done2
     assert env2.game_state["history"][-1]["capture_type"] == "scopa"
@@ -601,27 +603,27 @@ def test_shape_scopa_default_reward_is_0_1():
     env.game_state["hands"][3] = []
     env.game_state["table"] = [tid((3,'bastoni')), tid((4,'denari'))]
     env._rebuild_id_caches()
-    act = encode_action(tid((7,'denari')), [tid((3,'bastoni')), tid((4,'denari'))])
+    act = encode_action_from_ids_tensor(torch.tensor(tid((7,'denari')), dtype=torch.long), torch.tensor([tid((3,'bastoni')), tid((4,'denari'))], dtype=torch.long))
     _, r, done, info = env.step(act)
     assert not done
     import numpy as _np
     assert _np.isclose(r, 0.1)
 
 
-def test_update_game_state_raises_no_capture_end():
-    # La versione game_logic.update_game_state deve rispettare la stessa regola no-end-without-captures
-    from game_logic import update_game_state
+def test_env_raises_no_capture_end():
+    # La mano non può terminare senza alcuna presa: conferma via env.step
+    import torch
     env = ScoponeEnvMA()
     env.reset()
-    gs = env.game_state
-    gs["hands"] = {0: [tid((5,'denari'))], 1: [], 2: [], 3: []}
-    gs["table"] = [tid((9,'coppe'))]
-    gs["captured_squads"] = {0: [], 1: []}
-    gs["history"] = []
-    act = encode_action(tid((5,'denari')), [])
+    env.game_state["hands"] = {0: [tid((5,'denari'))], 1: [], 2: [], 3: []}
+    env.game_state["table"] = [tid((9,'coppe'))]
+    env.game_state["captured_squads"] = {0: [], 1: []}
+    env.game_state["history"] = []
+    env._rebuild_id_caches()
+    act = encode_action_from_ids_tensor(torch.tensor(tid((5,'denari')), dtype=torch.long), torch.tensor([], dtype=torch.long))
     import pytest as _pytest
     with _pytest.raises(ValueError):
-        update_game_state(gs, act, 0, rules={})
+        env.step(act)
 
 
 def test_settebello_on_table_does_not_score():

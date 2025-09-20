@@ -21,6 +21,8 @@ class LineProfiler:
     """
     def __init__(self):
         self.functions = {}  # Functions to profile
+        # Map code objects to unique function keys (module.qualname) to avoid name collisions
+        self.code_to_key = {}
         self.allowed_codes = set()  # Code objects of functions we trace
         # Stats structure: {func_name: {line_no: [hits, cpu_time, gpu_time, transfer_time]}}
         self.results = defaultdict(lambda: defaultdict(lambda: [0, 0, 0, 0]))
@@ -45,8 +47,14 @@ class LineProfiler:
     def add_function(self, func):
         """Adds a function to profile with line-by-line instrumentation."""
         code = func.__code__
-        self.functions[func.__name__] = func
+        # Use fully-qualified name for uniqueness across modules/classes
+        try:
+            qualified_key = f"{getattr(func, '__module__', '<unknown>')}.{getattr(func, '__qualname__', getattr(func, '__name__', '<lambda>'))}"
+        except Exception:
+            qualified_key = getattr(func, '__name__', '<unknown>')
+        self.functions[qualified_key] = func
         self.allowed_codes.add(code)
+        self.code_to_key[code] = qualified_key
         self.line_timings[id(code)] = {}
         
         # Create a tracing function for this code object
@@ -125,7 +133,14 @@ class LineProfiler:
                         end_event.record()
                         end_event.synchronize()
                         elapsed_s = start_event.elapsed_time(end_event) / 1000.0
-                        self.func_gpu_time[func.__name__] += float(elapsed_s)
+                        try:
+                            key_for_gpu = self.code_to_key.get(func.__code__)
+                        except Exception:
+                            key_for_gpu = None
+                        if key_for_gpu is None:
+                            # Fallback to simple name if mapping missing
+                            key_for_gpu = getattr(func, '__name__', '<unknown>')
+                        self.func_gpu_time[key_for_gpu] += float(elapsed_s)
                     except Exception:
                         pass
         
@@ -137,11 +152,12 @@ class LineProfiler:
         code = getattr(frame, 'f_code', None)
         if not isinstance(code, types.CodeType):
             return
-        func_name = code.co_name
+        # Resolve unique key for this code object
+        func_key = self.code_to_key.get(code)
         line_no = frame.f_lineno
         
         # Verify this is a function we're profiling
-        if func_name not in self.functions:
+        if not func_key or (func_key not in self.functions):
             return
         
         # Get timing info for this frame
@@ -162,13 +178,13 @@ class LineProfiler:
             transfer_time = 0.0
             
             # Update results dictionary
-            if last_line in self.results[func_name]:
-                self.results[func_name][last_line][0] += 1  # Increment hits
-                self.results[func_name][last_line][1] += cpu_elapsed  # Add CPU time
-                self.results[func_name][last_line][2] += gpu_elapsed  # Add GPU time
-                self.results[func_name][last_line][3] += transfer_time  # Add transfer time
+            if last_line in self.results[func_key]:
+                self.results[func_key][last_line][0] += 1  # Increment hits
+                self.results[func_key][last_line][1] += cpu_elapsed  # Add CPU time
+                self.results[func_key][last_line][2] += gpu_elapsed  # Add GPU time
+                self.results[func_key][last_line][3] += transfer_time  # Add transfer time
             else:
-                self.results[func_name][last_line] = [1, cpu_elapsed, gpu_elapsed, transfer_time]
+                self.results[func_key][last_line] = [1, cpu_elapsed, gpu_elapsed, transfer_time]
         
         # Update timing info for the current line
         timing_info['last_line'] = line_no
@@ -180,10 +196,10 @@ class LineProfiler:
         code = getattr(frame, 'f_code', None)
         if not isinstance(code, types.CodeType):
             return
-        func_name = code.co_name
+        func_key = self.code_to_key.get(code)
         
         # Verify this is a function we're profiling
-        if func_name not in self.functions:
+        if not func_key or (func_key not in self.functions):
             return
         
         # Get timing info for this frame
@@ -203,13 +219,13 @@ class LineProfiler:
             transfer_time = 0.0
             
             # Update results
-            if last_line in self.results[func_name]:
-                self.results[func_name][last_line][0] += 1
-                self.results[func_name][last_line][1] += cpu_elapsed
-                self.results[func_name][last_line][2] += gpu_elapsed
-                self.results[func_name][last_line][3] += transfer_time
+            if last_line in self.results[func_key]:
+                self.results[func_key][last_line][0] += 1
+                self.results[func_key][last_line][1] += cpu_elapsed
+                self.results[func_key][last_line][2] += gpu_elapsed
+                self.results[func_key][last_line][3] += transfer_time
             else:
-                self.results[func_name][last_line] = [1, cpu_elapsed, gpu_elapsed, transfer_time]
+                self.results[func_key][last_line] = [1, cpu_elapsed, gpu_elapsed, transfer_time]
             
             # Clean up timing info (moved to wrapper for safety)
             # del self.start_times[frame_id]

@@ -30,6 +30,16 @@ def _env_mode() -> str:
     )
 
 
+def _env_backend() -> str:
+    """Return backend for torch.compile. Default to 'inductor' (best on CPU and CUDA)."""
+    return os.environ.get('SCOPONE_TORCH_COMPILE_BACKEND', os.environ.get('TORCH_COMPILE_BACKEND', 'inductor'))
+
+
+def _env_fullgraph() -> bool:
+    """Return whether to request fullgraph=True in torch.compile via env flag."""
+    return os.environ.get('SCOPONE_TORCH_COMPILE_FULLGRAPH', os.environ.get('TORCH_COMPILE_FULLGRAPH', '0')) == '1'
+
+
 def _maybe_setup_dynamo() -> None:
     """Best-effort configuration for torch._dynamo to avoid hard failures when compiling."""
     if torch is None:
@@ -40,15 +50,13 @@ def _maybe_setup_dynamo() -> None:
         # Avoid throwing on graphs that the compiler cannot handle; fallback to eager.
         _dynamo.config.suppress_errors = True
         # Prefer dynamic shapes to reduce shape constraint eval failures
-        try:
+        dyn_env = os.environ.get('TORCHDYNAMO_DYNAMIC_SHAPES', None)
+        if dyn_env is not None:
+            _dynamo.config.dynamic_shapes = (dyn_env == '1')
+        else:
             _dynamo.config.dynamic_shapes = True
-        except Exception:
-            pass
         # Avoid graph breaks from scalar .item() by capturing scalar outputs in graphs
-        try:
-            _dynamo.config.capture_scalar_outputs = True
-        except Exception:
-            pass
+        _dynamo.config.capture_scalar_outputs = True
         # Increase cache size limit to reduce recompilation churn
         try:
             limit = int(os.environ.get('SCOPONE_DYNAMO_CACHE_SIZE_LIMIT', os.environ.get('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')))
@@ -73,16 +81,22 @@ def _maybe_setup_dynamo() -> None:
             _tlog.set_logs(dynamo="error", inductor="error", aot="error")
         except Exception:
             pass
-        # Tune Inductor to avoid GEMM autotune warnings on small GPUs
+        # Inductor autotune knobs: respect env if provided; otherwise don't override defaults
         try:
             from torch._inductor import config as _inductor_cfg  # type: ignore
-            _inductor_cfg.max_autotune_gemm = False
-            # Be conservative: also disable other autotune knobs if present
-            if hasattr(_inductor_cfg, 'max_autotune'):
-                _inductor_cfg.max_autotune = False
-            if hasattr(_inductor_cfg, 'max_autotune_pointwise'):
-                _inductor_cfg.max_autotune_pointwise = False
-            # Disable cudagraphs to avoid noisy skips on scalar ops
+            _auto_env = os.environ.get('SCOPONE_INDUCTOR_AUTOTUNE', None)
+            if _auto_env is not None:
+                _want_auto = (_auto_env == '1')
+                try:
+                    if hasattr(_inductor_cfg, 'max_autotune'):
+                        _inductor_cfg.max_autotune = _want_auto
+                    if hasattr(_inductor_cfg, 'max_autotune_pointwise'):
+                        _inductor_cfg.max_autotune_pointwise = _want_auto
+                    if hasattr(_inductor_cfg, 'max_autotune_gemm'):
+                        _inductor_cfg.max_autotune_gemm = _want_auto
+                except Exception:
+                    pass
+            # Disable cudagraphs if present (helps reduce noisy skips on some CUDA setups)
             try:
                 if hasattr(_inductor_cfg, 'triton') and hasattr(_inductor_cfg.triton, 'cudagraphs'):
                     _inductor_cfg.triton.cudagraphs = False
@@ -134,10 +148,24 @@ def maybe_compile_module(module: Any, name: Optional[str] = None) -> Any:
     _maybe_setup_dynamo()
     try:
         mode = get_mode()
-        compiled = torch.compile(module, mode=mode)  # type: ignore[attr-defined]
+        backend = _env_backend()
+        fullgraph = _env_fullgraph()
+        # If IPEX backend is requested, try to import it; otherwise, fallback to inductor.
+        if backend == 'ipex':
+            try:
+                import intel_extension_for_pytorch as _ipex  # type: ignore  # noqa: F401
+            except Exception:
+                if os.environ.get('SCOPONE_COMPILE_VERBOSE', '0') == '1':
+                    print("[compile] IPEX backend requested but intel_extension_for_pytorch is not available; falling back to 'inductor'.")
+                backend = 'inductor'
+        try:
+            compiled = torch.compile(module, mode=mode, backend=backend, fullgraph=fullgraph)  # type: ignore[attr-defined]
+        except TypeError:
+            # Older PyTorch versions may not accept fullgraph kwarg
+            compiled = torch.compile(module, mode=mode, backend=backend)  # type: ignore[attr-defined]
         if os.environ.get('SCOPONE_COMPILE_VERBOSE', '0') == '1':
             nm = name or getattr(module, '__class__', type(module)).__name__
-            print(f"[compile] Compiled module: {nm} (mode={mode})")
+            print(f"[compile] Compiled module: {nm} (mode={mode}, backend={backend}, fullgraph={fullgraph})")
         return compiled
     except Exception as e:
         if os.environ.get('SCOPONE_COMPILE_VERBOSE', '0') == '1':
@@ -156,10 +184,22 @@ def maybe_compile_function(fn: Callable, name: Optional[str] = None) -> Callable
     _maybe_setup_dynamo()
     try:
         mode = get_mode()
-        compiled = torch.compile(fn, mode=mode)  # type: ignore[attr-defined]
+        backend = _env_backend()
+        fullgraph = _env_fullgraph()
+        if backend == 'ipex':
+            try:
+                import intel_extension_for_pytorch as _ipex  # type: ignore  # noqa: F401
+            except Exception:
+                if os.environ.get('SCOPONE_COMPILE_VERBOSE', '0') == '1':
+                    print("[compile] IPEX backend requested but intel_extension_for_pytorch is not available; falling back to 'inductor'.")
+                backend = 'inductor'
+        try:
+            compiled = torch.compile(fn, mode=mode, backend=backend, fullgraph=fullgraph)  # type: ignore[attr-defined]
+        except TypeError:
+            compiled = torch.compile(fn, mode=mode, backend=backend)  # type: ignore[attr-defined]
         if os.environ.get('SCOPONE_COMPILE_VERBOSE', '0') == '1':
             nm = name or getattr(fn, '__name__', str(fn))
-            print(f"[compile] Compiled function: {nm} (mode={mode})")
+            print(f"[compile] Compiled function: {nm} (mode={mode}, backend={backend}, fullgraph={fullgraph})")
         return compiled
     except Exception as e:
         if os.environ.get('SCOPONE_COMPILE_VERBOSE', '0') == '1':

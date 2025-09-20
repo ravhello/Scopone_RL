@@ -1,4 +1,9 @@
 import os
+# Default compile-friendly settings (work on CPU and CUDA)
+os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
+os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 import torch
 from tqdm import tqdm
 from typing import Tuple
@@ -11,6 +16,7 @@ try:
 except Exception:
     TB_AVAILABLE = False
 from models.action_conditioned import ActionConditionedActor
+from utils.compile import maybe_compile_module
 from utils.device import get_compute_device
 from algorithms.is_mcts import run_is_mcts
 # BeliefState legacy opzionale (non usato nello scenario corrente)
@@ -113,8 +119,8 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
     obs_dim = env0.observation_space.shape[0]
     del env0
     # Carica attori
-    actor_a = ActionConditionedActor(obs_dim=obs_dim).to(device)
-    actor_b = ActionConditionedActor(obs_dim=obs_dim).to(device)
+    actor_a = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_A]').to(device)
+    actor_b = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_B]').to(device)
     try:
         if ckpt_a and os.path.isfile(ckpt_a):
             st_a = torch.load(ckpt_a, map_location=device)
@@ -151,9 +157,14 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                         (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32))
                     for x in legal_list], dim=0)
                     s_cpu = seat_vec.detach().to('cpu', dtype=torch.float32)
-                    o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                    leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
-                    s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                    if device.type == 'cuda':
+                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
+                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                    else:
+                        o_t = o_cpu.unsqueeze(0).to(device=device)
+                        leg_t = leg_cpu.to(device=device)
+                        s_t = s_cpu.unsqueeze(0).to(device=device)
                     with torch.no_grad():
                         logits = actor_model(o_t, leg_t, s_t)
                         probs = torch.softmax(logits, dim=0).detach().cpu().numpy()
@@ -227,9 +238,14 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                 (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32))
             for x in legals], dim=0)
             s_cpu = seat_vec.detach().to('cpu', dtype=torch.float32)
-            o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-            leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
-            s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+            if device.type == 'cuda':
+                o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
+                s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+            else:
+                o_t = o_cpu.unsqueeze(0).to(device=device)
+                leg_t = leg_cpu.to(device=device)
+                s_t = s_cpu.unsqueeze(0).to(device=device)
             with torch.no_grad():
                 logits = actor_model(o_t, leg_t, s_t)
                 idx = torch.argmax(logits).to('cpu')

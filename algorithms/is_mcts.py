@@ -122,7 +122,9 @@ def run_is_mcts(env: ScoponeEnvMA,
         # Assume torch.Tensor path
         import os as _os
         if not torch.is_tensor(priors):
-            priors = torch.as_tensor(priors, dtype=torch.float32, device=torch.device(_os.environ.get('SCOPONE_DEVICE', 'cpu')))
+            from utils.device import get_compute_device as _get_compute_device
+            pri_dev = _get_compute_device()
+            priors = torch.as_tensor(priors, dtype=torch.float32, device=pri_dev)
         device = priors.device
         priors_len = int(priors.numel())
         if priors_len != len(legals):
@@ -215,7 +217,9 @@ def run_is_mcts(env: ScoponeEnvMA,
                         priors_sel = priors_s[top_idx]
                     else:
                         if not torch.is_tensor(priors_s):
-                            priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=torch.device(_os.environ.get('SCOPONE_DEVICE', 'cpu')))
+                            from utils.device import get_compute_device as _get_compute_device
+                            pri_dev2 = _get_compute_device()
+                            priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=pri_dev2)
                         if prior_smooth_eps > 0 and priors_s.numel() > 1:
                             priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
                         visits_here = max(1, node.N)

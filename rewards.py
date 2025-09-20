@@ -53,13 +53,7 @@ def compute_final_score_breakdown(game_state, rules=None):
         suits = SUID[ids_t].to(torch.long)
         vals = PV[ranks]
         out = torch.zeros(4, dtype=torch.float32, device=device)
-        try:
-            out.scatter_reduce_(0, suits, vals, reduce='amax', include_self=True)
-        except Exception:
-            for s in range(4):
-                mask = (suits == s)
-                if mask.any():
-                    out[s] = torch.max(vals[mask])
+        out.scatter_reduce_(0, suits, vals, reduce='amax', include_self=True)
         return float(out.sum().item())
     prim0 = _primiera_points(ids0)
     prim1 = _primiera_points(ids1)

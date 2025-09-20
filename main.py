@@ -2,45 +2,50 @@ import os
 import sys
 import threading
 import io
+import warnings as _warnings
+
+# Suppress noisy third-party deprecation warning from IPEX importing pkg_resources
+_warnings.filterwarnings(
+    'ignore',
+    message=r'pkg_resources is deprecated as an API.*',
+    category=UserWarning,
+)
 
 # Targeted FD-level stderr filter to drop absl/TF CUDA registration warnings from C++
 _SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
 if _SILENCE_ABSL:
-    try:
-        _SUPPRESS_SUBSTRINGS = (
-            "All log messages before absl::InitializeLog() is called are written to STDERR",
-            "Unable to register cuDNN factory",
-            "Unable to register cuBLAS factory",
-            "cuda_dnn.cc",
-            "cuda_blas.cc",
-        )
+    _SUPPRESS_SUBSTRINGS = (
+        "All log messages before absl::InitializeLog() is called are written to STDERR",
+        "Unable to register cuDNN factory",
+        "Unable to register cuBLAS factory",
+        "cuda_dnn.cc",
+        "cuda_blas.cc",
+    )
 
-        _orig_fd2 = os.dup(2)
-        _r_fd, _w_fd = os.pipe()
-        os.dup2(_w_fd, 2)
+    _orig_fd2 = os.dup(2)
+    _r_fd, _w_fd = os.pipe()
+    os.dup2(_w_fd, 2)
 
-        def _stderr_reader(r_fd, orig_fd, suppressed):
-            with os.fdopen(r_fd, 'rb', buffering=0) as r:
-                buffer = b""
-                while True:
-                    chunk = r.read(1024)
-                    if not chunk:
-                        break
-                    buffer += chunk
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        txt = line.decode('utf-8', errors='ignore')
-                        if not any(s in txt for s in suppressed):
-                            os.write(orig_fd, line + b"\n")
-                if buffer:
-                    txt = buffer.decode('utf-8', errors='ignore')
+    def _stderr_reader(r_fd, orig_fd, suppressed):
+        with os.fdopen(r_fd, 'rb', buffering=0) as r:
+            buffer = b""
+            while True:
+                chunk = r.read(1024)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    txt = line.decode('utf-8', errors='ignore')
                     if not any(s in txt for s in suppressed):
-                        os.write(orig_fd, buffer)
+                        os.write(orig_fd, line + b"\n")
+            if buffer:
+                txt = buffer.decode('utf-8', errors='ignore')
+                if not any(s in txt for s in suppressed):
+                    os.write(orig_fd, buffer)
 
-        _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
-        _t.start()
-    except Exception as e:
-        raise
+    _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
+    _t.start()
 
 # Silence TensorFlow/absl noise before any heavy imports
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # hide INFO/WARNING/ERROR from TF C++ logs
@@ -49,15 +54,18 @@ os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # disable oneDNN custom ops
 # Abilita TensorBoard di default (override con SCOPONE_DISABLE_TB=1 per disattivarlo)
 os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
 ## Abilita torch.compile di default per l'intero progetto (override via env)
-os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE', '1')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'ipex')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_FULLGRAPH', '1')
 os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
-## Disabilita max_autotune_gemm di Inductor (alcune GPU loggano warning inutili)
+## Autotune controllabile: di default ON su CPU beneficia di fusioni; può essere disattivato via env
+os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
 ## Evita graph break su .item() catturando scalari nei grafi
 os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
 ## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
-os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
+os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '0')
 ## Alza il limite del cache di Dynamo per ridurre recompilazioni
 os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 ## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
@@ -67,10 +75,12 @@ os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
 os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
 os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
 os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
-# Default to CPU unless overridden by user env
-os.environ.setdefault('SCOPONE_DEVICE', 'cpu') # puoi selezionare "cuda" se vuoi gpu
-os.environ.setdefault('ENV_DEVICE', 'cpu') # puoi selezionare "cuda" se vuoi gpu
-# Preferire default CPU per evitare uso GPU implicito; override via env se desiderato
+# Imposta ENV_DEVICE una sola volta coerente con SCOPONE_DEVICE o disponibilità CUDA
+os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+os.environ.setdefault('ENV_DEVICE', 'cpu')
+# Enable approximate GELU and gate all runtime checks via a single flag
+os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
+os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
 try:
     import torch as _t
     _env_def = 'cuda' if _t.cuda.is_available() else 'cpu'
@@ -115,21 +125,16 @@ if __name__ == "__main__":
     device = get_compute_device()
     print(f"Using device: {device}")
     """
-    # Configure CPU threads for training in the main process only
-    # Env workers keep their own setting (forced to 1 thread in trainers/train_ppo.py)
-    try:
-        _cores = int(os.cpu_count()*0.75 or 1)
-        _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', str(_cores)))
-        _n_interop_default = max(1, _cores // 6)
+    # Configure CPU threads for training in the main process only (workers set to 1 in trainers/train_ppo.py)
+    if device.type == 'cpu':
+        _cores = int(max(1, (os.cpu_count() or 1)))
+        _target = max(1, int(_cores * 0.75))
+        _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', str(_target)))
+        _n_interop_default = max(1, _n_threads // 6)
         _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', str(_n_interop_default)))
         torch.set_num_threads(_n_threads)
         torch.set_num_interop_threads(_n_interop)
-        try:
-            print(f"Training threads: num_threads={_n_threads} interop={_n_interop}")
-        except Exception:
-            pass
-    except Exception:
-        pass
+        print(f"Training threads: num_threads={_n_threads} interop={_n_interop}")
     """
     _maybe_launch_tensorboard()
     # Default to random seed for training runs (set -1); stable only if user sets it

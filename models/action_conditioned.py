@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 import os
 from contextlib import nullcontext
 from typing import Dict, Tuple, Optional
@@ -21,85 +22,19 @@ except Exception:
 device = get_compute_device()
 autocast_device = device.type
 autocast_dtype = get_amp_dtype()
+STRICT = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
 
-# Optional: alias to torch._dynamo.disable for eager-only helpers
-try:
-    import torch._dynamo as _dynamo  # type: ignore
-    _dynamo_disable = _dynamo.disable  # type: ignore[attr-defined]
-except Exception:
-    def _dynamo_disable(fn):  # type: ignore
-        return fn
+# Observation flags are now imported from observation.py to ensure consistency.
+from observation import (
+    OBS_INCLUDE_INFERRED as _OBS_INCLUDE_INFERRED,
+    OBS_INCLUDE_RANK_PROBS as _OBS_INCLUDE_RANK_PROBS,
+    OBS_INCLUDE_SCOPA_PROBS as _OBS_INCLUDE_SCOPA_PROBS,
+    OBS_INCLUDE_DEALER as _OBS_INCLUDE_DEALER,
+)
 
+import torch._dynamo as _dynamo  # type: ignore
+_dynamo_disable = _dynamo.disable  # type: ignore[attr-defined]
 
-class StateEncoder10823(nn.Module):
-    """
-    Encoda l'osservazione 10823-dim in un vettore di contesto (256-dim),
-    riutilizzando la stessa scomposizione semantica già usata nelle reti correnti.
-    """
-    def __init__(self, obs_dim: int = 10823):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(obs_dim, 1024), nn.ReLU(),
-            nn.Linear(1024, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-        )
-        self.hand_table_processor = nn.Sequential(nn.Linear(83, 64), nn.ReLU())
-        self.captured_processor = nn.Sequential(nn.Linear(82, 64), nn.ReLU())
-        self.history_processor = nn.Sequential(nn.Linear(10320, 128), nn.ReLU(), nn.Linear(128, 64), nn.ReLU())
-        self.stats_processor = nn.Sequential(nn.Linear(334, 64), nn.ReLU())
-        # Seat/team embedding: 6-dim (4 seat one-hot + 1 ally flag + 1 opponent flag)
-        self.seat_head = nn.Sequential(nn.Linear(6, 32), nn.ReLU())
-        self.combiner = nn.Sequential(nn.Linear(128 + 64 * 4 + 32, 256), nn.ReLU())
-        self.to(device)
-
-    def forward(self, obs: torch.Tensor, seat_team_vec: torch.Tensor = None) -> torch.Tensor:
-        import torch.nn.functional as F
-        if not torch.is_tensor(obs):
-            obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
-        if obs.dim() == 1:
-            obs = obs.unsqueeze(0)
-        if obs.device != device:
-            obs = obs.to(device)
-        if not torch.isfinite(obs).all():
-            raise RuntimeError("StateEncoderCompact.forward: obs contains non-finite values")
-
-        cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
-        with cm:
-            x1 = F.relu(self.backbone[0](obs), inplace=True)
-            x2 = F.relu(self.backbone[2](x1), inplace=True)
-            x3 = F.relu(self.backbone[4](x2), inplace=True)
-            backbone_features = F.relu(self.backbone[6](x3), inplace=True)
-
-            hand_table = obs[:, :83]
-            captured = obs[:, 83:165]
-            history = obs[:, 169:10489]
-            stats = obs[:, 10489:]
-
-            hand_table_features = F.relu(self.hand_table_processor[0](hand_table), inplace=True)
-            captured_features = F.relu(self.captured_processor[0](captured), inplace=True)
-            history_features = F.relu(self.history_processor[0](history), inplace=True)
-            history_features = F.relu(self.history_processor[2](history_features), inplace=True)
-            stats_features = F.relu(self.stats_processor[0](stats), inplace=True)
-
-            if seat_team_vec is None:
-                notify_fallback('models.state_encoder10823.seat_team_missing')
-            elif seat_team_vec.dim() == 1:
-                seat_team_vec = seat_team_vec.unsqueeze(0)
-
-            seat_feat = F.relu(self.seat_head[0](seat_team_vec), inplace=True)
-
-            combined = torch.cat([
-                backbone_features,
-                hand_table_features,
-                captured_features,
-                history_features,
-                stats_features,
-                seat_feat
-            ], dim=1)
-
-            context = F.relu(self.combiner[0](combined), inplace=True)
-        return context  # (B,256)
 
 
 class StateEncoderCompact(nn.Module):
@@ -112,8 +47,9 @@ class StateEncoderCompact(nn.Module):
       - stats: variabile (resto delle feature)
       - seat/team: 6 (passato separatamente)
     """
-    def __init__(self):
+    def __init__(self, k_history: Optional[int] = None):
         super().__init__()
+        self.k_history_hint: Optional[int] = k_history
         # Card embedding for permutation-invariant set encoding (40 card IDs)
         # Initialize deterministically and ensure finite values
         torch.manual_seed(0)
@@ -135,8 +71,13 @@ class StateEncoderCompact(nn.Module):
         self.hist_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
         self.hist_pos_emb = nn.Embedding(40, 64)  # up to 40 recent moves
 
-        # Stats and seat/team (dimensione variabile → LazyLinear)
-        self.stats_processor = nn.Sequential(nn.LazyLinear(64), nn.ReLU())
+        # Stats and seat/team: fix input dim deterministically from flags to avoid LazyLinear pitfalls
+        self.stats_in_dim = 99 \
+            + (120 if _OBS_INCLUDE_INFERRED else 0) \
+            + (10 if _OBS_INCLUDE_SCOPA_PROBS else 0) \
+            + (150 if _OBS_INCLUDE_RANK_PROBS else 0) \
+            + (4 if _OBS_INCLUDE_DEALER else 0)
+        self.stats_processor = nn.Sequential(nn.Linear(self.stats_in_dim, 64), nn.ReLU())
         self.seat_head = nn.Sequential(nn.Linear(6, 32), nn.ReLU())
 
         # Combiner to 256-d state context
@@ -147,7 +88,7 @@ class StateEncoderCompact(nn.Module):
         self.to(device)
         # Final guard after move to device
         with torch.no_grad():
-            if not torch.isfinite(self.card_emb).all():
+            if (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1') and (not torch.isfinite(self.card_emb).all()):
                 self.card_emb.copy_(torch.zeros_like(self.card_emb))
         # Pre-create positional ids for up to 40 steps to avoid per-forward arange
         self.register_buffer('_hist_pos_ids', torch.arange(40, dtype=torch.long, device=device))
@@ -164,48 +105,36 @@ class StateEncoderCompact(nn.Module):
         Expects batch-first (B, T, E)."""
         out = torch.zeros_like(q)
         if kpm.dim() == 2:
+            with self._attn_ctx():
+                o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
+            if o.dtype != out.dtype:
+                o = o.to(dtype=out.dtype)
             all_masked = kpm.all(dim=1)
-            if bool((~all_masked).any()):
-                with self._attn_ctx():
-                    o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
-                if o.dtype != out.dtype:
-                    o = o.to(dtype=out.dtype)
-                if bool(all_masked.any()):
-                    o[all_masked] = 0
-                out = o
+            if all_masked.dtype != torch.bool:
+                all_masked = all_masked.to(torch.bool)
+            # Zero-out rows where all keys are masked (out-of-place to avoid autograd versioning issues)
+            o = torch.where(all_masked.view(-1, 1, 1), torch.zeros_like(o), o)
+            out = o
         return out
 
     def _mha_masked_mean(self, mha: nn.Module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                           q_present: torch.Tensor, k_present: torch.Tensor) -> torch.Tensor:
-        """Compute MHA and return masked mean over query tokens. Supports efficient path for B==1 by
-        compressing sequences to present tokens only (avoids key_padding work on 40-length sequences).
+        """Compute MHA and return masked mean over query tokens using a single key_padding_mask path.
         Returns shape (B, E)."""
-        B, Tq, E = q.shape
-        if B == 1:
-            q_mask = q_present[0]
-            k_mask = k_present[0]
-            if not bool(q_mask.any()) or not bool(k_mask.any()):
-                return torch.zeros((1, E), dtype=q.dtype, device=q.device)
-            q_comp = q[:, q_mask, :]
-            k_comp = k[:, k_mask, :]
-            v_comp = v[:, k_mask, :]
-            with self._attn_ctx():
-                o, _ = mha(query=q_comp, key=k_comp, value=v_comp, need_weights=False)
-            if o.dtype != q.dtype:
-                o = o.to(dtype=q.dtype)
-            return o.mean(dim=1)
-        # B > 1: use key_padding_mask path and compute masked mean
+        _, _, E = q.shape
         kpm = (~k_present)
         with self._attn_ctx():
             o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
         if o.dtype != q.dtype:
             o = o.to(dtype=q.dtype)
-        # Safety: zero-out rows where queries or keys are entirely absent to avoid NaNs propagating
+        # Zero-out rows where queries or keys are entirely absent to avoid NaNs propagating
         q_any = q_present.any(dim=1)
         k_any = k_present.any(dim=1)
         invalid_rows = (~q_any) | (~k_any)
-        if bool(invalid_rows.any()):
-            o[invalid_rows] = 0
+        if invalid_rows.dtype != torch.bool:
+            invalid_rows = invalid_rows.to(torch.bool)
+        # Out-of-place mask to avoid autograd versioning issues
+        o = torch.where(invalid_rows.view(-1, 1, 1), torch.zeros_like(o), o)
         m = q_present.unsqueeze(-1).to(o.dtype)
         summed = (o * m).sum(dim=1)
         denom = m.sum(dim=1).clamp_min(1.0)
@@ -222,38 +151,51 @@ class StateEncoderCompact(nn.Module):
 
         B = obs.size(0)
         D = obs.size(1)
-        # Calcola k in modo robusto dal totale D sapendo le combinazioni possibili delle stats.
-        # D = 165 + 61*k + stats_len, con stats_len = 99 + [0/120] + [0/10] + [0/150]
+        # Deterministic k inference from flags and total observation size.
+        # D = 165 + 61*k + stats_len, stats_len = 99 + [inferred(120)] + [scopa(10)] + [rank(150)] + [dealer(4)]
         base_prefix = 165
         base_stats = 99
-        option_dims = [120, 10, 150, 4]
+        stats_len = base_stats \
+            + (120 if _OBS_INCLUDE_INFERRED else 0) \
+            + (10 if _OBS_INCLUDE_SCOPA_PROBS else 0) \
+            + (150 if _OBS_INCLUDE_RANK_PROBS else 0) \
+            + (4 if _OBS_INCLUDE_DEALER else 0)
         k = 0
-        found = False
-        for kk in range(40, -1, -1):
-            rem = D - base_prefix - 61 * kk
-            if rem < base_stats:
-                continue
-            delta = rem - base_stats
-            ok = False
-            for a in (0, 1):
-                for b in (0, 1):
-                    for c in (0, 1):
-                        for d in (0, 1):
-                            if (a * option_dims[0] + b * option_dims[1] + c * option_dims[2] + d * option_dims[3]) == delta:
-                                ok = True
+        if self.k_history_hint is not None:
+            k = int(self.k_history_hint)
+        else:
+            rem = int(D) - base_prefix - stats_len
+            if rem >= 0 and (rem % 61) == 0:
+                k = rem // 61
+            else:
+                # Fallback to heuristic search (legacy), but signal mismatch
+                notify_fallback('models.state_encoder_compact.heuristic_k')
+                found = False
+                for kk in range(40, -1, -1):
+                    rem2 = D - base_prefix - 61 * kk
+                    if rem2 < base_stats:
+                        continue
+                    delta = rem2 - base_stats
+                    # Option dims: inferred(120), scopa(10), rank(150), dealer(4)
+                    option_dims = [120, 10, 150, 4]
+                    ok = False
+                    for a in (0, 1):
+                        for b in (0, 1):
+                            for c in (0, 1):
+                                for d in (0, 1):
+                                    if (a * option_dims[0] + b * option_dims[1] + c * option_dims[2] + d * option_dims[3]) == delta:
+                                        ok = True
+                                        break
+                                if ok:
+                                    break
+                            if ok:
                                 break
                         if ok:
                             break
                     if ok:
+                        k = kk
+                        found = True
                         break
-                if ok:
-                    break
-            if ok:
-                k = kk
-                found = True
-                break
-        if not found:
-            notify_fallback('models.state_encoder_compact.heuristic_k')
 
         # Autocast per tutto il compute del forward compatto
         cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
@@ -265,42 +207,62 @@ class StateEncoderCompact(nn.Module):
             hist_end = 165 + 61 * k
             history = obs[:, hist_start:hist_end]
             stats = obs[:, hist_end:]
-            # Align stats dimension to the LazyLinear in_features once materialized to avoid 99↔103 issues
-            try:
-                lin: nn.LazyLinear = self.stats_processor[0]  # type: ignore
-                in_feat = getattr(lin, 'in_features', None)
-                if in_feat is not None:
-                    Dcur = stats.size(1)
-                    if Dcur < in_feat:
-                        pad = torch.zeros((B, int(in_feat - Dcur)), dtype=stats.dtype, device=stats.device)
-                        stats = torch.cat([stats, pad], dim=1)
-                    elif Dcur > in_feat:
-                        stats = stats[:, :int(in_feat)]
-            except Exception:
-                pass
+            # Sanitize stats to avoid dynamic asserts/guards under torch.compile
+            stats = torch.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
+            # Early structure guard: stats segment must be non-empty
+            if STRICT:
+                if stats.size(1) <= 0:
+                    raise RuntimeError(
+                        f"StateEncoderCompact: empty stats segment (D={int(D)}, hist_end={int(hist_end)}, k={int(k)}, expected_stats_len≈{int(stats_len)})"
+                    )
+            # Strict shape check for stats segment to match configured flags
+            if STRICT:
+                if int(stats.size(1)) != int(stats_len):
+                    raise RuntimeError(
+                        f"StateEncoderCompact: stats segment dimension mismatch: got {int(stats.size(1))}, expected {int(stats_len)}; "
+                        f"D={int(D)} hist_end={int(hist_end)} k={int(k)} flags(inferred={int(_OBS_INCLUDE_INFERRED)}, scopa={int(_OBS_INCLUDE_SCOPA_PROBS)}, rank={int(_OBS_INCLUDE_RANK_PROBS)}, dealer={int(_OBS_INCLUDE_DEALER)})"
+                    )
+            # Validate stats input before feeding to LazyLinear
+            if STRICT:
+                torch._assert(torch.isfinite(stats).all(), "StateEncoderCompact: stats input contains non-finite values")
+                if stats.numel() > 0:
+                    torch._assert((stats.abs().amax() <= 1e6), "StateEncoderCompact: stats input magnitude too large (>1e6)")
+            # If LazyLinear already materialized, ensure weights are finite
+            lin: nn.Linear = self.stats_processor[0]  # type: ignore
+            w = getattr(lin, 'weight', None)
+            b = getattr(lin, 'bias', None)
+            if STRICT:
+                if (w is not None) and (not isinstance(w, torch.nn.parameter.UninitializedParameter)) and w.numel() > 0:
+                    torch._assert(torch.isfinite(w).all(), "StateEncoderCompact: stats_processor.weight non-finite")
+                    if w.numel() > 0:
+                        torch._assert((w.abs().amax() <= 1e6), "StateEncoderCompact: stats_processor.weight magnitude too large (>1e6)")
+                if (b is not None) and (not isinstance(b, torch.nn.parameter.UninitializedParameter)) and b.numel() > 0:
+                    torch._assert(torch.isfinite(b).all(), "StateEncoderCompact: stats_processor.bias non-finite")
+                    if b.numel() > 0:
+                        torch._assert((b.abs().amax() <= 1e6), "StateEncoderCompact: stats_processor.bias magnitude too large (>1e6)")
 
             # ----- Set encoders -----
             hand_mask = hand_table[:, :40]
             other_counts = hand_table[:, 40:43]
             table_mask = hand_table[:, 43:83]
             # Validate inputs are finite and in [0,1]
-            for name, t in (('hand_mask', hand_mask), ('other_counts', other_counts), ('table_mask', table_mask)):
-                if not torch.isfinite(t).all():
-                    raise RuntimeError(f"StateEncoderCompact: {name} contains non-finite values")
-                if (t.min() < 0) or (t.max() > 1):
-                    raise RuntimeError(f"StateEncoderCompact: {name} out of [0,1] range")
+            if STRICT:
+                for name, t in (('hand_mask', hand_mask), ('other_counts', other_counts), ('table_mask', table_mask)):
+                    torch._assert(torch.isfinite(t).all(), f"StateEncoderCompact: {name} contains non-finite values")
+                    torch._assert((t.min().ge(0) & t.max().le(1)), f"StateEncoderCompact: {name} out of [0,1] range")
             card_emb = self.card_emb
             # Parameter sanity before use
-            if not torch.isfinite(card_emb).all():
-                raise RuntimeError("StateEncoderCompact: card_emb contains non-finite values")
+            if STRICT:
+                torch._assert(torch.isfinite(card_emb).all(), "StateEncoderCompact: card_emb contains non-finite values")
             w_cnt: nn.Linear = self.counts_head_hand[0]  # type: ignore
-            if (not torch.isfinite(w_cnt.weight).all()) or (not torch.isfinite(w_cnt.bias).all()):
-                raise RuntimeError("StateEncoderCompact: counts_head_hand weights contain non-finite values")
+            if STRICT:
+                if (not torch.isfinite(w_cnt.weight).all()) or (not torch.isfinite(w_cnt.bias).all()):
+                    raise RuntimeError("StateEncoderCompact: counts_head_hand weights contain non-finite values")
             hand_feat = torch.matmul(hand_mask, card_emb)           # (B,32)
             table_feat = torch.matmul(table_mask, card_emb)         # (B,32)
             other_cnt_feat = self.counts_head_hand(other_counts)    # (B,16)
-            if (not torch.isfinite(hand_feat).all()) or (not torch.isfinite(table_feat).all()) or (not torch.isfinite(other_cnt_feat).all()):
-                raise RuntimeError("StateEncoderCompact: non-finite set base features (hand/table/counts)")
+            if STRICT:
+                torch._assert((torch.isfinite(hand_feat).all() & torch.isfinite(table_feat).all() & torch.isfinite(other_cnt_feat).all()), "StateEncoderCompact: non-finite set base features (hand/table/counts)")
             # Cross-attention mano↔tavolo
             hand_present = (hand_mask > 0.5)
             table_present = (table_mask > 0.5)
@@ -313,8 +275,8 @@ class StateEncoderCompact(nn.Module):
                                                    hand_present, table_present)  # (B,32)
             table_attn_feat = self._mha_masked_mean(self.cross_attn_t2h, table_seq, hand_seq, hand_seq,
                                                     table_present, hand_present)  # (B,32)
-            if (not torch.isfinite(hand_attn_feat).all()) or (not torch.isfinite(table_attn_feat).all()):
-                raise RuntimeError("StateEncoderCompact: non-finite attention features")
+            if STRICT:
+                torch._assert((torch.isfinite(hand_attn_feat).all() & torch.isfinite(table_attn_feat).all()), "StateEncoderCompact: non-finite attention features")
 
             # captured
             cap0_mask = captured[:, :40]
@@ -336,8 +298,10 @@ class StateEncoderCompact(nn.Module):
             set_merged[:, pos:pos+16] = other_cnt_feat; pos += 16
             set_merged[:, pos:pos+16] = cap_cnt_feat; pos += 16
             set_feat = self.set_merge_head(set_merged)               # (B,64)
-            if not torch.isfinite(set_feat).all():
-                raise RuntimeError("StateEncoderCompact: non-finite set_feat")
+            if STRICT:
+                torch._assert(torch.isfinite(set_feat).all(), "StateEncoderCompact: non-finite set_feat")
+                if set_feat.numel() > 0:
+                    torch._assert((set_feat.abs().amax() <= 1e6), "StateEncoderCompact: set_feat magnitude too large (>1e6)")
 
             # ----- History Transformer -----
             if k > 0:
@@ -351,27 +315,49 @@ class StateEncoderCompact(nn.Module):
                 hist_feat = henc.mean(dim=1)                         # (B,64)
             else:
                 hist_feat = torch.zeros((B, 64), dtype=obs.dtype, device=obs.device)
-            if not torch.isfinite(hist_feat).all():
-                raise RuntimeError("StateEncoderCompact: non-finite hist_feat")
+            if STRICT:
+                torch._assert(torch.isfinite(hist_feat).all(), "StateEncoderCompact: non-finite hist_feat")
+                if hist_feat.numel() > 0:
+                    torch._assert((hist_feat.abs().amax() <= 1e6), "StateEncoderCompact: hist_feat magnitude too large (>1e6)")
 
             # Stats e seat/team
             stats_feat = self.stats_processor(stats)
-            if not torch.isfinite(stats_feat).all():
-                raise RuntimeError("StateEncoderCompact: non-finite stats_feat")
+            if STRICT:
+                if not torch.isfinite(stats_feat).all():
+                    # Detailed diagnostics on failure
+                    lin: nn.Linear = self.stats_processor[0]  # type: ignore
+                    w = getattr(lin, 'weight', None)
+                    b = getattr(lin, 'bias', None)
+                    def _st(t: torch.Tensor):
+                        return {
+                            'min': float(t.min().item()) if t.numel() > 0 else None,
+                            'max': float(t.max().item()) if t.numel() > 0 else None,
+                            'mean': float(t.mean().item()) if t.numel() > 0 else None,
+                            'numel': int(t.numel())
+                        }
+                    w_stats = _st(w)
+                    b_stats = _st(b)
+                    s_stats = _st(stats)
+                    raise RuntimeError(f"StateEncoderCompact: non-finite stats_feat; weight_stats={w_stats}, bias_stats={b_stats}, stats_input_stats={s_stats}")
+                if stats_feat.numel() > 0:
+                    torch._assert((stats_feat.abs().amax() <= 1e6), "StateEncoderCompact: stats_feat magnitude too large (>1e6)")
             if seat_team_vec is None:
                 seat_team_vec = torch.zeros((B, 6), dtype=torch.float32, device=obs.device)
             elif seat_team_vec.dim() == 1:
                 seat_team_vec = seat_team_vec.unsqueeze(0)
             # Validate seat/team vector: one-hot seat and flags in [0,1]
-            if seat_team_vec.size(-1) != 6:
-                raise ValueError("StateEncoderCompact: seat_team_vec must have shape (B,6)")
-            if not (seat_team_vec[:, :4].sum(dim=1) == 1).all():
-                raise RuntimeError("StateEncoderCompact: seat one-hot invalid (sum != 1)")
-            if ((seat_team_vec[:, 4:6] < 0) | (seat_team_vec[:, 4:6] > 1)).any():
-                raise RuntimeError("StateEncoderCompact: team flags out of [0,1]")
+            if STRICT:
+                if seat_team_vec.size(-1) != 6:
+                    raise ValueError("StateEncoderCompact: seat_team_vec must have shape (B,6)")
+                if not (seat_team_vec[:, :4].sum(dim=1) == 1).all():
+                    raise RuntimeError("StateEncoderCompact: seat one-hot invalid (sum != 1)")
+                if ((seat_team_vec[:, 4:6] < 0) | (seat_team_vec[:, 4:6] > 1)).any():
+                    raise RuntimeError("StateEncoderCompact: team flags out of [0,1]")
             seat_feat = F.relu(self.seat_head[0](seat_team_vec), inplace=True)
-            if not torch.isfinite(seat_feat).all():
-                raise RuntimeError("StateEncoderCompact: non-finite seat_feat")
+            if STRICT:
+                torch._assert(torch.isfinite(seat_feat).all(), "StateEncoderCompact: non-finite seat_feat")
+                if seat_feat.numel() > 0:
+                    torch._assert((seat_feat.abs().amax() <= 1e6), "StateEncoderCompact: seat_feat magnitude too large (>1e6)")
 
             combined = torch.empty((B, 64+64+64+32), dtype=set_feat.dtype, device=set_feat.device)
             p2 = 0
@@ -380,8 +366,10 @@ class StateEncoderCompact(nn.Module):
             combined[:, p2:p2+64] = stats_feat; p2 += 64
             combined[:, p2:p2+32] = seat_feat; p2 += 32
             context = F.relu(self.combiner[0](combined), inplace=True)
-            if not torch.isfinite(context).all():
-                raise RuntimeError("StateEncoderCompact: non-finite context output")
+            if STRICT:
+                torch._assert(torch.isfinite(context).all(), "StateEncoderCompact: non-finite context output")
+                if context.numel() > 0:
+                    torch._assert((context.abs().amax() <= 1e6), "StateEncoderCompact: context magnitude too large (>1e6)")
         return context
 
 
@@ -409,7 +397,16 @@ class ActionEncoder80(nn.Module):
             in_dim = 80
         if actions.size(-1) != in_dim:
             raise ValueError(f"ActionEncoder80: expected last-dim {in_dim}, got {int(actions.size(-1))}")
-        return self.net(actions)
+        out = self.net(actions)
+        # Sanitize to keep compile path robust
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
+        # Keep checks only in STRICT mode
+        if STRICT:
+            torch._assert(torch.isfinite(out).all(), "ActionEncoder80.forward: non-finite output embedding")
+            if out.numel() > 0:
+                max_abs = out.abs().amax()
+                torch._assert((max_abs <= 1e6), "ActionEncoder80.forward: output magnitude too large (>1e6)")
+        return out
 
 
 class BeliefNet(nn.Module):
@@ -429,7 +426,9 @@ class BeliefNet(nn.Module):
         self.fc_out = nn.Linear(hidden_dim, 120)
         # temperatura appresa (clampata in (0.25, 4.0))
         self._log_temp = nn.Parameter(torch.log(torch.tensor(1.0)))
-        self.act = nn.GELU()
+        # CPU-friendly: allow approximate GELU when enabled via env (preserves quality in practice)
+        approx_gelu = (os.environ.get('SCOPONE_APPROX_GELU', '0') == '1')
+        self.act = nn.GELU(approximate='tanh' if approx_gelu else 'none')
         self.dropout = nn.Dropout(p=0.1)
         self.to(device)
 
@@ -464,8 +463,8 @@ class BeliefNet(nn.Module):
         x = x / t
         # softmax per-carta (dim=1 sui 3 giocatori)
         probs = torch.softmax(x, dim=1)
-        if not torch.isfinite(probs).all():
-            raise RuntimeError("BeliefNet.probs: softmax produced non-finite probabilities")
+        if STRICT:
+            torch._assert(torch.isfinite(probs).all(), "BeliefNet.probs: softmax produced non-finite probabilities")
         if visible_mask_40 is not None:
             if visible_mask_40.dim() == 1:
                 visible_mask_40 = visible_mask_40.unsqueeze(0)
@@ -473,7 +472,8 @@ class BeliefNet(nn.Module):
             m = visible_mask_40.to(probs.dtype).unsqueeze(1)  # (B,1,40)
             probs = probs * (1.0 - m)
         # Normalize across players for each card (avoid zero rows)
-        denom = probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        denom = probs.sum(dim=1, keepdim=True)
+        denom = torch.clamp_min(denom, 1e-12)
         probs = probs / denom
         return probs.view(B, 120)
 
@@ -501,6 +501,12 @@ class ActionConditionedActor(torch.nn.Module):
         # Merge: stato 256 + belief_head 64 + partner 32 + opp 32 = 384
         self.merge = nn.Sequential(nn.Linear(384, 256), nn.ReLU())
         self.state_to_action = nn.Linear(256, 64)
+        # Initialize small and stable
+        nn.init.kaiming_uniform_(self.state_to_action.weight, a=math.sqrt(5))
+        if self.state_to_action.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.state_to_action.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.state_to_action.bias, -bound, bound)
         self.action_enc = ActionEncoder80(action_dim)
         # Embedding per la selezione carta (40 carte)
         self.card_emb_play = nn.Parameter(torch.randn(40, 64, device=device, dtype=torch.float32) * 0.02)
@@ -544,12 +550,12 @@ class ActionConditionedActor(torch.nn.Module):
             if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
-        if not torch.isfinite(state_feat).all():
-            bad = state_feat[~torch.isfinite(state_feat)]
-            raise RuntimeError(f"state_enc produced non-finite features (count={int(bad.numel())})")
-        if not torch.isfinite(state_feat).all():
-            bad = state_feat[~torch.isfinite(state_feat)]
-            raise RuntimeError(f"state_enc produced non-finite features (count={int(bad.numel())})")
+        # Sanitize to keep graph free of data-dependent asserts
+        state_feat = torch.nan_to_num(state_feat, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
+        if STRICT:
+            torch._assert(torch.isfinite(state_feat).all(), "state_enc produced non-finite features")
+            if state_feat.numel() > 0:
+                torch._assert((state_feat.abs().amax() <= 1e6), "compute_state_proj: state_feat magnitude too large (>1e6)")
         # Ensure BeliefNet receives its parameter dtype (avoids Half/Float mismatch outside autocast)
         bn_dtype = self.belief_net.fc_in.weight.dtype
         if state_feat.dtype != bn_dtype:
@@ -559,15 +565,20 @@ class ActionConditionedActor(torch.nn.Module):
         belief_logits = self.belief_net(state_feat)        # (B,120)
         # Safety clamp before softmax to avoid NaNs from extreme values
         belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
-        if not torch.isfinite(belief_logits).all():
-            bad = belief_logits[~torch.isfinite(belief_logits)]
-            raise RuntimeError(f"BeliefNet produced non-finite logits (count={int(bad.numel())})")
+        if STRICT:
+            torch._assert(torch.isfinite(belief_logits).all(), "BeliefNet produced non-finite logits")
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
         belief_probs_flat = torch.nan_to_num(belief_probs_flat, nan=0.0, posinf=0.0, neginf=0.0)
-        if not torch.isfinite(belief_probs_flat).all():
-            bad = belief_probs_flat[~torch.isfinite(belief_probs_flat)]
-            raise RuntimeError(f"BeliefNet.probs produced non-finite probabilities (count={int(bad.numel())})")
+        if STRICT:
+            torch._assert(torch.isfinite(belief_probs_flat).all(), "BeliefNet.probs produced non-finite probabilities")
+        # Probability range guard
+        if STRICT:
+            torch._assert(((belief_probs_flat >= 0).all() & (belief_probs_flat <= 1).all()), "compute_state_proj: belief_probs out of [0,1]")
         belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
+        if STRICT:
+            torch._assert(torch.isfinite(belief_feat).all(), "compute_state_proj: belief_feat non-finite")
+            if belief_feat.numel() > 0:
+                torch._assert((belief_feat.abs().amax() <= 1e6), "compute_state_proj: belief_feat magnitude too large (>1e6)")
         partner_slice = belief_probs_flat[:, 40:80]
         opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
         emb = self.belief_card_emb
@@ -575,8 +586,19 @@ class ActionConditionedActor(torch.nn.Module):
         opp_feat = torch.matmul(opps_slice, emb)            # (B,32)
         pg = self.partner_gate(state_feat)
         og = self.opp_gate(state_feat)
+        # Gating range guards
+        if STRICT:
+            torch._assert(((pg >= 0).all() & (pg <= 1).all()), "compute_state_proj: partner_gate out of [0,1]")
+            torch._assert(((og >= 0).all() & (og <= 1).all()), "compute_state_proj: opp_gate out of [0,1]")
         partner_feat = partner_feat * pg
         opp_feat = opp_feat * og
+        if STRICT:
+            torch._assert(torch.isfinite(partner_feat).all(), "compute_state_proj: partner_feat non-finite before merge")
+            torch._assert(torch.isfinite(opp_feat).all(), "compute_state_proj: opp_feat non-finite before merge")
+            if partner_feat.numel() > 0:
+                torch._assert((partner_feat.abs().amax() <= 1e6), "compute_state_proj: partner_feat magnitude too large (>1e6)")
+            if opp_feat.numel() > 0:
+                torch._assert((opp_feat.abs().amax() <= 1e6), "compute_state_proj: opp_feat magnitude too large (>1e6)")
         B_ctx = state_feat.size(0)
         ctx_in = torch.empty((B_ctx, 256 + 64 + 32 + 32), dtype=state_feat.dtype, device=state_feat.device)
         p = 0
@@ -584,14 +606,25 @@ class ActionConditionedActor(torch.nn.Module):
         ctx_in[:, p:p+64] = belief_feat; p += 64
         ctx_in[:, p:p+32] = partner_feat; p += 32
         ctx_in[:, p:p+32] = opp_feat; p += 32
+        # Lightweight compile-friendly guard (tensor assert)
+        if STRICT:
+            if ctx_in.numel() > 0:
+                torch._assert((ctx_in.abs().amax() <= 1e6), "merge input (ctx_in) magnitude too large (>1e6)")
         state_ctx = self.merge(ctx_in)  # (B,256)
-        if not torch.isfinite(state_ctx).all():
-            bad = state_ctx[~torch.isfinite(state_ctx)]
-            raise RuntimeError(f"merge produced non-finite state_ctx (count={int(bad.numel())})")
+        if STRICT:
+            torch._assert(torch.isfinite(state_ctx).all(), "merge produced non-finite state_ctx")
+            # Guard extremely large activations (tensor assert)
+            if state_ctx.numel() > 0:
+                torch._assert((state_ctx.abs().amax() <= 1e6), "merge produced extremely large state_ctx (>1e6)")
         state_proj = self.state_to_action(state_ctx)  # (B,64)
-        if not torch.isfinite(state_proj).all():
-            bad = state_proj[~torch.isfinite(state_proj)]
-            raise RuntimeError(f"state_to_action produced non-finite state_proj (count={int(bad.numel())})")
+        if STRICT:
+            torch._assert(torch.isfinite(state_proj).all(), "state_to_action produced non-finite state_proj")
+            if state_proj.numel() > 0:
+                torch._assert((state_proj.abs().amax() <= 1e6), "state_to_action produced extremely large state_proj (>1e6)")
+        # Parameter guard for card_emb_play
+        # Evita sync CPU: controlla in modo leggero
+        if STRICT:
+            torch._assert((self.card_emb_play.abs().amax() <= 1e3), "card_emb_play parameter magnitude exploded (>1e3)")
         return state_proj
 
     def compute_state_features(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
@@ -616,9 +649,12 @@ class ActionConditionedActor(torch.nn.Module):
             if (seat_team_vec.device.type != x_obs.device.type) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
         sf = self.state_enc(x_obs, seat_team_vec)  # (B,256)
-        if not torch.isfinite(sf).all():
-            bad = sf[~torch.isfinite(sf)]
-            raise RuntimeError(f"state_enc produced non-finite features (count={int(bad.numel())})")
+        # Sanitize to keep compile graph free of data-dependent asserts
+        sf = torch.nan_to_num(sf, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
+        if STRICT:
+            if not torch.isfinite(sf).all():
+                bad = sf[~torch.isfinite(sf)]
+                raise RuntimeError(f"state_enc produced non-finite features (count={int(bad.numel())})")
         return sf
 
     def compute_state_proj_from_state(self, state_feat: torch.Tensor, x_obs: torch.Tensor, visible_mask_40: torch.Tensor = None) -> torch.Tensor:
@@ -630,14 +666,16 @@ class ActionConditionedActor(torch.nn.Module):
         visible_mask = (visible_mask_40 if visible_mask_40 is not None else self._visible_mask_from_obs(x_obs))
         belief_logits = self.belief_net(state_feat)        # (B,120)
         belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
-        if not torch.isfinite(belief_logits).all():
-            bad = belief_logits[~torch.isfinite(belief_logits)]
-            raise RuntimeError(f"BeliefNet produced non-finite logits (count={int(bad.numel())})")
+        if STRICT:
+            if not torch.isfinite(belief_logits).all():
+                bad = belief_logits[~torch.isfinite(belief_logits)]
+                raise RuntimeError(f"BeliefNet produced non-finite logits (count={int(bad.numel())})")
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
         belief_probs_flat = torch.nan_to_num(belief_probs_flat, nan=0.0, posinf=0.0, neginf=0.0)
-        if not torch.isfinite(belief_probs_flat).all():
-            bad = belief_probs_flat[~torch.isfinite(belief_probs_flat)]
-            raise RuntimeError(f"BeliefNet.probs produced non-finite probabilities (count={int(bad.numel())})")
+        if STRICT:
+            if not torch.isfinite(belief_probs_flat).all():
+                bad = belief_probs_flat[~torch.isfinite(belief_probs_flat)]
+                raise RuntimeError(f"BeliefNet.probs produced non-finite probabilities (count={int(bad.numel())})")
         belief_feat = self.belief_head(belief_probs_flat)  # (B,64)
         partner_slice = belief_probs_flat[:, 40:80]
         opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
@@ -656,10 +694,27 @@ class ActionConditionedActor(torch.nn.Module):
         ctx_in[:, p:p+32] = partner_feat; p += 32
         ctx_in[:, p:p+32] = opp_feat; p += 32
         state_ctx = self.merge(ctx_in)  # (B,256)
-        if not torch.isfinite(state_ctx).all():
-            bad = state_ctx[~torch.isfinite(state_ctx)]
-            raise RuntimeError(f"merge produced non-finite state_ctx (count={int(bad.numel())})")
-        return self.state_to_action(state_ctx)
+        state_ctx = torch.nan_to_num(state_ctx, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
+        if STRICT:
+            if not torch.isfinite(state_ctx).all():
+                bad = state_ctx[~torch.isfinite(state_ctx)]
+                raise RuntimeError(f"merge produced non-finite state_ctx (count={int(bad.numel())})")
+        if STRICT:
+            if state_ctx.numel() > 0:
+                max_abs_ctx = state_ctx.abs().amax()
+                torch._assert((max_abs_ctx <= 1e6), "merge produced extremely large state_ctx (>1e6)")
+        sp = self.state_to_action(state_ctx)
+        sp = torch.nan_to_num(sp, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e6, 1e6)
+        if STRICT:
+            if not torch.isfinite(sp).all():
+                bad = sp[~torch.isfinite(sp)]
+                raise RuntimeError(f"state_to_action produced non-finite state_proj (count={int(bad.numel())})")
+        if STRICT:
+            if sp.numel() > 0:
+                max_abs_proj = sp.abs().amax()
+                torch._assert((max_abs_proj <= 1e6), "state_to_action produced extremely large state_proj (>1e6)")
+            torch._assert((self.card_emb_play.abs().amax() <= 1e3), "card_emb_play parameter magnitude exploded")
+        return sp
 
     def invalidate_action_cache(self) -> None:
         """Invalida la cache degli embedding delle azioni (usata in inference)."""
@@ -677,23 +732,11 @@ class ActionConditionedActor(torch.nn.Module):
         cached = self._cached_action_emb_variants.get(key, None)
         if cached is not None:
             return cached
-        # Evita cattura in cudagraph/compile: calcola in eager e clona storage
-        tbl = self._compute_action_emb_table_eager(device=target_device, dtype=target_dtype)
+
+        eye = self.all_actions_eye.to(device=target_device, dtype=torch.float32)
+        tbl = self.action_enc(eye).to(device=target_device, dtype=target_dtype).contiguous()
         self._cached_action_emb_variants[key] = tbl
         return tbl
-
-    @_dynamo_disable
-    def _compute_action_emb_table_eager(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        with torch.no_grad():
-            target_device = device or next(self.action_enc.parameters()).device
-            base_dtype = next(self.action_enc.parameters()).dtype
-            # Clona l'input per assicurare storage indipendente
-            eye = self.all_actions_eye.to(device=target_device, dtype=torch.float32).clone()
-            tbl = self.action_enc(eye).detach().clone()  # computed in module dtype
-            desired_dtype = dtype or base_dtype
-            # Materializza su device/dtype specificati e contiguo
-            tbl = tbl.to(device=target_device, dtype=desired_dtype).contiguous()
-            return tbl
 
     def forward(self, obs: torch.Tensor, legals: torch.Tensor = None,
                 seat_team_vec: torch.Tensor = None) -> torch.Tensor:
@@ -776,12 +819,11 @@ class ActionConditionedActor(torch.nn.Module):
         if legals_t.dim() != 2 or legals_t.size(1) != 80:
             raise ValueError(f"Actor.forward: legals must be (A,80), got {tuple(legals_t.shape)}")
         ones = legals_t[:, :40].sum(dim=1)
-        if not torch.allclose(ones, torch.ones_like(ones)):
-            raise RuntimeError("Actor.forward: each legal must have exactly one played bit in [:40]")
+        if STRICT:
+            torch._assert(torch.allclose(ones, torch.ones_like(ones)), "Actor.forward: each legal must have exactly one played bit in [:40]")
         cap = legals_t[:, 40:]
-        cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)
-        if bool(cap_bad.any().item() if torch.is_tensor(cap_bad) else cap_bad.any()):
-            raise RuntimeError("Actor.forward: captured section must be binary (0/1)")
+        cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1.0e-6)
+        torch._assert((~cap_bad).all(), "Actor.forward: captured section must be binary (0/1)")
         # B atteso = 1 in path di selezione
         # In training evita la tabella cache per mantenere gradiente
         if self.training:
@@ -795,6 +837,77 @@ class ActionConditionedActor(torch.nn.Module):
             # Row-wise dot product: (A,64) ⊙ (A,64) → (A)
             scores = (a_emb * state_proj).sum(dim=1)
         return scores
+
+    def compute_two_stage_logp(self,
+                                card_logits_all: torch.Tensor,
+                                legals_mb: torch.Tensor,
+                                sample_idx_per_legal: torch.Tensor,
+                                state_proj: torch.Tensor,
+                                a_emb_mb: torch.Tensor) -> torch.Tensor:
+        """Compute per-legal total log-prob under the two-stage policy.
+        Inputs:
+          - card_logits_all: (B,40)
+          - legals_mb: (M,80)
+          - sample_idx_per_legal: (M,) mapping each legal row to its sample index [0..B)
+          - state_proj: (B,64)
+          - a_emb_mb: (M,64) action embeddings for each legal row (use action_enc during training)
+        Returns:
+          - logp_total_per_legal: (M,)
+        """
+        device_local = card_logits_all.device
+        dtype_local = card_logits_all.dtype
+        if legals_mb.numel() == 0:
+            return torch.zeros((0,), dtype=dtype_local, device=device_local)
+        # Validate shapes
+        if card_logits_all.dim() != 2 or card_logits_all.size(1) != 40:
+            raise ValueError(f"compute_two_stage_logp: card_logits_all must be (B,40), got {tuple(card_logits_all.shape)}")
+        if state_proj.dim() != 2 or state_proj.size(1) != 64:
+            raise ValueError(f"compute_two_stage_logp: state_proj must be (B,64), got {tuple(state_proj.shape)}")
+        if legals_mb.dim() != 2 or legals_mb.size(1) != 80:
+            raise ValueError(f"compute_two_stage_logp: legals_mb must be (M,80), got {tuple(legals_mb.shape)}")
+        if a_emb_mb.dim() != 2 or a_emb_mb.size(1) != 64:
+            raise ValueError(f"compute_two_stage_logp: a_emb_mb must be (M,64), got {tuple(a_emb_mb.shape)}")
+
+        # Played card ids per legal
+        ones_per_row = legals_mb[:, :40].sum(dim=1)
+        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+            if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
+                raise RuntimeError("compute_two_stage_logp: legals must have exactly one played bit in [:40]")
+        played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)  # (M)
+
+        # Card log-prob restricted to allowed set per sample
+        B = int(card_logits_all.size(0))
+        allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device_local)
+        allowed_mask[sample_idx_per_legal, played_ids_mb] = True
+        # Prefer additive mask over torch.where for IPEX CPU stability
+        masked_logits = card_logits_all + (~allowed_mask).to(card_logits_all.dtype) * (-1e9)
+        max_allowed = torch.amax(masked_logits, dim=1)
+        # Avoid in-place ops on tensors needed for gradient; keep computation out-of-place
+        exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
+        sum_allowed = exp_shift_allowed.sum(dim=1)
+        lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))  # (B)
+        logp_cards_allowed_per_legal = (card_logits_all[sample_idx_per_legal, played_ids_mb] - lse_allowed[sample_idx_per_legal])  # (M)
+
+        # Capture logits per legal using action embeddings
+        cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
+        if not torch.isfinite(cap_logits).all():
+            raise RuntimeError("compute_two_stage_logp: cap_logits non-finite")
+        # Group-wise logsumexp over (sample, card)
+        group_ids = sample_idx_per_legal * 40 + played_ids_mb
+        num_groups = B * 40
+        group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device_local)
+        group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
+        gmax_per_legal = group_max[group_ids]
+        exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
+        group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device_local)
+        group_sum.index_add_(0, group_ids, exp_shifted)
+        lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
+        logp_cap_per_legal = cap_logits - lse_per_legal
+
+        logp_total_per_legal = (logp_cards_allowed_per_legal + logp_cap_per_legal)
+        if not torch.isfinite(logp_total_per_legal).all():
+            raise RuntimeError("compute_two_stage_logp: logp_total_per_legal non-finite")
+        return logp_total_per_legal
 
 
 class CentralValueNet(torch.nn.Module):

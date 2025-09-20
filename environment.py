@@ -101,6 +101,20 @@ class ScoponeEnvMA(gym.Env):
         self._one_i64 = torch.tensor(1, dtype=torch.int64, device=device)
         # Precompute id range to avoid per-call allocations
         self._id_range = torch.arange(40, dtype=torch.int64, device=device)
+        # Derived features mirrors (kept as tensors for compile-friendly observation):
+        self._progress_t = torch.zeros(1, dtype=torch.float32, device=device)
+        self._last_capturing_team_t = torch.zeros(2, dtype=torch.float32, device=device)
+        # History mirrors (tensor ring buffer of moves encoded 61-dim)
+        self._hist_buf_t = torch.zeros(self.k_history, 61, dtype=torch.float32, device=device)
+        self._history_len_t = torch.zeros((), dtype=torch.long, device=device)
+        # Aggregates mirrors
+        self._played_bits_by_player_t = torch.zeros(4, dtype=torch.int64, device=device)
+        self._scopa_counts_t = torch.zeros(2, dtype=torch.float32, device=device)
+        # Optional mirrors for probabilistic features (populated eagerly when enabled)
+        self._inferred_probs_t = torch.zeros(120, dtype=torch.float32, device=device)
+        self._rank_probs_by_player_t = torch.zeros(150, dtype=torch.float32, device=device)
+        self._rank_presence_from_inferred_t = torch.zeros(30, dtype=torch.float32, device=device)
+        self._scopa_probs_t = torch.zeros(10, dtype=torch.float32, device=device)
         
         # Regole/varianti opzionali della partita
         # Nota: negli script con modalità di default, "asso_piglia_tutto" è disattivato
@@ -125,6 +139,8 @@ class ScoponeEnvMA(gym.Env):
         set_obs_device(device)
         # Compile and bind the observation encoder once
         self._encode_obs = maybe_compile_function(_encode_state_compact_for_player_fast, name='observation.encode_state_compact_for_player_fast')
+        # Preallocate observation output buffer to avoid per-call allocations
+        self._obs_out_buf = None
         self.reset()
     def _rebuild_id_caches(self):
         if not self._use_id_cache:
@@ -161,9 +177,7 @@ class ScoponeEnvMA(gym.Env):
         try:
             cloned._rebuild_id_caches()
         except Exception:
-            from utils.fallback import notify_fallback
-            # Segnala e interrompi: nessun fallback consentito
-            notify_fallback('env.clone.rebuild_id_caches_failed')
+            raise RuntimeError('Failed to rebuild id caches')
         return cloned
 
     def get_valid_actions(self):
@@ -232,7 +246,9 @@ class ScoponeEnvMA(gym.Env):
             if sums is None:
                 sums = (sel @ table_ranks.unsqueeze(1).to(torch.float32)).squeeze(1).to(torch.int64)
             if table_one_hot is None:
-                table_one_hot = F.one_hot(table_ids_t, num_classes=40).to(torch.float32)
+                # Build (n,40) one-hot using scatter instead of F.one_hot to reduce overhead
+                table_one_hot = torch.zeros((n, 40), dtype=torch.float32, device=device)
+                table_one_hot.scatter_(1, table_ids_t.view(-1, 1), 1.0)
             # Nota: capture_hot_by_mask calcolato lazy solo se necessario (vedi sotto)
         else:
             masks_all = torch.empty(0, dtype=torch.long, device=device)
@@ -269,16 +285,13 @@ class ScoponeEnvMA(gym.Env):
                 else:
                     captured_hot_sum = sel[m_idx].to(torch.float32) @ table_one_hot
                 # Aggiorna cache invarianti per questo tavolo
-                try:
-                    self._table_invariants_cache[tbl_bits_key] = {
-                        'n': n,
-                        'sel': sel,
-                        'sums': sums,
-                        'table_one_hot': table_one_hot,
-                        'capture_hot_by_mask': capture_hot_by_mask if capture_hot_by_mask is not None else (sel.to(torch.float32) @ table_one_hot)
-                    }
-                except Exception:
-                    pass
+                self._table_invariants_cache[tbl_bits_key] = {
+                    'n': n,
+                    'sel': sel,
+                    'sums': sums,
+                    'table_one_hot': table_one_hot,
+                    'capture_hot_by_mask': capture_hot_by_mask if capture_hot_by_mask is not None else (sel.to(torch.float32) @ table_one_hot)
+                }
             else:
                 pid_rows_sum = torch.empty((0,), dtype=torch.long, device=device)
                 captured_hot_sum = torch.empty((0,40), dtype=torch.float32, device=device)
@@ -329,15 +342,12 @@ class ScoponeEnvMA(gym.Env):
             raise RuntimeError(f"No valid actions for player {self.current_player} (hand_ids={hand_ids_t.tolist()}, table_ids={table_ids_t.tolist()}, rules={self.rules})")
 
         # Aggiorna cache LRU e contatori
-        try:
-            # limita la dimensione della cache per evitare crescita non controllata
-            self._valid_actions_cache[state_key] = actions
-            self._valid_actions_cache.move_to_end(state_key)
-            # cap manuale: riusa _cache_capacity (stessa capacità delle osservazioni)
-            while len(self._valid_actions_cache) > self._cache_capacity:
-                self._valid_actions_cache.popitem(last=False)
-        except Exception:
-            pass
+        # limita la dimensione della cache per evitare crescita non controllata
+        self._valid_actions_cache[state_key] = actions
+        self._valid_actions_cache.move_to_end(state_key)
+        # cap manuale: riusa _cache_capacity (stessa capacità delle osservazioni)
+        while len(self._valid_actions_cache) > self._cache_capacity:
+            self._valid_actions_cache.popitem(last=False)
         self._cache_misses += 1
         self._get_valid_actions_time += time.time() - start_time
         return actions
@@ -354,14 +364,11 @@ class ScoponeEnvMA(gym.Env):
             raise ValueError("Partita già finita: non puoi fare altri step.")
         
         # Validazione forma vettore azione (deve essere 80)
-        try:
-            import torch as _torch
-            if hasattr(action_vec, 'shape') and getattr(action_vec, 'ndim', 1) >= 1:
-                act_len = int(action_vec.numel() if _torch.is_tensor(action_vec) else _torch.as_tensor(action_vec).numel())
-            else:
-                act_len = len(action_vec)
-        except Exception:
-            act_len = None
+        import torch as _torch
+        if hasattr(action_vec, 'shape') and getattr(action_vec, 'ndim', 1) >= 1:
+            act_len = int(action_vec.numel() if _torch.is_tensor(action_vec) else _torch.as_tensor(action_vec).numel())
+        else:
+            act_len = len(action_vec)
         if act_len != 80:
             raise ValueError(f"Formato vettore azione non valido: atteso 80, ricevuto {act_len}")
 
@@ -401,17 +408,11 @@ class ScoponeEnvMA(gym.Env):
                     forced_ace_capture_on_empty = True
                 # Consuma l'override one-shot, se presente
                 if force_self_capture_once:
-                    try:
-                        self.rules["force_ace_self_capture_on_empty_once"] = False
-                    except Exception:
-                        pass
+                    self.rules["force_ace_self_capture_on_empty_once"] = False
         
         # Verifica regole di cattura via bitset su CPU
         # Usa solo strutture CPU per evitare kernel micro e sync
-        try:
-            table_ids_list = list(self._table_ids) if self._use_id_cache else [_card_to_id(c) for c in table]
-        except Exception as e:
-            raise
+        table_ids_list = list(self._table_ids) if self._use_id_cache else [_card_to_id(c) for c in table]
         same_rank_ids = [i for i in table_ids_list if (i // 4 + 1) == int(rank)]
         if same_rank_ids:
             # Eccezione: Asso piglia tutto permette di ignorare la regola della presa diretta
@@ -433,33 +434,21 @@ class ScoponeEnvMA(gym.Env):
         capture_type = "no_capture"
         
         # Rimuovi la carta giocata dalla mano (ID)
-        try:
-            hand.remove(pid)
-        except ValueError:
-            pass
+        hand.remove(pid)
         # Aggiorna cache ID/bitset
         if self._use_id_cache:
-            try:
-                self._hands_ids[current_player].remove(pid)
-            except Exception:
-                pass
+            self._hands_ids[current_player].remove(pid)
             if self._use_bitset:
                 self._hands_bits[current_player] &= ~(1 << pid)
                 # tensor mirror
-                try:
-                    mask = (self._one_i64 << int(pid))
-                    self._hands_bits_t[current_player] = self._hands_bits_t[current_player] & (~mask)
-                except Exception:
-                    pass
+                mask = (self._one_i64 << int(pid))
+                self._hands_bits_t[current_player] = self._hands_bits_t[current_player] & (~mask)
         
         if forced_ace_capture_on_empty:
             # Cattura forzata su tavolo vuoto con AP
             squad_id = 0 if current_player in [0, 2] else 1
             self.game_state["captured_squads"][squad_id].append(pid)
-            try:
-                self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | (self._one_i64 << int(pid))
-            except Exception:
-                pass
+            self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | (self._one_i64 << int(pid))
             # Regole scopa su AP a tavolo vuoto
             ap_scopa_on = bool(self.rules.get("scopa_on_asso_piglia_tutto", False))
             cards_left = sum(len(self.game_state["hands"][p]) for p in range(4))
@@ -474,28 +463,19 @@ class ScoponeEnvMA(gym.Env):
             for cid in cap_ids:
                 table.remove(cid)
                 if self._use_id_cache:
-                    try:
-                        self._table_ids.remove(cid)
-                    except Exception:
-                        pass
+                    self._table_ids.remove(cid)
                     if self._use_bitset:
                         self._table_bits &= ~(1 << cid)
-                        try:
-                            self._table_bits_t = self._table_bits_t & (~(self._one_i64 << int(cid)))
-                        except Exception:
-                            pass
+                        self._table_bits_t = self._table_bits_t & (~(self._one_i64 << int(cid)))
             
             # Aggiungi le carte catturate e la carta giocata alla squadra
             squad_id = 0 if current_player in [0, 2] else 1
             self.game_state["captured_squads"][squad_id].extend(cap_ids)
             self.game_state["captured_squads"][squad_id].append(pid)
-            try:
-                take_mask = (self._one_i64 << int(pid))
-                for cid in cap_ids:
-                    take_mask = take_mask | (self._one_i64 << int(cid))
-                self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | take_mask
-            except Exception:
-                pass
+            take_mask = (self._one_i64 << int(pid))
+            for cid in cap_ids:
+                take_mask = take_mask | (self._one_i64 << int(cid))
+            self._captured_bits_t[squad_id] = self._captured_bits_t[squad_id] | take_mask
             
             # Verifica scopa
             if len(table) == 0:
@@ -515,18 +495,12 @@ class ScoponeEnvMA(gym.Env):
                 self._table_ids.append(pid)
                 if self._use_bitset:
                     self._table_bits |= (1 << pid)
-                    try:
-                        self._table_bits_t = self._table_bits_t | (self._one_i64 << int(pid))
-                    except Exception:
-                        pass
+                    self._table_bits_t = self._table_bits_t | (self._one_i64 << int(pid))
         
         # Calcola reward shaping opzionale
         shaped_reward = 0.0
         if capture_type == "scopa" and bool(self.rules.get("shape_scopa", False)):
-            try:
-                shaped_reward = float(self.rules.get("scopa_reward", 0.1))
-            except Exception:
-                shaped_reward = 0.1
+            shaped_reward = float(self.rules.get("scopa_reward", 0.1))
 
         # Aggiorna history
         move_info = {
@@ -541,10 +515,7 @@ class ScoponeEnvMA(gym.Env):
         if (move_info["capture_type"] == "scopa" and rank == 1 and 
             self.rules.get("asso_piglia_tutto", False) and not self.rules.get("scopa_on_asso_piglia_tutto", False)):
             # Demote salvo eccezione: presa DIRETTA di un asso su asso (unica carta prima della mossa)
-            try:
-                single_ace_sweep = (pre_table_len == 1 and len(cap_ids) == 1 and ((cap_ids[0] // 4) + 1) == 1)
-            except Exception:
-                single_ace_sweep = False
+            single_ace_sweep = (pre_table_len == 1 and len(cap_ids) == 1 and ((cap_ids[0] // 4) + 1) == 1)
             if not single_ace_sweep:
                 move_info["capture_type"] = "capture"
 
@@ -569,6 +540,42 @@ class ScoponeEnvMA(gym.Env):
                     move_info["capture_type"] = "capture"
 
         self.game_state["history"].append(move_info)
+        # Aggiorna derived mirrors: progress len(history)/40 e last capturing team
+        hlen = len(self.game_state["history"])
+        pr = min(1.0, max(0.0, float(hlen) / 40.0))
+        self._progress_t = torch.tensor([pr], dtype=torch.float32, device=device)
+        # last capturing team: cerca ultima presa/scopa
+        l0 = l1 = 0.0
+        for m in reversed(self.game_state["history"]):
+            if m.get("capture_type") in ("capture", "scopa"):
+                l0 = 1.0 if (m.get("player") in [0, 2]) else 0.0
+                l1 = 1.0 - l0
+                break
+        self._last_capturing_team_t = torch.tensor([l0, l1], dtype=torch.float32, device=device)
+        # update history mirrors (ring buffer): encode move to 61-d
+        from observation import encode_move
+        enc = encode_move(move_info).to(device=device, dtype=torch.float32)
+        # shift left and append (small k, cpu-friendly)
+        if int(self._hist_buf_t.size(0)) > 1:
+            self._hist_buf_t = torch.roll(self._hist_buf_t, shifts=-1, dims=0)
+        self._hist_buf_t[-1] = enc
+        # increment length up to capacity
+        cap = int(self._hist_buf_t.size(0))
+        self._history_len_t = torch.clamp(self._history_len_t + 1, max=cap)
+        # update aggregates mirrors: played bits and scopa counts
+        pc = move_info.get("played_card")
+        if isinstance(pc, int):
+            cid = int(pc)
+        else:
+            r, s = pc
+            cid = int((int(r) - 1) * 4 + _suit_to_int(s))
+        if 0 <= cid < 40:
+            pidx = int(move_info.get("player", -1))
+            if 0 <= pidx <= 3:
+                self._played_bits_by_player_t[pidx] = self._played_bits_by_player_t[pidx] | (self._one_i64 << cid)
+        if move_info.get("capture_type") == "scopa":
+            team_id = 0 if current_player in [0, 2] else 1
+            self._scopa_counts_t[team_id] = self._scopa_counts_t[team_id] + 1.0
         
         # OTTIMIZZAZIONE: Invalida la cache delle osservazioni (LRU)
         self._observation_cache = OrderedDict()
@@ -592,23 +599,17 @@ class ScoponeEnvMA(gym.Env):
                     
                     if last_capturing_team is not None:
                         self.game_state["captured_squads"][last_capturing_team].extend(self.game_state["table"])
-                        try:
-                            add_mask = torch.zeros((), dtype=torch.int64, device=device)
-                            for cid in self.game_state["table"]:
-                                add_mask = add_mask | (self._one_i64 << int(_card_to_id(cid) if not isinstance(cid, int) else int(cid)))
-                            self._captured_bits_t[last_capturing_team] = self._captured_bits_t[last_capturing_team] | add_mask
-                        except Exception:
-                            pass
+                        add_mask = torch.zeros((), dtype=torch.int64, device=device)
+                        for cid in self.game_state["table"]:
+                            add_mask = add_mask | (self._one_i64 << int(_card_to_id(cid) if not isinstance(cid, int) else int(cid)))
+                        self._captured_bits_t[last_capturing_team] = self._captured_bits_t[last_capturing_team] | add_mask
                 # In ogni caso svuota il tavolo a fine mano
                 self.game_state["table"].clear()
                 # reset cache table
                 if self._use_id_cache:
                     self._table_ids.clear()
                     self._table_bits = 0
-                    try:
-                        self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
-                    except Exception:
-                        pass
+                    self._table_bits_t = torch.zeros((), dtype=torch.int64, device=device)
             
             # Calcolo punteggio finale
             from rewards import compute_final_score_breakdown, compute_final_reward_from_breakdown
@@ -651,14 +652,10 @@ class ScoponeEnvMA(gym.Env):
         start_time = time.time()
         
         # OTTIMIZZAZIONE: Chiave cache basata su bitset mirror (O(1)) + history_len
-        try:
-            hb = int(self._hands_bits_t[player_id].item())
-            tb = int(self._table_bits_t.item())
-            cb0 = int(self._captured_bits_t[0].item())
-            cb1 = int(self._captured_bits_t[1].item())
-        except Exception:
-            # Fallback a chiave basata su ID in caso di mirror assenti
-            hb = tb = cb0 = cb1 = -1
+        hb = int(self._hands_bits_t[player_id].item())
+        tb = int(self._table_bits_t.item())
+        cb0 = int(self._captured_bits_t[0].item())
+        cb1 = int(self._captured_bits_t[1].item())
         hlen = len(self.game_state.get("history", []))
         cache_key = (player_id, int(self.current_player), hb, tb, cb0, cb1, int(self.k_history), int(hlen))
         
@@ -674,12 +671,51 @@ class ScoponeEnvMA(gym.Env):
             self.game_state['_hands_bits_t'] = self._hands_bits_t
             self.game_state['_table_bits_t'] = self._table_bits_t
             self.game_state['_captured_bits_t'] = self._captured_bits_t
+            # esponi derived mirrors (progress, last_capturing_team)
+            self.game_state['_progress_t'] = self._progress_t
+            self.game_state['_last_capturing_team_t'] = self._last_capturing_team_t
+            # history mirrors for compile-friendly encoding
+            self.game_state['_hist_buf_t'] = self._hist_buf_t
+            self.game_state['_history_len_t'] = self._history_len_t
+            # expose aggregates mirrors
+            self.game_state['_played_bits_by_player_t'] = self._played_bits_by_player_t
+            self.game_state['_scopa_counts_t'] = self._scopa_counts_t
+            # probabilistic feature mirrors (if OBS_* enabled, compute eagerly once here)
+            if bool(OBS_INCLUDE_INFERRED):
+                from observation import compute_inferred_probabilities
+                ip = compute_inferred_probabilities(self.game_state, player_id)
+                self._inferred_probs_t = (ip if torch.is_tensor(ip) else torch.as_tensor(ip, dtype=torch.float32, device=device)).to(torch.float32)
+            if bool(OBS_INCLUDE_RANK_PROBS):
+                from observation import compute_rank_probabilities_by_player
+                rpb = compute_rank_probabilities_by_player(self.game_state, player_id).flatten()
+                self._rank_probs_by_player_t = rpb.to(torch.float32)
+                # derive rank_presence_from_inferred (30) from inferred or rank_probs if needed
+                if bool(OBS_INCLUDE_INFERRED):
+                    # reshape 3x40 -> sum over suits to 3x10
+                    ip3x40 = self._inferred_probs_t.view(3, 40)
+                    rp = ip3x40.view(3, 10, 4).sum(dim=2).reshape(-1)
+                    self._rank_presence_from_inferred_t = rp.to(torch.float32)
+            if bool(OBS_INCLUDE_SCOPA_PROBS):
+                from observation import compute_next_player_scopa_probabilities
+                sp = compute_next_player_scopa_probabilities(self.game_state, player_id)
+                self._scopa_probs_t = (sp if torch.is_tensor(sp) else torch.as_tensor(sp, dtype=torch.float32, device=device)).to(torch.float32)
+            self.game_state['_inferred_probs_t'] = self._inferred_probs_t
+            self.game_state['_rank_probs_by_player_t'] = self._rank_probs_by_player_t
+            self.game_state['_rank_presence_from_inferred_t'] = self._rank_presence_from_inferred_t
+            self.game_state['_scopa_probs_t'] = self._scopa_probs_t
             # esponi anche il current_player per feature derivate (es. dealer)
-            try:
-                self.game_state['current_player'] = int(self.current_player)
-            except Exception:
-                self.game_state['current_player'] = self.current_player
-            result = self._encode_obs(self.game_state, player_id, k_history=self.k_history)
+            self.game_state['current_player'] = int(self.current_player)
+            # Reuse preallocated output buffer when shape matches
+            if self._obs_out_buf is None:
+                # compute expected size based on flags
+                include_rank = bool(OBS_INCLUDE_RANK_PROBS)
+                include_scopa = bool(OBS_INCLUDE_SCOPA_PROBS)
+                include_inferred = bool(OBS_INCLUDE_INFERRED)
+                include_dealer = bool(OBS_INCLUDE_DEALER)
+                fixed = 43 + 40 + 82 + 61 * self.k_history + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+                exp = fixed + (120 if include_inferred else 0) + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if include_dealer else 0)
+                self._obs_out_buf = torch.empty((exp,), dtype=torch.float32, device=device)
+            result = self._encode_obs(self.game_state, player_id, k_history=self.k_history, out=self._obs_out_buf)
             
             # Salva in cache (LRU) senza forzare CPU: lascia il tensore sul suo device
             self._observation_cache[cache_key] = result
@@ -706,35 +742,34 @@ class ScoponeEnvMA(gym.Env):
         self._valid_actions_cache = OrderedDict()
         self._observation_cache = OrderedDict()
         # Ricostruisci cache ID/bitset
-        try:
-            # se in stato ID
-            if isinstance(self.game_state['hands'][0][0], int):
-                # popola cache con ID direttamente
-                for p in range(4):
-                    self._hands_ids[p] = list(self.game_state['hands'][p])
-                    self._hands_bits[p] = _ids_to_bitset(self._hands_ids[p]) if self._use_bitset else 0
-                    try:
-                        self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
-                    except Exception:
-                        self._hands_bits_t[p] = torch.tensor(int(self._hands_bits[p]), dtype=torch.int64, device=device)
-                self._table_ids = list(self.game_state['table'])
-                self._table_bits = _ids_to_bitset(self._table_ids) if self._use_bitset else 0
-                try:
-                    self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
-                except Exception:
-                    self._table_bits_t = torch.tensor(int(self._table_bits), dtype=torch.int64, device=device)
-            else:
-                self._rebuild_id_caches()
-        except Exception:
+        # se in stato ID
+        if isinstance(self.game_state['hands'][0][0], int):
+            # popola cache con ID direttamente
+            for p in range(4):
+                self._hands_ids[p] = list(self.game_state['hands'][p])
+                self._hands_bits[p] = _ids_to_bitset(self._hands_ids[p]) if self._use_bitset else 0
+                self._hands_bits_t[p] = torch.as_tensor(self._hands_bits[p], dtype=torch.int64, device=device)
+            self._table_ids = list(self.game_state['table'])
+            self._table_bits = _ids_to_bitset(self._table_ids) if self._use_bitset else 0
+            self._table_bits_t = torch.as_tensor(self._table_bits, dtype=torch.int64, device=device)
+        else:
             self._rebuild_id_caches()
         # reset captured bits tensors
-        try:
-            bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
-            bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
-        except Exception:
-            bits0, bits1 = 0, 0
+        bits0 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][0]])
+        bits1 = _ids_to_bitset([_card_to_id(c) for c in self.game_state['captured_squads'][1]])
         self._captured_bits_t[0] = torch.as_tensor(bits0, dtype=torch.int64, device=device)
         self._captured_bits_t[1] = torch.as_tensor(bits1, dtype=torch.int64, device=device)
+        # Reset derived mirrors
+        hlen = len(self.game_state.get("history", []))
+        pr = min(1.0, max(0.0, float(hlen) / 40.0))
+        self._progress_t = torch.tensor([pr], dtype=torch.float32, device=device)
+        self._last_capturing_team_t = torch.zeros(2, dtype=torch.float32, device=device)
+        # Reset history mirrors
+        self._hist_buf_t.zero_()
+        self._history_len_t.zero_()
+        # Reset aggregates mirrors
+        self._played_bits_by_player_t.zero_()
+        self._scopa_counts_t.zero_()
         
         # Ottieni l'osservazione iniziale
         return self._get_observation(self.current_player)

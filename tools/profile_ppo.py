@@ -1,6 +1,14 @@
 import os
 import sys
 import argparse
+import warnings as _warnings
+
+# Suppress noisy third-party deprecation warning from IPEX importing pkg_resources
+_warnings.filterwarnings(
+    'ignore',
+    message=r'pkg_resources is deprecated as an API.*',
+    category=UserWarning,
+)
 
 # Ensure project root on sys.path for module imports
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -14,8 +22,10 @@ os.environ.setdefault('ABSL_LOGGING_MIN_LOG_LEVEL', '3')
 os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
 os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
 ## Abilita torch.compile di default anche nel profiler (override via env)
-os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE', '1')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'ipex')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_FULLGRAPH', '1')
 os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
 ## Disabilita max_autotune_gemm di Inductor per evitare warning su GPU con poche SM
 os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
@@ -24,12 +34,13 @@ os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
 os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 ## Non forzare TORCH_LOGS ad un valore non valido; lascia default
 ## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
-os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '1')
+os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '0')
 ## Abilita di default feature dell'osservazione (dealer one-hot)
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
+os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
+os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
 ## Default to CPU unless overridden by user env
 os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
-os.environ.setdefault('ENV_DEVICE', 'cpu')
 ## Mantieni ENV_DEVICE allineato a main.py per profili consistenti
 try:
     import torch as _t
@@ -40,7 +51,9 @@ os.environ.setdefault('ENV_DEVICE', os.environ.get('SCOPONE_DEVICE', _env_def))
 ## Forza metodo di start del multiprocessing a 'fork' di default su Linux/WSL per evitare hang
 os.environ.setdefault('SCOPONE_MP_START', 'fork')
 
-_SILENCE_ABSL = (os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1') and (os.environ.get('SCALENE_RUNNING', '0') != '1')
+# Disable the stderr filtering thread when running under Scalene to avoid
+# attributing time to this file instead of user modules.
+_SILENCE_ABSL = (os.environ.get('SCALENE_RUNNING', '0') != '1') and (os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1')
 if _SILENCE_ABSL:
     _SUPPRESS_SUBSTRINGS = (
         "All log messages before absl::InitializeLog() is called are written to STDERR",
@@ -100,6 +113,13 @@ def main():
     parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
     parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel environments (default: 17 with --line, 1 without)')
+    # Line-profiler scope controls
+    parser.add_argument('--add-func', action='append', default=[], help='Qualified function or method to include, e.g. pkg.mod:Class.method or algorithms.ppo_ac:ActionConditionedPPO.update')
+    parser.add_argument('--add-module', action='append', default=[], help='Module to include all functions from, e.g. algorithms.ppo_ac or environment')
+    parser.add_argument('--profile-all', dest='profile_all', action='store_true', default=False, help='Profile all modules under project root (heavy)')
+    parser.add_argument('--no-profile-all', dest='profile_all', action='store_false', help=argparse.SUPPRESS)
+    parser.add_argument('--line-full', dest='line_full', action='store_true', default=False, help='Show all per-line rows (not just top 30)')
+    parser.add_argument('--line-csv', dest='line_csv', type=str, default=None, help='Path to write full per-line CSV (file, line, hits, cpu_s, gpu_s, transfer_s)')
     parser.add_argument('--cprofile', action='store_true', default=False, help='Use Python cProfile instead of torch or line-profiler')
     parser.add_argument('--cprofile-out', type=str, default=None, help='Output path for cProfile stats file (.prof). Default: timestamped file')
     parser.add_argument('--snakeviz', dest='snakeviz', action='store_true', default=True, help='Open SnakeViz on the generated .prof (default: on)')
@@ -120,12 +140,6 @@ def main():
     # Default to random seed for profiling runs; allow override via env/CLI passthrough
     seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
     seed = resolve_seed(seed_env)
-
-    # Perf flags
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.enabled = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision('high')
 
     # Ensure default profiles directory exists for profiler outputs
     DEFAULT_PROFILES_DIR = os.path.abspath(os.path.join(ROOT, 'profiles'))
@@ -211,15 +225,36 @@ def main():
         try:
             env = os.environ.copy()
             env['SCOPONE_SEED'] = str(seed)
-            # Mark inner run so we can disable stderr filtering; allow live progress bars
+            # Mark inner run; keep stderr filtering enabled to reduce noisy C++ warnings
             env['SCALENE_RUNNING'] = '1'
+            # Force-disable our stderr filter during Scalene runs
             env['SCOPONE_SILENCE_ABSL'] = '0'
             env['TQDM_DISABLE'] = '0'
             # Stream output live while capturing for summary at the end
             proc = subprocess.Popen(scalene_cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             captured_lines = []
             assert proc.stdout is not None
+            # Suppress frequent Scalene JSON validation/pydantic warnings and absl CUDA factory spam
+            def _suppress_scalene_line(txt: str) -> bool:
+                txt_low = txt.lower()
+                if ('json failed validation' in txt_low) or ('validation error for' in txt_low):
+                    return True
+                if ('n_core_utilization' in txt_low) or ('scalenejsonschema' in txt_low):
+                    return True
+                if ('errors.pydantic.dev' in txt_low):
+                    return True
+                # Newer Scalene prints just the validation rows without headers
+                if ('input should be less than or equal to 1' in txt_low) or ('less_than_equal' in txt_low):
+                    return True
+                # absl/CUDA registration noise
+                if ('unable to register cudnn factory' in txt_low) or ('unable to register cublas factory' in txt_low):
+                    return True
+                if ('all log messages before absl::initializelog() is called are written to stderr'.lower() in txt_low):
+                    return True
+                return False
             for _ln in proc.stdout:
+                if _suppress_scalene_line(_ln):
+                    continue
                 try:
                     print(_ln, end='', flush=True)
                 except Exception:
@@ -494,6 +529,119 @@ def main():
         # Lightweight line-by-line profiling for Python code with file:line output
         from profilers.line_profiler import profile as line_profile, global_profiler
 
+        # Optional: register additional targets for profiling before running training
+        def _resolve_attr(path: str):
+            try:
+                import importlib as _importlib
+                if ':' in path:
+                    mod_path, attr_path = path.split(':', 1)
+                else:
+                    parts = path.split('.')
+                    for i in range(len(parts), 0, -1):
+                        try:
+                            mod_path = '.'.join(parts[:i])
+                            _importlib.import_module(mod_path)
+                            attr_path = '.'.join(parts[i:])
+                            break
+                        except Exception:
+                            continue
+                    else:
+                        mod_path, attr_path = path, ''
+                mod = _importlib.import_module(mod_path)
+                if not attr_path:
+                    return mod
+                obj = mod
+                for name in attr_path.split('.'):
+                    obj = getattr(obj, name)
+                return obj
+            except Exception:
+                return None
+
+        def _iter_module_functions(module):
+            try:
+                import inspect as _inspect
+                for name, obj in _inspect.getmembers(module):
+                    if _inspect.isfunction(obj) and getattr(obj, '__module__', None) == module.__name__:
+                        yield obj
+                    if _inspect.isclass(obj) and getattr(obj, '__module__', None) == module.__name__:
+                        for _, member in _inspect.getmembers(obj):
+                            if _inspect.isfunction(member) and getattr(member, '__qualname__', '').startswith(obj.__name__ + '.'):
+                                yield member
+            except Exception:
+                return
+
+        def _iter_package_functions(pkg_module):
+            try:
+                import pkgutil as _pkgutil
+                import importlib as _importlib
+                for _finder, _name, _is_pkg in _pkgutil.walk_packages(pkg_module.__path__, pkg_module.__name__ + "."):
+                    try:
+                        submod = _importlib.import_module(_name)
+                    except Exception:
+                        continue
+                    for fn in _iter_module_functions(submod):
+                        yield fn
+            except Exception:
+                return
+
+        # Register user-specified functions and modules
+        any_registered = False
+        if getattr(args, 'add_func', None):
+            for spec in (args.add_func or []):
+                obj = _resolve_attr(spec)
+                if obj is None:
+                    continue
+                try:
+                    line_profile(getattr(obj, '__func__', obj))
+                    any_registered = True
+                except Exception:
+                    pass
+        if getattr(args, 'add_module', None):
+            for mod_spec in (args.add_module or []):
+                mod = _resolve_attr(mod_spec)
+                if mod is None:
+                    continue
+                for fn in _iter_module_functions(mod):
+                    try:
+                        line_profile(fn)
+                        any_registered = True
+                    except Exception:
+                        pass
+
+        # If requested, register most project modules/functions automatically (heavy)
+        if getattr(args, 'profile_all', False):
+            import importlib as _importlib
+            default_targets = [
+                'environment',
+                'observation',
+                'benchmark',
+                'main',
+                'algorithms',
+                'models',
+                'trainers',
+                'evaluation',
+            ]
+            for tgt in default_targets:
+                try:
+                    mod = _importlib.import_module(tgt)
+                except Exception:
+                    continue
+                # Package: recurse; Module: shallow
+                if hasattr(mod, '__path__'):
+                    for fn in _iter_package_functions(mod):
+                        try:
+                            line_profile(fn)
+                            any_registered = True
+                        except Exception:
+                            pass
+                else:
+                    for fn in _iter_module_functions(mod):
+                        try:
+                            line_profile(fn)
+                            any_registered = True
+                        except Exception:
+                            pass
+
         # Wrap hotspots and also enable global tracing fallback
         import trainers.train_ppo as train_mod
         train_mod.collect_trajectory = line_profile(train_mod.collect_trajectory)
@@ -558,11 +706,37 @@ def main():
                 total = s['cpu_s']
                 print(f"{i:>2}. {f}\n    CPU: {total:8.4f}s  GPU: {s['gpu_s']:8.4f}s  Transfer: {s['transfer_s']:8.4f}s  Hits: {s['hits']}")
 
-            # Print top lines across files
+            # Print top lines across files (optionally full)
             print("\n===== Line-profiler — Top lines (by CPU time) =====")
             ranked_sites = sorted(per_site.items(), key=lambda kv: kv[1]['cpu_s'], reverse=True)
-            for i, ((f, ln), agg) in enumerate(ranked_sites[:30], 1):
+            limit = None
+            try:
+                limit = None if getattr(args, 'line_full', False) else 30
+            except Exception:
+                limit = 30
+            for i, ((f, ln), agg) in enumerate(ranked_sites[: (None if limit is None else limit) ], 1):
                 print(f"{i:>2}. {f}:{ln}  CPU: {agg['cpu_s']:.6f}s  GPU: {agg['gpu_s']:.6f}s  Transfer: {agg['transfer_s']:.6f}s  Hits: {agg['hits']}")
+
+            # Optional CSV dump for full per-line times across all files
+            try:
+                line_csv = getattr(args, 'line_csv', None)
+            except Exception:
+                line_csv = None
+            if line_csv:
+                import csv as _csv
+                abs_csv = os.path.abspath(line_csv)
+                out_dir = os.path.dirname(abs_csv)
+                if out_dir:
+                    try:
+                        os.makedirs(out_dir, exist_ok=True)
+                    except Exception:
+                        pass
+                with open(abs_csv, 'w', newline='', encoding='utf-8') as f:
+                    w = _csv.writer(f)
+                    w.writerow(['file', 'line', 'hits', 'cpu_s', 'gpu_s', 'transfer_s'])
+                    for (frel, lno), agg in ranked_sites:
+                        w.writerow([frel, int(lno), int(agg['hits']), f"{agg['cpu_s']:.9f}", f"{agg['gpu_s']:.9f}", f"{agg['transfer_s']:.9f}"])
+                print("Saved per-line CSV to:", abs_csv)
         except Exception as e:
             print(f"Line-profiler per-file aggregation failed: {e}")
         return

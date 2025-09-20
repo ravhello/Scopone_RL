@@ -12,7 +12,7 @@ from layout import LayoutManager
 
 # Import game components
 from environment import ScoponeEnvMA
-from actions import encode_action, decode_action
+from actions import encode_action_from_ids_tensor, decode_action_ids
 
 # Constants
 SCREEN_WIDTH = 1024
@@ -4908,12 +4908,15 @@ class GameScreen(BaseScreen):
                         if same_rank:
                             # Se c'è una sola carta di pari rank: auto-cattura quella
                             if len(same_rank) == 1:
-                                action = encode_action(ace_card, list(same_rank))
+                                import torch
+                                def _to_id(x):
+                                    return x if isinstance(x, int) else (x[0]-1)*4 + { 'denari':0, 'coppe':1, 'spade':2, 'bastoni':3 }[x[1]]
+                                action = encode_action_from_ids_tensor(torch.tensor(_to_id(ace_card), dtype=torch.long), torch.tensor([_to_id(c) for c in same_rank], dtype=torch.long))
                                 valid_actions = self.env.get_valid_actions()
                                 chosen = None
                                 for v in valid_actions:
                                     try:
-                                        pc, cc = decode_action(v)
+                                        pc, cc = decode_action_ids(v)
                                         if pc == ace_card and set(cc) == set(same_rank):
                                             chosen = v
                                             break
@@ -4948,12 +4951,15 @@ class GameScreen(BaseScreen):
                                 return
                         else:
                             # Nessuna carta di ugual rank: posa consentita (nessuna presa)
-                            action = encode_action(ace_card, [])
+                            import torch
+                            def _to_id(x):
+                                return x if isinstance(x, int) else (x[0]-1)*4 + { 'denari':0, 'coppe':1, 'spade':2, 'bastoni':3 }[x[1]]
+                            action = encode_action_from_ids_tensor(torch.tensor(_to_id(ace_card), dtype=torch.long), torch.tensor([], dtype=torch.long))
                             valid_actions = self.env.get_valid_actions()
                             chosen = None
                             for v in valid_actions:
                                 try:
-                                    pc, cc = decode_action(v)
+                                    pc, cc = decode_action_ids(v)
                                     if pc == ace_card and len(cc) == 0:
                                         chosen = v
                                         break
@@ -4997,7 +5003,10 @@ class GameScreen(BaseScreen):
                             table_cards = list(self.env.game_state.get("table", []))
                         # Se tavolo vuoto → auto-presa dell'asso senza posarlo
                         if len(table_cards) == 0:
-                            action = encode_action(ace_card, [])
+                            import torch
+                            def _to_id(x):
+                                return x if isinstance(x, int) else (x[0]-1)*4 + { 'denari':0, 'coppe':1, 'spade':2, 'bastoni':3 }[x[1]]
+                            action = encode_action_from_ids_tensor(torch.tensor(_to_id(ace_card), dtype=torch.long), torch.tensor([], dtype=torch.long))
                             if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
                                 # Client online: invia e attendi; nessuna animazione locale
                                 try:
@@ -5019,7 +5028,10 @@ class GameScreen(BaseScreen):
                             self.pending_action = action
                             self.pending_action_flags = {"force_ace_self_capture_on_empty_once": True}
                         else:
-                            action = encode_action(ace_card, list(table_cards))
+                            import torch
+                            def _to_id(x):
+                                return x if isinstance(x, int) else (x[0]-1)*4 + { 'denari':0, 'coppe':1, 'spade':2, 'bastoni':3 }[x[1]]
+                            action = encode_action_from_ids_tensor(torch.tensor(_to_id(ace_card), dtype=torch.long), torch.tensor([_to_id(c) for c in table_cards], dtype=torch.long))
                             if self.app.game_config.get("mode") == "online_multiplayer" and not self.app.game_config.get("is_host", False):
                                 # Client online: invia e attendi; nessuna animazione locale
                                 try:
@@ -5214,7 +5226,7 @@ class GameScreen(BaseScreen):
                 if hasattr(self, 'pending_action') and self.pending_action is not None:
                     # CRITICAL FIX: Verify the action is valid for the current player before executing
                     try:
-                        card_played, cards_captured = decode_action(self.pending_action)
+                        card_played, cards_captured = decode_action_ids(self.pending_action)
                     except ValueError:
                         card_played, cards_captured = None, []
                     hands = {}
@@ -5343,7 +5355,7 @@ class GameScreen(BaseScreen):
                     if (self.app.game_config.get("mode") == "online_multiplayer"
                         and not self.app.game_config.get("is_host", False)):
                         try:
-                            pc, cc = decode_action(self.pending_action) if self.pending_action is not None else (None, [])
+                            pc, cc = decode_action_ids(self.pending_action) if self.pending_action is not None else (None, [])
                         except Exception:
                             pc, cc = None, []
                         if pc and pc[0] == 1 and isinstance(cc, list) and len(cc) == 0:
@@ -5433,7 +5445,7 @@ class GameScreen(BaseScreen):
                         filtered = []
                         for act in valid_actions:
                             try:
-                                pc, cc = decode_action(act)
+                                pc, cc = decode_action_ids(act)
                                 if pc == the_card:
                                     filtered.append((act, pc, cc))
                             except ValueError:
@@ -5947,7 +5959,7 @@ class GameScreen(BaseScreen):
                 # Execute the move and create animations
                 try:
                     # Decode the move
-                    card_played, cards_captured = decode_action(move)
+                    card_played, cards_captured = decode_action_ids(move)
                     print(f"HOST: processing move seat={mapped_player_id} card={card_played} captured={cards_captured} table={self.env.game_state.get('table', [])}")
                     #print(f"Host processing move: Player {player_id} plays {card_played}, captures {cards_captured}")
 
@@ -6834,7 +6846,10 @@ class GameScreen(BaseScreen):
             pass
 
         # Encode the action
-        action_vec = encode_action(self.selected_hand_card, list(self.selected_table_cards))
+        import torch
+        def _to_id(x):
+            return x if isinstance(x, int) else (x[0]-1)*4 + { 'denari':0, 'coppe':1, 'spade':2, 'bastoni':3 }[x[1]]
+        action_vec = encode_action_from_ids_tensor(torch.tensor(_to_id(self.selected_hand_card), dtype=torch.long), torch.tensor([_to_id(c) for c in self.selected_table_cards], dtype=torch.long))
         
         # Verifica che l'azione sia valida
         valid_actions = self.env.get_valid_actions()
@@ -6842,7 +6857,7 @@ class GameScreen(BaseScreen):
         valid_action = None
         for valid_act in valid_actions:
             try:
-                card, captured = decode_action(valid_act)
+                card, captured = decode_action_ids(valid_act)
             except ValueError:
                 continue
             # Regola speciale: se esistono carte di pari rank sul tavolo, permetti solo la cattura di UNA di esse
@@ -6871,7 +6886,10 @@ class GameScreen(BaseScreen):
                 if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                     table_cards = list(self.env.game_state.get("table", []))
                 if ap_enabled and not ap_posabile and self.selected_hand_card and rank_of(self.selected_hand_card) == 1 and len(table_cards) == 0:
-                    forced_action = encode_action(self.selected_hand_card, [])
+                    import torch
+                    def _to_id(x):
+                        return x if isinstance(x, int) else (x[0]-1)*4 + { 'denari':0, 'coppe':1, 'spade':2, 'bastoni':3 }[x[1]]
+                    forced_action = encode_action_from_ids_tensor(torch.tensor(_to_id(self.selected_hand_card), dtype=torch.long), torch.tensor([], dtype=torch.long))
                     self.create_move_animations(self.selected_hand_card, [], source_player_id=self.current_player_id, force_self_capture=True)
                     self.app.resources.play_sound("card_play")
                     self.waiting_for_animation = True
@@ -6892,7 +6910,7 @@ class GameScreen(BaseScreen):
         
         # Get the card played and cards captured for animation
         try:
-            card_played, cards_captured = decode_action(valid_action)
+            card_played, cards_captured = decode_action_ids(valid_action)
         except ValueError:
             self.status_message = "Invalid move. Try again."
             return False
@@ -6910,7 +6928,7 @@ class GameScreen(BaseScreen):
                     table_cards = []
                     if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                         table_cards = list(self.env.game_state.get("table", []))
-                    pc, cc = decode_action(valid_action)
+                    pc, cc = decode_action_ids(valid_action)
                     if ap_enabled and pc[0] == 1 and len(table_cards) == 0 and len(cc) == 0 and not ap_posabile:
                         flags = {"force_ace_self_capture_on_empty_once": True}
                 except Exception:
@@ -6981,7 +6999,7 @@ class GameScreen(BaseScreen):
                 # preemptively suppress the echoed network animation from host for this same move
                 try:
                     if isinstance(flags, dict) and flags.get('force_ace_self_capture_on_empty_once'):
-                        pc, cc = decode_action(move)
+                        pc, cc = decode_action_ids(move)
                         if pc and pc[0] == 1 and isinstance(cc, list) and len(cc) == 0:
                             self.suppress_next_network_own_move = True
                 except Exception:
@@ -7027,7 +7045,7 @@ class GameScreen(BaseScreen):
         
         # Get the card played and cards captured for animation
         try:
-            card_played, cards_captured = decode_action(action)
+            card_played, cards_captured = decode_action_ids(action)
         except ValueError:
             return
         

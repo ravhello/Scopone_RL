@@ -56,7 +56,7 @@ Note: la codifica a storia completa legacy è stata rimossa. Usare l'osservazion
 - Seeds: `--seed`
 
 ## Dependencies
-See `requirements.txt` (torch, numpy, tqdm, gym, pandas, openpyxl, scipy, tensorboard, numba optional).
+See `requirements.txt` (torch, numpy, tqdm, gymnasium, pandas, openpyxl, scipy, tensorboard, numba optional).
 
 ## Structure
 - `environment.py` — Gym env with compact obs and caches
@@ -72,4 +72,12 @@ See `requirements.txt` (torch, numpy, tqdm, gym, pandas, openpyxl, scipy, tensor
 - `tests/` — unit tests
 
 ## Reproducibility
-Use `--seed` in trainer/benchmark. Checkpoints include run config.
+Use `--seed` in trainer/benchmark. If `--seed < 0`, a random non-negative seed is generated and printed. Checkpoints include run config.
+
+## Notes on MCTS defaults
+- Training uses IS-MCTS optionally. Defaults are now neutral: `prior_smooth_eps=0.0`, `root_dirichlet_eps=0.0`. Set them explicitly if you want smoothing or root noise.
+- Root temperature can be scheduled during rollout; pass `--mcts-root-temp` to override.
+
+## Devices and AMP
+- Environment runs on CPU by default; models use `SCOPONE_DEVICE` (auto-selects CUDA if available unless overridden).
+- GradScaler uses the unified AMP API when on CUDA; falls back gracefully otherwise.

@@ -9,7 +9,7 @@ Questa guida spiega come installare, allenare, fare benchmark e profilare l'agen
 pip install -r requirements.txt
 ```
 
-In alternativa, con i target del `Makefile` (richiede l'ambiente conda `gym_tf` già creato):
+In alternativa, con i target del `Makefile` (richiede l'ambiente conda `pt_ipex` già creato):
 ```bash
 make install
 ```
@@ -60,9 +60,9 @@ Opzioni CLI e significato:
 - `--mcts-dets` (int, default 4): numero di determinizzazioni del belief per ricerca MCTS (train/eval se attivo).
 - `--mcts-c-puct` (float, default 1.0): costante di esplorazione PUCT.
 - `--mcts-root-temp` (float, default 0.0): temperatura alla radice per campionamento basato su visite (0 = argmax visite).
-- `--mcts-prior-smooth-eps` (float, default 0.0): smoothing dei prior (1−eps)·p + eps/|A|.
+- `--mcts-prior-smooth-eps` (float, default 0.0): smoothing dei prior (1−eps)·p + eps/|A| (default NEUTRO).
 - `--mcts-dirichlet-alpha` (float, default 0.25): parametro alpha per rumore Dirichlet alla radice (se `--mcts-dirichlet-eps` > 0).
-- `--mcts-dirichlet-eps` (float, default 0.25): mixing con rumore Dirichlet alla radice.
+- `--mcts-dirichlet-eps` (float, default 0.0): mixing con rumore Dirichlet alla radice (default NEUTRO).
 
 Output e logging:
 - Checkpoint salvato su `--ckpt` ogni `--save-every` iterazioni (contiene pesi actor/critic e ottimizzatori).
@@ -113,7 +113,7 @@ Opzioni CLI e significato:
 - `--belief-ess-frac` (float, default 0.5): soglia ESS per resampling del belief.
 - `--robust-child` (flag): seleziona il figlio con più visite (robust child). Se non impostato, usa max-Q.
 - `--root-dirichlet-alpha` (float, default 0.0): alpha del Dirichlet alla radice.
-- `--root-dirichlet-eps` (float, default 0.0): mixing con il rumore Dirichlet alla radice.
+- `--root-dirichlet-eps` (float, default 0.0): mixing con il rumore Dirichlet alla radice (default NEUTRO).
 - `--out-csv` (str): salva report per-partita in CSV.
 - `--out-json` (str): salva sommario aggregato in JSON.
 
@@ -173,7 +173,9 @@ Opzioni CLI e significato:
 - Osservazione compatta: usare `--compact` e regolare `--k-history` per bilanciare informatività e costo computazionale. Valori tipici: 12–39.
 - Entropia: il coefficiente di entropia segue uno schedule (`linear` o `cosine`) per facilitare esplorazione iniziale e stabilizzazione successiva.
 - Belief + IS-MCTS: aumentare `--belief-particles`, `--dets` e `--sims` migliora la qualità della ricerca ma scala i tempi.
-- Riproducibilità: impostare sempre `--seed`. I checkpoint includono un `run_config` minimale.
+- Riproducibilità: impostare sempre `--seed`. Se si passa un seed negativo, il codice genera un seed casuale non-negativo e lo stampa. I checkpoint includono un `run_config` minimale.
+- Dipendenze: la repo usa `gymnasium` (non `gym`).
+- Dispositivi/AMP: su CUDA, il trainer usa AMP con GradScaler (API unificata); su CPU la mixed precision è disabilitata.
 - TensorBoard: avviare `tensorboard --logdir runs` per monitorare loss, KL, entropia, grad norm, ecc.
 - Dispositivo ambiente: per impostazione predefinita l'ambiente gira su CPU. È possibile forzare il device impostando `ENV_DEVICE` (es. `ENV_DEVICE=cuda`), ma in generale è sconsigliato per via di micro-kernel poco efficienti.
 
@@ -187,7 +189,7 @@ Opzioni CLI e significato:
 
 Comandi comuni:
 python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --cprofile --iters 1
-python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --line --iters 1
+python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --line --profile-all  --line-full --iters 1
 python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --scalene --scalene-out html --iters 1
 python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --pytorch --iters 1 --horizon 2048
 

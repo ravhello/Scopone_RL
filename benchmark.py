@@ -11,8 +11,13 @@ Usage:
 """
 
 import torch
-import argparse
 import os
+# Default compile-friendly settings for CLI run
+os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
+os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
+os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
+import argparse
 import time
 import re
 from tqdm import tqdm
@@ -29,11 +34,11 @@ import openpyxl
 from environment import ScoponeEnvMA
 from algorithms.is_mcts import run_is_mcts
 from models.action_conditioned import ActionConditionedActor, CentralValueNet
+from utils.compile import maybe_compile_module
 import torch
-from main import DQNAgent
+ 
 
 # Device selection with overrides
-import os
 device = torch.device(os.environ.get(
     'SCOPONE_DEVICE',
     ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
@@ -56,19 +61,22 @@ DEFAULT_RULES = {
     'last_cards_to_dealer': True,
 }
 
-def load_agent_from_checkpoint(checkpoint_path):
-    """Load a Team 0 agent from a checkpoint file."""
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    
-    # Always create a Team 0 agent
-    agent = DQNAgent(team_id=0)
-    agent.load_checkpoint(checkpoint_path)
-    # Set epsilon to 0 for deterministic play during evaluation
-    agent.epsilon = 0.0
-    return agent
+def load_actor_critic(ckpt_path: str):
+    actor = ActionConditionedActor()
+    critic = CentralValueNet()
+    # Enable compiled versions when requested (works on CPU with inductor)
+    actor = maybe_compile_module(actor, name='ActionConditionedActor[benchmark]')
+    critic = maybe_compile_module(critic, name='CentralValueNet[benchmark]')
+    ckpt = torch.load(ckpt_path, map_location=device)
+    # se si usa algorithms/ppo_ac save
+    if 'actor' in ckpt and 'critic' in ckpt:
+        actor.load_state_dict(ckpt['actor'])
+        critic.load_state_dict(ckpt['critic'])
+    else:
+        raise RuntimeError('No weights in checkpoint')
+    return actor, critic
 
-def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=16):
+def play_game(actor1, actor2, starting_player=0, use_mcts=False, sims=128, dets=16):
     """
     Play a single game between two Team 0 agents.
     
@@ -88,20 +96,13 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
     done = False
     info = {}
     
-    # Track which agent is controlling the current player
-    # In even positions (0, 2) of Team 0, agent1 plays. In odd positions (1, 3) of Team 1, agent2 plays.
-    agent1_positions = [0, 2]  # Team 0 positions
-    agent2_positions = [1, 3]  # Team 1 positions
+    # Track which actor controls which seats
+    actor1_positions = [0, 2]  # Team 0 positions
+    actor2_positions = [1, 3]  # Team 1 positions
     
     # Game loop
     while not done:
         current_player = env.current_player
-        
-        # Choose the right agent based on player position
-        if current_player in agent1_positions:
-            agent = agent1
-        else:
-            agent = agent2
         
         # Get valid actions
         valid_actions = env.get_valid_actions()
@@ -113,89 +114,107 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
         # Get observation for current player
         obs = env._get_observation(current_player)
         
-        # Agent selects action (with optional IS-MCTS if available)
+        # Select action (with optional IS-MCTS if available)
         if use_mcts:
-            try:
-                actor = ActionConditionedActor()
-                critic = CentralValueNet()
-                def policy_fn(o, leg):
-                    o_t = torch.tensor(o, dtype=torch.float32, device=device)
-                    if len(leg) > 0 and torch.is_tensor(leg[0]):
-                        leg_t = torch.stack(leg).to(device=device, dtype=torch.float32)
-                    else:
-                        leg_t = torch.stack([
-                            x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
-                        for x in leg], dim=0)
-                    with torch.no_grad():
-                        logits = actor(o_t.unsqueeze(0), leg_t)
-                    probs = torch.softmax(logits, dim=0)
-                    return probs
-                def value_fn(o, _env=None):
-                    o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
-                    # build seat vector if env available
-                    if _env is not None:
-                        cp = _env.current_player
-                        s = torch.zeros(6, dtype=torch.float32, device=device)
-                        s[cp] = 1.0
-                        s[4] = 1.0 if cp in [0, 2] else 0.0
-                        s[5] = 1.0 if cp in [1, 3] else 0.0
-                    else:
-                        s = torch.zeros(6, dtype=torch.float32, device=device)
-                    with torch.no_grad():
-                        return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
-                # Belief sampler neurale: determinizza le mani avversarie dai margini del BeliefNet
-                def belief_sampler_neural(_env):
-                    try:
-                        cp = _env.current_player
-                        obs_cur = _env._get_observation(cp)
-                        o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
-                        if torch.is_tensor(o_cpu):
-                            o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
-                        # seat/team vec: 6-dim
-                        s_cpu = torch.zeros(6, dtype=torch.float32)
-                        s_cpu[cp] = 1.0
-                        s_cpu[4] = 1.0 if cp in [0, 2] else 0.0
-                        s_cpu[5] = 1.0 if cp in [1, 3] else 0.0
-                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        with torch.no_grad():
-                            state_feat = actor.state_enc(o_t, s_t)
-                            logits = actor.belief_net(state_feat)
-                            hand_table = o_t[:, :83]
-                            hand_mask = hand_table[:, :40] > 0.5
-                            table_mask = hand_table[:, 43:83] > 0.5
-                            captured = o_t[:, 83:165]
-                            cap0_mask = captured[:, :40] > 0.5
-                            cap1_mask = captured[:, 40:80] > 0.5
-                            visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
-                            probs_flat = actor.belief_net.probs(logits, visible_mask)
-                        probs = probs_flat.view(3, 40).detach().cpu().numpy()
-                        vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
-                        unknown_ids = [cid for cid in range(40) if not vis[cid]]
-                        others = [(cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4]
-                        det = {pid: [] for pid in others}
-                        counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
-                        caps = [int(counts.get(pid, 0)) for pid in others]
-                        n = len(unknown_ids)
-                        if sum(caps) != n:
-                            caps[2] = max(0, n - caps[0] - caps[1])
-                        for cid in unknown_ids:
-                            pc = probs[:, cid]
-                            s = pc.sum()
-                            ps = pc / (s if s > 0 else 1e-9)
-                            j = int(torch.argmax(torch.tensor(ps)).item())
-                            if caps[j] > 0:
-                                det[others[j]].append(cid)
-                                caps[j] -= 1
-                        return det
-                    except Exception:
-                        return None
-                action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=1.0, belief=None, num_determinization=dets,
-                                     belief_sampler=belief_sampler_neural)
-            except Exception:
-                action = agent.pick_action(obs, valid_actions, env)
+            # Use the corresponding loaded actor; critic can be a lightweight instance for value
+            actor = actor1 if current_player in actor1_positions else actor2
+            critic = maybe_compile_module(CentralValueNet(), name='CentralValueNet[bench_mcts]')
+            def policy_fn(o, leg):
+                o_t = torch.tensor(o, dtype=torch.float32, device=device)
+                if len(leg) > 0 and torch.is_tensor(leg[0]):
+                    leg_t = torch.stack(leg).to(device=device, dtype=torch.float32)
+                else:
+                    leg_t = torch.stack([
+                        x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
+                    for x in leg], dim=0)
+                with torch.no_grad():
+                    # seat/team vec aligned to current env seat
+                    s = torch.zeros(6, dtype=torch.float32, device=device)
+                    cp = env.current_player
+                    s[cp] = 1.0
+                    s[4] = 1.0 if cp in [0, 2] else 0.0
+                    s[5] = 1.0 if cp in [1, 3] else 0.0
+                    logits = actor(o_t.unsqueeze(0), leg_t, s.unsqueeze(0))
+                probs = torch.softmax(logits, dim=0)
+                return probs
+            def value_fn(o, _env=None):
+                o_t = o.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(o) else torch.tensor(o, dtype=torch.float32, device=device)
+                # build seat vector if env available
+                if _env is not None:
+                    cp = _env.current_player
+                    s = torch.zeros(6, dtype=torch.float32, device=device)
+                    s[cp] = 1.0
+                    s[4] = 1.0 if cp in [0, 2] else 0.0
+                    s[5] = 1.0 if cp in [1, 3] else 0.0
+                else:
+                    s = torch.zeros(6, dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
+            # Belief sampler neurale: determinizza le mani avversarie dai margini del BeliefNet
+            def belief_sampler_neural(_env):
+                cp = _env.current_player
+                obs_cur = _env._get_observation(cp)
+                o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
+                if torch.is_tensor(o_cpu):
+                    o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
+                # seat/team vec: 6-dim
+                s_cpu = torch.zeros(6, dtype=torch.float32)
+                s_cpu[cp] = 1.0
+                s_cpu[4] = 1.0 if cp in [0, 2] else 0.0
+                s_cpu[5] = 1.0 if cp in [1, 3] else 0.0
+                if device.type == 'cuda':
+                    o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                    s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                else:
+                    o_t = o_cpu.unsqueeze(0).to(device=device)
+                    s_t = s_cpu.unsqueeze(0).to(device=device)
+                with torch.no_grad():
+                    state_feat = actor.state_enc(o_t, s_t)
+                    logits = actor.belief_net(state_feat)
+                    hand_table = o_t[:, :83]
+                    hand_mask = hand_table[:, :40] > 0.5
+                    table_mask = hand_table[:, 43:83] > 0.5
+                    captured = o_t[:, 83:165]
+                    cap0_mask = captured[:, :40] > 0.5
+                    cap1_mask = captured[:, 40:80] > 0.5
+                    visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
+                    probs_flat = actor.belief_net.probs(logits, visible_mask)
+                probs = probs_flat.view(3, 40).detach().cpu().numpy()
+                vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
+                unknown_ids = [cid for cid in range(40) if not vis[cid]]
+                others = [(cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4]
+                det = {pid: [] for pid in others}
+                counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
+                caps = [int(counts.get(pid, 0)) for pid in others]
+                n = len(unknown_ids)
+                if sum(caps) != n:
+                    caps[2] = max(0, n - caps[0] - caps[1])
+                for cid in unknown_ids:
+                    pc = probs[:, cid]
+                    s = pc.sum()
+                    ps = pc / (s if s > 0 else 1e-9)
+                    j = int(torch.argmax(torch.tensor(ps)).item())
+                    if caps[j] > 0:
+                        det[others[j]].append(cid)
+                        caps[j] -= 1
+                return det
+            action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=1.0, belief=None, num_determinization=dets,
+                                    belief_sampler=belief_sampler_neural)
         else:
-            action = agent.pick_action(obs, valid_actions, env)
+            # Greedy selection by actor scoring
+            with torch.no_grad():
+                o_t = obs.clone().detach().to(device=device, dtype=torch.float32) if torch.is_tensor(obs) else torch.tensor(obs, dtype=torch.float32, device=device)
+                leg_t = torch.stack([
+                    x if torch.is_tensor(x) else torch.tensor(x, dtype=torch.float32, device=device)
+                for x in valid_actions], dim=0)
+                s = torch.zeros(6, dtype=torch.float32, device=device)
+                s[current_player] = 1.0
+                s[4] = 1.0 if current_player in [0, 2] else 0.0
+                s[5] = 1.0 if current_player in [1, 3] else 0.0
+                actor = actor1 if current_player in actor1_positions else actor2
+                logits = actor(o_t.unsqueeze(0), leg_t, s.unsqueeze(0))
+                idx = torch.argmax(logits).item()
+            action = valid_actions[idx]
 
         # Take step in environment
         next_obs, reward, done, info = env.step(action)
@@ -216,17 +235,16 @@ def play_game(agent1, agent2, starting_player=0, use_mcts=False, sims=128, dets=
 def load_actor_critic(ckpt_path: str):
     actor = ActionConditionedActor()
     critic = CentralValueNet()
-    try:
-        ckpt = torch.load(ckpt_path, map_location=device)
-        # se si usa algorithms/ppo_ac save
-        if 'actor' in ckpt and 'critic' in ckpt:
-            actor.load_state_dict(ckpt['actor'])
-            critic.load_state_dict(ckpt['critic'])
-        else:
-            from utils.fallback import notify_fallback
-            notify_fallback('benchmark.load_actor_critic.no_weights_in_ckpt')
-    except Exception as e:
-        raise
+    # Enable compiled versions when requested (works on CPU with inductor)
+    actor = maybe_compile_module(actor, name='ActionConditionedActor[benchmark]')
+    critic = maybe_compile_module(critic, name='CentralValueNet[benchmark]')
+    ckpt = torch.load(ckpt_path, map_location=device)
+    # se si usa algorithms/ppo_ac save
+    if 'actor' in ckpt and 'critic' in ckpt:
+        actor.load_state_dict(ckpt['actor'])
+        critic.load_state_dict(ckpt['critic'])
+    else:
+        raise RuntimeError('No weights in checkpoint')
     return actor, critic
 
 
@@ -242,7 +260,8 @@ def main_cli():
     parser.add_argument('--games', type=int, default=10, help='Number of games to play')
     args = parser.parse_args()
     # Placeholder for agent loading and running a quick game
-    actor, critic = load_actor_critic(args.ckpt) if args.ckpt else (ActionConditionedActor(), CentralValueNet())
+    actor, critic = load_actor_critic(args.ckpt) if args.ckpt else (maybe_compile_module(ActionConditionedActor(), name='ActionConditionedActor[benchmark]'),
+                                                                     maybe_compile_module(CentralValueNet(), name='CentralValueNet[benchmark]'))
     for g in range(args.games):
         env = ScoponeEnvMA(k_history=args.k_history)
         done = False
@@ -267,50 +286,51 @@ def main_cli():
                     with torch.no_grad():
                         return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
                 def belief_sampler_neural(_env):
-                    try:
-                        cp = _env.current_player
-                        obs_cur = _env._get_observation(cp)
-                        o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
-                        if torch.is_tensor(o_cpu):
-                            o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
-                        s_cpu = torch.zeros(6, dtype=torch.float32)
-                        s_cpu[cp] = 1.0
-                        s_cpu[4] = 1.0 if cp in [0, 2] else 0.0
-                        s_cpu[5] = 1.0 if cp in [1, 3] else 0.0
+                    cp = _env.current_player
+                    obs_cur = _env._get_observation(cp)
+                    o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
+                    if torch.is_tensor(o_cpu):
+                        o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
+                    s_cpu = torch.zeros(6, dtype=torch.float32)
+                    s_cpu[cp] = 1.0
+                    s_cpu[4] = 1.0 if cp in [0, 2] else 0.0
+                    s_cpu[5] = 1.0 if cp in [1, 3] else 0.0
+                    if device.type == 'cuda':
                         o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
                         s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        with torch.no_grad():
-                            state_feat = actor.state_enc(o_t, s_t)
-                            logits = actor.belief_net(state_feat)
-                            hand_table = o_t[:, :83]
-                            hand_mask = hand_table[:, :40] > 0.5
-                            table_mask = hand_table[:, 43:83] > 0.5
-                            captured = o_t[:, 83:165]
-                            cap0_mask = captured[:, :40] > 0.5
-                            cap1_mask = captured[:, 40:80] > 0.5
-                            visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
-                            probs_flat = actor.belief_net.probs(logits, visible_mask)
-                        probs = probs_flat.view(3, 40).detach().cpu().numpy()
-                        vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
-                        unknown_ids = [cid for cid in range(40) if not vis[cid]]
-                        others = [(cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4]
-                        det = {pid: [] for pid in others}
-                        counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
-                        caps = [int(counts.get(pid, 0)) for pid in others]
-                        n = len(unknown_ids)
-                        if sum(caps) != n:
-                            caps[2] = max(0, n - caps[0] - caps[1])
-                        for cid in unknown_ids:
-                            pc = probs[:, cid]
-                            s = pc.sum()
-                            ps = pc / (s if s > 0 else 1e-9)
-                            j = int(torch.argmax(torch.tensor(ps)).item())
-                            if caps[j] > 0:
-                                det[others[j]].append(cid)
-                                caps[j] -= 1
-                        return det
-                    except Exception:
-                        return None
+                    else:
+                        o_t = o_cpu.unsqueeze(0).to(device=device)
+                        s_t = s_cpu.unsqueeze(0).to(device=device)
+                    with torch.no_grad():
+                        state_feat = actor.state_enc(o_t, s_t)
+                        logits = actor.belief_net(state_feat)
+                        hand_table = o_t[:, :83]
+                        hand_mask = hand_table[:, :40] > 0.5
+                        table_mask = hand_table[:, 43:83] > 0.5
+                        captured = o_t[:, 83:165]
+                        cap0_mask = captured[:, :40] > 0.5
+                        cap1_mask = captured[:, 40:80] > 0.5
+                        visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
+                        probs_flat = actor.belief_net.probs(logits, visible_mask)
+                    probs = probs_flat.view(3, 40).detach().cpu().numpy()
+                    vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
+                    unknown_ids = [cid for cid in range(40) if not vis[cid]]
+                    others = [(cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4]
+                    det = {pid: [] for pid in others}
+                    counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
+                    caps = [int(counts.get(pid, 0)) for pid in others]
+                    n = len(unknown_ids)
+                    if sum(caps) != n:
+                        caps[2] = max(0, n - caps[0] - caps[1])
+                    for cid in unknown_ids:
+                        pc = probs[:, cid]
+                        s = pc.sum()
+                        ps = pc / (s if s > 0 else 1e-9)
+                        j = int(torch.argmax(torch.tensor(ps)).item())
+                        if caps[j] > 0:
+                            det[others[j]].append(cid)
+                            caps[j] -= 1
+                    return det
                 action = run_is_mcts(env, policy_fn, value_fn, num_simulations=args.sims, c_puct=1.0, belief=None, num_determinization=args.dets,
                                       belief_sampler=belief_sampler_neural)
             else:
@@ -362,23 +382,23 @@ def evaluate_checkpoints(checkpoint_paths, num_games=10000):
     """Evaluate Team 0 checkpoints against each other in head-to-head matches."""
     results = {}
     
-    # Load all agents
-    agents = {}
+    # Load all models (actor/critic)
+    models = {}
     for path in checkpoint_paths:
         # Extract episode number for better naming
         episode_num = extract_episode_number(path)
         name = f"ep{episode_num}" if episode_num != float('inf') else os.path.basename(path).replace(".pth", "")
         
-        print(f"Loading Team 0 agent from checkpoint: {path} as {name}")
-        agents[name] = load_agent_from_checkpoint(path)
+        print(f"Loading actor/critic from checkpoint: {path} as {name}")
+        models[name] = load_actor_critic(path)
     
     # Play games between all pairs of agents (each pair plays only once)
-    matchups = list(itertools.combinations(agents.keys(), 2))
+    matchups = list(itertools.combinations(models.keys(), 2))
     
     for agent1_name, agent2_name in matchups:
         print(f"\nEvaluating: {agent1_name} vs {agent2_name}")
-        agent1 = agents[agent1_name]
-        agent2 = agents[agent2_name]
+        actor1, critic1 = models[agent1_name]
+        actor2, critic2 = models[agent2_name]
         
         matchup_key = f"{agent1_name}_vs_{agent2_name}"
         
@@ -404,7 +424,7 @@ def evaluate_checkpoints(checkpoint_paths, num_games=10000):
             starting_player = game_idx % 4
             
             # Play game
-            winner, scores, game_length = play_game(agent1, agent2, starting_player)
+            winner, scores, game_length = play_game(actor1, actor2, starting_player)
             
             # Record results
             agent1_score, agent2_score = scores
@@ -657,59 +677,50 @@ def generate_excel_comparison(checkpoint_paths, results, output_file):
                 
                 if sheet_name == "Win Rates" and isinstance(value, str) and '%' in value and value != "—":
                     # Apply color gradient to win rates (green for high, red for low)
-                    try:
-                        win_rate = float(value.strip('%'))
-                        if win_rate >= 50:
-                            intensity = min(255, int(155 + (win_rate - 50) * 2))
-                            green_hex = format(intensity, '02x')
-                            red_hex = format(255 - intensity // 3, '02x')
-                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                  end_color=f"{red_hex}{green_hex}55", 
-                                                  fill_type="solid")
-                        else:
-                            intensity = min(255, int(155 + (50 - win_rate) * 2))
-                            red_hex = format(intensity, '02x')
-                            green_hex = format(255 - intensity // 3, '02x')
-                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                  end_color=f"{red_hex}{green_hex}55", 
-                                                  fill_type="solid")
-                    except ValueError:
-                        pass
+                    win_rate = float(value.strip('%'))
+                    if win_rate >= 50:
+                        intensity = min(255, int(155 + (win_rate - 50) * 2))
+                        green_hex = format(intensity, '02x')
+                        red_hex = format(255 - intensity // 3, '02x')
+                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                end_color=f"{red_hex}{green_hex}55", 
+                                                fill_type="solid")
+                    else:
+                        intensity = min(255, int(155 + (50 - win_rate) * 2))
+                        red_hex = format(intensity, '02x')
+                        green_hex = format(255 - intensity // 3, '02x')
+                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                end_color=f"{red_hex}{green_hex}55", 
+                                                fill_type="solid")
                 
                 elif sheet_name == "Score Differences" and isinstance(value, str) and value not in ["N/A", "—"]:
-                    # Apply color gradient to score differences
-                    try:
-                        score_diff = float(value)
-                        if score_diff > 0:
-                            intensity = min(255, int(155 + min(score_diff * 25, 100)))
-                            green_hex = format(intensity, '02x')
-                            red_hex = format(255 - intensity // 3, '02x')
-                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                  end_color=f"{red_hex}{green_hex}55", 
-                                                  fill_type="solid")
-                        elif score_diff < 0:
-                            intensity = min(255, int(155 + min(abs(score_diff) * 25, 100)))
-                            red_hex = format(intensity, '02x')
-                            green_hex = format(255 - intensity // 3, '02x')
-                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                  end_color=f"{red_hex}{green_hex}55", 
-                                                  fill_type="solid")
-                    except ValueError:
-                        pass
+                # Apply color gradient to score differences
+                    score_diff = float(value)
+                    if score_diff > 0:
+                        intensity = min(255, int(155 + min(score_diff * 25, 100)))
+                        green_hex = format(intensity, '02x')
+                        red_hex = format(255 - intensity // 3, '02x')
+                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                end_color=f"{red_hex}{green_hex}55", 
+                                                fill_type="solid")
+                    elif score_diff < 0:
+                        intensity = min(255, int(155 + min(abs(score_diff) * 25, 100)))
+                        red_hex = format(intensity, '02x')
+                        green_hex = format(255 - intensity // 3, '02x')
+                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
+                                                end_color=f"{red_hex}{green_hex}55", 
+                                                fill_type="solid")
                 
                 elif sheet_name == "First-Starter Advantage" and isinstance(value, str) and value not in ["N/A", "—"]:
                     # Apply color gradient to starter advantage (neutral at 0.5)
-                    try:
-                        advantage = float(value)
-                        # Distance from 0.5 (neutral)
-                        distance = abs(advantage - 0.5)
-                        intensity = min(255, int(155 + min(distance * 200, 100)))
-                        blue_hex = format(intensity, '02x')
-                        cell.fill = PatternFill(start_color=f"55{blue_hex}{blue_hex}", 
-                                              end_color=f"55{blue_hex}{blue_hex}", 
-                                              fill_type="solid")
-                    except ValueError:
-                        pass
+                    advantage = float(value)
+                    # Distance from 0.5 (neutral)
+                    distance = abs(advantage - 0.5)
+                    intensity = min(255, int(155 + min(distance * 200, 100)))
+                    blue_hex = format(intensity, '02x')
+                    cell.fill = PatternFill(start_color=f"55{blue_hex}{blue_hex}", 
+                                            end_color=f"55{blue_hex}{blue_hex}", 
+                                            fill_type="solid")
         
         # Apply formatting to header row and column
         for row in sheet.iter_rows(min_row=4, max_row=4, min_col=2):

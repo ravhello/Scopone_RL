@@ -3,7 +3,7 @@ numpy>=1.23
 torch>=2.1
 
 # RL env
-gym==0.26.2
+gymnasium>=0.29
 
 # Utilities
 tqdm>=4.66

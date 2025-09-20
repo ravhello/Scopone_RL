@@ -7,12 +7,12 @@ from contextlib import nullcontext
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
 from utils.device import get_compute_device, get_amp_dtype
 from utils.compile import maybe_compile_module, maybe_compile_function
-from utils.fallback import notify_fallback
-
 import os as _os
 device = get_compute_device()
 autocast_device = device.type
 autocast_dtype = get_amp_dtype()
+import os as _os
+STRICT_CHECKS = (_os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
 
 
 class ActionConditionedPPO:
@@ -28,45 +28,54 @@ class ActionConditionedPPO:
                  value_coef: float = 0.5,
                  entropy_coef: float = 0.01,
                  value_clip: float = 0.2,
-                 target_kl: float = 0.02):
-        shared_enc = StateEncoderCompact()
+                 target_kl: float = 0.02,
+                 k_history: int = None):
+        shared_enc = StateEncoderCompact(k_history=k_history)
         self.actor = ActionConditionedActor(obs_dim, action_dim, state_encoder=shared_enc)
         self.critic = CentralValueNet(obs_dim, state_encoder=shared_enc)
 
-        # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) outside no_grad/inference
-        with torch.enable_grad():
-            _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
-            # Build valid seat/team vectors (one-hot seat + team flags)
-            _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device)
-            _seat_w[0, 0] = 1.0; _seat_w[0, 4] = 1.0  # seat 0, team0 flag
-            _seat_w[1, 1] = 1.0; _seat_w[1, 5] = 1.0  # seat 1, team1 flag
-            # Initialize encoder path shared by actor/critic under autocast to avoid dtype mismatch
-            cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
-            with cm:
-                _ = self.actor.compute_state_proj(_obs_w, _seat_w)
-                _ = self.critic(_obs_w, _seat_w)
+        # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) only when CUDA
+        if device.type == 'cuda':
+            with torch.enable_grad():
+                _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
+                _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device)
+                _seat_w[0, 0] = 1.0; _seat_w[0, 4] = 1.0
+                _seat_w[1, 1] = 1.0; _seat_w[1, 5] = 1.0
+                cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype)
+                with cm:
+                    _ = self.actor.compute_state_proj(_obs_w, _seat_w)
+                    _ = self.critic(_obs_w, _seat_w)
 
-        # Unified compile: wrap modules and hotspots if enabled via utils.compile
+        # Unified compile: allow CPU and CUDA. Avoid compiling backward-heavy compute_loss on CPU.
         self.actor = maybe_compile_module(self.actor, name='ActionConditionedActor')
         self.critic = maybe_compile_module(self.critic, name='CentralValueNet')
-        # compute_state_proj is heavily used outside actor.__call__; compile it separately
+        # Forward hotspots (safe on CPU/CUDA)
         try:
             self.actor.compute_state_proj = maybe_compile_function(self.actor.compute_state_proj, name='ActionConditionedActor.compute_state_proj')
-        except Exception:
-            from utils.fallback import notify_fallback
-            notify_fallback('ppo.init.compile_compute_state_proj_failed')
-        # Hot functions in profiler: compute_loss and select_action
-        try:
-            self.compute_loss = maybe_compile_function(self.compute_loss, name='ActionConditionedPPO.compute_loss')
-        except Exception:
-            from utils.fallback import notify_fallback
-            notify_fallback('ppo.init.compile_compute_loss_failed')
-        # compile the pure compute core of select_action (I/O wrapper remains eager)
+        except Exception as e:
+            raise RuntimeError('ppo.init.compile_compute_state_proj_failed') from e
         try:
             self._select_action_core = maybe_compile_function(self._select_action_core, name='ActionConditionedPPO._select_action_core')
-        except Exception:
-            from utils.fallback import notify_fallback
-            notify_fallback('ppo.init.compile_select_action_core_failed')
+        except Exception as e:
+            raise RuntimeError('ppo.init.compile_select_action_core_failed') from e
+        # Additional forward hotspots
+        try:
+            self.actor.compute_state_features = maybe_compile_function(self.actor.compute_state_features, name='ActionConditionedActor.compute_state_features')
+        except Exception as e:
+            raise RuntimeError('ppo.init.compile_compute_state_features_failed') from e
+        try:
+            self.actor.compute_state_proj_from_state = maybe_compile_function(self.actor.compute_state_proj_from_state, name='ActionConditionedActor.compute_state_proj_from_state')
+        except Exception as e:
+            raise RuntimeError('ppo.init.compile_compute_state_proj_from_state_failed') from e
+        try:
+            self.critic.forward_from_state = maybe_compile_function(self.critic.forward_from_state, name='CentralValueNet.forward_from_state')
+        except Exception as e:
+            raise RuntimeError('ppo.init.compile_critic_forward_from_state_failed') from e
+        # Compile compute_loss as well (CPU/CUDA). We ensure stable strides/shapes in update() to support CPU.
+        try:
+            self.compute_loss = maybe_compile_function(self.compute_loss, name='ActionConditionedPPO.compute_loss')
+        except Exception as e:
+            raise RuntimeError('ppo.init.compile_compute_loss_failed') from e
 
         # Optimizers with deduplicated shared encoder params to avoid double updates
         shared_ids = {id(p) for p in self.actor.state_enc.parameters()}
@@ -111,42 +120,50 @@ class ActionConditionedPPO:
             torch.backends.cudnn.enabled = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.set_float32_matmul_precision('high')
-        except Exception:
-            from utils.fallback import notify_fallback
-            notify_fallback('ppo.init.set_matmul_precision_failed')
+        except Exception as e:
+            raise RuntimeError('ppo.init.set_matmul_precision_failed') from e
 
         # AMP GradScaler su CUDA; disabilitato su CPU
         self.scaler = None
         if device.type == 'cuda':
             try:
-                self.scaler = torch.amp.GradScaler('cuda')
+                # Prefer the unified AMP GradScaler API with explicit device
+                self.scaler = torch.amp.GradScaler(device='cuda')
             except Exception:
                 try:
+                    # Fallback to legacy CUDA-specific GradScaler
                     self.scaler = torch.cuda.amp.GradScaler()
                 except Exception:
                     self.scaler = None
 
         # Pre-allocate pinned CPU buffers to cut repeated pin_memory/allocations in select_action
         # These are sized for single-step inference (batch size 1) and dynamic actions buffer
-        try:
-            self._obs_cpu_pinned = torch.empty((1, obs_dim), dtype=torch.float32, pin_memory=True)
-            # seat_team_vec is expected to be length 6 (one-hot seats + team flags)
-            self._seat_cpu_pinned = torch.empty((1, 6), dtype=torch.float32, pin_memory=True)
-        except Exception:
-            # Nessun fallback: pin_memory deve essere disponibile o configurazione errata
-            notify_fallback('ppo.init.pin_memory_unavailable')
-        self._actions_cpu_pinned = None
-        self._actions_cpu_capacity = 0
+        if device.type == 'cuda':
+            try:
+                self._obs_cpu_pinned = torch.empty((1, obs_dim), dtype=torch.float32, pin_memory=True)
+                self._seat_cpu_pinned = torch.empty((1, 6), dtype=torch.float32, pin_memory=True)
+            except Exception as e:
+                raise RuntimeError('ppo.init.pin_memory_unavailable') from e
+            self._actions_cpu_pinned = None
+            self._actions_cpu_capacity = 0
+        else:
+            self._obs_cpu_pinned = None
+            self._seat_cpu_pinned = None
+            self._actions_cpu_pinned = None
+            self._actions_cpu_capacity = 0
 
     def _ensure_actions_pinned_capacity(self, capacity: int):
         # Lazily allocate or grow the pinned actions buffer
         if (self._actions_cpu_pinned is None) or (capacity > self._actions_cpu_capacity):
             new_cap = max(capacity, int(self._actions_cpu_capacity * 1.5) if self._actions_cpu_capacity > 0 else 64)
             try:
-                self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32, pin_memory=True)
+                if device.type == 'cuda':
+                    self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32, pin_memory=True)
+                else:
+                    self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32)
                 self._actions_cpu_capacity = new_cap
-            except Exception:
-                notify_fallback('ppo.ensure_actions_pinned_capacity.pin_memory_unavailable')
+            except Exception as e:
+                raise RuntimeError('ppo.ensure_actions_pinned_capacity.pin_memory_unavailable') from e
 
     def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
@@ -188,18 +205,11 @@ class ActionConditionedPPO:
                 o_cpu = obs.detach().to('cpu', dtype=torch.float32)
                 if o_cpu.dim() == 1:
                     o_cpu = o_cpu.unsqueeze(0)
-                # Use preallocated pinned buffer when shape matches
-                if getattr(self, '_obs_cpu_pinned', None) is not None and self._obs_cpu_pinned.shape == o_cpu.shape:
-                    try:
-                        self._obs_cpu_pinned.copy_(o_cpu, non_blocking=True)
-                        obs_t = self._obs_cpu_pinned.to(device=device, non_blocking=True)
-                    except Exception:
-                        obs_t = o_cpu.pin_memory().to(device=device, non_blocking=True)
+                if device.type == 'cuda':
+                    self._obs_cpu_pinned.copy_(o_cpu, non_blocking=True)
+                    obs_t = self._obs_cpu_pinned.to(device=device, non_blocking=True)
                 else:
-                    try:
-                        obs_t = o_cpu.pin_memory().to(device=device, non_blocking=True)
-                    except Exception:
-                        obs_t = o_cpu.to(device=device)
+                    obs_t = o_cpu
             else:
                 raise RuntimeError('select_action expects obs tensor on compute device or CPU tensor')
         else:
@@ -207,10 +217,7 @@ class ActionConditionedPPO:
             o_cpu = torch.as_tensor(obs, dtype=torch.float32, device='cpu')
             if o_cpu.dim() == 1:
                 o_cpu = o_cpu.unsqueeze(0)
-            try:
-                obs_t = o_cpu.pin_memory().to(device=device, non_blocking=True)
-            except Exception:
-                obs_t = o_cpu.to(device=device)
+            obs_t = (o_cpu.pin_memory().to(device=device, non_blocking=True) if device.type == 'cuda' else o_cpu)
 
         # Legal actions: accept CPU and list inputs, stage via pinned memory when needed
         if torch.is_tensor(legal_actions):
@@ -218,21 +225,20 @@ class ActionConditionedPPO:
                 actions_t = legal_actions.to(dtype=torch.float32)
             elif legal_actions.device.type == 'cpu':
                 la_cpu = legal_actions.detach().to('cpu', dtype=torch.float32)
-                # Use/grow preallocated pinned actions buffer
-                try:
-                    A = int(la_cpu.size(0))
-                except Exception:
-                    A = 0
+                A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
                 if A > 0:
-                    try:
-                        self._ensure_actions_pinned_capacity(A)
-                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                    except Exception:
+                    if device.type == 'cuda':
                         try:
-                            actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                            self._ensure_actions_pinned_capacity(A)
+                            self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
                         except Exception:
-                            actions_t = la_cpu.to(device=device)
+                            try:
+                                actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                            except Exception:
+                                actions_t = la_cpu.to(device=device)
+                    else:
+                        actions_t = la_cpu
                 else:
                     actions_t = la_cpu.to(device=device)
             else:
@@ -241,47 +247,48 @@ class ActionConditionedPPO:
             if torch.is_tensor(legal_actions[0]):
                 # Stack on CPU then transfer via preallocated pinned buffer
                 la_cpu = torch.stack([x.detach().to('cpu', dtype=torch.float32) for x in legal_actions], dim=0)
-                try:
-                    A = int(la_cpu.size(0))
-                except Exception:
-                    A = 0
+                A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
                 if A > 0:
-                    try:
-                        self._ensure_actions_pinned_capacity(A)
-                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                    except Exception:
+                    if device.type == 'cuda':
                         try:
-                            actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                            self._ensure_actions_pinned_capacity(A)
+                            self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
                         except Exception:
-                            actions_t = la_cpu.to(device=device)
+                            try:
+                                actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                            except Exception:
+                                actions_t = la_cpu.to(device=device)
+                    else:
+                        actions_t = la_cpu
                 else:
                     actions_t = la_cpu.to(device=device)
             else:
                 import numpy as _np
                 la_cpu = torch.as_tensor(_np.asarray(legal_actions, dtype=_np.float32), dtype=torch.float32, device='cpu')
-                try:
-                    A = int(la_cpu.size(0))
-                except Exception:
-                    A = 0
+                A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
                 if A > 0:
-                    try:
-                        self._ensure_actions_pinned_capacity(A)
-                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                    except Exception:
+                    if device.type == 'cuda':
                         try:
-                            actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                            self._ensure_actions_pinned_capacity(A)
+                            self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
                         except Exception:
-                            actions_t = la_cpu.to(device=device)
+                            try:
+                                actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
+                            except Exception:
+                                actions_t = la_cpu.to(device=device)
+                    else:
+                        actions_t = la_cpu
                 else:
                     actions_t = la_cpu.to(device=device)
         else:
             raise RuntimeError('select_action expects non-empty legal_actions')
         # Validate each legal row has exactly one played bit
         ones_per_row = actions_t[:, :40].sum(dim=1)
-        if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
-            raise RuntimeError("select_action: each legal action must have exactly one played bit in [:40]")
+        if STRICT_CHECKS:
+            if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
+                raise RuntimeError("select_action: each legal action must have exactly one played bit in [:40]")
         # Validate captured is binary
         cap = actions_t[:, 40:]
         cap_bad = ((cap > 0.0 + 1e-6) & (cap < 1.0 - 1e-6)) | (cap < -1e-6) | (cap > 1.0 + 1e-6)
@@ -299,11 +306,14 @@ class ActionConditionedPPO:
                     st_cpu = seat_team_vec.detach().to('cpu', dtype=torch.float32)
                 else:
                     st_cpu = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
-                if (self._seat_cpu_pinned is not None) and (st_cpu.numel() == self._seat_cpu_pinned.size(1)):
-                    self._seat_cpu_pinned[0].copy_(st_cpu, non_blocking=True)
-                    st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
+                if device.type == 'cuda':
+                    if (self._seat_cpu_pinned is not None) and (st_cpu.numel() == self._seat_cpu_pinned.size(1)):
+                        self._seat_cpu_pinned[0].copy_(st_cpu, non_blocking=True)
+                        st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
+                    else:
+                        raise RuntimeError('select_action expects seat_team_vec on compute device or as CUDA-ready tensor')
                 else:
-                    raise RuntimeError('select_action expects seat_team_vec on compute device or as CUDA-ready tensor')
+                    st = st_cpu.unsqueeze(0) if st_cpu.dim() == 1 else st_cpu
             # Validate seat one-hot + team flags (after staging)
             if st is not None:
                 if st.size(1) != 6:
@@ -334,84 +344,74 @@ class ActionConditionedPPO:
             raise ValueError(f"_select_action_core expects seat_team_t with shape (1, 6), got {None if seat_team_t is None else tuple(seat_team_t.shape)}")
         cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
         with cm:
-            # Scoring simultaneo di tutte le azioni legali via fattorizzazione
+            # Scoring simultaneo via fattorizzazione: proiezione di stato e logits carta
             state_proj = self.actor.compute_state_proj(obs_t, seat_team_t)  # (1,64)
-            # Precompute logits carta una volta (keep inside autocast for dtype alignment)
+            # Logits carta su tutte le 40 carte (mantieni dentro autocast per allineamento dtype)
             card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t()).squeeze(0)  # (40)
         # Early diagnostics on non-finite values
-        if not torch.isfinite(state_proj).all():
+        if STRICT_CHECKS and (not torch.isfinite(state_proj).all()):
             bad = state_proj[~torch.isfinite(state_proj)]
             raise RuntimeError(f"Actor state_proj contains non-finite values (count={int(bad.numel())})")
-        if not torch.isfinite(card_logits_all).all():
+        if STRICT_CHECKS and (not torch.isfinite(card_logits_all).all()):
             bad = card_logits_all[~torch.isfinite(card_logits_all)]
             raise RuntimeError(f"Actor card_logits_all contains non-finite values (count={int(bad.numel())})")
+        # Estrai card id per ciascuna azione legale
         played_ids_all = torch.argmax(actions_t[:, :40], dim=1)  # (A)
-        # Evita torch.unique: computa logsumexp una sola volta e indicizza
-        lse_cards = torch.logsumexp(card_logits_all, dim=0)  # scalar
-        logp_cards_per_legal = card_logits_all[played_ids_all] - lse_cards  # (A)
         # Validate legal actions have exactly one played bit per row
         ones_per_row = actions_t[:, :40].sum(dim=1)
-        if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
-            raise RuntimeError(f"Invalid legal actions: expected exactly one played card per row, got sums={ones_per_row.tolist()}")
-        # Use cached action embedding table to embed all legals in one matmul
+        if STRICT_CHECKS:
+            if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
+                raise RuntimeError(f"Invalid legal actions: expected exactly one played card per row, got sums={ones_per_row.tolist()}")
+
+        # Two-stage sampling (equivalente alla softmax su logp_totals):
+        # 1) campiona la carta tra quelle presenti nelle legali usando p_card ristretto alle carte ammissibili
+        logp_cards_all = torch.log_softmax(card_logits_all, dim=0)  # (40)
+        unique_cards, inv_idx = torch.unique(played_ids_all, sorted=False, return_inverse=True)
+        logp_cards_allowed = logp_cards_all[unique_cards]  # (G)
+        probs_card_allowed = torch.softmax(logp_cards_allowed, dim=0)  # rinormalizza su carte consentite
+        # sample card
+        cdf_c = torch.cumsum(probs_card_allowed, dim=0)
+        # Avoid scalarization: clamp last element to valid positive value
+        last_c = torch.clamp(cdf_c[-1], min=torch.finfo(cdf_c.dtype).eps)
+        if STRICT_CHECKS:
+            torch._assert(torch.isfinite(last_c), "Invalid card CDF: non-finite last element")
+        u_c = torch.rand((), device=cdf_c.device, dtype=cdf_c.dtype) * last_c
+        sel_card_pos = torch.searchsorted(cdf_c, u_c, right=True)
+        sel_card_pos = torch.clamp(sel_card_pos, max=cdf_c.numel() - 1)
+        sel_card_id = unique_cards[sel_card_pos]
+
+        # 2) campiona la presa condizionata alla carta scelta, usando solo le azioni del gruppo
+        group_mask = (played_ids_all == sel_card_id)
+        group_idx = torch.nonzero(group_mask, as_tuple=False).flatten()
+        if group_idx.numel() <= 0:
+            # Non dovrebbe accadere: carta scelta deve comparire tra le legali
+            raise RuntimeError("Two-stage sampling: empty group for selected card")
+        actions_grp = actions_t[group_idx]
         a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)  # (80,64)
-        a_emb = actions_t.to(dtype=a_tbl.dtype) @ a_tbl  # (A,64)
-        if not torch.isfinite(a_emb).all():
-            bad = a_emb[~torch.isfinite(a_emb)]
-            raise RuntimeError(f"Action embeddings contain non-finite values (count={int(bad.numel())})")
-        cap_logits = torch.matmul(a_emb, state_proj.squeeze(0).to(dtype=a_emb.dtype))  # (A)
-        if not torch.isfinite(cap_logits).all():
-            bad = cap_logits[~torch.isfinite(cap_logits)]
-            raise RuntimeError(f"Capture logits contain non-finite values (count={int(bad.numel())})")
-        # log-softmax within group (card)
-        group_ids = played_ids_all  # (A)
-        num_groups = 40
-        # Allocate fresh buffers sized for this call
-        group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=actions_t.device)
-        group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-        gmax_per_legal = group_max[group_ids]
-        # Ensure dtype consistency under autocast (exp may return float32)
-        exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
-        group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=actions_t.device)
-        group_sum.index_add_(0, group_ids, exp_shifted)
-        # numerically stable logsumexp per-legal within group
-        lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
-        logp_cap_per_legal = cap_logits - lse_per_legal  # (A)
-        # logp totale per legal = logp(card played) + logp(capture|card)
-        logp_totals = logp_cards_per_legal + logp_cap_per_legal  # (A)
-        probs = torch.softmax(logp_totals, dim=0)
-        # Sanitize before sampling: clamp negatives/NaN, then strictly validate
-        probs = probs.nan_to_num(0.0)
-        probs = torch.clamp(probs, min=0.0)
-        s = probs.sum()
-        if (not torch.isfinite(s)) or (s <= 0):
-            def _stats(t: torch.Tensor):
-                try:
-                    return {
-                        'min': float(torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0).min().item()),
-                        'max': float(torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0).max().item()),
-                        'nan': bool(torch.isnan(t).any().item()),
-                        'inf': bool(torch.isinf(t).any().item()),
-                    }
-                except Exception:
-                    return {'min': None, 'max': None, 'nan': None, 'inf': None}
-            a = int(probs.numel())
-            sval = float(s.item()) if torch.is_tensor(s) else float(s)
-            raise RuntimeError(
-                f"Invalid probability distribution: sum={sval}, num_actions={a}; "
-                f"card_logits_all={_stats(card_logits_all)}, cap_logits={_stats(cap_logits)}, "
-                f"logp_cards={_stats(logp_cards_per_legal)}, logp_cap={_stats(logp_cap_per_legal)}"
-            )
-        probs = probs / s
-        # Fast sampling via cumulative sum + searchsorted with safe bounds
-        cdf = torch.cumsum(probs, dim=0)
-        last = cdf[-1]
-        if (not torch.isfinite(last)) or (last <= 0):
-            raise RuntimeError(f"Invalid CDF for sampling: last={float(last.item())}")
-        u = torch.rand((), device=probs.device, dtype=probs.dtype) * last
-        idx_t = torch.searchsorted(cdf, u, right=True)
-        idx_t = torch.clamp(idx_t, max=cdf.numel() - 1)
-        logp_total = logp_totals[idx_t].detach()
+        a_emb_grp = actions_grp.to(dtype=a_tbl.dtype) @ a_tbl  # (Gk,64)
+        if STRICT_CHECKS and (not torch.isfinite(a_emb_grp).all()):
+            bad = a_emb_grp[~torch.isfinite(a_emb_grp)]
+            raise RuntimeError(f"Action embeddings (group) contain non-finite values (count={int(bad.numel())})")
+        cap_logits_grp = torch.matmul(a_emb_grp, state_proj.squeeze(0).to(dtype=a_emb_grp.dtype))  # (Gk)
+        if STRICT_CHECKS and (not torch.isfinite(cap_logits_grp).all()):
+            bad = cap_logits_grp[~torch.isfinite(cap_logits_grp)]
+            raise RuntimeError(f"Capture logits (group) contain non-finite values (count={int(bad.numel())})")
+        # softmax nel gruppo
+        probs_cap_grp = torch.softmax(cap_logits_grp, dim=0)
+        probs_cap_grp = probs_cap_grp.nan_to_num(0.0)
+        s_g = probs_cap_grp.sum()
+        if STRICT_CHECKS and ((not torch.isfinite(s_g)) or (s_g <= 0)):
+            raise RuntimeError("Invalid group probabilities for capture selection")
+        cdf_g = torch.cumsum(probs_cap_grp, dim=0)
+        u_g = torch.rand((), device=cdf_g.device, dtype=cdf_g.dtype) * cdf_g[-1]
+        idx_in_group = torch.searchsorted(cdf_g, u_g, right=True)
+        idx_in_group = torch.clamp(idx_in_group, max=cdf_g.numel() - 1)
+
+        # Indice assoluto e log-prob totale coerente con training (log-softmax su 40 carte + log-softmax nel gruppo)
+        idx_t = group_idx[idx_in_group]
+        logp_card_sel = logp_cards_all[sel_card_id]
+        logp_cap_sel = torch.log_softmax(cap_logits_grp, dim=0)[idx_in_group]
+        logp_total = (logp_card_sel + logp_cap_sel).detach()
         chosen_act = actions_t[idx_t].detach()
         return chosen_act, logp_total, idx_t
 
@@ -459,14 +459,17 @@ class ActionConditionedPPO:
                 x_cpu = x.detach().to('cpu', dtype=dtype)
             else:
                 x_cpu = torch.as_tensor(x, dtype=dtype, device='cpu')
-            # Evita pin_memory durante la compilazione o su tensori vuoti (FakeTensor NYI)
-            try:
-                if (hasattr(torch, '_dynamo') and getattr(torch._dynamo, 'is_compiling', lambda: False)()) or (x_cpu.numel() == 0):
+            if device.type == 'cuda':
+                try:
+                    import torch._dynamo as _dyn  # type: ignore
+                    is_compiling = bool(getattr(_dyn, 'is_compiling', lambda: False)())
+                except Exception:
+                    is_compiling = False
+                if is_compiling or (x_cpu.numel() == 0):
                     return x_cpu.to(device=device, dtype=dtype, non_blocking=True)
-            except Exception:
-                from utils.fallback import notify_fallback
-                notify_fallback('ppo.compute.to_cuda_nb.compile_check_failed')
-            return x_cpu.pin_memory().to(device=device, dtype=dtype, non_blocking=True)
+                return x_cpu.pin_memory().to(device=device, dtype=dtype, non_blocking=True)
+            else:
+                return x_cpu
 
         # Required keys validation
         for key in ('obs','act','old_logp','ret','adv','legals','legals_offset','legals_count','chosen_index','seat_team'):
@@ -482,6 +485,18 @@ class ActionConditionedPPO:
         offs = to_cuda_nb(batch['legals_offset'], torch.long)
         cnts = to_cuda_nb(batch['legals_count'], torch.long)
         chosen_idx = to_cuda_nb(batch['chosen_index'], torch.long)
+        # Plausibility checks on old_logp early to catch bad batches
+        if STRICT_CHECKS and (not torch.isfinite(old_logp).all()):
+            raise RuntimeError("compute_loss: old_logp contains non-finite values")
+        if STRICT_CHECKS and old_logp.numel() > 0:
+            pos_any = (old_logp > 1.0e-6).any()
+            small_any = (old_logp < -120.0).any()
+            if bool(pos_any.detach().cpu().item()):
+                mx = float(old_logp.max().detach().cpu().item())
+                raise RuntimeError(f"compute_loss: old_logp contains positive values (max={mx})")
+            if bool(small_any.detach().cpu().item()):
+                mn = float(old_logp.min().detach().cpu().item())
+                raise RuntimeError(f"compute_loss: old_logp too small (min={mn})")
         # Sanity on ragged indices
         if obs.size(0) != seat.size(0) or obs.size(0) != act.size(0):
             raise RuntimeError("compute_loss: batch size mismatch among obs/seat/act")
@@ -512,15 +527,27 @@ class ActionConditionedPPO:
         # Prepara indici legal per minibatch usando offs/cnts contro legals globali
         max_cnt = int(cnts.max().item()) if B > 0 else 0
         # Validate ragged structure before use
-        if (offs < 0).any() or (cnts < 0).any():
-            raise RuntimeError("compute_loss: negative offsets or counts in legals structure")
-        if int(offs[-1].item() + cnts[-1].item()) > int(legals.size(0)) if (B > 0 and legals.size(0) > 0) else False:
-            raise RuntimeError("compute_loss: last window exceeds legals length")
-        if (chosen_idx < 0).any() or ((chosen_idx >= cnts) & (cnts > 0)).any():
-            raise RuntimeError("compute_loss: chosen_index out of range for some rows")
+        if STRICT_CHECKS:
+            neg_offs = (offs < 0).any()
+            neg_cnts = (cnts < 0).any()
+            if bool((neg_offs | neg_cnts).detach().cpu().item()):
+                raise RuntimeError("compute_loss: negative offsets or counts in legals structure")
+        if STRICT_CHECKS:
+            if (B > 0) and (legals.size(0) > 0):
+                last_sum = int((offs[-1] + cnts[-1]).detach().cpu().item())
+                if last_sum > int(legals.size(0)):
+                    raise RuntimeError("compute_loss: last window exceeds legals length")
+        if STRICT_CHECKS:
+            bad_low = (chosen_idx < 0).any()
+            bad_high = ((chosen_idx >= cnts) & (cnts > 0)).any()
+            if bool((bad_low | bad_high).detach().cpu().item()):
+                raise RuntimeError("compute_loss: chosen_index out of range for some rows")
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # Compute state features once; reuse for actor and critic
-        state_feat = self.actor.compute_state_features(obs, seat)  # (B,256)
+        state_feat = self._fn_state_features(obs, seat)  # (B,256)
+        if STRICT_CHECKS and (not torch.isfinite(state_feat).all()):
+            bad = state_feat[~torch.isfinite(state_feat)]
+            raise RuntimeError(f"compute_loss: state_feat non-finite (count={int(bad.numel())})")
         # Precompute visible mask once and reuse
         hand_table = obs[:, :83]
         hand_mask = hand_table[:, :40] > 0.5
@@ -530,8 +557,18 @@ class ActionConditionedPPO:
         cap1_mask = captured[:, 40:80] > 0.5
         visible_mask_40 = (hand_mask | table_mask | cap0_mask | cap1_mask)
         # State projection e logits per carta
-        state_proj = self.actor.compute_state_proj_from_state(state_feat, obs, visible_mask_40=visible_mask_40)  # (B,64)
+        state_proj = self._fn_state_proj_from_state(state_feat, obs, visible_mask_40=visible_mask_40)  # (B,64)
+        if STRICT_CHECKS and (not torch.isfinite(state_proj).all()):
+            bad = state_proj[~torch.isfinite(state_proj)]
+            raise RuntimeError(f"compute_loss: state_proj non-finite (count={int(bad.numel())})")
         card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t())       # (B,40)
+        # Guard extreme magnitudes before exp/softmax usage
+        if STRICT_CHECKS and (not torch.isfinite(card_logits_all).all()):
+            bad = card_logits_all[~torch.isfinite(card_logits_all)]
+            raise RuntimeError(f"compute_loss: card_logits_all non-finite (count={int(bad.numel())})")
+        max_abs_cl = float(card_logits_all.abs().max().item()) if card_logits_all.numel() > 0 else 0.0
+        if max_abs_cl > 1e3:
+            raise RuntimeError(f"compute_loss: card_logits_all magnitude too large (max_abs={max_abs_cl})")
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -540,9 +577,19 @@ class ActionConditionedPPO:
             abs_idx = abs_idx_2d[mask]
             sample_idx_per_legal = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
             legals_mb = legals[abs_idx].contiguous()                   # (M_mb,80)
+            ones_per_row = legals_mb[:, :40].sum(dim=1)
+            if STRICT_CHECKS:
+                if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
+                    raise RuntimeError("compute_loss: legals_mb must have exactly one played bit per row in [:40]")
             played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)     # (M_mb)
-            # card logp per-sample via log-softmax + gather
-            logp_cards_all = torch.log_softmax(card_logits_all, dim=1)  # (B,40)
+            # Card log-prob restricted to allowed set per sample (two-stage policy)
+            # Build allowed mask per sample over the 40 cards
+            allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
+            allowed_mask[sample_idx_per_legal, played_ids_mb] = True
+            # LSE over allowed set per sample (out-of-place; avoid in-place masking + exp)
+            neg_inf = torch.full_like(card_logits_all, float('-inf'))
+            masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
+            lse_allowed = torch.logsumexp(masked_logits, dim=1)
             # chosen abs indices e played ids (evita pos_map grande)
             chosen_clamped = torch.minimum(chosen_idx, (cnts - 1).clamp_min(0))
             chosen_abs_idx = (offs + chosen_clamped)                                 # (B)
@@ -556,9 +603,14 @@ class ActionConditionedPPO:
                 chosen_pos_vals = pos_in_sample[match]
                 chosen_pos_idx = sample_idx_per_legal[match]
                 chosen_pos.index_copy_(0, chosen_pos_idx, chosen_pos_vals)
+            if STRICT_CHECKS:
+                has_neg = (chosen_pos < 0).any() if chosen_pos.numel() > 0 else torch.tensor(False, device=device)
+                if bool(has_neg.detach().cpu().item()):
+                    bad_rows = torch.nonzero(chosen_pos < 0, as_tuple=False).flatten().tolist()
+                    raise RuntimeError(f"compute_loss: chosen_pos mapping failed for rows {bad_rows}")
             played_ids_all = torch.argmax(legals[:, :40], dim=1)
             chosen_card_ids = played_ids_all[chosen_abs_idx]
-            logp_card = logp_cards_all[row_idx, chosen_card_ids]
+            logp_card = card_logits_all[row_idx, chosen_card_ids] - lse_allowed[row_idx]
             # capture logits per-legal via action embedding
             # Prefer precomputed global embeddings to avoid recomputation per minibatch
             if a_emb_global is not None:
@@ -570,7 +622,13 @@ class ActionConditionedPPO:
                 else:
                     a_tbl = self.actor.get_action_emb_table_cached(device=legals_mb.device, dtype=state_proj.dtype)
                     a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
+            if STRICT_CHECKS and (not torch.isfinite(a_emb_mb).all()):
+                bad = a_emb_mb[~torch.isfinite(a_emb_mb)]
+                raise RuntimeError(f"compute_loss: a_emb_mb non-finite (count={int(bad.numel())})")
             cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
+            if STRICT_CHECKS and (not torch.isfinite(cap_logits).all()):
+                bad = cap_logits[~torch.isfinite(cap_logits)]
+                raise RuntimeError(f"compute_loss: cap_logits non-finite (count={int(bad.numel())})")
             # segment logsumexp per gruppo (sample, card)
             group_ids = sample_idx_per_legal * 40 + played_ids_mb
             num_groups = B * 40
@@ -584,28 +642,49 @@ class ActionConditionedPPO:
             lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
             logp_cap_per_legal = cap_logits - lse_per_legal
             logp_cap = logp_cap_per_legal[chosen_pos]
+            if STRICT_CHECKS and (not torch.isfinite(logp_card).all()):
+                raise RuntimeError("compute_loss: logp_card non-finite")
+            if STRICT_CHECKS and (not torch.isfinite(logp_cap).all()):
+                raise RuntimeError("compute_loss: logp_cap non-finite")
             logp_new = logp_card + logp_cap
+            if not torch.isfinite(logp_new).all():
+                raise RuntimeError("compute_loss: logp_new non-finite")
             # Distribuzione completa sui legali per entropia/KL (computata solo se serve)
             need_entropy = (float(self.entropy_coef) > 0.0)
             if need_entropy:
-                # Entropia per-sample senza padding: H = -Σ p * log p
-                logp_total_per_legal = logp_cards_all[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
+                # Entropia per-sample sui soli sample con legali: H = -Σ p * log p
+                logp_cards_allowed_per_legal = (card_logits_all[sample_idx_per_legal, played_ids_mb] - lse_allowed[sample_idx_per_legal])
+                logp_total_per_legal = logp_cards_allowed_per_legal + logp_cap_per_legal
                 probs = torch.exp(logp_total_per_legal)
                 neg_p_logp = -(probs * logp_total_per_legal)
                 ent_per_row = torch.zeros((B,), dtype=neg_p_logp.dtype, device=device)
                 ent_per_row.index_add_(0, sample_idx_per_legal, neg_p_logp)
-                entropy = ent_per_row.mean()
+                valid_rows = torch.zeros((B,), dtype=torch.bool, device=device)
+                valid_rows.index_fill_(0, sample_idx_per_legal.unique(), True)
+                denom = valid_rows.to(ent_per_row.dtype).sum().clamp_min(1.0)
+                entropy = (ent_per_row[valid_rows].sum() / denom)
             else:
                 entropy = torch.tensor(0.0, device=device)
+            if not torch.isfinite(entropy).all():
+                raise RuntimeError("compute_loss: entropy non-finite")
         else:
             logp_new = torch.zeros((B,), device=device, dtype=state_proj.dtype)
             entropy = torch.tensor(0.0, device=device)
 
-        # Stabilize ratio: clamp old_logp to avoid infs; use expm1 for small diffs if needed
-        logp_new_s = torch.nan_to_num(logp_new, nan=0.0, posinf=0.0, neginf=0.0)
-        old_logp_s = torch.nan_to_num(old_logp, nan=0.0, posinf=0.0, neginf=0.0)
-        ratio = torch.exp(logp_new_s - old_logp_s)
-        ratio = torch.nan_to_num(ratio, nan=1.0, posinf=1e6, neginf=0.0)
+        # Ratio: assert inputs finite and gaps not extreme; raise early with diagnostics
+        if STRICT_CHECKS and (not torch.isfinite(logp_new).all()):
+            raise RuntimeError("compute_loss: logp_new non-finite before ratio")
+        if STRICT_CHECKS and (not torch.isfinite(old_logp).all()):
+            raise RuntimeError("compute_loss: old_logp non-finite before ratio")
+        diff = (logp_new - old_logp)
+        if STRICT_CHECKS and (not torch.isfinite(diff).all()):
+            raise RuntimeError("compute_loss: non-finite (logp_new - old_logp)")
+        if diff.numel() > 0:
+            max_gap = diff.abs().amax()
+            torch._assert((max_gap <= 80.0), "compute_loss: log-prob gap too large; likely to overflow exp")
+        ratio = torch.exp(diff)
+        if STRICT_CHECKS and (not torch.isfinite(ratio).all()):
+            raise RuntimeError("compute_loss: ratio non-finite (exp overflow)")
         clipped = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv
         # Maschera off-policy per step MCTS: quando presente mcts_weight>0, escludi la loss di policy
         mcts_w = batch.get('mcts_weight', None)
@@ -627,11 +706,14 @@ class ActionConditionedPPO:
             loss_pi = -(torch.min(ratio * adv, clipped)).mean()
         # Guard against non-finite intermediates spilling into the loss
         for name, tensor in (("ratio", ratio), ("adv", adv), ("ret", ret)):
-            if not torch.isfinite(tensor).all():
+            if STRICT_CHECKS and (not torch.isfinite(tensor).all()):
                 raise RuntimeError(f"compute_loss: non-finite {name}")
 
         # Passa others_hands (se disponibile) al critico per percorso CTDE opzionale
         v = self.critic.forward_from_state(state_feat, obs, batch.get('others_hands', None), visible_mask_40=visible_mask_40)
+        if STRICT_CHECKS and (not torch.isfinite(v).all()):
+            bad = v[~torch.isfinite(v)]
+            raise RuntimeError(f"compute_loss: critic value non-finite (count={int(bad.numel())})")
         if self.value_clip is not None and self.value_clip > 0:
             v_clipped = torch.clamp(v, ret - self.value_clip, ret + self.value_clip)
             loss_v = torch.max((v - ret) ** 2, (v_clipped - ret) ** 2).mean()
@@ -649,6 +731,8 @@ class ActionConditionedPPO:
         # Loss ausiliaria per BeliefNet solo se necessario
         belief_aux = torch.tensor(0.0, device=device)
         if (coef > 0.0) and max_cnt > 0 and mcts_weight.numel() == B and (mcts_weight.sum() > 0) and mcts_policy_flat.numel() >= int(cnts.sum().item()):
+            if STRICT_CHECKS and (not torch.isfinite(mcts_policy_flat).all()):
+                raise RuntimeError("compute_loss: mcts_policy_flat non-finite")
             # Ricostruisci (B, max_cnt) target evitando loop Python: usa masked_scatter
             target = torch.zeros((B, max_cnt), device=device, dtype=torch.float32)
             valid_mask = torch.arange(max_cnt, device=device).unsqueeze(0).expand(B, max_cnt) < cnts.unsqueeze(1)
@@ -660,7 +744,8 @@ class ActionConditionedPPO:
             safe_log_t = torch.zeros_like(target)
             safe_log_t[mask_pos] = torch.log(torch.clamp(target[mask_pos], min=eps))
             # Costruisci sempre i log-prob totali per-legal paddati (usati dalla KL MCTS)
-            logp_total_per_legal = logp_cards_all[sample_idx_per_legal, played_ids_mb] + logp_cap_per_legal
+            logp_cards_allowed_per_legal = (card_logits_all[sample_idx_per_legal, played_ids_mb] - lse_allowed[sample_idx_per_legal])
+            logp_total_per_legal = logp_cards_allowed_per_legal + logp_cap_per_legal
             logp_total_padded = torch.full((B, max_cnt), float('-inf'), dtype=cap_logits.dtype, device=device)
             logp_total_padded[mask] = logp_total_per_legal
             diff = safe_log_t - logp_total_padded
@@ -680,12 +765,16 @@ class ActionConditionedPPO:
             w = (mcts_weight.clamp(0.0, 1.0) * w_unc)
             if w.sum() > 0:
                 distill_loss = (kl_per_row * w).sum() / torch.clamp_min(w.sum(), 1.0)
+            if STRICT_CHECKS and (not torch.isfinite(distill_loss).all()):
+                raise RuntimeError("compute_loss: distill_loss non-finite")
         # Prepara target belief supervision (se batch fornisce mani reali degli altri)
         real_hands = batch.get('others_hands', None)  # shape (B,3,40) one-hot o multi-hot per altri giocatori
         if (belief_coef > 0.0) and (real_hands is not None):
             rh = to_cuda_nb(real_hands, torch.float32)
             # riusa state_feat già calcolato e la visible_mask_40 già costruita
             logits_b = self.actor.belief_net(state_feat)  # (B,120)
+            if STRICT_CHECKS and (not torch.isfinite(logits_b).all()):
+                raise RuntimeError("compute_loss: belief logits non-finite")
             visible_mask = visible_mask_40  # (B,40)
             Bsz = logits_b.size(0)
             logits_3x40 = logits_b.view(Bsz, 3, 40)
@@ -708,7 +797,7 @@ class ActionConditionedPPO:
             ('entropy', entropy),
             ('approx_kl', approx_kl),
         ):
-            if not torch.isfinite(tensor).all():
+            if STRICT_CHECKS and (not torch.isfinite(tensor).all()):
                 raise RuntimeError(f"compute_loss: non-finite {name}")
         # clip fraction reale: frazione di sample con |ratio-1| > clip_ratio
         if B > 0:
@@ -745,7 +834,7 @@ class ActionConditionedPPO:
             return total_sq.sqrt()
 
         check_every = 8  # reduce CPU syncs for early-stop
-        # Stage intero batch su CUDA una sola volta
+        # Stage intero batch su device una sola volta (CPU-friendly: evita .to no-op)
         batch_cuda = {}
         for k, v in batch.items():
             if k in ('routing_log',):
@@ -755,12 +844,17 @@ class ActionConditionedPPO:
                 dtype = v.dtype
                 if k in ('obs', 'act', 'ret', 'adv'):
                     dtype = torch.float32
-                batch_cuda[k] = v.detach().to(device=device, dtype=dtype, non_blocking=True)
+                if v.device.type == device.type and v.dtype == dtype:
+                    batch_cuda[k] = v.detach()
+                else:
+                    batch_cuda[k] = v.detach().to(device=device, dtype=dtype, non_blocking=(device.type == 'cuda'))
             else:
                 batch_cuda[k] = v
         # 'legals' è globale: porta su device una volta
         if 'legals' in batch_cuda:
-            batch_cuda['legals'] = batch_cuda['legals'].to(device=device, dtype=torch.float32, non_blocking=True)
+            lv = batch_cuda['legals']
+            if not (torch.is_tensor(lv) and lv.device.type == device.type and lv.dtype == torch.float32):
+                batch_cuda['legals'] = lv.to(device=device, dtype=torch.float32, non_blocking=(device.type == 'cuda'))
             # Precompute global embeddings ONLY when not training to avoid graph reuse across backward
             # which leads to "Trying to backward through the graph a second time" errors.
             if not self.actor.training:
@@ -771,14 +865,55 @@ class ActionConditionedPPO:
             else:
                 batch_cuda['a_emb_global'] = None
 
+        # Stabilizza forme tra minibatch: usa massimo globale di legali e minibatch costante che divide il totale
+        global_max_cnt = int(batch_cuda['legals_count'].max().item()) if num_samples > 0 else 0
+        pos_global = (torch.arange(global_max_cnt, device=device, dtype=torch.long) if global_max_cnt > 0 else torch.zeros((0,), device=device, dtype=torch.long))
+
         for ep in range(epochs):
-            # Indici su CUDA per evitare hop CPU↔GPU
+            # Indici su device; scegli un minibatch_size effettivo che divida num_samples
             perm = torch.randperm(num_samples, device=device)
-            for start in range(0, num_samples, minibatch_size):
-                idx_t = perm[start:start+minibatch_size]
+            mb_eff = int(minibatch_size)
+            if num_samples > 0 and mb_eff > 0 and (num_samples % mb_eff) != 0:
+                d = min(mb_eff, num_samples)
+                found = False
+                for k in range(d, 0, -1):
+                    if (num_samples % k) == 0:
+                        mb_eff = k
+                        found = True
+                        break
+                if not found:
+                    mb_eff = max(1, num_samples)
+            for start in range(0, num_samples, mb_eff):
+                idx_t = perm[start:start+mb_eff]
                 # Slice direttamente su CUDA
                 def sel_cuda(x):
                     return torch.index_select(x, 0, idx_t)
+                # Seleziona sottovettori offs/cnts del minibatch (no fallback)
+                offs_mb = sel_cuda(batch_cuda['legals_offset'])
+                cnts_mb = sel_cuda(batch_cuda['legals_count'])
+                B_mb = int(cnts_mb.size(0))
+                # Fissa la dimensione al massimo globale per stabilità delle forme compilate
+                max_cnt_mb = int(global_max_cnt)
+                # Verifica presenza mcts_weight
+                if batch_cuda.get('mcts_weight', None) is None:
+                    raise RuntimeError('update: missing mcts_weight in batch')
+                mcts_weight_mb = sel_cuda(batch_cuda['mcts_weight'])
+                # Costruisci indice assoluto sui legali globali per estrarre la porzione di mcts_policy, solo se necessario
+                if max_cnt_mb > 0 and bool((mcts_weight_mb > 0).any().item()):
+                    if batch_cuda.get('mcts_policy', None) is None:
+                        raise RuntimeError("update: 'mcts_policy' is required when mcts_weight>0 in minibatch")
+                    if batch_cuda['mcts_policy'].dim() != 1:
+                        raise RuntimeError('update: mcts_policy must be 1D flat vector')
+                    if int(batch_cuda['mcts_policy'].numel()) < int(batch_cuda['legals'].size(0)):
+                        raise RuntimeError('update: mcts_policy length smaller than total legals')
+                    pos = pos_global
+                    rel_pos_2d = (pos.unsqueeze(0).expand(B_mb, max_cnt_mb) if max_cnt_mb > 0 else torch.zeros((B_mb, 0), device=device, dtype=torch.long))
+                    mask = rel_pos_2d < cnts_mb.unsqueeze(1)
+                    abs_idx = (offs_mb.unsqueeze(1) + rel_pos_2d)[mask]
+                    mcts_policy_mb = batch_cuda['mcts_policy'][abs_idx].contiguous()
+                else:
+                    mcts_policy_mb = torch.zeros((0,), dtype=torch.float32, device=device)
+
                 mini = {
                     'obs': sel_cuda(batch_cuda['obs']),
                     'act': sel_cuda(batch_cuda['act']),
@@ -786,12 +921,14 @@ class ActionConditionedPPO:
                     'ret': sel_cuda(batch_cuda['ret']),
                     'adv': sel_cuda(batch_cuda['adv']),
                     'legals': batch_cuda['legals'],  # globale su device
-                    'legals_offset': sel_cuda(batch_cuda['legals_offset']),
-                    'legals_count': sel_cuda(batch_cuda['legals_count']),
+                    'legals_offset': offs_mb,
+                    'legals_count': cnts_mb,
                     'chosen_index': sel_cuda(batch_cuda['chosen_index']),
                     'seat_team': sel_cuda(batch_cuda['seat_team']) if batch_cuda.get('seat_team', None) is not None else None,
                     'others_hands': sel_cuda(batch_cuda['others_hands']) if batch_cuda.get('others_hands', None) is not None else None,
                     'a_emb_global': batch_cuda.get('a_emb_global', None),
+                    'mcts_policy': mcts_policy_mb,
+                    'mcts_weight': mcts_weight_mb,
                 }
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
@@ -802,14 +939,11 @@ class ActionConditionedPPO:
                     # Unscale prima del grad clip
                     self.scaler.unscale_(self.opt_actor)
                     self.scaler.unscale_(self.opt_critic)
-                    # Check gradients finiti prima dello step
-                    for group in (self.actor.parameters(), self.critic.parameters()):
-                        for p in group:
-                            if p.grad is not None and (not torch.isfinite(p.grad).all()):
-                                raise RuntimeError("update: non-finite gradients detected")
                     # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
                     gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                     gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    if STRICT_CHECKS and ((not torch.isfinite(gn_actor)) or (not torch.isfinite(gn_critic))):
+                        raise RuntimeError("update: non-finite gradients detected (norm)")
                     # garanzia tensor per logging coerente
                     gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
                     gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
@@ -817,29 +951,23 @@ class ActionConditionedPPO:
                     self.scaler.step(self.opt_critic)
                     self.scaler.update()
                     # Post-step: parametri finiti (cattura divergenze immediate)
-                    try:
-                        if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
-                            if not torch.isfinite(self.actor.state_enc.card_emb).all():
-                                raise RuntimeError("update: state_enc.card_emb became non-finite after step")
-                    except Exception:
-                        raise
+
+                    if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
+                        if STRICT_CHECKS and (not torch.isfinite(self.actor.state_enc.card_emb).all()):
+                            raise RuntimeError("update: state_enc.card_emb became non-finite after step")
                     # invalidate any inference caches after params changed
                     try:
                         self.actor.invalidate_action_cache()
-                    except Exception:
-                        from utils.fallback import notify_fallback
-                        notify_fallback('ppo.update.invalidate_action_cache_failed')
+                    except Exception as e:
+                        raise RuntimeError('ppo.update.invalidate_action_cache_failed') from e
                 else:
                     loss, info = self.compute_loss(mini)
                     loss.backward()
-                    # Check gradients finiti prima dello step
-                    for group in (self.actor.parameters(), self.critic.parameters()):
-                        for p in group:
-                            if p.grad is not None and (not torch.isfinite(p.grad).all()):
-                                raise RuntimeError("update: non-finite gradients detected")
                     # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
                     gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                     gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    if STRICT_CHECKS and ((not torch.isfinite(gn_actor)) or (not torch.isfinite(gn_critic))):
+                        raise RuntimeError("update: non-finite gradients detected (norm)")
                     gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
                     gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
                     self.opt_actor.step()
@@ -847,15 +975,14 @@ class ActionConditionedPPO:
                     # Post-step: parametri finiti
                     try:
                         if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
-                            if not torch.isfinite(self.actor.state_enc.card_emb).all():
+                            if STRICT_CHECKS and (not torch.isfinite(self.actor.state_enc.card_emb).all()):
                                 raise RuntimeError("update: state_enc.card_emb became non-finite after step")
                     except Exception:
                         raise
                     try:
                         self.actor.invalidate_action_cache()
-                    except Exception:
-                        from utils.fallback import notify_fallback
-                        notify_fallback('ppo.update.invalidate_action_cache_failed')
+                    except Exception as e:
+                        raise RuntimeError('ppo.update.invalidate_action_cache_failed') from e
                 last_info = info
                 self.update_steps += 1
                 avg_kl_acc += info.get('approx_kl', torch.tensor(0.0, device=device))
@@ -867,7 +994,8 @@ class ActionConditionedPPO:
                 last_info['lr_critic'] = self.opt_critic.param_groups[0]['lr']
                 # early stop per target KL (controlla meno spesso per ridurre sync CPU)
                 if (count_mb % check_every) == 0:
-                    _kl = info.get('approx_kl', torch.tensor(0.0, device=device)).detach()
+                    # Use averaged KL so far to decide early stop (smoother)
+                    _kl = (avg_kl_acc / max(1, count_mb)).detach()
                     if bool((_kl > self.target_kl).item()):
                         self._high_kl_count += 1
                         early_stop = True
@@ -877,13 +1005,13 @@ class ActionConditionedPPO:
             # Step any schedulers
             for sch in self._lr_schedulers:
                 sch.step()
-            # entropy schedule opzionale
+            # entropy schedule opzionale (clamp in range sicuro)
             if self._entropy_schedule is not None:
                 try:
-                    self.entropy_coef = float(self._entropy_schedule(self.update_steps))
-                except Exception:
-                    from utils.fallback import notify_fallback
-                    notify_fallback('ppo.update.entropy_schedule_failed')
+                    new_coef = float(self._entropy_schedule(self.update_steps))
+                    self.entropy_coef = float(max(0.0, min(0.1, new_coef)))
+                except Exception as e:
+                    raise RuntimeError('ppo.update.entropy_schedule_failed') from e
             if early_stop:
                 break
         # riduzione LR automatica quando KL alto ripetuto
@@ -924,8 +1052,7 @@ class ActionConditionedPPO:
         try:
             self.opt_actor.load_state_dict(ckpt['opt_actor'])
             self.opt_critic.load_state_dict(ckpt['opt_critic'])
-        except Exception:
-            from utils.fallback import notify_fallback
-            notify_fallback('ppo.load.optim_state_load_failed')
+        except Exception as e:
+            raise RuntimeError('ppo.load.optim_state_load_failed') from e
         self.run_config = ckpt.get('run_config', self.run_config)
         self.update_steps = ckpt.get('update_steps', 0)
