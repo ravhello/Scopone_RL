@@ -42,10 +42,7 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
                   root_dirichlet_alpha=0.0, root_dirichlet_eps=0.0):
     random.seed(seed)
     np.random.seed(seed)
-    try:
-        torch.manual_seed(seed)
-    except Exception:
-        pass
+    torch.manual_seed(seed)
 
     # Build nets with correct obs_dim from env
     # Create a temp env to read obs_dim

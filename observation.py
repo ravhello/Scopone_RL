@@ -968,21 +968,21 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     counts = ((ranks_all.unsqueeze(0) == rank_bins) & present_tbl.unsqueeze(0)).sum(dim=1).to(torch.int64)  # (10)
     bitset = _get_bit_one(device)  # bit 0 attivo (somma 0)
     mask_bits = _get_mask_bits(device)  # mantieni 11 bit (0..10)
-    # Vectorize the four additions per rank using powers-of-two mask accumulation
+    # LUT per ripetizioni 0..4 del shift: precomputata in registro
     r_vals = torch.arange(1, 11, dtype=torch.int64, device=device)
+    # Genera in parallelo i quattro step e seleziona con where senza branch Python
     for ri in range(10):
         r = r_vals[ri]
         c = counts[ri]
-        # Repeat-add r up to four times without per-iter where allocations
-        # Each iteration: bitset = (bitset | (bitset << r)) & mask_bits if c > t
-        if bool((c > 0).item()):
-            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        if bool((c > 1).item()):
-            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        if bool((c > 2).item()):
-            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        if bool((c > 3).item()):
-            bitset = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
+        s1 = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
+        s2 = torch.bitwise_and(s1    | torch.bitwise_left_shift(s1,    r), mask_bits)
+        s3 = torch.bitwise_and(s2    | torch.bitwise_left_shift(s2,    r), mask_bits)
+        s4 = torch.bitwise_and(s3    | torch.bitwise_left_shift(s3,    r), mask_bits)
+        # Applica il numero di ripetizioni richiesto (0..4) senza .item()
+        bitset = torch.where(c <= 0, bitset,
+                  torch.where(c == 1, s1,
+                  torch.where(c == 2, s2,
+                  torch.where(c == 3, s3, s4))))
     # Estrai bit 1..10
     sums_bits = bitset
     idx = _get_idx_1_10(device)

@@ -42,15 +42,43 @@ os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cuda')
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
-## Mantieni ENV_DEVICE allineato a main.py per profili consistenti
-try:
-    import torch as _t
-    _env_def = 'cuda' if _t.cuda.is_available() else 'cpu'
-except Exception:
-    _env_def = 'cpu'
-os.environ.setdefault('ENV_DEVICE', os.environ.get('SCOPONE_DEVICE', _env_def))
-## Forza metodo di start del multiprocessing a 'fork' di default su Linux/WSL per evitare hang
-os.environ.setdefault('SCOPONE_MP_START', 'fork')
+os.environ.setdefault('SCOPONE_PAR_PROFILE', '0')
+# TQDM_DISABLE: 1=disattiva progress bar/logging di tqdm; 0=abilitato
+os.environ.setdefault('TQDM_DISABLE', '0')
+# SELFPLAY: 1=single net (self-play), 0=dual nets (Team A/B)
+os.environ.setdefault('SCOPONE_SELFPLAY', '1')
+# SCOPONE_TRAIN_FROM_BOTH_TEAMS: ONLY when SELFPLAY=1 and OPP_FROZEN=0; use both teams' transitions
+os.environ.setdefault('SCOPONE_TRAIN_FROM_BOTH_TEAMS', '1')
+os.environ.setdefault('SCOPONE_OPP_FROZEN', '1')
+# Warm-start policy controlled by SCOPONE_WARM_START: '0' start-from-scratch, '1' force top1 clone, '2' use top2 if available
+os.environ.setdefault('SCOPONE_WARM_START', '2')
+# SCOPONE_ALTERNATE_ITERS: dual-nets+frozen alternation period (A↔B)
+os.environ.setdefault('SCOPONE_ALTERNATE_ITERS', '1')
+# SCOPONE_FROZEN_UPDATE_EVERY: selfplay+frozen shadow refresh period
+os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
+# Refresh League from disk at startup (scan checkpoints/). 1=ON, 0=OFF
+os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '1')
+# Evaluation games for Elo mini-evals and refresh assessments
+os.environ.setdefault('SCOPONE_EVAL_GAMES', '100')
+# Workers paralleli per eval: 1=seriale; >1 usa multiprocessing
+os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)//2)))
+# MCTS eval flags
+os.environ.setdefault('SCOPONE_EVAL_USE_MCTS', '0')
+os.environ.setdefault('SCOPONE_EVAL_MCTS_SIMS', '128')
+os.environ.setdefault('SCOPONE_EVAL_MCTS_DETS', '1')
+os.environ.setdefault('SCOPONE_EVAL_K_HISTORY', '39')
+# Training flags (manual overrides available via env)
+os.environ.setdefault('SCOPONE_SAVE_EVERY', '10')
+os.environ.setdefault('SCOPONE_MCTS_TRAIN', '1')
+os.environ.setdefault('SCOPONE_MCTS_SIMS', '128')
+os.environ.setdefault('SCOPONE_MCTS_DETS', '4')
+os.environ.setdefault('SCOPONE_MINIBATCH', '4096')
+# Default to random seed for training runs (set -1); stable only if user sets it
+seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
+# Allow configuring iterations/horizon/num_envs via env; sensible defaults
+iters = int(os.environ.get('SCOPONE_ITERS', '0'))
+horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '1'))
 
 # Disable the stderr filtering thread when running under Scalene to avoid
 # attributing time to this file instead of user modules.
@@ -106,14 +134,14 @@ from utils.seed import resolve_seed
 
 def main():
     parser = argparse.ArgumentParser(description='Profile short PPO run (torch or line-level).')
-    parser.add_argument('--iters', type=int, default=5, help='Iterations to run')
-    parser.add_argument('--horizon', type=int, default=16384, help='Rollout horizon per iteration')
+    parser.add_argument('--iters', type=int, default=int(os.environ.get('SCOPONE_ITERS', '0')), help='Iterations to run')
+    parser.add_argument('--horizon', type=int, default=int(os.environ.get('SCOPONE_HORIZON', '16384')), help='Rollout horizon per iteration')
     parser.add_argument('--line', dest='line', action='store_true', default=False, help='Enable line-by-line profiler with per-line timings (default: on)')
     parser.add_argument('--no-line', dest='line', action='store_false', help='Disable line-by-line profiler')
     parser.add_argument('--wrap-update', dest='wrap_update', action='store_true', default=True, help='Also profile ActionConditionedPPO.update (default: on; slower)')
     parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
-    parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel environments (default: 17 with --line, 1 without)')
+    parser.add_argument('--num-envs', type=int, default=int(os.environ.get('SCOPONE_NUM_ENVS', '16')), help='Number of parallel environments (default from env SCOPONE_NUM_ENVS)')
     # Line-profiler scope controls
     parser.add_argument('--add-func', action='append', default=[], help='Qualified function or method to include, e.g. pkg.mod:Class.method or algorithms.ppo_ac:ActionConditionedPPO.update')
     parser.add_argument('--add-module', action='append', default=[], help='Module to include all functions from, e.g. algorithms.ppo_ac or environment')
@@ -121,6 +149,7 @@ def main():
     parser.add_argument('--no-profile-all', dest='profile_all', action='store_false', help=argparse.SUPPRESS)
     parser.add_argument('--line-full', dest='line_full', action='store_true', default=False, help='Show all per-line rows (not just top 30)')
     parser.add_argument('--line-csv', dest='line_csv', type=str, default=None, help='Path to write full per-line CSV (file, line, hits, cpu_s, gpu_s, transfer_s)')
+    parser.add_argument('--line-self-only', dest='line_self_only', action='store_true', default=False, help='Use only self CPU time (drop lines without self time)')
     parser.add_argument('--cprofile', action='store_true', default=False, help='Use Python cProfile instead of torch or line-profiler')
     parser.add_argument('--cprofile-out', type=str, default=None, help='Output path for cProfile stats file (.prof). Default: timestamped file')
     parser.add_argument('--snakeviz', dest='snakeviz', action='store_true', default=True, help='Open SnakeViz on the generated .prof (default: on)')
@@ -178,14 +207,8 @@ def main():
         # Ensure directory exists for HTML output
         if want_html and html_path:
             out_dir = os.path.dirname(html_path) or DEFAULT_PROFILES_DIR
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-            except Exception:
-                pass
-        try:
-            ne = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-        except Exception:
-            ne = 1
+            os.makedirs(out_dir, exist_ok=True)
+        ne = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
         scalene_cmd = [sys.executable, '-m', 'scalene']
         if getattr(args, 'scalene_cpu_only', True):
             scalene_cmd.append('--cpu-only')
@@ -209,28 +232,26 @@ def main():
             # CLI only; request CLI output explicitly
             scalene_cmd += ['--cli', '--cpu-percent-threshold', '0', '--malloc-threshold', '1000000000']
         # Include all modules (not only the executed file's dir) and restrict to project root
-        try:
-            scalene_cmd += ['--profile-all', '--profile-only', ROOT]
-        except Exception:
-            pass
+        scalene_cmd += ['--profile-all', '--profile-only', ROOT]
         scalene_cmd += [
             script_path,
             '--scalene-run',
             '--no-line',
             '--no-wrap-update',
-            '--iters', str(max(1, args.iters)),
+            '--iters', str(max(0, args.iters)),
             '--horizon', str(max(40, args.horizon)),
             '--num-envs', str(ne),
         ]
+        # propagate selfplay via env
+        env = os.environ.copy()
+        env['SCOPONE_SEED'] = str(seed)
+        env['SCALENE_RUNNING'] = '1'
+        env['SCOPONE_SILENCE_ABSL'] = '0'
+        env['TQDM_DISABLE'] = '0'
+        # read desired selfplay from env or default to ON; do not override here
+        # keep SCOPONE_SELFPLAY as-is so outer env controls behavior
         print("Running under Scalene... this may add overhead.")
         try:
-            env = os.environ.copy()
-            env['SCOPONE_SEED'] = str(seed)
-            # Mark inner run; keep stderr filtering enabled to reduce noisy C++ warnings
-            env['SCALENE_RUNNING'] = '1'
-            # Force-disable our stderr filter during Scalene runs
-            env['SCOPONE_SILENCE_ABSL'] = '0'
-            env['TQDM_DISABLE'] = '0'
             # Stream output live while capturing for summary at the end
             proc = subprocess.Popen(scalene_cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             captured_lines = []
@@ -256,14 +277,7 @@ def main():
             for _ln in proc.stdout:
                 if _suppress_scalene_line(_ln):
                     continue
-                try:
-                    print(_ln, end='', flush=True)
-                except Exception:
-                    sys.stdout.write(_ln)
-                    try:
-                        sys.stdout.flush()
-                    except Exception:
-                        pass
+                print(_ln, end='')
                 captured_lines.append(_ln)
             proc.wait()
             full_cli_output = ''.join(captured_lines)
@@ -274,14 +288,11 @@ def main():
         else:
             if 'full_cli_output' in locals() and full_cli_output:
                 # Save full CLI output to file to avoid flooding terminal
-                try:
-                    ts_cli = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    cli_out_path = os.path.abspath(os.path.join(DEFAULT_PROFILES_DIR, f'ppo_scalene_{ts_cli}_cli.txt'))
-                    with open(cli_out_path, 'w', encoding='utf-8') as f:
-                        f.write(full_cli_output)
-                    print("\nScalene CLI saved to:", cli_out_path)
-                except Exception:
-                    cli_out_path = None
+                ts_cli = datetime.now().strftime('%Y%m%d_%H%M%S')
+                cli_out_path = os.path.abspath(os.path.join(DEFAULT_PROFILES_DIR, f'ppo_scalene_{ts_cli}_cli.txt'))
+                with open(cli_out_path, 'w', encoding='utf-8') as f:
+                    f.write(full_cli_output)
+                print("\nScalene CLI saved to:", cli_out_path)
 
                 # Print compact, line-profiler-like summary at the bottom
                 print("\n===== Scalene — Compact summary (by file) =====")
@@ -289,10 +300,7 @@ def main():
                     import re as _re
 
                     def _strip_ansi(txt: str) -> str:
-                        try:
-                            return _re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", txt)
-                        except Exception:
-                            return txt
+                        return _re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", txt)
 
                     def _to_rel(pth: str) -> str:
                         ap = os.path.abspath(pth)
@@ -301,44 +309,38 @@ def main():
                         return ap
 
                     def _parse_secs(s: str) -> float:
-                        try:
-                            s = s.strip()
-                            total = 0.0
-                            for m in _re.findall(r'(\d+(?:\.\d+)?)\s*([hms])', s):
-                                val = float(m[0])
-                                unit = m[1]
-                                if unit == 'h':
-                                    total += val * 3600.0
-                                elif unit == 'm':
-                                    total += val * 60.0
-                                else:
-                                    total += val
-                            if total == 0.0:
-                                mmss = _re.match(r'(?:(\d+)m:)?(\d+(?:\.\d+)?)s', s)
-                                if mmss:
-                                    mins = float(mmss.group(1) or '0')
-                                    secs = float(mmss.group(2))
-                                    total = mins * 60.0 + secs
-                            return total
-                        except Exception:
-                            return 0.0
+                        s = s.strip()
+                        total = 0.0
+                        for m in _re.findall(r'(\d+(?:\.\d+)?)\s*([hms])', s):
+                            val = float(m[0])
+                            unit = m[1]
+                            if unit == 'h':
+                                total += val * 3600.0
+                            elif unit == 'm':
+                                total += val * 60.0
+                            else:
+                                total += val
+                        if total == 0.0:
+                            mmss = _re.match(r'(?:(\d+)m:)?(\d+(?:\.\d+)?)s', s)
+                            if mmss:
+                                mins = float(mmss.group(1) or '0')
+                                secs = float(mmss.group(2))
+                                total = mins * 60.0 + secs
+                        return total
 
                     clean_output = _strip_ansi(full_cli_output)
                     per_file = {}
                     for line in clean_output.splitlines():
                         if '.py: % of time' in line:
-                            try:
-                                before, after = line.split(': % of time', 1)
-                                file_abs = before.strip()
-                                # seconds may be absent in some builds
-                                m_pct = _re.search(r'=\s*([0-9]+(?:\.[0-9]+)?)%\s*(?:\(([^\)]*)\))?', after)
-                                if not m_pct:
-                                    continue
-                                pct = float(m_pct.group(1))
-                                secs = _parse_secs(m_pct.group(2)) if (m_pct.lastindex and m_pct.lastindex >= 2) else 0.0
-                                per_file[_to_rel(file_abs)] = {'seconds': secs, 'percent': pct}
-                            except Exception:
+                            before, after = line.split(': % of time', 1)
+                            file_abs = before.strip()
+                            # seconds may be absent in some builds
+                            m_pct = _re.search(r'=\s*([0-9]+(?:\.[0-9]+)?)%\s*(?:\(([^\)]*)\))?', after)
+                            if not m_pct:
                                 continue
+                            pct = float(m_pct.group(1))
+                            secs = _parse_secs(m_pct.group(2)) if (m_pct.lastindex and m_pct.lastindex >= 2) else 0.0
+                            per_file[_to_rel(file_abs)] = {'seconds': secs, 'percent': pct}
 
                     if per_file:
                         ranked = sorted(per_file.items(), key=lambda kv: kv[1]['seconds'], reverse=True)
@@ -360,17 +362,11 @@ def main():
                             m_row = _re.match(r"^\s*(\d+)\s*[│|]\s*([^│|]*)[│|]([^│|]*)[│|]([^│|]*)[│|]", _line)
                             if not m_row:
                                 continue
-                            try:
-                                ln_no = int(m_row.group(1))
-                            except Exception:
-                                continue
+                            ln_no = int(m_row.group(1))
                             def _pct_to_float(txt: str) -> float:
-                                try:
-                                    t = txt.strip()
-                                    m = _re.search(r"([0-9]+(?:\.[0-9]+)?)%", t)
-                                    return float(m.group(1)) if m else 0.0
-                                except Exception:
-                                    return 0.0
+                                t = txt.strip()
+                                m = _re.search(r"([0-9]+(?:\.[0-9]+)?)%", t)
+                                return float(m.group(1)) if m else 0.0
                             py_pct = _pct_to_float(m_row.group(2))
                             na_pct = _pct_to_float(m_row.group(3))
                             sy_pct = _pct_to_float(m_row.group(4))
@@ -410,10 +406,7 @@ def main():
                                 if in_func_summary:
                                     mfr = _re.match(r"^\s*(\d+)\s*[│|]\s*([^│|]*)[│|]([^│|]*)[│|]([^│|]*)[│|]", _line)
                                     if mfr and last_file and last_file_secs > 0.0:
-                                        try:
-                                            ln_no = int(mfr.group(1))
-                                        except Exception:
-                                            continue
+                                        ln_no = int(mfr.group(1))
                                         def _pctf(txt: str) -> float:
                                             mm = _re.search(r"([0-9]+(?:\.[0-9]+)?)%", txt.strip())
                                             return float(mm.group(1)) if mm else 0.0
@@ -447,11 +440,8 @@ def main():
                         print(tail)
                 except Exception:
                     # On parser error, still show the tail of cleaned output
-                    try:
-                        tail = '\n'.join(clean_output.splitlines()[-80:])
-                        print(tail)
-                    except Exception:
-                        pass
+                    tail = '\n'.join(clean_output.splitlines()[-80:])
+                    print(tail)
 
             if want_html and html_path:
                 print(f"\nScalene HTML report: {html_path}")
@@ -466,24 +456,65 @@ def main():
     # Inner run invoked by Scalene: execute training without additional profilers.
     if getattr(args, 'scalene_run', False):
         num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
+        _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
+        _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
+        # Training flags for profiling as well
+        _save_every = int(os.environ.get('SCOPONE_SAVE_EVERY','10'))
+        _entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED','linear')
+        _belief_particles = int(os.environ.get('SCOPONE_BELIEF_PARTICLES','512'))
+        _belief_ess = float(os.environ.get('SCOPONE_BELIEF_ESS_FRAC','0.5'))
+        _mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']
+        _mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','128'))
+        _mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','4'))
+        _mcts_c_puct = float(os.environ.get('SCOPONE_MCTS_C_PUCT','1.0'))
+        _mcts_root_temp = float(os.environ.get('SCOPONE_MCTS_ROOT_TEMP','0.0'))
+        _mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS','0.0'))
+        _mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA','0.25'))
+        _mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS','0.25'))
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
+        train_ppo(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs,
+                  mcts_sims=_mcts_sims, mcts_sims_eval=0, save_every=_save_every,
+                  entropy_schedule_type=_entropy_sched,
+                  eval_every=0, eval_games=_eval_games, mcts_in_eval=False, seed=seed, use_selfplay=_selfplay)
         return
 
     # cProfile mode takes precedence over line/torch profiler
     if getattr(args, 'cprofile', False):
-        try:
-            import cProfile
-            import pstats
-        except Exception as e:
-            print(f"cProfile unavailable: {e}")
-            return
+        import cProfile
+        import pstats
 
         prof = cProfile.Profile()
         # Keep run short to avoid OOM without scheduler
         num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
 
+        # Honor training/profile env config (consistent with other modes)
+        _save_every = int(os.environ.get('SCOPONE_SAVE_EVERY','10'))
+        _entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED','linear')
+        _belief_particles = int(os.environ.get('SCOPONE_BELIEF_PARTICLES','512'))
+        _belief_ess = float(os.environ.get('SCOPONE_BELIEF_ESS_FRAC','0.5'))
+        _mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']
+        _mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','128'))
+        _mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','4'))
+        _mcts_c_puct = float(os.environ.get('SCOPONE_MCTS_C_PUCT','1.0'))
+        _mcts_root_temp = float(os.environ.get('SCOPONE_MCTS_ROOT_TEMP','0.0'))
+        _mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS','0.0'))
+        _mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA','0.25'))
+        _mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS','0.25'))
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
+
         def _run():
-            train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
+            _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
+            _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
+            train_ppo(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs,
+                      save_every=_save_every,
+                      entropy_schedule_type=_entropy_sched,
+                      belief_particles=_belief_particles, belief_ess_frac=_belief_ess,
+                      mcts_in_eval=False, mcts_train=_mcts_train,
+                      mcts_sims=_mcts_sims, mcts_sims_eval=0, mcts_dets=_mcts_dets, mcts_c_puct=_mcts_c_puct,
+                      mcts_root_temp=_mcts_root_temp, mcts_prior_smooth_eps=_mcts_prior_eps,
+                      mcts_dirichlet_alpha=_mcts_dir_alpha, mcts_dirichlet_eps=_mcts_dir_eps,
+                      eval_every=0, eval_games=_eval_games,
+                      seed=seed, use_selfplay=_selfplay)
 
         prof.enable()
         try:
@@ -532,58 +563,43 @@ def main():
 
         # Optional: register additional targets for profiling before running training
         def _resolve_attr(path: str):
-            try:
-                import importlib as _importlib
-                if ':' in path:
-                    mod_path, attr_path = path.split(':', 1)
+            import importlib as _importlib
+            if ':' in path:
+                mod_path, attr_path = path.split(':', 1)
+            else:
+                parts = path.split('.')
+                for i in range(len(parts), 0, -1):
+                    mod_path = '.'.join(parts[:i])
+                    _importlib.import_module(mod_path)
+                    attr_path = '.'.join(parts[i:])
+                    break
                 else:
-                    parts = path.split('.')
-                    for i in range(len(parts), 0, -1):
-                        try:
-                            mod_path = '.'.join(parts[:i])
-                            _importlib.import_module(mod_path)
-                            attr_path = '.'.join(parts[i:])
-                            break
-                        except Exception:
-                            continue
-                    else:
-                        mod_path, attr_path = path, ''
-                mod = _importlib.import_module(mod_path)
-                if not attr_path:
-                    return mod
-                obj = mod
-                for name in attr_path.split('.'):
-                    obj = getattr(obj, name)
-                return obj
-            except Exception:
-                return None
+                    mod_path, attr_path = path, ''
+            mod = _importlib.import_module(mod_path)
+            if not attr_path:
+                return mod
+            obj = mod
+            for name in attr_path.split('.'):
+                obj = getattr(obj, name)
+            return obj
 
         def _iter_module_functions(module):
-            try:
-                import inspect as _inspect
-                for name, obj in _inspect.getmembers(module):
-                    if _inspect.isfunction(obj) and getattr(obj, '__module__', None) == module.__name__:
-                        yield obj
-                    if _inspect.isclass(obj) and getattr(obj, '__module__', None) == module.__name__:
-                        for _, member in _inspect.getmembers(obj):
-                            if _inspect.isfunction(member) and getattr(member, '__qualname__', '').startswith(obj.__name__ + '.'):
-                                yield member
-            except Exception:
-                return
+            import inspect as _inspect
+            for name, obj in _inspect.getmembers(module):
+                if _inspect.isfunction(obj) and getattr(obj, '__module__', None) == module.__name__:
+                    yield obj
+                if _inspect.isclass(obj) and getattr(obj, '__module__', None) == module.__name__:
+                    for _, member in _inspect.getmembers(obj):
+                        if _inspect.isfunction(member) and getattr(member, '__qualname__', '').startswith(obj.__name__ + '.'):
+                            yield member
 
         def _iter_package_functions(pkg_module):
-            try:
-                import pkgutil as _pkgutil
-                import importlib as _importlib
-                for _finder, _name, _is_pkg in _pkgutil.walk_packages(pkg_module.__path__, pkg_module.__name__ + "."):
-                    try:
-                        submod = _importlib.import_module(_name)
-                    except Exception:
-                        continue
-                    for fn in _iter_module_functions(submod):
-                        yield fn
-            except Exception:
-                return
+            import pkgutil as _pkgutil
+            import importlib as _importlib
+            for _finder, _name, _is_pkg in _pkgutil.walk_packages(pkg_module.__path__, pkg_module.__name__ + "."):
+                submod = _importlib.import_module(_name)
+                for fn in _iter_module_functions(submod):
+                    yield fn
 
         # Register user-specified functions and modules
         any_registered = False
@@ -592,22 +608,16 @@ def main():
                 obj = _resolve_attr(spec)
                 if obj is None:
                     continue
-                try:
-                    line_profile(getattr(obj, '__func__', obj))
-                    any_registered = True
-                except Exception:
-                    pass
+                line_profile(getattr(obj, '__func__', obj))
+                any_registered = True
         if getattr(args, 'add_module', None):
             for mod_spec in (args.add_module or []):
                 mod = _resolve_attr(mod_spec)
                 if mod is None:
                     continue
                 for fn in _iter_module_functions(mod):
-                    try:
-                        line_profile(fn)
-                        any_registered = True
-                    except Exception:
-                        pass
+                    line_profile(fn)
+                    any_registered = True
 
         # If requested, register most project modules/functions automatically (heavy)
         if getattr(args, 'profile_all', False):
@@ -623,30 +633,115 @@ def main():
                 'evaluation',
             ]
             for tgt in default_targets:
-                try:
-                    mod = _importlib.import_module(tgt)
-                except Exception:
-                    continue
+                mod = _importlib.import_module(tgt)
                 # Package: recurse; Module: shallow
                 if hasattr(mod, '__path__'):
                     for fn in _iter_package_functions(mod):
-                        try:
-                            line_profile(fn)
-                            any_registered = True
-                        except Exception:
-                            pass
+                        line_profile(fn)
+                        any_registered = True
                 else:
                     for fn in _iter_module_functions(mod):
-                        try:
-                            line_profile(fn)
-                            any_registered = True
-                        except Exception:
-                            pass
+                        line_profile(fn)
+                        any_registered = True
 
         # Wrap hotspots and also enable global tracing fallback
         import trainers.train_ppo as train_mod
         train_mod.collect_trajectory = line_profile(train_mod.collect_trajectory)
         train_fn = line_profile(train_mod.train_ppo)
+        # Trainer data path internals
+        train_mod.collect_trajectory_parallel = line_profile(train_mod.collect_trajectory_parallel)
+        train_mod._batched_select_indices = line_profile(train_mod._batched_select_indices)
+        train_mod._batched_select_indices_with_actor = line_profile(train_mod._batched_select_indices_with_actor)
+        train_mod._batched_service = line_profile(train_mod._batched_service)
+        # Worker loop
+        if hasattr(train_mod, '_env_worker'):
+            train_mod._env_worker = line_profile(train_mod._env_worker)
+        # Trainer parallel/batching internals
+        if hasattr(train_mod, 'collect_trajectory_parallel'):
+            train_mod.collect_trajectory_parallel = line_profile(train_mod.collect_trajectory_parallel)
+        for _name in ['_batched_select_indices', '_batched_select_indices_with_actor', '_batched_service']:
+            if hasattr(train_mod, _name):
+                setattr(train_mod, _name, line_profile(getattr(train_mod, _name)))
+
+        # Always profile eval, environment and MCTS stack by default under --line
+        import evaluation.eval as eval_mod
+        eval_mod.evaluate_pair_actors = line_profile(eval_mod.evaluate_pair_actors)
+        eval_mod.play_match = line_profile(eval_mod.play_match)
+        # Environment hotspots
+        import environment as env_mod
+        if hasattr(env_mod, 'ScoponeEnvMA'):
+            _Env = env_mod.ScoponeEnvMA
+            if hasattr(_Env, 'step'):
+                _Env.step = line_profile(_Env.step)
+            if hasattr(_Env, 'get_valid_actions'):
+                _Env.get_valid_actions = line_profile(_Env.get_valid_actions)
+            if hasattr(_Env, '_get_observation'):
+                _Env._get_observation = line_profile(_Env._get_observation)
+            if hasattr(_Env, 'reset'):
+                _Env.reset = line_profile(_Env.reset)
+        import algorithms.is_mcts as mcts_mod
+        if hasattr(mcts_mod, 'run_is_mcts'):
+            mcts_mod.run_is_mcts = line_profile(mcts_mod.run_is_mcts)
+        # If IS-MCTS exposes subroutines, profile them too (best-effort)
+        for sub_name in ['tree_policy', 'expand', 'simulate', 'backpropagate', 'select_child']:
+            if hasattr(mcts_mod, sub_name):
+                setattr(mcts_mod, sub_name, line_profile(getattr(mcts_mod, sub_name)))
+        # Model forward paths (actor/belief)
+        import models.action_conditioned as ac_mod
+        if hasattr(ac_mod, 'ActionConditionedActor'):
+            _Act = ac_mod.ActionConditionedActor
+            if hasattr(_Act, 'forward'):
+                _Act.forward = line_profile(_Act.forward)
+        if hasattr(ac_mod, 'CentralValueNet'):
+            _Crit = ac_mod.CentralValueNet
+            if hasattr(_Crit, 'forward'):
+                _Crit.forward = line_profile(_Crit.forward)
+        # PPO core
+        import algorithms.ppo_ac as ppo_mod
+        if hasattr(ppo_mod, 'ActionConditionedPPO'):
+            _PPO = ppo_mod.ActionConditionedPPO
+            if hasattr(_PPO, 'update'):
+                _PPO.update = line_profile(_PPO.update)
+            if hasattr(_PPO, 'compute_loss'):
+                _PPO.compute_loss = line_profile(_PPO.compute_loss)
+            if hasattr(_PPO, 'select_action'):
+                _PPO.select_action = line_profile(_PPO.select_action)
+            if hasattr(_PPO, '_select_action_core'):
+                _PPO._select_action_core = line_profile(_PPO._select_action_core)
+            # Try common names for submodules
+            for attr in ['state_enc', 'belief_net']:
+                if hasattr(_Act, attr):
+                    sub = getattr(_Act, attr)
+                    # If it's a Module class attribute, decorate .forward
+                    if hasattr(sub, 'forward'):
+                        sub.forward = line_profile(sub.forward)
+
+        # Allow nested local functions in trainer to be decorated if they opt-in
+        setattr(train_mod, 'LINE_PROFILE_DECORATOR', line_profile)
+
+        # Observation encoding hot path
+        import observation as obs_mod
+        # The environment binds maybe_compile_function(_encode_state_compact_for_player_fast)
+        # We decorate both the symbol and the compiled wrapper if present
+        if hasattr(obs_mod, 'encode_state_compact_for_player_fast'):
+            obs_mod.encode_state_compact_for_player_fast = line_profile(obs_mod.encode_state_compact_for_player_fast)
+        for _obs_fn in ['bitset_rank_counts', 'bitset_table_sum']:
+            if hasattr(obs_mod, _obs_fn):
+                setattr(obs_mod, _obs_fn, line_profile(getattr(obs_mod, _obs_fn)))
+
+        # Algorithms (PPO) heavy paths
+        import algorithms.ppo_ac as ppo_ac_mod
+        if hasattr(ppo_ac_mod, 'ActionConditionedPPO'):
+            _PPO = ppo_ac_mod.ActionConditionedPPO
+            if hasattr(_PPO, 'update'):
+                _PPO.update = line_profile(_PPO.update)
+            if hasattr(_PPO, 'compute_loss'):
+                _PPO.compute_loss = line_profile(_PPO.compute_loss)
+
+        # Actions/state helpers (if used by env)
+        import actions as actions_mod
+        if hasattr(actions_mod, 'decode_action_ids'):
+            actions_mod.decode_action_ids = line_profile(actions_mod.decode_action_ids)
 
         if args.wrap_update:
             import algorithms.ppo_ac as ppo_mod
@@ -659,87 +754,119 @@ def main():
             global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         # Use the same default as other modes for apples-to-apples comparisons
         num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-        train_fn(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, mcts_sims_eval=0, eval_every=0, mcts_in_eval=False, seed=seed)
+        _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
+        _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
+        # Eval parity with main: read eval flags from env
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
+        _eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','0').lower() in ['1','true','yes','on']
+        _eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS','128'))
+        _eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS','1'))
+        _eval_c_puct = float(os.environ.get('SCOPONE_EVAL_MCTS_C_PUCT','1.0'))
+        _eval_root_temp = float(os.environ.get('SCOPONE_EVAL_MCTS_ROOT_TEMP','0.0'))
+        _eval_prior_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_PRIOR_SMOOTH_EPS','0.0'))
+        _eval_dir_alpha = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_ALPHA','0.25'))
+        _eval_dir_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_EPS','0.25'))
+        train_fn(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs,
+                 mcts_sims=0, mcts_sims_eval=_eval_mcts_sims, eval_every=0, eval_games=_eval_games,
+                 mcts_in_eval=_eval_use_mcts, mcts_dets=_eval_mcts_dets, mcts_c_puct=_eval_c_puct,
+                 mcts_root_temp=_eval_root_temp, mcts_prior_smooth_eps=_eval_prior_eps,
+                 mcts_dirichlet_alpha=_eval_dir_alpha, mcts_dirichlet_eps=_eval_dir_eps,
+                 seed=seed, use_selfplay=_selfplay)
 
-        # Print per-function and per-line stats (includes line numbers and source)
-        global_profiler.print_stats(sort_by='cpu')
+        # Print per-function and per-line stats sorted by self time (TOT time per line)
+        # Options: sort_by in {'cpu','gpu','transfer','self_cpu','self_gpu'} depending on implementation.
+        # Prefer self CPU time to focus on exclusive line cost.
+        global_profiler.print_stats(sort_by='self_cpu')
         if args.report:
             print(global_profiler.generate_report(include_line_details=True))
 
-        # Aggregate by file and by file:line from line-profiler results
-        try:
-            import inspect
-            from collections import defaultdict
+        # Aggregate by file and by file:line from line-profiler results (use self time where available)
+        import inspect
+        from collections import defaultdict
 
-            project_root = ROOT
-            def relpath(p):
-                ap = os.path.abspath(p)
-                if project_root in ap:
-                    return os.path.relpath(ap, project_root)
-                return ap
+        project_root = ROOT
+        def relpath(p):
+            ap = os.path.abspath(p)
+            if project_root in ap:
+                return os.path.relpath(ap, project_root)
+            return ap
 
-            per_file = defaultdict(lambda: {'cpu_s': 0.0, 'gpu_s': 0.0, 'transfer_s': 0.0, 'hits': 0})
-            per_site = defaultdict(lambda: {'hits': 0, 'cpu_s': 0.0, 'gpu_s': 0.0, 'transfer_s': 0.0})
+        per_file = defaultdict(lambda: {'cpu_s': 0.0, 'gpu_s': 0.0, 'transfer_s': 0.0, 'hits': 0})
+        per_site = defaultdict(lambda: {'hits': 0, 'cpu_s': 0.0, 'gpu_s': 0.0, 'transfer_s': 0.0})
 
-            for func_name, lines in global_profiler.results.items():
-                func_obj = global_profiler.functions.get(func_name)
-                if func_obj is None:
+        # Exclude profiler internals and this script from aggregation
+        def _is_excluded(rel_path: str) -> bool:
+            rp = (rel_path or '').replace('\\', '/')
+            return (
+                rp.startswith('profilers/') or
+                rp.endswith('/profilers/line_profiler.py') or
+                rp.endswith('profilers/line_profiler.py') or
+                rp.endswith('tools/profile_ppo.py')
+            )
+
+        use_self_only = bool(getattr(args, 'line_self_only', False))
+
+        for func_name, lines in global_profiler.results.items():
+            func_obj = global_profiler.functions.get(func_name)
+            if func_obj is None:
+                continue
+            filename = inspect.getsourcefile(func_obj) or func_obj.__code__.co_filename
+            rfile = relpath(filename)
+            if _is_excluded(rfile):
+                continue
+            for line_no, payload in lines.items():
+                # Support both 4-tuple and 5-tuple (with self_cpu)
+                if isinstance(payload, (list, tuple)) and len(payload) >= 4:
+                    hits, cpu_time, gpu_time, transfer_time = payload[:4]
+                    self_cpu = payload[4] if len(payload) >= 5 else None
+                else:
                     continue
-                filename = inspect.getsourcefile(func_obj) or func_obj.__code__.co_filename
-                rfile = relpath(filename)
-                for line_no, (hits, cpu_time, gpu_time, transfer_time) in lines.items():
-                    pf = per_file[rfile]
-                    pf['cpu_s'] += cpu_time
-                    pf['gpu_s'] += gpu_time
-                    pf['transfer_s'] += transfer_time
-                    pf['hits'] += hits
-                    key = (rfile, int(line_no))
-                    site = per_site[key]
-                    site['hits'] += hits
-                    site['cpu_s'] += cpu_time
-                    site['gpu_s'] += gpu_time
-                    site['transfer_s'] += transfer_time
+                # Decide which metric to use
+                metric_cpu = (self_cpu if (self_cpu is not None) else (None if use_self_only else cpu_time))
+                if metric_cpu is None:
+                    continue
+                # Some implementations provide self_cpu in rest[0]; prefer it when present
+                pf = per_file[rfile]
+                pf['cpu_s'] += metric_cpu
+                pf['gpu_s'] += gpu_time
+                pf['transfer_s'] += transfer_time
+                pf['hits'] += hits
+                key = (rfile, int(line_no))
+                site = per_site[key]
+                site['hits'] += hits
+                site['cpu_s'] += metric_cpu
+                site['gpu_s'] += gpu_time
+                site['transfer_s'] += transfer_time
 
-            # Print file summary
-            print("\n===== Line-profiler — Time by file =====")
-            ranked_files = sorted(per_file.items(), key=lambda kv: kv[1]['cpu_s'], reverse=True)
-            for i, (f, s) in enumerate(ranked_files[:20], 1):
-                total = s['cpu_s']
-                print(f"{i:>2}. {f}\n    CPU: {total:8.4f}s  GPU: {s['gpu_s']:8.4f}s  Transfer: {s['transfer_s']:8.4f}s  Hits: {s['hits']}")
+        # Print file summary
+        print("\n===== Line-profiler — Time by file (self CPU) =====" if use_self_only else "\n===== Line-profiler — Time by file (preferring self CPU) =====")
+        ranked_files = sorted(per_file.items(), key=lambda kv: kv[1]['cpu_s'], reverse=True)
+        for i, (f, s) in enumerate(ranked_files[:20], 1):
+            total = s['cpu_s']
+            print(f"{i:>2}. {f}\n    CPU: {total:8.4f}s  GPU: {s['gpu_s']:8.4f}s  Transfer: {s['transfer_s']:8.4f}s  Hits: {s['hits']}")
 
-            # Print top lines across files (optionally full)
-            print("\n===== Line-profiler — Top lines (by CPU time) =====")
-            ranked_sites = sorted(per_site.items(), key=lambda kv: kv[1]['cpu_s'], reverse=True)
-            limit = None
-            try:
-                limit = None if getattr(args, 'line_full', False) else 30
-            except Exception:
-                limit = 30
-            for i, ((f, ln), agg) in enumerate(ranked_sites[: (None if limit is None else limit) ], 1):
-                print(f"{i:>2}. {f}:{ln}  CPU: {agg['cpu_s']:.6f}s  GPU: {agg['gpu_s']:.6f}s  Transfer: {agg['transfer_s']:.6f}s  Hits: {agg['hits']}")
+        # Print top lines across files (optionally full)
+        print("\n===== Line-profiler — Top lines (by Self CPU time) =====" if use_self_only else "\n===== Line-profiler — Top lines (preferring Self CPU) =====")
+        ranked_sites = sorted(per_site.items(), key=lambda kv: kv[1]['cpu_s'], reverse=True)
+        limit = None
+        limit = None if getattr(args, 'line_full', False) else 30
+        for i, ((f, ln), agg) in enumerate(ranked_sites[: (None if limit is None else limit) ], 1):
+            print(f"{i:>2}. {f}:{ln}  Self CPU: {agg['cpu_s']:.6f}s  GPU: {agg['gpu_s']:.6f}s  Transfer: {agg['transfer_s']:.6f}s  Hits: {agg['hits']}")
 
-            # Optional CSV dump for full per-line times across all files
-            try:
-                line_csv = getattr(args, 'line_csv', None)
-            except Exception:
-                line_csv = None
-            if line_csv:
-                import csv as _csv
-                abs_csv = os.path.abspath(line_csv)
-                out_dir = os.path.dirname(abs_csv)
-                if out_dir:
-                    try:
-                        os.makedirs(out_dir, exist_ok=True)
-                    except Exception:
-                        pass
-                with open(abs_csv, 'w', newline='', encoding='utf-8') as f:
-                    w = _csv.writer(f)
-                    w.writerow(['file', 'line', 'hits', 'cpu_s', 'gpu_s', 'transfer_s'])
-                    for (frel, lno), agg in ranked_sites:
-                        w.writerow([frel, int(lno), int(agg['hits']), f"{agg['cpu_s']:.9f}", f"{agg['gpu_s']:.9f}", f"{agg['transfer_s']:.9f}"])
-                print("Saved per-line CSV to:", abs_csv)
-        except Exception as e:
-            print(f"Line-profiler per-file aggregation failed: {e}")
+        # Optional CSV dump for full per-line times across all files
+        line_csv = getattr(args, 'line_csv', None)
+        if line_csv:
+            import csv as _csv
+            abs_csv = os.path.abspath(line_csv)
+            out_dir = os.path.dirname(abs_csv)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(abs_csv, 'w', newline='', encoding='utf-8') as f:
+                w = _csv.writer(f)
+                w.writerow(['file', 'line', 'hits', 'cpu_s', 'gpu_s', 'transfer_s'])
+                for (frel, lno), agg in ranked_sites:
+                    w.writerow([frel, int(lno), int(agg['hits']), f"{agg['cpu_s']:.9f}", f"{agg['gpu_s']:.9f}", f"{agg['transfer_s']:.9f}"])
+            print("Saved per-line CSV to:", abs_csv)
         return
 
     #trace_path = os.path.abspath('profile_trace.json')
@@ -753,74 +880,83 @@ def main():
     # Keep run short to avoid OOM without scheduler
     # Wrap selected hotspots with record_function via monkeypatch, without editing sources
     from torch.profiler import record_function as _record_function
-    try:
-        # observation
-        import observation as _obs_mod
-        if hasattr(_obs_mod, 'encode_state_compact_for_player_fast'):
-            _orig_encode = _obs_mod.encode_state_compact_for_player_fast
-            def _wrap_encode(*a, **kw):
-                with _record_function('obs.encode_state_compact_for_player_fast'):
-                    return _orig_encode(*a, **kw)
-            _obs_mod.encode_state_compact_for_player_fast = _wrap_encode  # type: ignore
-    except Exception:
-        pass
-    try:
-        # environment
-        import environment as _env_mod
-        if hasattr(_env_mod.ScoponeEnvMA, 'get_valid_actions'):
-            _orig_gva = _env_mod.ScoponeEnvMA.get_valid_actions
-            def _wrap_gva(self, *a, **kw):
-                with _record_function('env.get_valid_actions'):
-                    return _orig_gva(self, *a, **kw)
-            _env_mod.ScoponeEnvMA.get_valid_actions = _wrap_gva  # type: ignore
-        if hasattr(_env_mod.ScoponeEnvMA, '_get_observation'):
-            _orig_go = _env_mod.ScoponeEnvMA._get_observation
-            def _wrap_go(self, *a, **kw):
-                with _record_function('env._get_observation'):
-                    return _orig_go(self, *a, **kw)
-            _env_mod.ScoponeEnvMA._get_observation = _wrap_go  # type: ignore
-        if hasattr(_env_mod.ScoponeEnvMA, 'step'):
-            _orig_step = _env_mod.ScoponeEnvMA.step
-            def _wrap_step(self, *a, **kw):
-                with _record_function('env.step'):
-                    return _orig_step(self, *a, **kw)
-            _env_mod.ScoponeEnvMA.step = _wrap_step  # type: ignore
-    except Exception:
-        pass
-    try:
-        # algorithms / actor
-        import algorithms.ppo_ac as _ppo_mod
-        if hasattr(_ppo_mod.ActionConditionedPPO, '_select_action_core'):
-            _orig_core = _ppo_mod.ActionConditionedPPO._select_action_core
-            def _wrap_core(self, *a, **kw):
-                with _record_function('algo._select_action_core'):
-                    return _orig_core(self, *a, **kw)
-            _ppo_mod.ActionConditionedPPO._select_action_core = _wrap_core  # type: ignore
-        if hasattr(_ppo_mod.ActionConditionedPPO, 'select_action'):
-            _orig_sel = _ppo_mod.ActionConditionedPPO.select_action
-            def _wrap_sel(self, *a, **kw):
-                with _record_function('algo.select_action'):
-                    return _orig_sel(self, *a, **kw)
-            _ppo_mod.ActionConditionedPPO.select_action = _wrap_sel  # type: ignore
-    except Exception:
-        pass
-    try:
-        # model internals
-        import models.action_conditioned as _ac_mod
-        if hasattr(_ac_mod.ActionConditionedActor, 'compute_state_proj'):
-            _orig_csp = _ac_mod.ActionConditionedActor.compute_state_proj
-            def _wrap_csp(self, *a, **kw):
-                with _record_function('model.compute_state_proj'):
-                    return _orig_csp(self, *a, **kw)
-            _ac_mod.ActionConditionedActor.compute_state_proj = _wrap_csp  # type: ignore
-        if hasattr(_ac_mod.ActionConditionedActor, '_mha_masked_mean'):
-            _orig_mmm = _ac_mod.ActionConditionedActor._mha_masked_mean
-            def _wrap_mmm(self, *a, **kw):
-                with _record_function('model._mha_masked_mean'):
-                    return _orig_mmm(self, *a, **kw)
-            _ac_mod.ActionConditionedActor._mha_masked_mean = _wrap_mmm  # type: ignore
-    except Exception:
-        pass
+    # observation
+    import observation as _obs_mod
+    if hasattr(_obs_mod, 'encode_state_compact_for_player_fast'):
+        _orig_encode = _obs_mod.encode_state_compact_for_player_fast
+        def _wrap_encode(*a, **kw):
+            with _record_function('obs.encode_state_compact_for_player_fast'):
+                return _orig_encode(*a, **kw)
+        _obs_mod.encode_state_compact_for_player_fast = _wrap_encode  # type: ignore
+    # environment
+    import environment as _env_mod
+    if hasattr(_env_mod.ScoponeEnvMA, 'get_valid_actions'):
+        _orig_gva = _env_mod.ScoponeEnvMA.get_valid_actions
+        def _wrap_gva(self, *a, **kw):
+            with _record_function('env.get_valid_actions'):
+                return _orig_gva(self, *a, **kw)
+        _env_mod.ScoponeEnvMA.get_valid_actions = _wrap_gva  # type: ignore
+    if hasattr(_env_mod.ScoponeEnvMA, '_get_observation'):
+        _orig_go = _env_mod.ScoponeEnvMA._get_observation
+        def _wrap_go(self, *a, **kw):
+            with _record_function('env._get_observation'):
+                return _orig_go(self, *a, **kw)
+        _env_mod.ScoponeEnvMA._get_observation = _wrap_go  # type: ignore
+    if hasattr(_env_mod.ScoponeEnvMA, 'step'):
+        _orig_step = _env_mod.ScoponeEnvMA.step
+        def _wrap_step(self, *a, **kw):
+            with _record_function('env.step'):
+                return _orig_step(self, *a, **kw)
+        _env_mod.ScoponeEnvMA.step = _wrap_step  # type: ignore
+    # algorithms / actor
+    import algorithms.ppo_ac as _ppo_mod
+    if hasattr(_ppo_mod.ActionConditionedPPO, '_select_action_core'):
+        _orig_core = _ppo_mod.ActionConditionedPPO._select_action_core
+        def _wrap_core(self, *a, **kw):
+            with _record_function('algo._select_action_core'):
+                return _orig_core(self, *a, **kw)
+        _ppo_mod.ActionConditionedPPO._select_action_core = _wrap_core  # type: ignore
+    if hasattr(_ppo_mod.ActionConditionedPPO, 'select_action'):
+        _orig_sel = _ppo_mod.ActionConditionedPPO.select_action
+        def _wrap_sel(self, *a, **kw):
+            with _record_function('algo.select_action'):
+                return _orig_sel(self, *a, **kw)
+        _ppo_mod.ActionConditionedPPO.select_action = _wrap_sel  # type: ignore
+    # model internals
+    import models.action_conditioned as _ac_mod
+    if hasattr(_ac_mod.ActionConditionedActor, 'compute_state_proj'):
+        _orig_csp = _ac_mod.ActionConditionedActor.compute_state_proj
+        def _wrap_csp(self, *a, **kw):
+            with _record_function('model.compute_state_proj'):
+                return _orig_csp(self, *a, **kw)
+        _ac_mod.ActionConditionedActor.compute_state_proj = _wrap_csp  # type: ignore
+    if hasattr(_ac_mod.ActionConditionedActor, '_mha_masked_mean'):
+        _orig_mmm = _ac_mod.ActionConditionedActor._mha_masked_mean
+        def _wrap_mmm(self, *a, **kw):
+            with _record_function('model._mha_masked_mean'):
+                return _orig_mmm(self, *a, **kw)
+        _ac_mod.ActionConditionedActor._mha_masked_mean = _wrap_mmm  # type: ignore
+
+    # Configure child workers to run a torch profiler by default when torch-profiler is selected
+    _profiles_dir = os.path.abspath(os.path.join(ROOT, 'profiles'))
+    os.makedirs(_profiles_dir, exist_ok=True)
+    os.environ['SCOPONE_TORCH_PROF'] = '1'
+    os.environ.setdefault('SCOPONE_TORCH_PROF_DIR', _profiles_dir)
+    from datetime import datetime as _dt
+    _run_tag = _dt.now().strftime('%Y%m%d_%H%M%S')
+    os.environ['SCOPONE_TORCH_PROF_RUN'] = _run_tag
+    # TensorBoard combined timeline directory (shared across main + workers)
+    _tb_dir = os.path.abspath(os.path.join(ROOT, 'runs', 'profiler', _run_tag))
+    os.makedirs(_tb_dir, exist_ok=True)
+    os.environ['SCOPONE_TORCH_TB_DIR'] = _tb_dir
+
+    from torch.profiler import schedule as _tp_schedule, tensorboard_trace_handler as _tb_handler
+    _tb_handler_main = _tb_handler(_tb_dir, worker_name=f"main-pid{os.getpid()}")
+
+    # Relax timeouts and workload for profiling stability
+    os.environ.setdefault('SCOPONE_RPC_TIMEOUT_S', '300')
+    os.environ.setdefault('SCOPONE_COLLECTOR_STALL_S', '300')
+    os.environ.setdefault('SCOPONE_EP_PUT_TIMEOUT_S', '60')
 
     with torch.profiler.profile(
         activities=[
@@ -831,14 +967,30 @@ def main():
         profile_memory=False,
         with_stack=True,
         with_modules=True,
-        #experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
+        schedule=_tp_schedule(wait=0, warmup=0, active=1, repeat=1000000),
+        on_trace_ready=_tb_handler_main,
     ) as prof:
-        # Short run for signal; adjust if needed
-        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-        train_ppo(num_iterations=max(1, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs, mcts_sims=0, seed=seed)
+        # Constrain workload under profiler
+        _prof_max_envs = int(os.environ.get('SCOPONE_PROF_NUM_ENVS', '8'))
+        _prof_max_horizon = int(os.environ.get('SCOPONE_PROF_HORIZON', '2048'))
+        num_envs = max(1, int(min(int(args.num_envs), _prof_max_envs))) if getattr(args, 'num_envs', None) is not None else 1
+        _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
+        _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
+        def _on_iter_end_cb(it_idx: int):
+            prof.step()
+        _h_eff = int(min(max(40, args.horizon), _prof_max_horizon))
+        print(f"[torch-profiler] Effective profiling config: num_envs={num_envs}, horizon={_h_eff}, RPC_TIMEOUT_S={os.environ.get('SCOPONE_RPC_TIMEOUT_S')}")
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
+        train_ppo(num_iterations=max(0, args.iters), horizon=_h_eff, k_history=39, num_envs=num_envs,
+                  mcts_sims=0, mcts_sims_eval=0, eval_every=0, eval_games=_eval_games, mcts_in_eval=False, seed=seed, use_selfplay=_selfplay,
+                  on_iter_end=_on_iter_end_cb)
 
-    # Export chrome trace
-    #prof.export_chrome_trace(trace_path)
+    # Export chrome trace for main process
+    out_main = os.path.abspath(os.path.join(_profiles_dir, f"tp_main_{os.getpid()}_{os.environ.get('SCOPONE_TORCH_PROF_RUN','run')}.json"))
+    prof.export_chrome_trace(out_main)
+    print(f"\nSaved main torch profiler trace: {out_main}")
+    print(f"TensorBoard combined timeline saved under: {_tb_dir}")
+    print("Per-worker traces are saved in profiles/ as tp_worker_<wid>_<pid>_<run>.json")
 
     # Print top operators by CUDA time and CPU time
     print("\nTop ops by CUDA time:")
@@ -853,36 +1005,30 @@ def main():
     print(prof.key_averages(group_by_stack_n=10).table(sort_by="self_cpu_time_total", row_limit=30))
 
     # Summarize record_function tags to make hotspots immediately visible
-    try:
-        from collections import defaultdict as _dd
-        tag_totals = _dd(lambda: { 'cpu_us': 0.0, 'cuda_us': 0.0, 'count': 0 })
-        for avg in prof.key_averages():
-            name = getattr(avg, 'key', '') or getattr(avg, 'name', '') or ''
-            if not isinstance(name, str):
-                continue
-            if not (name.startswith('env.') or name.startswith('algo.') or name.startswith('model.') or name.startswith('obs.')):
-                continue
-            cpu_us = getattr(avg, 'self_cpu_time_total', 0.0) or 0.0
-            cuda_us = getattr(avg, 'self_device_time_total', None)
-            if cuda_us is None:
-                cuda_us = getattr(avg, 'self_cuda_time_total', 0.0) or 0.0
-            tag_totals[name]['cpu_us'] += float(cpu_us)
-            tag_totals[name]['cuda_us'] += float(cuda_us)
-            tag_totals[name]['count'] += getattr(avg, 'count', 1) or 1
+    from collections import defaultdict as _dd
+    tag_totals = _dd(lambda: { 'cpu_us': 0.0, 'cuda_us': 0.0, 'count': 0 })
+    for avg in prof.key_averages():
+        name = getattr(avg, 'key', '') or getattr(avg, 'name', '') or ''
+        if not isinstance(name, str):
+            continue
+        if not (name.startswith('env.') or name.startswith('algo.') or name.startswith('model.') or name.startswith('obs.')):
+            continue
+        cpu_us = getattr(avg, 'self_cpu_time_total', 0.0) or 0.0
+        cuda_us = getattr(avg, 'self_device_time_total', None)
+        if cuda_us is None:
+            cuda_us = getattr(avg, 'self_cuda_time_total', 0.0) or 0.0
+        tag_totals[name]['cpu_us'] += float(cpu_us)
+        tag_totals[name]['cuda_us'] += float(cuda_us)
+        tag_totals[name]['count'] += getattr(avg, 'count', 1) or 1
 
-        if tag_totals:
-            def _to_ms(us: float) -> float:
-                try:
-                    return float(us) / 1000.0
-                except Exception:
-                    return 0.0
-            print("\nTop by tag (record_function):")
-            ranked_tags = sorted(tag_totals.items(), key=lambda kv: (kv[1]['cuda_us'] + kv[1]['cpu_us']), reverse=True)
-            for i, (tag, s) in enumerate(ranked_tags[:20], 1):
-                total_ms = _to_ms(s['cpu_us'] + s['cuda_us'])
-                print(f"{i:>2}. {tag}\n    Total: {total_ms:8.2f} ms | CPU: {_to_ms(s['cpu_us']):8.2f} ms | CUDA: {_to_ms(s['cuda_us']):8.2f} ms | count: {int(s['count'])}")
-    except Exception:
-        pass
+    if tag_totals:
+        def _to_ms(us: float) -> float:
+            return float(us) / 1000.0
+        print("\nTop by tag (record_function):")
+        ranked_tags = sorted(tag_totals.items(), key=lambda kv: (kv[1]['cuda_us'] + kv[1]['cpu_us']), reverse=True)
+        for i, (tag, s) in enumerate(ranked_tags[:20], 1):
+            total_ms = _to_ms(s['cpu_us'] + s['cuda_us'])
+            print(f"{i:>2}. {tag}\n    Total: {total_ms:8.2f} ms | CPU: {_to_ms(s['cpu_us']):8.2f} ms | CUDA: {_to_ms(s['cuda_us']):8.2f} ms | count: {int(s['count'])}")
 
     # Aggregate by user source file (from Python stacks) and highlight H2D/D2H memcpys
     try:
@@ -1003,35 +1149,31 @@ def main():
 
         only_external = all(k == '<external/CUDA or Library>' for k, _ in per_file.items()) or len(per_file) == 0
         if only_external:
-            try:
-                per_file_agg = defaultdict(lambda: {
-                    'cpu_ms': 0.0,
-                    'cuda_ms': 0.0,
-                    'count': 0,
-                    'memcpy_h2d_count': 0,
-                    'memcpy_d2h_count': 0,
-                    'memcpy_ms': 0.0,
-                })
-                for avg in prof.key_averages(group_by_stack_n=25):
-                    stack_obj = getattr(avg, 'stack', None)
-                    file_rel, _ = find_user_file(stack_obj)
-                    if not file_rel:
-                        file_rel = '<external/CUDA or Library>'
-                    cuda_us = getattr(avg, 'self_device_time_total', None)
-                    if cuda_us is None:
-                        cuda_us = getattr(avg, 'self_cuda_time_total', 0.0)
-                    cpu_us = getattr(avg, 'self_cpu_time_total', 0.0) or 0.0
-                    s = per_file_agg[file_rel]
-                    s['cpu_ms'] += to_ms(cpu_us)
-                    s['cuda_ms'] += to_ms(cuda_us or 0.0)
-                    s['count'] += getattr(avg, 'count', 1) or 1
-                print("\n===== Fallback (aggregated stacks) — Time by source file =====")
-                ranked2 = sorted(per_file_agg.items(), key=lambda kv: (kv[1]['cuda_ms'] + kv[1]['cpu_ms']), reverse=True)
-                for i, (file_rel, s) in enumerate(ranked2[:30], 1):
-                    print(fmt_row(i, file_rel, s))
-            except Exception:
-                # If stack grouping fails, continue without aggregated section
-                pass
+            per_file_agg = defaultdict(lambda: {
+                'cpu_ms': 0.0,
+                'cuda_ms': 0.0,
+                'count': 0,
+                'memcpy_h2d_count': 0,
+                'memcpy_d2h_count': 0,
+                'memcpy_ms': 0.0,
+            })
+            for avg in prof.key_averages(group_by_stack_n=25):
+                stack_obj = getattr(avg, 'stack', None)
+                file_rel, _ = find_user_file(stack_obj)
+                if not file_rel:
+                    file_rel = '<external/CUDA or Library>'
+                cuda_us = getattr(avg, 'self_device_time_total', None)
+                if cuda_us is None:
+                    cuda_us = getattr(avg, 'self_cuda_time_total', 0.0)
+                cpu_us = getattr(avg, 'self_cpu_time_total', 0.0) or 0.0
+                s = per_file_agg[file_rel]
+                s['cpu_ms'] += to_ms(cpu_us)
+                s['cuda_ms'] += to_ms(cuda_us or 0.0)
+                s['count'] += getattr(avg, 'count', 1) or 1
+            print("\n===== Fallback (aggregated stacks) — Time by source file =====")
+            ranked2 = sorted(per_file_agg.items(), key=lambda kv: (kv[1]['cuda_ms'] + kv[1]['cpu_ms']), reverse=True)
+            for i, (file_rel, s) in enumerate(ranked2[:30], 1):
+                print(fmt_row(i, file_rel, s))
 
         if memcpy_sites:
             print("\n===== Top memcpy sites (by time) =====")

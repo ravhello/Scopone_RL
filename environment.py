@@ -213,10 +213,12 @@ class ScoponeEnvMA(gym.Env):
 
         # Estrai ID mano e tavolo da bitset mirror
         ids = self._id_range
-        hand_mask = ((self._hands_bits_t[self.current_player] >> ids) & 1).bool()
-        table_mask = ((self._table_bits_t >> ids) & 1).bool()
-        hand_ids_t = ids[hand_mask]  # (H)
-        table_ids_t = ids[table_mask]  # (n)
+        hb = self._hands_bits_t[self.current_player]
+        tb = self._table_bits_t
+        hand_mask = ((hb >> ids) & 1).to(torch.bool)
+        table_mask = ((tb >> ids) & 1).to(torch.bool)
+        hand_ids_t = ids.masked_select(hand_mask)  # (H)
+        table_ids_t = ids.masked_select(table_mask)  # (n)
 
         if hand_ids_t.numel() == 0:
             self._get_valid_actions_time += time.time() - start_time
@@ -248,7 +250,7 @@ class ScoponeEnvMA(gym.Env):
             if sel is None:
                 sel = ((masks_all.unsqueeze(1) >> pos) & 1).to(torch.float32)  # (M,n)
             if sums is None:
-                sums = (sel @ table_ranks.unsqueeze(1).to(torch.float32)).squeeze(1).to(torch.int64)
+                sums = torch.matmul(sel, table_ranks.unsqueeze(1).to(torch.float32)).squeeze(1).to(torch.int64)
             if table_one_hot is None:
                 # Build (n,40) one-hot using scatter instead of F.one_hot to reduce overhead
                 table_one_hot = torch.zeros((n, 40), dtype=torch.float32, device=device)

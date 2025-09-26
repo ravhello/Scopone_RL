@@ -43,15 +43,14 @@ class LineProfiler:
             torch.cuda.reset_peak_memory_stats()
             self.last_memory_allocated = torch.cuda.memory_allocated()
             self.last_memory_reserved = torch.cuda.memory_reserved()
+        # Self-only mode: exclude callee time from parent line timings
+        self.self_only = str(os.environ.get('SCOPONE_LINE_SELF_ONLY', '0')).strip().lower() in ('1','true','yes','on')
     
     def add_function(self, func):
         """Adds a function to profile with line-by-line instrumentation."""
         code = func.__code__
         # Use fully-qualified name for uniqueness across modules/classes
-        try:
-            qualified_key = f"{getattr(func, '__module__', '<unknown>')}.{getattr(func, '__qualname__', getattr(func, '__name__', '<lambda>'))}"
-        except Exception:
-            qualified_key = getattr(func, '__name__', '<unknown>')
+        qualified_key = f"{getattr(func, '__module__', '<unknown>')}.{getattr(func, '__qualname__', getattr(func, '__name__', '<lambda>'))}"
         self.functions[qualified_key] = func
         self.allowed_codes.add(code)
         self.code_to_key[code] = qualified_key
@@ -60,24 +59,81 @@ class LineProfiler:
         # Create a tracing function for this code object
         def tracefunc(frame, event, arg):
             if event == 'call':
-                # Initialize timing when entering a profiled function
-                try:
-                    codeobj = getattr(frame, 'f_code', None)
-                    in_allowed = (isinstance(codeobj, types.CodeType) and (codeobj in self.allowed_codes))
-                except Exception:
-                    in_allowed = False
+                # Parent pause handling for self-only mode
+                if self.self_only:
+                    parent = getattr(frame, 'f_back', None)
+                    if parent is not None:
+                        pid = id(parent)
+                        if pid in self.start_times:
+                            pinfo = self.start_times[pid]
+                            # If currently timing a line in parent, accumulate up to this call and pause
+                            if pinfo.get('last_line') is not None and pinfo.get('line_start_time') is not None:
+                                now = time.perf_counter()
+                                elapsed = (now - pinfo['line_start_time'])
+                                func_key_parent = self.code_to_key.get(getattr(parent, 'f_code', None))
+                                if func_key_parent in self.results:
+                                    last_ln = pinfo['last_line']
+                                    if last_ln in self.results[func_key_parent]:
+                                        self.results[func_key_parent][last_ln][0] += 1
+                                        self.results[func_key_parent][last_ln][1] += elapsed
+                                    else:
+                                        self.results[func_key_parent][last_ln] = [1, elapsed, 0.0, 0.0]
+                                # Pause timing on parent line until callee returns
+                                pinfo['line_start_time'] = None
+                            # Track nested pause depth
+                            pinfo['paused_depth'] = int(pinfo.get('paused_depth', 0)) + 1
+
+                # Initialize timing when entering a profiled function (callee)
+                codeobj = getattr(frame, 'f_code', None)
+                in_allowed = (isinstance(codeobj, types.CodeType) and (codeobj in self.allowed_codes))
                 if in_allowed:
                     func_start_time = time.perf_counter()
                     self.start_times[id(frame)] = {
                         'cpu_time': func_start_time,
                         'line_start_time': func_start_time,
-                        'last_line': None
+                        'last_line': None,
+                        'paused_depth': 0,
                     }
                     frame.f_trace = tracefunc
+                    return tracefunc
+
+                # For non-profiled callees, still install a lightweight return hook to resume parent timing
+                if self.self_only:
+                    def _child_return_trace(f, ev, a):
+                        if ev == 'return':
+                            parent2 = getattr(f, 'f_back', None)
+                            if parent2 is not None:
+                                pid2 = id(parent2)
+                                if pid2 in self.start_times:
+                                    pinfo2 = self.start_times[pid2]
+                                    depth = int(pinfo2.get('paused_depth', 0))
+                                    depth = max(0, depth - 1)
+                                    pinfo2['paused_depth'] = depth
+                                    if depth == 0:
+                                        # Resume timing on parent line after callee returns
+                                        pinfo2['line_start_time'] = time.perf_counter()
+                        return _child_return_trace
+                    frame.f_trace = _child_return_trace
+                    return _child_return_trace
+
                 return tracefunc
             if event == 'line':
                 self._trace_line(frame)
             elif event == 'return':
+                # Before handling this frame's return, resume parent timing in self-only mode
+                if self.self_only:
+                    parent = getattr(frame, 'f_back', None)
+                    if parent is not None:
+                        pid = id(parent)
+                        if pid in self.start_times:
+                            pinfo = self.start_times[pid]
+                            depth = int(pinfo.get('paused_depth', 0))
+                            if depth > 0:
+                                depth -= 1
+                                pinfo['paused_depth'] = depth
+                            if depth == 0:
+                                # Resume timing on parent line right now
+                                pinfo['line_start_time'] = time.perf_counter()
                 self._trace_return(frame)
             return tracefunc
         
@@ -129,20 +185,11 @@ class LineProfiler:
                         del self.start_times[frame_id]
                 # Finalize optional function-level GPU timing
                 if self.use_cuda and self.gpu_granularity in ('function', 'func') and start_event is not None:
-                    try:
-                        end_event.record()
-                        end_event.synchronize()
-                        elapsed_s = start_event.elapsed_time(end_event) / 1000.0
-                        try:
-                            key_for_gpu = self.code_to_key.get(func.__code__)
-                        except Exception:
-                            key_for_gpu = None
-                        if key_for_gpu is None:
-                            # Fallback to simple name if mapping missing
-                            key_for_gpu = getattr(func, '__name__', '<unknown>')
-                        self.func_gpu_time[key_for_gpu] += float(elapsed_s)
-                    except Exception:
-                        pass
+                    end_event.record()
+                    end_event.synchronize()
+                    elapsed_s = start_event.elapsed_time(end_event) / 1000.0
+                    key_for_gpu = self.code_to_key.get(func.__code__)
+                    self.func_gpu_time[key_for_gpu] += float(elapsed_s)
         
         return wrapper
     
@@ -558,64 +605,61 @@ class LineProfiler:
                 
                 # Add source code context for top functions if available
                 if func_name in top_funcs and func_name in self.functions:
-                    try:
-                        import inspect
-                        import linecache
+                    import inspect
+                    import linecache
+                    
+                    # Get function source code
+                    source_lines = inspect.getsourcelines(self.functions[func_name])
+                    if source_lines:
+                        code_lines, start_line = source_lines
                         
-                        # Get function source code
-                        source_lines = inspect.getsourcelines(self.functions[func_name])
-                        if source_lines:
-                            code_lines, start_line = source_lines
+                        # Find hot lines (>5% of function time)
+                        hot_lines = {}
+                        for line_no, hits, cpu_time, gpu_time, transfer_time in line_timings:
+                            if cpu_time / func_cpu_time * 100 > 5:
+                                hot_lines[line_no] = (cpu_time, hits)
+                        
+                        report_lines.append("\nSource code with hotspot analysis:")
+                        report_lines.append("-" * 100)
+                        
+                        # Show source with annotations
+                        for i, line in enumerate(code_lines):
+                            line_number = start_line + i
+                            line_str = f"{line_number}: {line.rstrip()}"
                             
-                            # Find hot lines (>5% of function time)
-                            hot_lines = {}
-                            for line_no, hits, cpu_time, gpu_time, transfer_time in line_timings:
-                                if cpu_time / func_cpu_time * 100 > 5:
-                                    hot_lines[line_no] = (cpu_time, hits)
+                            # Add performance annotations for hot lines
+                            if line_number in hot_lines:
+                                cpu_time, hits = hot_lines[line_number]
+                                percentage = (cpu_time / func_cpu_time * 100)
+                                
+                                if percentage > 20:
+                                    line_str += f"  # 🔥🔥 CRITICAL: {percentage:.1f}% of time ({cpu_time:.6f}s, {hits} hits)"
+                                elif percentage > 10:
+                                    line_str += f"  # 🔥 HOT: {percentage:.1f}% of time ({cpu_time:.6f}s)"
+                                else:
+                                    line_str += f"  # ⚠️ {percentage:.1f}% of time ({cpu_time:.6f}s)"
                             
-                            report_lines.append("\nSource code with hotspot analysis:")
+                            report_lines.append(line_str)
+                        
+                        # Add optimization suggestions based on profile data
+                        if self.use_cuda:
+                            report_lines.append("\nOptimization suggestions:")
                             report_lines.append("-" * 100)
                             
-                            # Show source with annotations
-                            for i, line in enumerate(code_lines):
-                                line_number = start_line + i
-                                line_str = f"{line_number}: {line.rstrip()}"
-                                
-                                # Add performance annotations for hot lines
-                                if line_number in hot_lines:
-                                    cpu_time, hits = hot_lines[line_number]
-                                    percentage = (cpu_time / func_cpu_time * 100)
-                                    
-                                    if percentage > 20:
-                                        line_str += f"  # 🔥🔥 CRITICAL: {percentage:.1f}% of time ({cpu_time:.6f}s, {hits} hits)"
-                                    elif percentage > 10:
-                                        line_str += f"  # 🔥 HOT: {percentage:.1f}% of time ({cpu_time:.6f}s)"
-                                    else:
-                                        line_str += f"  # ⚠️ {percentage:.1f}% of time ({cpu_time:.6f}s)"
-                                
-                                report_lines.append(line_str)
+                            # Look for CPU/GPU imbalances
+                            cpu_gpu_ratio = func_cpu_time / func_gpu_time if func_gpu_time > 0 else float('inf')
+                            if cpu_gpu_ratio > 3:
+                                report_lines.append("- Function is CPU-bound. Consider moving more computation to GPU.")
                             
-                            # Add optimization suggestions based on profile data
-                            if self.use_cuda:
-                                report_lines.append("\nOptimization suggestions:")
-                                report_lines.append("-" * 100)
+                            # Look for high transfer overhead
+                            transfer_ratio = func_transfer_time / (func_cpu_time + func_gpu_time) if (func_cpu_time + func_gpu_time) > 0 else 0
+                            if transfer_ratio > 0.2:  # >20% transfer overhead
+                                report_lines.append("- High data transfer overhead. Consider reducing CPU-GPU transfers.")
                                 
-                                # Look for CPU/GPU imbalances
-                                cpu_gpu_ratio = func_cpu_time / func_gpu_time if func_gpu_time > 0 else float('inf')
-                                if cpu_gpu_ratio > 3:
-                                    report_lines.append("- Function is CPU-bound. Consider moving more computation to GPU.")
-                                
-                                # Look for high transfer overhead
-                                transfer_ratio = func_transfer_time / (func_cpu_time + func_gpu_time) if (func_cpu_time + func_gpu_time) > 0 else 0
-                                if transfer_ratio > 0.2:  # >20% transfer overhead
-                                    report_lines.append("- High data transfer overhead. Consider reducing CPU-GPU transfers.")
-                                    
-                                # Look for underutilized GPU
-                                gpu_util = func_gpu_time / func_cpu_time * 100 if func_cpu_time > 0 else 0
-                                if gpu_util < 30 and func_cpu_time > 0.1:
-                                    report_lines.append("- Low GPU utilization. Consider batching operations or using CUDA streams.")
-                    except Exception as e:
-                        report_lines.append(f"\nCould not retrieve source code: {e}")
+                            # Look for underutilized GPU
+                            gpu_util = func_gpu_time / func_cpu_time * 100 if func_cpu_time > 0 else 0
+                            if gpu_util < 30 and func_cpu_time > 0.1:
+                                report_lines.append("- Low GPU utilization. Consider batching operations or using CUDA streams.")
         
         # Add overall summary
         report_lines.append("\n" + "=" * 100)

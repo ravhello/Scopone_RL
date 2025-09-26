@@ -33,8 +33,49 @@ torch.backends.cudnn.enabled = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
 
-# Lightweight parallel timing instrumentation flag
-_PAR_TIMING = (os.environ.get('SCOPONE_PAR_PROFILE', '0') == '1')
+# Parallel profiling controls (single boolean -> full detail when enabled)
+_PAR_TIMING = (os.environ.get('SCOPONE_PAR_PROFILE', '0') != '0')
+_PAR_DEBUG = (os.environ.get('SCOPONE_PAR_DEBUG', '0') in ['1','true','yes','on'])
+
+def _dbg(msg: str) -> None:
+    if _PAR_DEBUG:
+        try:
+            tqdm.write(str(msg))
+        except Exception:
+            print(str(msg), flush=True)
+
+# Sub-profilers (used whenever _PAR_TIMING is True)
+_BATCHSEL_PROF = {
+    'count': 0,
+    't_stack': 0.0,
+    't_leg_stack': 0.0,
+    't_state_proj': 0.0,
+    't_action_enc': 0.0,
+    't_mask': 0.0,
+    't_score': 0.0,
+    't_softmax_sample': 0.0,
+    't_total': 0.0,
+    'sum_B': 0,
+    'sum_M': 0,
+    'cnt_hist': {},
+}
+
+# get_reqs sub-profiler
+_GETREQS_PROF = {
+    'batches': 0,
+    'total_reqs': 0,
+    't_first_block': 0.0,
+    't_nowait_drain': 0.0,
+    't_topup_block': 0.0,
+    't_post_drain': 0.0,
+    'cnt_first_ok': 0,
+    'cnt_first_to': 0,
+    'cnt_nowait_ok': 0,
+    'cnt_nowait_empty': 0,
+    'cnt_topup_ok': 0,
+    'cnt_topup_to': 0,
+    'bs_hist': {},
+}
 
 # One-time run flags
 _HORIZON_ADJUST_LOGGED = False
@@ -53,6 +94,13 @@ def _env_worker(worker_id: int,
                 request_q: mp.Queue,
                 action_q: mp.Queue,
                 episode_q: mp.Queue):
+    _WDBG = (os.environ.get('SCOPONE_PAR_DEBUG', '0') in ['1','true','yes','on'])
+    def _wdbg(msg: str) -> None:
+        if _WDBG:
+            try:
+                tqdm.write(f"[worker {int(worker_id)} pid={os.getpid()}] {msg}")
+            except Exception:
+                print(f"[worker {int(worker_id)} pid={os.getpid()}] {msg}", flush=True)
     # Limit CPU threads per worker to reduce contention on the host
     wt = int(os.environ.get('SCOPONE_WORKER_THREADS', '1'))
     os.environ['OMP_NUM_THREADS'] = str(wt)
@@ -80,10 +128,29 @@ def _env_worker(worker_id: int,
     mcts_progress_full = float(cfg.get('mcts_progress_full', 0.75))
     mcts_min_sims = int(cfg.get('mcts_min_sims', 0))
 
+    # Torch profiler in worker: enabled by default when torch profiler mode is active in the main process
+    _tp_active = (os.environ.get('SCOPONE_TORCH_PROF', '0') == '1')
+    _worker_prof = None
+    from torch.profiler import record_function as _record_function  # type: ignore
+    if _tp_active:
+        from torch.profiler import profile as _tp_profile, ProfilerActivity as _PA, tensorboard_trace_handler as _tb_handler_factory  # type: ignore
+        _tb_dir_env = os.environ.get('SCOPONE_TORCH_TB_DIR', '').strip()
+        _tb_write_fn = (_tb_handler_factory(_tb_dir_env, worker_name=f"env-{int(worker_id)}-pid{os.getpid()}") if _tb_dir_env else None)
+        _worker_prof = _tp_profile(
+            activities=[_PA.CPU],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            with_modules=False,
+        )
+        _worker_prof.start()
+
     t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
     t0_glob = time.time()
+    _wdbg(f"start (episodes_per_env={int(episodes_per_env)})")
     for ep in range(episodes_per_env):
         t0 = time.time(); env.reset(); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
+        _wdbg(f"ep {ep} reset")
         obs_list, next_obs_list = [], []
         act_list = []
         rew_list, done_list = [], []
@@ -97,19 +164,24 @@ def _env_worker(worker_id: int,
 
         done = False
         info = {}
+        step_idx = 0
         while not done:
-            t0 = time.time(); obs = env._get_observation(env.current_player); t_get_obs += (time.time() - t0) if _PAR_TIMING else 0.0
-            t0 = time.time(); legal = env.get_valid_actions(); t_get_legals += (time.time() - t0) if _PAR_TIMING else 0.0
+            t0 = time.time();
+            with _record_function('env._get_observation'):
+                obs = env._get_observation(env.current_player)
+            t_get_obs += (time.time() - t0) if _PAR_TIMING else 0.0
+            if step_idx < 3:
+                _wdbg(f"ep {ep} step {step_idx}: got obs (cp={env.current_player})")
+            t0 = time.time();
+            with _record_function('env.get_valid_actions'):
+                legal = env.get_valid_actions()
+            t_get_legals += (time.time() - t0) if _PAR_TIMING else 0.0
+            if step_idx < 3:
+                _wdbg(f"ep {ep} step {step_idx}: legals={int(len(legal))}")
             if torch.is_tensor(legal) and (legal.size(0) == 0):
                 raise RuntimeError(f"collect_trajectory_parallel: worker {worker_id} got 0 legal actions (player={env.current_player})")
             # Avoid ambiguous truth-value on tensors; treat empty action sets explicitly
-            try:
-                is_empty = (int(legal.numel()) == 0)
-            except Exception:
-                try:
-                    is_empty = (len(legal) == 0)
-                except Exception:
-                    is_empty = False
+            is_empty = (int(legal.numel()) == 0)
             if is_empty:
                 raise RuntimeError(f"worker {worker_id}: no legal actions at episode start (player={env.current_player})")
             cp = env.current_player
@@ -123,10 +195,13 @@ def _env_worker(worker_id: int,
                 else:
                     leg_serial = []
                 def policy_fn_mcts(_obs, _legals):
+                    nonlocal t_rpc
                     # Invia tensori CPU direttamente (no conversione a liste) per ridurre overhead IPC
                     o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
                     leg_cpu = torch.stack([ (y.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
                     t1 = time.time()
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: MCTS policy -> send, waiting priors")
                     request_q.put({
                         'type': 'score_policy',
                         'wid': worker_id,
@@ -139,7 +214,10 @@ def _env_worker(worker_id: int,
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_policy priors") from e
                     t_rpc_local = (time.time() - t1)
-                    t_rpc += t_rpc_local if _PAR_TIMING else 0.0
+                    if _PAR_TIMING:
+                        t_rpc = t_rpc + t_rpc_local
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: MCTS policy <- got priors")
                     pri = resp.get('priors', None)
                     import numpy as _np
                     if pri is None or (len(pri) != len(_legals)):
@@ -148,6 +226,8 @@ def _env_worker(worker_id: int,
                 def value_fn_mcts(_obs, _env):
                     s_vec = _seat_vec_for(_env.current_player)
                     o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: MCTS value -> send, waiting value")
                     request_q.put({
                         'type': 'score_value',
                         'wid': worker_id,
@@ -158,109 +238,109 @@ def _env_worker(worker_id: int,
                         resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_value") from e
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: MCTS value <- got value")
                     return float(resp.get('value', 0.0))
                 def belief_sampler_neural(_env):
+                    o_cur = _env._get_observation(_env.current_player)
+                    s_vec = _seat_vec_for(_env.current_player)
+                    o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: MCTS belief -> send, waiting probs")
+                    request_q.put({
+                        'type': 'score_belief',
+                        'wid': worker_id,
+                        'obs': o_cpu,
+                        'seat': s_vec,
+                    })
                     try:
-                        o_cur = _env._get_observation(_env.current_player)
-                        s_vec = _seat_vec_for(_env.current_player)
-                        o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
-                        request_q.put({
-                            'type': 'score_belief',
-                            'wid': worker_id,
-                            'obs': o_cpu,
-                            'seat': s_vec,
-                        })
-                        try:
-                            resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
-                        except queue.Empty as e:
-                            raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_belief") from e
-                        probs_flat = resp.get('belief_probs', None)
-                        if probs_flat is None:
-                            return None
-                        import numpy as _np
-                        probs = _np.asarray(probs_flat, dtype=_np.float32).reshape(3, 40)
-                        # visible mask from obs on worker side
-                        if torch.is_tensor(o_cur):
-                            o_t = o_cur.detach().to('cpu', dtype=torch.float32).unsqueeze(0)
-                        else:
-                            o_t = torch.as_tensor(o_cur, dtype=torch.float32).unsqueeze(0)
-                        hand_table = o_t[:, :83]
-                        hand_mask = hand_table[:, :40] > 0.5
-                        table_mask = hand_table[:, 43:83] > 0.5
-                        captured = o_t[:, 83:165]
-                        cap0_mask = captured[:, :40] > 0.5
-                        cap1_mask = captured[:, 40:80] > 0.5
-                        vis = (hand_mask | table_mask | cap0_mask | cap1_mask).squeeze(0).numpy().astype(bool)
-                        unknown_ids = [cid for cid in range(40) if not vis[cid]]
-                        others = [(_env.current_player + 1) % 4, (_env.current_player + 2) % 4, (_env.current_player + 3) % 4]
-                        counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
-                        caps = [int(counts.get(pid, 0)) for pid in others]
-                        n = len(unknown_ids)
-                        if sum(caps) != n:
-                            caps[2] = max(0, n - caps[0] - caps[1])
-                            if sum(caps) != n:
-                                base = n // 3
-                                rem = n - 3 * base
-                                caps = [base, base, base]
-                                for i in range(rem):
-                                    caps[i] += 1
-                        import numpy as _np
-                        noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
-                        costs = []
-                        for cid in unknown_ids:
-                            pc = probs[:, cid]
-                            ps = pc / max(1e-12, pc.sum())
-                            c = [-_np.log(max(1e-12, ps[i])) for i in range(3)]
-                            if noise_scale > 0:
-                                u = _np.random.uniform(1e-9, 1.0-1e-9, size=3)
-                                g = -_np.log(-_np.log(u)) * noise_scale
-                                c = [c[i] + float(g[i]) for i in range(3)]
-                            costs.append(c)
-                        INF = 1e12
-                        cap0, cap1, cap2 = caps
-                        dp = [[[INF]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                        bk = [[[-1]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                        dp[0][0][0] = 0.0
-                        for t in range(n):
-                            c0, c1, c2 = costs[t]
-                            for a in range(0, min(t, cap0)+1):
-                                for b in range(0, min(t-a, cap1)+1):
-                                    cur = dp[t][a][b]
-                                    if cur >= INF:
-                                        continue
-                                    if a+1 <= cap0 and dp[t+1][a+1][b] > cur + c0:
-                                        dp[t+1][a+1][b] = cur + c0
-                                        bk[t+1][a+1][b] = 0
-                                    if b+1 <= cap1 and dp[t+1][a][b+1] > cur + c1:
-                                        dp[t+1][a][b+1] = cur + c1
-                                        bk[t+1][a][b+1] = 1
-                                    assigned2 = t - a - b
-                                    if assigned2 + 1 <= cap2 and dp[t+1][a][b] > cur + c2:
-                                        dp[t+1][a][b] = cur + c2
-                                        bk[t+1][a][b] = 2
-                        if dp[n][cap0][cap1] >= INF:
-                            return None
-                        det = {pid: [] for pid in others}
-                        a, b = cap0, cap1
-                        for t in range(n, 0, -1):
-                            choice = bk[t][a][b]
-                            cid = unknown_ids[t-1]
-                            if choice == 0:
-                                det[others[0]].append(cid)
-                                a -= 1
-                            elif choice == 1:
-                                det[others[1]].append(cid)
-                                b -= 1
-                            else:
-                                det[others[2]].append(cid)
-                        return det
-                    except Exception:
+                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                    except queue.Empty as e:
+                        raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_belief") from e
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: MCTS belief <- got probs")
+                    probs_flat = resp.get('belief_probs', None)
+                    if probs_flat is None:
                         return None
+                    import numpy as _np
+                    probs = _np.asarray(probs_flat, dtype=_np.float32).reshape(3, 40)
+                    # visible mask from obs on worker side
+                    if torch.is_tensor(o_cur):
+                        o_t = o_cur.detach().to('cpu', dtype=torch.float32).unsqueeze(0)
+                    else:
+                        o_t = torch.as_tensor(o_cur, dtype=torch.float32).unsqueeze(0)
+                    hand_table = o_t[:, :83]
+                    hand_mask = hand_table[:, :40] > 0.5
+                    table_mask = hand_table[:, 43:83] > 0.5
+                    captured = o_t[:, 83:165]
+                    cap0_mask = captured[:, :40] > 0.5
+                    cap1_mask = captured[:, 40:80] > 0.5
+                    vis = (hand_mask | table_mask | cap0_mask | cap1_mask).squeeze(0).numpy().astype(bool)
+                    unknown_ids = [cid for cid in range(40) if not vis[cid]]
+                    others = [(_env.current_player + 1) % 4, (_env.current_player + 2) % 4, (_env.current_player + 3) % 4]
+                    counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
+                    caps = [int(counts.get(pid, 0)) for pid in others]
+                    n = len(unknown_ids)
+                    if sum(caps) != n:
+                        caps[2] = max(0, n - caps[0] - caps[1])
+                        if sum(caps) != n:
+                            base = n // 3
+                            rem = n - 3 * base
+                            caps = [base, base, base]
+                            for i in range(rem):
+                                caps[i] += 1
+                    import numpy as _np
+                    noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
+                    costs = []
+                    for cid in unknown_ids:
+                        pc = probs[:, cid]
+                        ps = pc / max(1e-12, pc.sum())
+                        c = [-_np.log(max(1e-12, ps[i])) for i in range(3)]
+                        if noise_scale > 0:
+                            u = _np.random.uniform(1e-9, 1.0-1e-9, size=3)
+                            g = -_np.log(-_np.log(u)) * noise_scale
+                            c = [c[i] + float(g[i]) for i in range(3)]
+                        costs.append(c)
+                    INF = 1e12
+                    cap0, cap1, cap2 = caps
+                    dp = [[[INF]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
+                    bk = [[[-1]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
+                    dp[0][0][0] = 0.0
+                    for t in range(n):
+                        c0, c1, c2 = costs[t]
+                        for a in range(0, min(t, cap0)+1):
+                            for b in range(0, min(t-a, cap1)+1):
+                                cur = dp[t][a][b]
+                                if cur >= INF:
+                                    continue
+                                if a+1 <= cap0 and dp[t+1][a+1][b] > cur + c0:
+                                    dp[t+1][a+1][b] = cur + c0
+                                    bk[t+1][a+1][b] = 0
+                                if b+1 <= cap1 and dp[t+1][a][b+1] > cur + c1:
+                                    dp[t+1][a][b+1] = cur + c1
+                                    bk[t+1][a][b+1] = 1
+                                assigned2 = t - a - b
+                                if assigned2 + 1 <= cap2 and dp[t+1][a][b] > cur + c2:
+                                    dp[t+1][a][b] = cur + c2
+                                    bk[t+1][a][b] = 2
+                    if dp[n][cap0][cap1] >= INF:
+                        return None
+                    det = {pid: [] for pid in others}
+                    a, b = cap0, cap1
+                    for t in range(n, 0, -1):
+                        choice = bk[t][a][b]
+                        cid = unknown_ids[t-1]
+                        if choice == 0:
+                            det[others[0]].append(cid)
+                            a -= 1
+                        elif choice == 1:
+                            det[others[1]].append(cid)
+                            b -= 1
+                        else:
+                            det[others[2]].append(cid)
+                    return det
                 # Progress-based scaling (uniform with single-env)
-                try:
-                    progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
-                except Exception:
-                    progress = 0.0
+                progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
                 denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
                 alpha = min(1.0, max(0.0, (progress - mcts_progress_start) / denom))
                 # Permetti 0 simulazioni se mcts_min_sims==0
@@ -293,7 +373,8 @@ def _env_worker(worker_id: int,
                         raise TimeoutError('Timeout waiting for step index for MCTS (invalid_sims_scaled)') from e
                     idx = max(0, min(idx, len(legal) - 1))
                     act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                    next_obs, rew, done, info = env.step(act_t)
+                    with _record_function('env.step'):
+                        next_obs, rew, done, info = env.step(act_t)
                     # No distillation target
                     mcts_policy_list.extend([0.0] * len(legal))
                     mcts_weight_list.append(0.0)
@@ -338,22 +419,19 @@ def _env_worker(worker_id: int,
                     key_target = _act_key(chosen_act)
                     idx = 0
                     for i_a, a in enumerate(legal):
-                        try:
-                            if _act_key(a) == key_target:
-                                idx = int(i_a)
-                                break
-                        except Exception:
-                            continue
+                        if _act_key(a) == key_target:
+                            idx = int(i_a)
+                            break
                     act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                    t1 = time.time(); next_obs, rew, done, info = env.step(act_t); t_step += (time.time() - t1) if _PAR_TIMING else 0.0
+                    t1 = time.time();
+                    with _record_function('env.step'):
+                        next_obs, rew, done, info = env.step(act_t)
+                    t_step += (time.time() - t1) if _PAR_TIMING else 0.0
                     # Distillation targets
-                    try:
-                        mcts_probs = torch.as_tensor(mcts_visits, dtype=torch.float32)
-                        ssum = float(mcts_probs.sum().item())
-                        if ssum > 0:
-                            mcts_probs = mcts_probs / ssum
-                    except Exception:
-                        mcts_probs = torch.full((len(legal),), 0.0, dtype=torch.float32)
+                    mcts_probs = torch.as_tensor(mcts_visits, dtype=torch.float32)
+                    ssum = float(mcts_probs.sum().item())
+                    if ssum > 0:
+                        mcts_probs = mcts_probs / ssum
                     mcts_policy_list.extend((mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs)))
                     mcts_weight_list.append(1.0)
             else:
@@ -362,6 +440,8 @@ def _env_worker(worker_id: int,
                     leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
                 else:
                     leg_serial = torch.zeros((0,80), dtype=torch.float32)
+                if step_idx < 3:
+                    _wdbg(f"ep {ep} step {step_idx}: STEP -> send, waiting idx (A={len(legal)})")
                 t1 = time.time(); request_q.put({
                     'type': 'step',
                     'wid': worker_id,
@@ -375,9 +455,17 @@ def _env_worker(worker_id: int,
                 except queue.Empty as e:
                     raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (main path)") from e
                 t_rpc += (time.time() - t1) if _PAR_TIMING else 0.0
+                if step_idx < 3:
+                    _wdbg(f"ep {ep} step {step_idx}: STEP <- got idx={int(idx)}")
                 idx = max(0, min(idx, len(legal) - 1))
                 act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                t1 = time.time(); next_obs, rew, done, info = env.step(act_t); t_step += (time.time() - t1) if _PAR_TIMING else 0.0
+                t1 = time.time();
+                with _record_function('env.step'):
+                    next_obs, rew, done, info = env.step(act_t)
+                if step_idx < 3:
+                    _wdbg(f"ep {ep} step {step_idx}: env.step done={bool(done)} rew={float(rew)}")
+                step_idx += 1
+                t_step += (time.time() - t1) if _PAR_TIMING else 0.0
                 # No distillation target
                 mcts_policy_list.extend([0.0] * len(legal))
                 mcts_weight_list.append(0.0)
@@ -399,40 +487,31 @@ def _env_worker(worker_id: int,
                 notify_fallback('trainer.collect_trajectory.legals_missing_for_store')
             chosen_index_list.append(int(idx))
             # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
-            try:
-                if float(os.environ.get('BELIEF_AUX_COEF', '0.1')) <= 0.0:
-                    others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
-                else:
-                    hands = env.game_state.get('hands', None)
-                    if hands is not None:
-                        others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-                        target = torch.zeros((3,40), dtype=torch.float32)
-                        for i,pid in enumerate(others):
-                            for c in hands[pid]:
-                                if isinstance(c, int):
-                                    cid = c
-                                else:
-                                    r, s = c
-                                    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                                    cid = int((r - 1) * 4 + suit_to_int[s])
-                                target[i, int(cid)] = 1.0
-                        others_hands_list.append(target)
-                    else:
-                        others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
-            except Exception:
+            if float(os.environ.get('BELIEF_AUX_COEF', '0.1')) <= 0.0:
                 others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
+            else:
+                hands = env.game_state.get('hands', None)
+                if hands is not None:
+                    others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                    target = torch.zeros((3,40), dtype=torch.float32)
+                    for i,pid in enumerate(others):
+                        for c in hands[pid]:
+                            if isinstance(c, int):
+                                cid = c
+                            else:
+                                r, s = c
+                                suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+                                cid = int((r - 1) * 4 + suit_to_int[s])
+                            target[i, int(cid)] = 1.0
+                    others_hands_list.append(target)
+                else:
+                    others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
 
         # Ensure at least one step per episode to avoid empty payloads
         if len(obs_list) == 0:
             obs = env._get_observation(env.current_player)
             legal = env.get_valid_actions()
-            try:
-                is_empty = (int(legal.numel()) == 0)
-            except Exception:
-                try:
-                    is_empty = (len(legal) == 0)
-                except Exception:
-                    is_empty = False
+            is_empty = (int(legal.numel()) == 0)
             if not is_empty:
                 cp = env.current_player
                 seat_vec = _seat_vec_for(cp)
@@ -454,7 +533,8 @@ def _env_worker(worker_id: int,
                     raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (forced first step)") from e
                 idx = max(0, min(idx, len(legal) - 1))
                 act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                next_obs, rew, done, info = env.step(act_t)
+                with _record_function('env.step'):
+                    next_obs, rew, done, info = env.step(act_t)
                 obs_list.append(torch.as_tensor(obs, dtype=torch.float32) if not torch.is_tensor(obs) else obs.clone().detach().to('cpu', dtype=torch.float32))
                 next_obs_list.append(torch.as_tensor(next_obs, dtype=torch.float32) if not torch.is_tensor(next_obs) else next_obs.clone().detach().to('cpu', dtype=torch.float32))
                 act_list.append(act_t.clone().detach().to('cpu', dtype=torch.float32))
@@ -528,17 +608,28 @@ def _env_worker(worker_id: int,
         try:
             if len(obs_list) == 0:
                 raise RuntimeError(f"worker {worker_id}: episode finished with zero steps — invalid episode")
+            _wdbg(f"ep {ep} putting episode payload (steps={len(obs_list)})")
             episode_q.put(payload, timeout=float(os.environ.get('SCOPONE_EP_PUT_TIMEOUT_S', '15')))
+            _wdbg(f"ep {ep} payload put ok")
         except Exception as e:
             raise RuntimeError(f"worker {worker_id}: episode_q.put failed") from e
+        # Do not advance worker profiler schedule per-episode to avoid Kineto stack issues
+    # Stop and export worker torch profiler if active
+    if _worker_prof is not None:
+        _worker_prof.stop()
+        from datetime import datetime as _dt  # local import to avoid changing global imports
+        _dir = os.environ.get('SCOPONE_TORCH_PROF_DIR', os.path.abspath(os.path.join(_PROJECT_ROOT, 'profiles')))
+        _run = os.environ.get('SCOPONE_TORCH_PROF_RUN', _dt.now().strftime('%Y%m%d_%H%M%S'))
+        os.makedirs(_dir, exist_ok=True)
+        _out = os.path.abspath(os.path.join(_dir, f"tp_worker_{int(worker_id)}_{os.getpid()}_{_run}.json"))
+        _worker_prof.export_chrome_trace(_out)
+        # Also write into the combined TensorBoard trace directory, if configured
+        if '_tb_write_fn' in locals() and _tb_write_fn is not None:
+            _tb_write_fn(_worker_prof)
+
     # Signal completion to master
-    try:
-        episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
-    except Exception:
-        try:
-            episode_q.put({'wid': worker_id, 'type': 'done'})
-        except Exception:
-            pass
+    _wdbg("sending done marker")
+    episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
     if _PAR_TIMING:
         total = time.time() - t0_glob
         episode_q.put({'wid': worker_id, 'type': 'timing',
@@ -561,10 +652,15 @@ def _batched_select_indices(agent: ActionConditionedPPO,
     for r in reqs:
         if 'obs' not in r or 'legals' not in r or 'wid' not in r:
             raise KeyError("_batched_select_indices: missing 'obs'/'legals'/'wid' in request")
-    # Stack CPU tensors then move once to CUDA
+    # Stack CPU tensors; keep selection on CPU to avoid small GPU kernels
+    _t_total0 = time.time() if _PAR_TIMING else 0.0
+    _t0 = time.time() if _PAR_TIMING else 0.0
     obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
     seat_cpu = torch.stack([torch.as_tensor(r['seat'], dtype=torch.float32) for r in reqs], dim=0)
+    if _PAR_TIMING:
+        _BATCHSEL_PROF['t_stack'] += (time.time() - _t0)
     # Flatten legals and build offsets
+    _t0 = time.time() if _PAR_TIMING else 0.0
     flat_legals = []
     offs, cnts = [], []
     for r in reqs:
@@ -576,42 +672,56 @@ def _batched_select_indices(agent: ActionConditionedPPO,
     if len(flat_legals) == 0:
         # No legals, return zeros
         return [(int(reqs[i]['wid']), 0) for i in range(len(reqs))]
+    if _PAR_TIMING:
+        _BATCHSEL_PROF['t_leg_stack'] += (time.time() - _t0)
+    _t0 = time.time() if _PAR_TIMING else 0.0
     leg_cpu = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in flat_legals], dim=0)
+    if _PAR_TIMING:
+        _BATCHSEL_PROF['t_leg_stack'] += (time.time() - _t0)
     with torch.no_grad():
-        # Avoid pin_memory/non_blocking transfers when running on CPU-only to prevent accelerator access errors
-        if getattr(device, 'type', str(device)) == 'cuda':
-            if device.type == 'cuda':
-                o_t = obs_cpu.pin_memory().to(device=device, non_blocking=True)
-                s_t = seat_cpu.pin_memory().to(device=device, non_blocking=True)
-                leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
-            else:
-                o_t = obs_cpu.to(device=device)
-                s_t = seat_cpu.to(device=device)
-                leg_t = leg_cpu.to(device=device)
-        else:
-            o_t = obs_cpu
-            s_t = seat_cpu
-            leg_t = leg_cpu
-        # Validate legal encoding: exactly one played bit per row
-        ones = leg_t[:, :40].sum(dim=1)
+        # Keep selection on CPU device
+        cpu_device = torch.device('cpu')
+        o_t = obs_cpu
+        s_t = seat_cpu
+        leg_t = leg_cpu
+        # Validate legal encoding in STRICT mode only
         if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+            ones = leg_t[:, :40].sum(dim=1)
             if not torch.allclose(ones, torch.ones_like(ones)):
                 raise RuntimeError("_batched_select_indices: each legal must have one played bit in [:40]")
+        _t0 = time.time() if _PAR_TIMING else 0.0
         state_proj = agent.actor.compute_state_proj(o_t, s_t)  # (B,64)
+        if _PAR_TIMING:
+            _BATCHSEL_PROF['t_state_proj'] += (time.time() - _t0)
+        _t0 = time.time() if _PAR_TIMING else 0.0
         a_emb_all = agent.actor.action_enc(leg_t)             # (M,64)
+        if _PAR_TIMING:
+            _BATCHSEL_PROF['t_action_enc'] += (time.time() - _t0)
         B = o_t.size(0)
         cnts_t = torch.as_tensor(cnts, dtype=torch.long, device=device)
         max_cnt = int(cnts_t.max().item()) if B > 0 else 0
         pos = torch.arange(max_cnt, device=device, dtype=torch.long) if max_cnt > 0 else None
         out_idx = []
+        if _PAR_TIMING:
+            _BATCHSEL_PROF['sum_B'] += int(B)
+            _BATCHSEL_PROF['sum_M'] += int(leg_t.size(0))
+            ch = _BATCHSEL_PROF['cnt_hist']
+            ch[max_cnt] = int(ch.get(int(max_cnt), 0)) + 1
         if max_cnt > 0:
+            _t0 = time.time() if _PAR_TIMING else 0.0
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
             mask = rel_pos_2d < cnts_t.unsqueeze(1)
             offs_t = torch.as_tensor(offs, dtype=torch.long, device=device)
             abs_idx = (offs_t.unsqueeze(1) + rel_pos_2d)[mask]
             sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+            if _PAR_TIMING:
+                _BATCHSEL_PROF['t_mask'] += (time.time() - _t0)
+            _t0 = time.time() if _PAR_TIMING else 0.0
             a_emb_mb = a_emb_all[abs_idx]
             legal_scores = (a_emb_mb * state_proj[sample_idx]).sum(dim=1)
+            if _PAR_TIMING:
+                _BATCHSEL_PROF['t_score'] += (time.time() - _t0)
+            _t0 = time.time() if _PAR_TIMING else 0.0
             padded = torch.full((B, max_cnt), -1e9, device=device, dtype=legal_scores.dtype)
             padded[mask] = legal_scores
             logits = padded
@@ -639,8 +749,13 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             sel_cpu = sel.detach().to('cpu')
             for i in range(B):
                 out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
+            if _PAR_TIMING:
+                _BATCHSEL_PROF['t_softmax_sample'] += (time.time() - _t0)
         else:
             out_idx = [(int(reqs[i]['wid']), 0) for i in range(B)]
+    if _PAR_TIMING:
+        _BATCHSEL_PROF['t_total'] += (time.time() - _t_total0)
+        _BATCHSEL_PROF['count'] += 1
     return out_idx
 
 def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict]:
@@ -723,12 +838,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
             group_ids = sample_idx_per_legal * 40 + played_ids_all
             num_groups = Bp * 40
             group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
-            try:
-                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-            except Exception:
-                tmp = torch.full_like(group_max, float('-inf'))
-                tmp.index_copy_(0, group_ids, cap_logits)
-                group_max = torch.maximum(group_max, tmp)
+            group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
             gmax_per_legal = group_max[group_ids]
             exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
             group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
@@ -821,6 +931,75 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
             results[i] = {'belief_probs': probs_flat}
 
     return results
+
+def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List[Dict]) -> List[Tuple[int, int]]:
+    """Like _batched_select_indices but using a provided frozen actor (no critic)."""
+    if len(reqs) == 0:
+        return []
+    for r in reqs:
+        if 'obs' not in r or 'legals' not in r or 'wid' not in r:
+            raise KeyError("_batched_select_indices_with_actor: missing 'obs'/'legals'/'wid' in request")
+    _t_total0 = time.time() if _PAR_TIMING else 0.0
+    obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
+    seat_cpu = torch.stack([torch.as_tensor(r['seat'], dtype=torch.float32) for r in reqs], dim=0)
+    flat_legals = []
+    offs, cnts = [], []
+    for r in reqs:
+        offs.append(len(flat_legals))
+        cnt = len(r['legals'])
+        cnts.append(cnt)
+        if cnt > 0:
+            flat_legals.extend(r['legals'])
+    if len(flat_legals) == 0:
+        return [(int(reqs[i]['wid']), 0) for i in range(len(reqs))]
+    leg_cpu = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in flat_legals], dim=0)
+    with torch.no_grad():
+        # Use CPU to avoid device churn
+        o_t = obs_cpu
+        s_t = seat_cpu
+        leg_t = leg_cpu
+        # State projection via frozen actor's encoder
+        state_proj = actor.compute_state_proj(o_t, s_t)
+        a_emb_all = actor.action_enc(leg_t)
+        B = o_t.size(0)
+        cnts_t = torch.as_tensor(cnts, dtype=torch.long)
+        max_cnt = int(cnts_t.max().item()) if B > 0 else 0
+        pos = torch.arange(max_cnt, dtype=torch.long) if max_cnt > 0 else None
+        out_idx = []
+        if max_cnt > 0:
+            rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
+            mask = rel_pos_2d < cnts_t.unsqueeze(1)
+            offs_t = torch.as_tensor(offs, dtype=torch.long)
+            abs_idx = (offs_t.unsqueeze(1) + rel_pos_2d)[mask]
+            sample_idx = torch.arange(B, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+            a_emb_mb = a_emb_all[abs_idx]
+            legal_scores = (a_emb_mb * state_proj[sample_idx]).sum(dim=1)
+            padded = torch.full((B, max_cnt), -1e9, dtype=legal_scores.dtype)
+            padded[mask] = legal_scores
+            probs = torch.softmax(padded, dim=1)
+            probs = torch.where(mask, probs, torch.zeros_like(probs))
+            valid_rows = (cnts_t > 0)
+            sel = torch.zeros((B,), dtype=torch.long)
+            if bool(valid_rows.any()):
+                pv = probs[valid_rows]
+                mv = mask[valid_rows]
+                pv = pv.nan_to_num(0.0)
+                pv = torch.clamp(pv, min=0.0)
+                rs = pv.sum(dim=1, keepdim=True)
+                bad_rows = (~torch.isfinite(rs)) | (rs <= 0)
+                if bool(bad_rows.any()):
+                    raise RuntimeError("_batched_select_indices_with_actor: invalid probability rows (NaN/Inf or zero-sum)")
+                sub = torch.multinomial(pv, num_samples=1).squeeze(1)
+                sel[valid_rows] = sub
+            sel_cpu = sel.detach()
+            for i in range(B):
+                out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
+        else:
+            out_idx = [(int(reqs[i]['wid']), 0) for i in range(B)]
+    if _PAR_TIMING:
+        _BATCHSEL_PROF['t_total'] += (time.time() - _t_total0)
+        _BATCHSEL_PROF['count'] += 1
+    return out_idx
 def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> Dict[str, torch.Tensor]:
     """Calcola approx_kl, entropia e clip_frac per gruppi seat 0/2 vs 1/3.
 
@@ -914,11 +1093,34 @@ def _load_frozen_actor(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
     actor = maybe_compile_module(actor, name='ActionConditionedActor[trainer_partner]')
     try:
         ckpt = torch.load(ckpt_path, map_location=device)
-        if 'actor' in ckpt:
+        if isinstance(ckpt, dict) and 'actor' in ckpt:
             actor.load_state_dict(ckpt['actor'])
         # else: leave randomly init
-    except Exception:
-        pass
+    except Exception as e:
+        # Detailed diagnostics on why loading failed
+        import os as _os
+        import pickle as _pickle  # noqa: F401
+        exists = bool(ckpt_path and _os.path.isfile(ckpt_path))
+        size_b = int(_os.path.getsize(ckpt_path)) if exists else -1
+        etype = type(e).__name__
+        emsg = str(e) if str(e) else repr(e)
+        # Heuristics for human-readable reason
+        if not exists:
+            reason = "not_found"
+        elif size_b <= 0:
+            reason = "empty_file"
+        elif etype == 'EOFError':
+            reason = "truncated_or_corrupt"
+        elif etype in ('UnpicklingError', 'AttributeError', 'ModuleNotFoundError'):
+            reason = "invalid_pickle_or_missing_class"
+        elif etype == 'RuntimeError' and ('PytorchStreamReader' in emsg or 'invalid header or archive' in emsg):
+            reason = "invalid_archive_or_format"
+        else:
+            reason = "unknown_error"
+        tqdm.write(f"[WARN] Failed to load checkpoint {ckpt_path}: reason={reason} type={etype} size={max(size_b,0)}B msg={emsg}")
+        # Optional: escalate failure for CI/debug
+        if _os.environ.get('SCOPONE_RAISE_ON_CKPT_FAIL', '0') == '1':
+            raise RuntimeError(f"Checkpoint load failed: {ckpt_path} (reason={reason}, type={etype}, size={max(size_b,0)}B)") from e
     actor.eval()
     return actor
 
@@ -954,7 +1156,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
         global _HORIZON_ADJUST_LOGGED
         if not _HORIZON_ADJUST_LOGGED:
-            print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+            tqdm.write(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
             _HORIZON_ADJUST_LOGGED = True
         horizon = new_h
     # After alignment, horizon is divisible by per_ep_util by construction
@@ -1049,10 +1251,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             else:
                 bsum = torch.zeros(120, dtype=torch.float32)
             # MCTS sempre attivo (stile AlphaZero): poche simulazioni sempre, scala con il progresso della mano
-            try:
-                progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
-            except Exception:
-                progress = 0.0
+            progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
             use_mcts_cur = bool(use_mcts and len(legal) > 0)
             if use_mcts_cur:
                 # Se il fattore di training è 0, disabilita MCTS del tutto (nessun minimo forzato)
@@ -1101,12 +1300,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                         group_ids = played_ids
                         num_groups = 40
                         group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=leg_t.device)
-                        try:
-                            group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-                        except Exception:
-                            tmp = torch.zeros_like(group_max)
-                            tmp.index_copy_(0, group_ids, cap_logits)
-                            group_max = torch.maximum(group_max, tmp)
+                        group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
                         gmax_per_legal = group_max[group_ids]
                         exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
                         group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=leg_t.device)
@@ -1332,36 +1526,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 mcts_weight_list.append(1.0)
             else:
                 chosen_act, _logp, idx_t = agent.select_action(obs, legal, seat_vec)
-                try:
-                    next_obs, rew, done, info = env.step(chosen_act)
-                except Exception as e:
-                    if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
-                        try:
-                            import traceback as _tb
-                            cp = env.current_player
-                            hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
-                            table_ids_dbg = list(env._table_ids) if hasattr(env, '_table_ids') else []
-                            try:
-                                nz = (chosen_act > 0.5)
-                                played_id = int(torch.argmax(chosen_act[:40]).item()) if torch.is_tensor(chosen_act) else None
-                                captured_ids = [int(i) for i in torch.nonzero(nz[40:], as_tuple=False).flatten().tolist()] if torch.is_tensor(chosen_act) else []
-                            except Exception:
-                                played_id, captured_ids = None, []
-                            print("[DEBUG] Exception in env.step during main (no-MCTS) path:", str(e))
-                            _tb.print_exc()
-                            print({
-                                'current_player': cp,
-                                'hand_ids': hand_ids_dbg,
-                                'table_ids': table_ids_dbg,
-                                'chosen_played_id': played_id,
-                                'chosen_captured_ids': captured_ids,
-                                'num_legals': int(len(legal)),
-                                'matches_any_legal': any(bool(((l > 0.5) == (chosen_act > 0.5)).all().item()) for l in legal) if (torch.is_tensor(chosen_act) and isinstance(legal, list) and len(legal)>0 and torch.is_tensor(legal[0])) else 'n/a',
-                                'rules': getattr(env, 'rules', {})
-                            })
-                        except Exception:
-                            pass
-                    raise
+                next_obs, rew, done, info = env.step(chosen_act)
                 routing_log.append((cp, 'main'))
                 # Per mantenere l'allineamento per-sample della distillazione, aggiungi zeri
                 mcts_policy_flat.extend([0.0] * len(legal))
@@ -1379,33 +1544,28 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             chosen_index_t_list.append(idx_t)
             legals_list.extend(legal)
             # costruisci target mani reali altrui (3x40) vettoriale sfruttando bitset CPU
-            try:
-                others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-                # usa mirror bitset CPU se disponibile per evitare loop Python
-                if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
-                    ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
-                    target = torch.zeros((3,40), dtype=torch.float32)
-                    for i, pid in enumerate(others):
-                        try:
-                            bits_t = env._hands_bits_t[pid]
-                            bits = int(bits_t.item()) if torch.is_tensor(bits_t) else int(bits_t)
-                        except Exception:
-                            bits = 0
-                        mask = (((torch.tensor(bits, dtype=torch.int64) >> ids) & 1).to(torch.float32))
-                        target[i] = mask
-                    others_hands_targets.append(target)
-                else:
-                    from utils.fallback import notify_fallback
-                    notify_fallback('trainer.others_hands_targets.slow_game_state_path')
-            except Exception:
+            others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+            # usa mirror bitset CPU se disponibile per evitare loop Python
+            if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
+                ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
+                target = torch.zeros((3,40), dtype=torch.float32)
+                for i, pid in enumerate(others):
+                    bits_t = env._hands_bits_t[pid]
+                    bits = int(bits_t.item()) if torch.is_tensor(bits_t) else int(bits_t)
+                    mask = (((torch.tensor(bits, dtype=torch.int64) >> ids) & 1).to(torch.float32))
+                    target[i] = mask
+                others_hands_targets.append(target)
+            else:
                 from utils.fallback import notify_fallback
-                notify_fallback('trainer.others_hands_targets.compute_failed')
+                notify_fallback('trainer.others_hands_targets.slow_game_state_path')
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
             is_partner_seat = (cp in [0, 2] and (main_seats == [1, 3])) or (cp in [1, 3] and (main_seats == [0, 2]))
             frozen = partner_actor if (is_partner_seat and partner_actor is not None) else opponent_actor
             if frozen is not None:
-                with torch.no_grad():
+                # Fast, inference-only path for frozen actor
+                _inference = torch.inference_mode if hasattr(torch, 'inference_mode') else torch.no_grad
+                with _inference():
                     # Use GPU for frozen actor scoring but keep env data on CPU
                     o_cpu = obs.clone().detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device='cpu')
                     leg_cpu = torch.stack([x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device='cpu') for x in legal], dim=0)
@@ -1415,7 +1575,13 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                     else:
                         o_t = o_cpu.unsqueeze(0).to(device=device)
                         leg_t = leg_cpu.to(device=device)
-                    logits = frozen(o_t, leg_t)
+                    # Build seat_team_vec (B,6) for the frozen actor forward
+                    s_cpu = seat_vec.clone().detach().to('cpu', dtype=torch.float32)
+                    if device.type == 'cuda':
+                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                    else:
+                        s_t = s_cpu.unsqueeze(0).to(device=device)
+                    logits = frozen(o_t, leg_t, s_t)
                     idx_t = torch.argmax(logits).to('cpu')
                     act = leg_cpu[idx_t]
             else:
@@ -1440,35 +1606,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 matches = (codes == code_ch)
                 nz = torch.nonzero(matches, as_tuple=False).flatten()
                 idx_t = (nz[0] if nz.numel() > 0 else torch.tensor(0, dtype=torch.long))
-            try:
-                next_obs, rew, done, info = env.step(act)
-            except Exception as e:
-                if os.environ.get('SCOPONE_DEBUG_ILLEGAL', '0') == '1':
-                    try:
-                        import traceback as _tb
-                        cp = env.current_player
-                        hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
-                        table_ids_dbg = list(env._table_ids) if hasattr(env, '_table_ids') else []
-                        try:
-                            nz = (act > 0.5)
-                            played_id = int(torch.argmax(act[:40]).item()) if torch.is_tensor(act) else None
-                            captured_ids = [int(i) for i in torch.nonzero(nz[40:], as_tuple=False).flatten().tolist()] if torch.is_tensor(act) else []
-                        except Exception:
-                            played_id, captured_ids = None, []
-                        print("[DEBUG] Exception in env.step during frozen/opponent path:", str(e))
-                        _tb.print_exc()
-                        print({
-                            'current_player': cp,
-                            'hand_ids': hand_ids_dbg,
-                            'table_ids': table_ids_dbg,
-                            'chosen_played_id': played_id,
-                            'chosen_captured_ids': captured_ids,
-                            'num_legals': int(len(legal)),
-                            'rules': getattr(env, 'rules', {})
-                        })
-                    except Exception:
-                        pass
-                raise
+            next_obs, rew, done, info = env.step(act)
             routing_log.append((cp, 'partner' if is_partner_seat else 'opponent'))
             # Per i seat non-main mantieni l'allineamento dei target
             mcts_policy_flat.extend([0.0] * len(legal))
@@ -1481,10 +1619,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             if done:
                 # Registra i confini dell'episodio corrente e i team rewards
                 ep_slices.append((current_ep_start_idx, len(obs_list)))
-                try:
-                    tr = info.get('team_rewards', [0.0, 0.0]) if isinstance(info, dict) else [0.0, 0.0]
-                except Exception:
-                    tr = [0.0, 0.0]
+                tr = info.get('team_rewards', [0.0, 0.0]) if isinstance(info, dict) else [0.0, 0.0]
                 ep_team_rewards.append(tr)
                 if episodes_done >= (episodes - 1):
                     break
@@ -1546,26 +1681,11 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         for i_ep, (s, e) in enumerate(ep_slices):
             tr = ep_team_rewards[i_ep] if i_ep < len(ep_team_rewards) else [0.0, 0.0]
             # Determina la reward per team 0 e team 1 (proporzionale al risultato finale)
-            try:
-                t0 = float(tr[0])
-            except Exception:
-                # Supporta struttura dict {0:pos,1:neg}
-                t0 = float(tr.get(0, 0.0)) if isinstance(tr, dict) else 0.0
-            try:
-                t1 = float(tr[1])
-            except Exception:
-                t1 = float(tr.get(1, -t0)) if isinstance(tr, dict) else -t0
+            t0 = float(tr[0])
+            t1 = float(tr[1])
             for i in range(s, e):
                 st = seat_team_list[i]
-                try:
-                    team0_flag = bool(float(st[4]) > 0.5)
-                except Exception:
-                    # fallback: deduci dal seat index 0/2 vs 1/3
-                    try:
-                        seat_idx = int(torch.argmax(st[:4]).item()) if torch.is_tensor(st) else int(max(range(4), key=lambda k: st[k]))
-                    except Exception:
-                        seat_idx = 0
-                    team0_flag = seat_idx in [0, 2]
+                team0_flag = bool(float(st[4]) > 0.5)
                 flat_rew[i] = t0 if team0_flag else t1
         rew_t = torch.as_tensor(flat_rew, dtype=torch.float32, device=device)
     else:
@@ -1685,12 +1805,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                 group_ids = sample_idx_per_legal * 40 + played_ids_mb
                 num_groups = B * 40
                 group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
-                try:
-                    group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-                except Exception:
-                    tmp = torch.zeros_like(group_max)
-                    tmp.index_copy_(0, group_ids, cap_logits)
-                    group_max = torch.maximum(group_max, tmp)
+                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
+
                 gmax_per_legal = group_max[group_ids]
                 exp_shifted = torch.exp(cap_logits - gmax_per_legal)
                 group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
@@ -1792,7 +1908,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                                 mcts_min_sims: int = 0,
                                 seed: int = 0,
                                 show_progress_env: bool = True,
-                                tqdm_base_pos: int = 2) -> Dict:
+                                tqdm_base_pos: int = 2,
+                                frozen_actor: ActionConditionedActor = None,
+                                frozen_non_main: bool = False) -> Dict:
     # Validate configuration invariants
     if int(num_envs) <= 0:
         raise ValueError("collect_trajectory_parallel: num_envs must be > 0")
@@ -1814,21 +1932,18 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     # - Windows: 'spawn'
     # - POSIX with CUDA or background threads: prefer 'forkserver' (avoid forking after CUDA/threads)
     # - Otherwise: 'fork'
-    try:
-        override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
-        if override in {'spawn', 'fork', 'forkserver'}:
-            start_method = override
+    override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
+    if override in {'spawn', 'fork', 'forkserver'}:
+        start_method = override
+    else:
+        if platform.system().lower() == 'windows':
+            start_method = 'spawn'
         else:
-            if platform.system().lower() == 'windows':
+            # If CUDA is in use, prefer 'spawn' to avoid CUDA re-init issues in children
+            if getattr(device, 'type', str(device)) == 'cuda' or (hasattr(torch, 'cuda') and torch.cuda.is_available()):
                 start_method = 'spawn'
             else:
-                # If CUDA is in use, prefer 'spawn' to avoid CUDA re-init issues in children
-                if getattr(device, 'type', str(device)) == 'cuda' or (hasattr(torch, 'cuda') and torch.cuda.is_available()):
-                    start_method = 'spawn'
-                else:
-                    start_method = 'fork'
-    except Exception:
-        start_method = 'forkserver'
+                start_method = 'fork'
     ctx = mp.get_context(start_method)
     request_q = ctx.Queue(maxsize=num_envs * 4)
     # Make episode queue large enough to avoid backpressure when multiple workers finish close together
@@ -1839,12 +1954,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     base = int(episodes_total_hint) // int(num_envs)
     rem = int(episodes_total_hint) % int(num_envs)
     episodes_per_env_list = [base + (1 if wid < rem else 0) for wid in range(num_envs)]
-    try:
-        total_eps = sum(episodes_per_env_list)
-        print(f"[collector] num_envs={num_envs} episodes_total_hint={episodes_total_hint} "
-              f"episodes_per_env_list(min..max)={min(episodes_per_env_list)}..{max(episodes_per_env_list)} total_env_episodes={total_eps}", flush=True)
-    except Exception:
-        pass
+    total_eps = sum(episodes_per_env_list)
+    tqdm.write(f"[collector] num_envs={num_envs} episodes_total_hint={episodes_total_hint} "
+                   f"episodes_per_env_list(min..max)={min(episodes_per_env_list)}..{max(episodes_per_env_list)} total_env_episodes={total_eps}")
     workers = []
     cfg_base = {
         'rules': {'shape_scopa': False},
@@ -1853,6 +1965,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'use_mcts': bool(use_mcts),
         'train_both_teams': bool(train_both_teams),
         'main_seats': main_seats if main_seats is not None else [0,2],
+        'frozen_non_main': bool(frozen_non_main),
         'mcts_sims': int(mcts_sims),
         'mcts_dets': int(mcts_dets),
         'mcts_c_puct': float(mcts_c_puct),
@@ -1878,20 +1991,32 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     # Optional timing buffers
     timing_from_workers = [] if _PAR_TIMING else None
     t_drain = 0.0; t_get_reqs = 0.0; t_batch_select = 0.0; t_batch_service = 0.0; t_dispatch = 0.0
+    # Fine-grained get_reqs profiling (new consolidated struct)
+    getreqs_batches = 0
+    getreqs_total_reqs = 0
+    t_get_nowait = 0.0
+    t_get_block = 0.0
+    cnt_nowait_ok = 0
+    cnt_nowait_empty = 0
+    cnt_block_ok = 0
+    cnt_block_timeout = 0
+    # Extra timers for post-collector breakdown
+    t_build = 0.0; t_values_gae = 0.0; t_oldlogp = 0.0; t_teardown = 0.0
     t_master_start = time.time() if _PAR_TIMING else 0.0
+    # Batch size histogram and request type counters (active when profiling)
+    bs_hist = {}
+    step_reqs_count = 0
+    other_reqs_count = 0
     # Optional per-env progress bars
     env_pbars = []
-    try:
-        if show_progress_env:
-            for wid in range(num_envs):
-                try:
-                    b = tqdm(total=int(episodes_per_env_list[wid]), desc=f"env {wid}", position=(tqdm_base_pos + wid), leave=False, dynamic_ncols=True)
-                    env_pbars.append(b)
-                except Exception:
-                    env_pbars.append(None)
-        else:
-            env_pbars = [None] * num_envs
-    except Exception:
+    _TQDM_DISABLE = (os.environ.get('TQDM_DISABLE','0') in ['1','true','yes','on'])
+    # Hide per-env progress bars when debug logs are enabled to avoid clutter
+    _SHOW_PB = bool(show_progress_env) and (not _TQDM_DISABLE) and (not _PAR_DEBUG)
+    if _SHOW_PB:
+        for wid in range(num_envs):
+            b = tqdm(total=int(episodes_per_env_list[wid]), desc=f"env {wid}", position=(tqdm_base_pos + wid), leave=False, dynamic_ncols=True, disable=_TQDM_DISABLE)
+            env_pbars.append(b)
+    else:
         env_pbars = [None] * num_envs
     # Main loop: drain episodes first (to avoid backpressure), then service requests
     _last_activity_ts = time.time()
@@ -1922,20 +2047,14 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                         raise RuntimeError(f"collector: empty or invalid episode payload from wid={wid}")
                     episodes_payloads.append(ep)
                     episodes_received += 1
-                    try:
-                        wid = int(ep.get('wid', -1))
-                        if 0 <= wid < len(produced_count):
-                            produced_count[wid] += 1
-                    except Exception:
-                        pass
+                    wid = int(ep.get('wid', -1))
+                    if 0 <= wid < len(produced_count):
+                        produced_count[wid] += 1
                     drained_any = True
                     # Update per-env progress bar
-                    try:
-                        wid = int(ep.get('wid', -1))
-                        if 0 <= wid < len(env_pbars) and env_pbars[wid] is not None:
-                            env_pbars[wid].update(1)
-                    except Exception:
-                        pass
+                    wid = int(ep.get('wid', -1))
+                    if 0 <= wid < len(env_pbars) and env_pbars[wid] is not None:
+                        env_pbars[wid].update(1)
             except queue.Empty:
                 break
         if drained_any:
@@ -1945,28 +2064,122 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
 
         # 2) Gather a micro-batch of requests without blocking
         reqs = []
-        batch_target = max(4 * num_envs, 64)
+        min_batch = int(os.environ.get('SCOPONE_COLLECT_MIN_BATCH', '0'))
+        if min_batch <= 0:
+            min_batch = max(32, 2 * int(num_envs))
+        batch_target = max(min_batch, 64)
+        max_latency_ms = float(os.environ.get('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0'))
+        max_latency_s = max(0.0, max_latency_ms / 1000.0)
         t0_get = time.time() if _PAR_TIMING else 0.0
-        for _ in range(batch_target):
+        deadline = (t0_get + max_latency_s)
+        # Block briefly for the first item (up to max_latency)
+        try:
+            t0_blk = time.time() if _PAR_TIMING else 0.0
+            r0 = request_q.get(timeout=max_latency_s)
+            reqs.append(r0)
+            if _PAR_TIMING:
+                cnt_block_ok += 1
+                t_get_block += (time.time() - t0_blk)
+                _GETREQS_PROF['cnt_first_ok'] += 1
+                _GETREQS_PROF['t_first_block'] += (time.time() - t0_blk)
+        except queue.Empty:
+            if _PAR_TIMING:
+                cnt_block_timeout += 1
+                t_get_block += (time.time() - t0_blk)
+                _GETREQS_PROF['cnt_first_to'] += 1
+                _GETREQS_PROF['t_first_block'] += (time.time() - t0_blk)
+            # No requests arrived within latency budget
+            if _PAR_TIMING:
+                t_get_reqs += (time.time() - t0_get)
+            # Continue to next loop iteration
+            continue
+        # After first item, drain quickly without spinning
+        t0_now = time.time() if _PAR_TIMING else 0.0
+        while len(reqs) < batch_target:
             try:
                 r = request_q.get_nowait()
+                # If configured, label non-main requests for shadow (frozen) selection
+                if bool(cfg_base.get('frozen_non_main', False)) and isinstance(r, dict) and r.get('type') == 'step':
+                    seat = r.get('seat', None)
+                    is_main = False
+                    if seat is not None:
+                        st = torch.as_tensor(seat, dtype=torch.float32)
+                        seat_idx = int(torch.argmax(st[:4]).item())
+                        main_set = set(cfg_base.get('main_seats', [0, 2]))
+                        is_main = (seat_idx in main_set)
+                    if not is_main:
+                        r = dict(r)
+                        r['type'] = 'step_shadow'
                 reqs.append(r)
+                if _PAR_TIMING:
+                    cnt_nowait_ok += 1
+                    _GETREQS_PROF['cnt_nowait_ok'] += 1
             except queue.Empty:
+                if _PAR_TIMING:
+                    cnt_nowait_empty += 1
+                    _GETREQS_PROF['cnt_nowait_empty'] += 1
                 break
-        # If none, do a short timed wait to avoid spin and to allow new requests to arrive
-        if len(reqs) == 0:
+        if _PAR_TIMING:
+            dt_now = (time.time() - t0_now)
+            t_get_nowait += dt_now
+            _GETREQS_PROF['t_nowait_drain'] += dt_now
+        # If under min_batch and we still have latency budget, do a short block to top up
+        while (len(reqs) < min_batch) and (time.time() < deadline):
             try:
-                r0 = request_q.get(timeout=0.01)
-                reqs.append(r0)
+                remaining = max(0.0, deadline - time.time())
+                t0_blk = time.time() if _PAR_TIMING else 0.0
+                r = request_q.get(timeout=remaining)
+                reqs.append(r)
+                if _PAR_TIMING:
+                    cnt_block_ok += 1
+                    t_get_block += (time.time() - t0_blk)
+                    _GETREQS_PROF['cnt_topup_ok'] += 1
+                    _GETREQS_PROF['t_topup_block'] += (time.time() - t0_blk)
+                # Opportunistically drain any burst
+                t0_now = time.time() if _PAR_TIMING else 0.0
+                while len(reqs) < batch_target:
+                    try:
+                        r2 = request_q.get_nowait()
+                        reqs.append(r2)
+                        if _PAR_TIMING:
+                            cnt_nowait_ok += 1
+                            _GETREQS_PROF['cnt_nowait_ok'] += 1
+                    except queue.Empty:
+                        if _PAR_TIMING:
+                            cnt_nowait_empty += 1
+                            _GETREQS_PROF['cnt_nowait_empty'] += 1
+                        break
+                if _PAR_TIMING:
+                    dt_now2 = (time.time() - t0_now)
+                    t_get_nowait += dt_now2
+                    _GETREQS_PROF['t_post_drain'] += dt_now2
             except queue.Empty:
-                pass
+                if _PAR_TIMING:
+                    cnt_block_timeout += 1
+                    t_get_block += (time.time() - t0_blk)
+                    _GETREQS_PROF['cnt_topup_to'] += 1
+                    _GETREQS_PROF['t_topup_block'] += (time.time() - t0_blk)
+                break
         if _PAR_TIMING:
             t_get_reqs += (time.time() - t0_get)
         # 3) Process batch on GPU
         if len(reqs) > 0:
             _last_activity_ts = time.time()
+            if _PAR_TIMING:
+                getreqs_batches += 1
+                getreqs_total_reqs += len(reqs)
+                _GETREQS_PROF['batches'] += 1
+                _GETREQS_PROF['total_reqs'] += len(reqs)
+                _GETREQS_PROF['bs_hist'][len(reqs)] = int(_GETREQS_PROF['bs_hist'].get(len(reqs), 0)) + 1
+            if _PAR_TIMING:
+                bs_hist[len(reqs)] = bs_hist.get(len(reqs), 0) + 1
             step_reqs = [r for r in reqs if r.get('type') == 'step']
+            shadow_reqs = [r for r in reqs if r.get('type') == 'step_shadow']
             other_reqs = [r for r in reqs if r.get('type') != 'step']
+            other_reqs = [r for r in other_reqs if r.get('type') != 'step_shadow']
+            if _PAR_TIMING:
+                step_reqs_count += len(step_reqs)
+                other_reqs_count += len(other_reqs)
             if len(step_reqs) > 0:
                 _t0 = time.time() if _PAR_TIMING else 0.0
                 sel = _batched_select_indices(agent, step_reqs)
@@ -1974,10 +2187,29 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     t_batch_select += (time.time() - _t0)
                 _t0d = time.time() if _PAR_TIMING else 0.0
                 for (wid, idx) in sel:
-                    try:
-                        action_queues[wid].put({'idx': int(idx)}, block=False)
-                    except Exception:
-                        action_queues[wid].put({'idx': int(idx)})
+                    if _PAR_DEBUG:
+                        _dbg(f"[master] dispatch step wid={int(wid)} idx={int(idx)}")
+                    action_queues[wid].put({'idx': int(idx)}, block=False)
+                if _PAR_TIMING:
+                    t_dispatch += (time.time() - _t0d)
+            if len(shadow_reqs) > 0:
+                # Use frozen actor to score non-main seats if provided
+                if frozen_actor is None:
+                    # Fallback: select with main actor if frozen not provided
+                    _t0 = time.time() if _PAR_TIMING else 0.0
+                    sel = _batched_select_indices(agent, shadow_reqs)
+                    if _PAR_TIMING:
+                        t_batch_select += (time.time() - _t0)
+                else:
+                    _t0 = time.time() if _PAR_TIMING else 0.0
+                    sel = _batched_select_indices_with_actor(frozen_actor, shadow_reqs)
+                    if _PAR_TIMING:
+                        t_batch_select += (time.time() - _t0)
+                _t0d = time.time() if _PAR_TIMING else 0.0
+                for (wid, idx) in sel:
+                    if _PAR_DEBUG:
+                        _dbg(f"[master] dispatch shadow wid={int(wid)} idx={int(idx)}")
+                    action_queues[wid].put({'idx': int(idx)}, block=False)
                 if _PAR_TIMING:
                     t_dispatch += (time.time() - _t0d)
             if len(other_reqs) > 0:
@@ -1988,10 +2220,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 _t0d = time.time() if _PAR_TIMING else 0.0
                 for r, out in zip(other_reqs, outs):
                     wid = int(r.get('wid', 0))
-                    try:
-                        action_queues[wid].put(out, block=False)
-                    except Exception:
-                        action_queues[wid].put(out)
+                    if _PAR_DEBUG:
+                        _dbg(f"[master] dispatch {r.get('type')} wid={int(wid)} keys={list(out.keys())}")
+                    action_queues[wid].put(out, block=False)
                 if _PAR_TIMING:
                     t_dispatch += (time.time() - _t0d)
 
@@ -2008,6 +2239,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             raise RuntimeError(f"Collector stalled: episodes_received={episodes_received}/{_expected_total}; workers={alive}")
 
     # Close per-env progress bars
+    _t_td0 = time.time() if _PAR_TIMING else 0.0
     for b in env_pbars:
         if b is not None:
             b.close()
@@ -2027,6 +2259,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     episode_q.close(); episode_q.join_thread()
     for q in action_queues:
         q.close(); q.join_thread()
+    if _PAR_TIMING:
+        t_teardown = (time.time() - _t_td0)
 
     # If no episodes were produced, raise with context (no fallback)
     if len(episodes_payloads) == 0:
@@ -2054,14 +2288,24 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     else:
         seat_counts = (0, 0, 0, 0)
     if total_steps != episodes * E:
-        # Build compact stats of episode lengths
-        lengths_unique = sorted(set(episode_lengths))
-        # frequency per length
-        freq = {L: episode_lengths.count(L) for L in lengths_unique}
-        raise RuntimeError(
-            f"collector: util transitions mismatch; got_total={total_steps}, expected_total={episodes * E}; "
-            f"episodes_done={episodes}, per_ep_expected={E}, length_stats={freq}, seat_counts={seat_counts}"
-        )
+        # Try alternate E (20<->40) to accommodate upstream per-episode util choice
+        alt_E = (40 if E == 20 else 20)
+        if total_steps == episodes * alt_E:
+            # Adopt observed per-episode util and continue with a warning
+            from tqdm import tqdm as _tqdm
+            _tqdm.write(
+                f"[collector] Adjusting per-episode util from {E} to observed {alt_E} (episodes={episodes}, total_steps={total_steps})"
+            )
+            E = alt_E
+        else:
+            # Build compact stats of episode lengths
+            lengths_unique = sorted(set(episode_lengths))
+            # frequency per length
+            freq = {L: episode_lengths.count(L) for L in lengths_unique}
+            raise RuntimeError(
+                f"collector: util transitions mismatch; got_total={total_steps}, expected_total={episodes * E}; "
+                f"episodes_done={episodes}, per_ep_expected={E}, length_stats={freq}, seat_counts={seat_counts}"
+            )
 
     # Additional guard: ensure we produced exactly the requested number of episodes overall
     if episodes != int(episodes_total_hint):
@@ -2072,27 +2316,73 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     # Print timing after validation
     if _PAR_TIMING:
         master_total = (time.time() - t_master_start)
-        try:
-            import numpy as _np
-            if timing_from_workers is not None and len(timing_from_workers) > 0:
-                def _agg(key):
-                    arr = _np.asarray([x.get(key, 0.0) for x in timing_from_workers], dtype=_np.float64)
-                    return float(arr.sum()), float(arr.mean()), float(arr.max())
-                s_env, m_env, M_env = _agg('t_env_reset')
-                s_obs, m_obs, M_obs = _agg('t_get_obs')
-                s_leg, m_leg, M_leg = _agg('t_get_legals')
-                s_mcts, m_mcts, M_mcts = _agg('t_mcts')
-                s_rpc, m_rpc, M_rpc = _agg('t_rpc')
-                s_step, m_step, M_step = _agg('t_step')
-                s_pack, m_pack, M_pack = _agg('t_pack')
-                s_tot, m_tot, M_tot = _agg('t_total')
-                print(f"[par-timing] workers={num_envs} workers_total={s_tot:.3f}s (avg={m_tot:.3f}, max={M_tot:.3f})\n"
-                      f"  env.reset={s_env:.3f} get_obs={s_obs:.3f} get_legals={s_leg:.3f} rpc_wait={s_rpc:.3f} mcts={s_mcts:.3f} env.step={s_step:.3f} pack={s_pack:.3f}", flush=True)
-            print(f"[par-timing-master] total={master_total:.3f}s drain={t_drain:.3f} get_reqs={t_get_reqs:.3f} batch_select={t_batch_select:.3f} batch_service={t_batch_service:.3f} dispatch={t_dispatch:.3f}", flush=True)
-        except Exception:
-            pass
+        import numpy as _np
+        if timing_from_workers is not None and len(timing_from_workers) > 0:
+            def _agg(key):
+                arr = _np.asarray([x.get(key, 0.0) for x in timing_from_workers], dtype=_np.float64)
+                return float(arr.sum()), float(arr.mean()), float(arr.max())
+            s_env, m_env, M_env = _agg('t_env_reset')
+            s_obs, m_obs, M_obs = _agg('t_get_obs')
+            s_leg, m_leg, M_leg = _agg('t_get_legals')
+            s_mcts, m_mcts, M_mcts = _agg('t_mcts')
+            s_rpc, m_rpc, M_rpc = _agg('t_rpc')
+            s_step, m_step, M_step = _agg('t_step')
+            s_pack, m_pack, M_pack = _agg('t_pack')
+            s_tot, m_tot, M_tot = _agg('t_total')
+            tqdm.write(f"[par-timing] workers={num_envs} workers_total={s_tot:.3f}s (avg={m_tot:.3f}, max={M_tot:.3f})\n"
+                        f"  env.reset={s_env:.3f} get_obs={s_obs:.3f} get_legals={s_leg:.3f} rpc_wait={s_rpc:.3f} mcts={s_mcts:.3f} env.step={s_step:.3f} pack={s_pack:.3f}")
+        tqdm.write(f"[par-timing-master] total={master_total:.3f}s drain={t_drain:.3f} get_reqs={t_get_reqs:.3f} batch_select={t_batch_select:.3f} batch_service={t_batch_service:.3f} dispatch={t_dispatch:.3f}")
+        # Detailed get_reqs breakdown
+        avg_batch = (getreqs_total_reqs / max(getreqs_batches, 1))
+        tqdm.write(f"[par-getreqs] batches={getreqs_batches} total_reqs={getreqs_total_reqs} nowait_ok={cnt_nowait_ok} nowait_empty={cnt_nowait_empty} block_ok={cnt_block_ok} block_to={cnt_block_timeout} t_nowait={t_get_nowait:.3f} t_block={t_get_block:.3f} avg_batch={avg_batch:.2f}")
+        # New sub-breakdown for get_reqs gather loop
+        if _PAR_TIMING:
+            b = max(1, int(_GETREQS_PROF['batches']))
+            avg_b = float(_GETREQS_PROF['total_reqs']) / float(b)
+            top_bins = sorted(_GETREQS_PROF['bs_hist'].items(), key=lambda kv: kv[1], reverse=True)[:8]
+            bins_str = ' '.join([f"{k}x{v}" for k, v in top_bins]) if len(top_bins) > 0 else ''
+            tqdm.write(
+                f"[par-getreqs-sub] batches={_GETREQS_PROF['batches']} total_reqs={_GETREQS_PROF['total_reqs']} avg_batch={avg_b:.2f}\n"
+                f"  first_block={_GETREQS_PROF['t_first_block']:.3f}s(now={_GETREQS_PROF['cnt_first_ok']} to={_GETREQS_PROF['cnt_first_to']}) "
+                f"nowait_drain={_GETREQS_PROF['t_nowait_drain']:.3f}s(ok={_GETREQS_PROF['cnt_nowait_ok']} empty={_GETREQS_PROF['cnt_nowait_empty']})\n"
+                f"  topup_block={_GETREQS_PROF['t_topup_block']:.3f}s(ok={_GETREQS_PROF['cnt_topup_ok']} to={_GETREQS_PROF['cnt_topup_to']}) post_drain={_GETREQS_PROF['t_post_drain']:.3f}s\n"
+                f"  bs_top_bins={bins_str}"
+            )
+        if _PAR_TIMING:
+            # Batch size histogram summary (top bins)
+            if len(bs_hist) > 0:
+                import math as _math
+                tot_batches = int(sum(bs_hist.values()))
+                top_bins = sorted(bs_hist.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                bins_str = ' '.join([f"{k}x{v}" for k,v in top_bins])
+                tqdm.write(f"[par-getreqs-hist] batches={tot_batches} step_reqs={step_reqs_count} other_reqs={other_reqs_count} top_bins={bins_str}")
+            # Sub-timers for batched_select
+            if _BATCHSEL_PROF['count'] > 0:
+                c = max(1, int(_BATCHSEL_PROF['count']))
+                avg_B = _BATCHSEL_PROF['sum_B'] / c
+                avg_M = _BATCHSEL_PROF['sum_M'] / c
+                top_cnt = sorted(_BATCHSEL_PROF['cnt_hist'].items(), key=lambda kv: kv[1], reverse=True)[:8]
+                cnt_str = ' '.join([f"{k}x{v}" for k,v in top_cnt]) if len(top_cnt) > 0 else ''
+                tqdm.write(
+                    f"[par-batch_select-sub] calls={_BATCHSEL_PROF['count']} total={_BATCHSEL_PROF['t_total']:.3f}s avg_B={avg_B:.1f} avg_M={avg_M:.1f}\n"
+                    f"  stack={_BATCHSEL_PROF['t_stack']:.3f}s leg_stack={_BATCHSEL_PROF['t_leg_stack']:.3f}s "
+                    f"state_proj={_BATCHSEL_PROF['t_state_proj']:.3f}s action_enc={_BATCHSEL_PROF['t_action_enc']:.3f}s "
+                    f"mask={_BATCHSEL_PROF['t_mask']:.3f}s score={_BATCHSEL_PROF['t_score']:.3f}s softmax_sample={_BATCHSEL_PROF['t_softmax_sample']:.3f}s\n"
+                    f"  cnt_max_hist={cnt_str}")
+            # Actor.compute_state_proj internal breakdown (if available)
+            from utils.prof import snapshot_actor_stateproj, reset_actor_stateproj
+            _sp = snapshot_actor_stateproj()
+            if int(_sp.get('count', 0)) > 0:
+                tqdm.write(
+                    f"[par-state_proj-sub] calls={int(_sp['count'])} state_enc={_sp['t_state_enc']:.3f}s "
+                    f"belief_logits={_sp['t_belief_logits']:.3f}s belief_probs={_sp['t_belief_probs']:.3f}s "
+                    f"gates={_sp['t_belief_gates']:.3f}s merge={_sp['t_merge']:.3f}s proj={_sp['t_proj']:.3f}s"
+                )
+            reset_actor_stateproj()
+        tqdm.write(f"[par-collect-post] build={t_build:.3f} values_gae={t_values_gae:.3f} old_logp={t_oldlogp:.3f} teardown={t_teardown:.3f}")
 
     # Build batch CPU tensors from payloads
+    _t_build0 = time.time() if _PAR_TIMING else 0.0
     obs_cpu = []
     act_cpu = []
     next_obs_cpu = []
@@ -2112,22 +2402,13 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         seat_ep = [torch.as_tensor(x, dtype=torch.float32) for x in ep['seat']]
         # Determina reward episodio dal team 0/1 (proporzionale al risultato)
         tr = ep.get('team_rewards', [0.0, 0.0])
-        try:
-            t0 = float(tr[0])
-        except Exception:
-            t0 = float(tr.get(0, 0.0)) if isinstance(tr, dict) else 0.0
-        try:
-            t1 = float(tr[1])
-        except Exception:
-            t1 = float(tr.get(1, -t0)) if isinstance(tr, dict) else -t0
+        t0 = float(tr[0])
+        t1 = float(tr[1])
         rew_ep = []
         for st in seat_ep:
             team0_flag = bool(float(st[4]) > 0.5)
             if not team0_flag:
-                try:
-                    seat_idx = int(torch.argmax(st[:4]).item())
-                except Exception:
-                    seat_idx = 0
+                seat_idx = int(torch.argmax(st[:4]).item())
                 team0_flag = seat_idx in [0, 2]
             rew_ep.append(t0 if team0_flag else t1)
 
@@ -2189,6 +2470,10 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     mcts_weight_t = torch.as_tensor(mcts_weight, dtype=torch.float32) if len(mcts_weight)>0 else torch.zeros((0,), dtype=torch.float32)
     others_hands_t = torch.stack(others_hands, dim=0) if len(others_hands)>0 else torch.zeros((0,3,40), dtype=torch.float32)
 
+    # End build
+    if _PAR_TIMING:
+        t_build = (time.time() - _t_build0)
+
     # Validate ragged legals structure before computing values
     total_legals = len(legals_cpu)
     if int(torch.as_tensor(leg_cnt, dtype=torch.long).sum().item()) != total_legals:
@@ -2209,6 +2494,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     # Compute values and advantages on GPU similar to collect_trajectory (CTDE coerente)
     rew_t = torch.as_tensor(rew_list, dtype=torch.float32, device=device) if len(rew_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
     done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if len(done_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
+    _t_val0 = time.time() if _PAR_TIMING else 0.0
     if len(rew_list) > 0:
         with torch.no_grad():
             if device.type == 'cuda':
@@ -2244,8 +2530,11 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         gae = delta + gamma * lam * (1.0 - done_mask[t]) * gae
         adv_vec[t] = gae
     ret_vec = adv_vec + val_t
+    if _PAR_TIMING:
+        t_values_gae = (time.time() - _t_val0)
 
     # Compute old_logp in batch on GPU (factored card + capture scheme)
+    _t_olp0 = time.time() if _PAR_TIMING else 0.0
     if obs_cpu_t.size(0) > 0:
         with torch.no_grad():
             def to_pinned(x):
@@ -2299,12 +2588,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 group_ids = sample_idx * 40 + played_ids_mb
                 num_groups = B * 40
                 group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
-                try:
-                    group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-                except Exception:
-                    tmp = torch.zeros_like(group_max)
-                    tmp.index_copy_(0, group_ids, cap_logits)
-                    group_max = torch.maximum(group_max, tmp)
+                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
                 gmax_per_legal = group_max[group_ids]
                 exp_shifted = torch.exp(cap_logits - gmax_per_legal)
                 group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
@@ -2343,6 +2627,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
     else:
         old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
+    if _PAR_TIMING:
+        t_oldlogp = (time.time() - _t_olp0)
 
     batch = {
         'obs': obs_cpu_t,
@@ -2367,12 +2653,13 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     return batch
 
 
-def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 200, ckpt_path: str = 'checkpoints/ppo_ac.pth', k_history: int = 39, seed: int = 0,
+def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 10, ckpt_path: str = 'checkpoints/ppo_ac.pth', k_history: int = 39, seed: int = 0,
               entropy_schedule_type: str = 'linear', eval_every: int = 0, eval_games: int = 10, belief_particles: int = 512, belief_ess_frac: float = 0.5,
               mcts_in_eval: bool = True, mcts_train: bool = True, mcts_sims: int = 128, mcts_sims_eval: Optional[int] = None, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
               mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25,
               num_envs: int = 32,
               train_both_teams: bool = True,
+              use_selfplay: bool = True,
               on_iter_end: Optional[Callable[[int], None]] = None):
     # Enforce minimum horizon of 40 and align horizon to minibatch size
     horizon = max(40, int(horizon))
@@ -2383,16 +2670,21 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     _mb_env = int(_os.environ.get('SCOPONE_MINIBATCH', str(minibatch_size)))
     if _mb_env > 0:
         minibatch_size = _mb_env
-    _per_ep_util = (40 if bool(train_both_teams) else 20)
+    # Determine effective per-episode useful transitions based on desired collection semantics
+    _tfb_env = str(_os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS', '0')).strip().lower() in ['1','true','yes','on']
+    _frozen_env = str(_os.environ.get('SCOPONE_OPP_FROZEN', '1')).strip().lower() in ['1','true','yes','on']
+    # In selfplay, collecting from both teams only makes sense when opponent is not frozen
+    _collect_both = (bool(use_selfplay) and _tfb_env and (not _frozen_env))
+    _per_ep_util = (40 if _collect_both else 20)
     lcm_mb_ep = (abs(minibatch_size * _per_ep_util) // _math.gcd(minibatch_size, _per_ep_util)) if (minibatch_size > 0 and _per_ep_util > 0) else max(minibatch_size, _per_ep_util)
     if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
         new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
-        print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={_per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+        tqdm.write(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={_per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
         horizon = new_h
     # Resolve and announce final seed (seed<0 => random per run)
     seed = resolve_seed(seed)
     set_global_seeds(seed)
-    print(f"[seed] Using seed={seed}")
+    tqdm.write(f"[seed] Using seed={seed}")
     # Disattiva reward shaping intermedio: solo reward finale
     env = ScoponeEnvMA(rules={'shape_scopa': False}, k_history=k_history)
     obs_dim = env.observation_space.shape[0]
@@ -2401,6 +2693,26 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     # Allow big-compute-on-GPU during update while env/collection stays on CPU.
     # Controlled by env var SCOPONE_TRAIN_DEVICE (cpu|cuda[:id]). Defaults to cpu.
     # Models live on CPU for collection; moved to train device inside agent.update.
+
+    # Discover existing checkpoints to possibly resume later (actual load happens after league init)
+    best_ckpt_path = ckpt_path.replace('.pth', '_best.pth') if isinstance(ckpt_path, str) else 'checkpoints/ppo_ac_best.pth'
+    best_wr_ckpt_path = ckpt_path.replace('.pth', '_bestwr.pth') if isinstance(ckpt_path, str) else 'checkpoints/ppo_ac_bestwr.pth'
+    resume_ckpt = None
+    def _is_bootstrap_path(p: str) -> bool:
+        try:
+            return ('bootstrap' in os.path.basename(p).lower())
+        except Exception:
+            return False
+
+    for _p in [ckpt_path, best_ckpt_path, best_wr_ckpt_path]:
+        if _p and (not _is_bootstrap_path(_p)) and os.path.isfile(_p) and os.path.getsize(_p) > 0:
+            resume_ckpt = _p
+            break
+    if resume_ckpt is None:
+        import glob as _glob
+        _all = [p for p in _glob.glob(os.path.join('checkpoints', '*.pth')) if (not _is_bootstrap_path(p)) and os.path.isfile(p) and os.path.getsize(p) > 0]
+        if _all:
+            resume_ckpt = max(_all, key=lambda p: os.path.getmtime(p))
 
     # Cosine annealing LR schedulers
     actor_sched = optim.lr_scheduler.CosineAnnealingLR(agent.opt_actor, T_max=max(1, num_iterations))
@@ -2427,15 +2739,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
 
     writer = None
     if os.environ.get('SCOPONE_DISABLE_TB', '0') != '1':
-        try:
-            from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
-            flush_secs = int(os.environ.get('TB_FLUSH_SECS', '2'))
-            try:
-                writer = _SummaryWriter(log_dir='runs/ppo_ac', flush_secs=flush_secs)
-            except TypeError:
-                writer = _SummaryWriter(log_dir='runs/ppo_ac')
-        except Exception:
-            writer = None
+        from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
+        writer = _SummaryWriter(log_dir='runs/ppo_ac')
     if writer is not None:
         # Spiega le metriche chiave in TensorBoard
         writer.add_text('help/metrics',
@@ -2459,9 +2764,205 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                             'league/elo_current / league/elo_previous: Elo nel league per corrente/precedente.',
                         ]), 0)
     league = League(base_dir='checkpoints/league')
+    # Helper to build MCTS config for eval consistently from trainer flags
+    def _make_mcts_cfg_for_eval():
+        if not mcts_in_eval:
+            return None
+        return {
+            'sims': int(mcts_sims_eval if mcts_sims_eval is not None else mcts_sims),
+            'dets': mcts_dets,
+            'c_puct': mcts_c_puct,
+            'root_temp': mcts_root_temp,
+            'prior_smooth_eps': mcts_prior_smooth_eps,
+            'root_dirichlet_alpha': mcts_dirichlet_alpha,
+            'root_dirichlet_eps': mcts_dirichlet_eps,
+            'robust_child': True,
+        }
+    # Optional startup refresh: SCOPONE_LEAGUE_REFRESH in {1,0}
+    _refresh_flag = str(os.environ.get('SCOPONE_LEAGUE_REFRESH', '1')).strip().lower() in ['1','true','yes','on']
+    if _refresh_flag:
+        tqdm.write("[league-refresh] starting league refresh from disk …")
+        # Refresh league from disk: scan for existing checkpoints not yet registered.
+        # We scan both 'checkpoints/' and 'checkpoints/league/' and ignore bootstrap/empty files.
+        def _refresh_league_from_disk(_league):
+            old_hist = list(getattr(_league, 'history', []) or [])
+            roots = ['checkpoints', os.path.join('checkpoints', 'league')]
+            seen = set(getattr(_league, 'history', []) or [])
+            added = 0
+            scanned = 0
+            pth_seen = 0
+            skipped = 0
+            added_paths = []
+            for root in roots:
+                if not os.path.isdir(root):
+                    tqdm.write(f"[league-refresh] root '{root}' missing; skipping root scan")
+                    continue
+                tqdm.write(f"[league-refresh] scanning root: {os.path.abspath(root)}")
+                for dirpath, _dirs, files in os.walk(root):
+                    for fname in files:
+                        scanned += 1
+                        fpath = os.path.join(dirpath, fname)
+                        if not fname.endswith('.pth'):
+                            tqdm.write(f"[league-refresh] ignore {fpath}: reason=ext_mismatch")
+                            skipped += 1
+                            continue
+                        pth_seen += 1
+                        low = fname.lower()
+                        reason = None
+                        if 'bootstrap' in low:
+                            reason = 'bootstrap_file'
+                        elif fpath in seen:
+                            reason = 'already_registered'
+                        elif not os.path.isfile(fpath):
+                            reason = 'not_a_file'
+                        else:
+                            if os.path.getsize(fpath) <= 0:
+                                reason = 'empty_file'
+                        if reason is not None:
+                            tqdm.write(f"[league-refresh] skip {fpath}: reason={reason}")
+                            skipped += 1
+                            continue
+                        # Deep validation: try loading the checkpoint to detect truncated/invalid formats
+                        try:
+                            _sz = os.path.getsize(fpath)
+                            _ck = torch.load(fpath, map_location='cpu')
+                            del _ck
+                        except Exception as _load_e:
+                            tqdm.write(
+                                f"[league-refresh] skip {fpath}: reason=load_error type={type(_load_e).__name__} size={_sz} msg={_load_e!r}"
+                            )
+                            skipped += 1
+                            continue
+                        _league.register(fpath)
+                        seen.add(fpath)
+                        added += 1
+                        added_paths.append(fpath)
+            tqdm.write(f"[league] Refresh scan: roots={len(roots)} scanned_files={scanned} pth_seen={pth_seen} added={added} skipped={skipped} total_now={len(_league.history)}")
+            if added > 0:
+                tqdm.write(f"[league] Refreshed from disk: +{added} new checkpoints (total={len(_league.history)})")
+            # Evaluate newly added checkpoints to update Elo
+            if added > 0:
+                # Reference is the current top1 among the pre-existing history, if any
+                ref_candidates = [p for p in old_hist if os.path.isfile(p)]
+                if len(ref_candidates) >= 1:
+                    # pick highest Elo among old history
+                    ref = max(ref_candidates, key=lambda p: float(_league.elo.get(p, 1000.0)))
+                    for npth in added_paths:
+                        if npth == ref:
+                            continue
+                        wr, bd = evaluate_pair_actors(npth, ref, games=eval_games, k_history=k_history,
+                                                     mcts=_make_mcts_cfg_for_eval(),
+                                                     belief_particles=(belief_particles if mcts_in_eval else 0),
+                                                     belief_ess_frac=belief_ess_frac,
+                                                     tqdm_desc=f"League refresh: {os.path.basename(npth)} vs top",
+                                                     tqdm_position=2)
+                        diff = float(bd[0].get('total', 0.0)) - float(bd[1].get('total', 0.0))
+                        _league.update_elo_from_diff(npth, ref, diff)
+                elif len(added_paths) >= 2:
+                    # Evaluate sequentially among new paths to seed relative Elo
+                    anchor = added_paths[0]
+                    for npth in added_paths[1:]:
+                        wr, bd = evaluate_pair_actors(npth, anchor, games=eval_games, k_history=k_history,
+                                                     mcts=_make_mcts_cfg_for_eval(),
+                                                     belief_particles=(belief_particles if mcts_in_eval else 0),
+                                                     belief_ess_frac=belief_ess_frac,
+                                                     tqdm_desc=f"League refresh: {os.path.basename(npth)} vs anchor",
+                                                     tqdm_position=2)
+                        diff = float(bd[0].get('total', 0.0)) - float(bd[1].get('total', 0.0))
+                        _league.update_elo_from_diff(npth, anchor, diff)
+
+        _LP = globals().get('LINE_PROFILE_DECORATOR', None)
+        if _LP is not None:
+            _refresh_league_from_disk = _LP(_refresh_league_from_disk)
+        tqdm.write("[league-refresh] invoking refresh function")
+        _refresh_league_from_disk(league)
+    else:
+        tqdm.write("[league] Startup refresh disabled (SCOPONE_LEAGUE_REFRESH=0)")
+        
+    # Purge any bootstrap entries from league history on startup
+    if getattr(league, 'history', None):
+        boot_hist = [p for p in list(league.history) if 'bootstrap' in os.path.basename(p).lower()]
+        if boot_hist:
+            league.history = [p for p in league.history if p not in boot_hist]
+            for p in boot_hist:
+                if p in league.elo:
+                    del league.elo[p]
+            # Save cleaned league state
+            league._save()
+            tqdm.write(f"[league] Purged bootstrap entries from league: {len(boot_hist)} removed")
+    if len(getattr(league, 'history', [])) == 0:
+        # Warm-start the league with the resume checkpoint if present (ignore bootstrap files)
+        if resume_ckpt and (('bootstrap' not in os.path.basename(resume_ckpt).lower())) and os.path.isfile(resume_ckpt) and os.path.getsize(resume_ckpt) > 0:
+            league.register(resume_ckpt)
+            tqdm.write(f"[league] Warm-started with existing checkpoint: {resume_ckpt}")
+
+    # Helper to get top-k checkpoints by Elo (fallback Elo=1000.0 for missing entries)
+    def _league_top_k(_league: 'League', k: int) -> List[str]:
+        hist = list(getattr(_league, 'history', []) or [])
+        if not hist:
+            return []
+        elo_map = getattr(_league, 'elo', {}) or {}
+        ranked = sorted(hist, key=lambda p: float(elo_map.get(p, 1000.0)), reverse=True)
+        return ranked[:max(0, int(k))]
+
+    
+
+    # Warm-start policy controlled by SCOPONE_WARM_START: '0' start-from-scratch, '1' force top1 clone, '2' use top2 if available
+    warm_start_mode = str(os.environ.get('SCOPONE_WARM_START', '2')).strip()
+    league_hist = list(getattr(league, 'history', []) or [])
+    topN = _league_top_k(league, 2) if league_hist else []
+    # Decide resume checkpoint(s)
+    resume_A = None
+    resume_B = None
+    if warm_start_mode == '0':
+        resume_A = None; resume_B = None
+    elif warm_start_mode == '1':
+        resume_A = (topN[0] if len(topN) >= 1 else resume_ckpt)
+        resume_B = resume_A
+    else:  # '2' default
+        resume_A = (topN[0] if len(topN) >= 1 else resume_ckpt)
+        resume_B = (topN[1] if len(topN) >= 2 else resume_A)
+    # Apply resume to main agent (always)
+    if resume_A:
+        agent.load(resume_A, map_location='cpu')
+        tqdm.write(f"[resume] Loaded agent(A) from {resume_A}")
 
     partner_actor = None
     opponent_actor = None
+    # Semantics:
+    # - SELFPLAY decides number of nets: True -> 1 net; False -> 2 nets (A,B)
+    # - SCOPONE_TRAIN_FROM_BOTH_TEAMS decides transitions usage when applicable
+    #   NOTE: TRAIN_FROM_BOTH_TEAMS is effective ONLY when SELFPLAY=1 and OPP_FROZEN=0.
+    #         Rationale: on-policy PPO must update a policy with its own data. In dual-nets or
+    #         when the opponent is frozen, we never mix opponent (non-learning) transitions into
+    #         the learner's update.
+    train_from_both = str(os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS', '0')).strip().lower() in ['1','true','yes','on']
+    opp_frozen_env = str(os.environ.get('SCOPONE_OPP_FROZEN', '1')).strip().lower() in ['1','true','yes','on']
+    # Validate combinations under new semantics
+    # With SELFPLAY=False we always have two nets; frozen=0 means co-training live; frozen=1 means alternate.
+
+    if use_selfplay:
+        # In selfplay we have a single net. train_from_both means use both teams' transitions.
+        # If opp_frozen_env is True, we must not use opponent transitions (they come from a frozen mirror).
+        train_both_teams = bool(train_from_both and (not opp_frozen_env))
+        dual_team_nets = False
+    else:
+        # In non-selfplay we always maintain two separate nets (A,B)
+        dual_team_nets = True
+        # In dual-nets collection, each update call uses only main seats for that net
+        # so treat per-episode util as 20 everywhere in collection paths
+        train_both_teams = False
+        agent_teamB = ActionConditionedPPO(obs_dim=obs_dim, k_history=k_history)
+        # Load resume_B according to warm-start policy
+        if warm_start_mode == '0':
+            resumeB = None
+        elif warm_start_mode == '1':
+            resumeB = resume_A
+        else:
+            resumeB = resume_B
+        if resumeB:
+            agent_teamB.load(resumeB, map_location='cpu')
+            tqdm.write(f"[resume] Loaded team-B agent from {resumeB}")
     # alterna il main actor tra seat 0/2 e 1/3 per episodi
     even_main_seats = [0, 2]
     odd_main_seats = [1, 3]
@@ -2472,13 +2973,74 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     best_wr_ckpt_path = ckpt_path.replace('.pth', '_bestwr.pth')
 
     # Two-line UI: top line shows metrics, second line is the progress bar
-    metrics_bar = tqdm(total=1, desc="", position=0, dynamic_ncols=True, bar_format='{desc}', leave=True)
-    pbar = tqdm(range(num_iterations), desc="PPO iterations", dynamic_ncols=True, position=1, leave=True)
+    _TQDM_DISABLE = (os.environ.get('TQDM_DISABLE','0') in ['1','true','yes','on'])
+    metrics_bar = tqdm(total=1, desc="", position=0, dynamic_ncols=True, bar_format='{desc}', leave=True, disable=_TQDM_DISABLE)
+    pbar = tqdm(range(num_iterations), desc="PPO iterations", dynamic_ncols=True, position=1, leave=True, disable=_TQDM_DISABLE)
+    shadow_actor = None
+    shadow_every = max(1, int(os.environ.get('SCOPONE_FROZEN_UPDATE_EVERY', '1')))
     for it in pbar:
         t0 = time.time()
-        try:
-            p_ckpt, o_ckpt = league.sample_pair()
-            # Simple local cache to avoid reloading frozen actors every iter
+        # Iteration-level timing breakdown (enabled by SCOPONE_PAR_PROFILE=1)
+        _iter_t_collect = 0.0
+        _iter_t_preproc = 0.0
+        _iter_t_update = 0.0
+        # Partner/opponent selection policy
+        # Opponent selection
+        # SELFPLAY=1: no frozen unless explicitly requested via OPP_FROZEN (still treated as single learner vs frozen)
+        # SELFPLAY=0: choose according to SCOPONE_START_OPP='top1'|'top2'|'bootstrap' when OPP_FROZEN=1, else live opponent (requires BOTH=1)
+        # Auto-bootstrap only when a frozen opponent is required but the league is empty
+        if opp_frozen_env and (len(getattr(league, 'history', [])) == 0):
+            _bootstrap_dir = 'checkpoints'
+            _bootstrap_path = os.path.join(_bootstrap_dir, 'bootstrap_random.pth')
+            os.makedirs(_bootstrap_dir, exist_ok=True)
+            if (not os.path.isfile(_bootstrap_path)) or (os.path.getsize(_bootstrap_path) <= 0):
+                tqdm.write("[league] Bootstrapping empty league with random frozen actor → checkpoints/bootstrap_random.pth")
+                _rand_actor = ActionConditionedActor(obs_dim=obs_dim)
+                torch.save({'actor': _rand_actor.state_dict()}, _bootstrap_path)
+            # Do NOT register bootstrap into league; use ad-hoc only
+        if use_selfplay:
+            p_ckpt, o_ckpt = None, None
+            if opp_frozen_env:
+                # Single learner vs frozen mirror
+                top1 = _league_top_k(league, 1)
+                p_ckpt = o_ckpt = (top1[0] if top1 else None)
+        else:
+            if opp_frozen_env:
+                start_opp = str(os.environ.get('SCOPONE_START_OPP', 'top1')).strip().lower()
+                hist = list(getattr(league, 'history', []) or [])
+                if start_opp == 'bootstrap' and not hist:
+                    _bootstrap_dir = 'checkpoints'
+                    _bootstrap_path = os.path.join(_bootstrap_dir, 'bootstrap_random.pth')
+                    os.makedirs(_bootstrap_dir, exist_ok=True)
+                    if (not os.path.isfile(_bootstrap_path)) or (os.path.getsize(_bootstrap_path) <= 0):
+                        tqdm.write("[league] Bootstrapping empty league with random frozen actor → checkpoints/bootstrap_random.pth")
+                        _rand_actor = ActionConditionedActor(obs_dim=obs_dim)
+                        torch.save({'actor': _rand_actor.state_dict()}, _bootstrap_path)
+                    # Do NOT register bootstrap; use directly for this start if needed
+                    hist = []
+                if start_opp == 'top2':
+                    top2 = _league_top_k(league, 2)
+                    if len(top2) >= 2:
+                        p_ckpt, o_ckpt = top2[0], top2[1]
+                    elif len(top2) == 1:
+                        p_ckpt = o_ckpt = top2[0]
+                    else:
+                        # Fallback to bootstrap pair only if history empty
+                        _bootstrap_path = os.path.join('checkpoints', 'bootstrap_random.pth')
+                        p_ckpt = o_ckpt = (_bootstrap_path if os.path.isfile(_bootstrap_path) and os.path.getsize(_bootstrap_path) > 0 else None)
+                else:
+                    # default 'top1': both sides face strongest
+                    top1 = _league_top_k(league, 1)
+                    if top1:
+                        p_ckpt = o_ckpt = top1[0]
+                    else:
+                        _bootstrap_path = os.path.join('checkpoints', 'bootstrap_random.pth')
+                        p_ckpt = o_ckpt = (_bootstrap_path if os.path.isfile(_bootstrap_path) and os.path.getsize(_bootstrap_path) > 0 else None)
+            else:
+                # live opponent (co-training). Requires BOTH=1; validated above
+                p_ckpt, o_ckpt = None, None
+        # Simple local cache to avoid reloading frozen actors every iter
+        if not use_selfplay:
             if not hasattr(league, '_frozen_cache'):
                 league._frozen_cache = {}
             if p_ckpt and os.path.isfile(p_ckpt):
@@ -2491,16 +3053,23 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 if opponent_actor is None:
                     opponent_actor = _load_frozen_actor(o_ckpt, obs_dim)
                     league._frozen_cache[o_ckpt] = opponent_actor
-        except Exception:
-            partner_actor = None
+            # Live co-training override: use teamB live actor as partner/opponent
+            if dual_team_nets and (not opp_frozen_env):
+                partner_actor = agent_teamB.actor
+                opponent_actor = agent_teamB.actor
+        # Alternation controls for dual nets with frozen opponent
+        # SCOPONE_ALTERNATE_ITERS: in dual-nets+frozen, number of iterations to train one net
+        #   before swapping roles (A<->B). Larger values give more stable short-term learning
+        #   per net; smaller values promote frequent role switches.
+        alt_k = max(1, int(os.environ.get('SCOPONE_ALTERNATE_ITERS', '1')))
+        train_A_now = ((it // alt_k) % 2 == 0)
         main_seats = even_main_seats if (it % 2 == 0) else odd_main_seats
+        # Complementary seats for the other team (used when swapping A<->B)
+        main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
         use_parallel = (num_envs is not None and int(num_envs) > 1)
         # Eval mode during data collection (dropout/BN off)
-        try:
-            agent.actor.eval()
-            agent.critic.eval()
-        except Exception:
-            pass
+        agent.actor.eval()
+        agent.critic.eval()
         if use_parallel:
             # Mirror single-env logic: choose episodes so that batch B is a multiple of minibatch_size
             per_ep_util = (40 if train_both_teams else 20)
@@ -2513,99 +3082,375 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 horizon = new_h
             episodes_hint = max(1, horizon // per_ep_util)
             # Debug: mostra hint e distribuzione per-env
-            try:
-                eps_per_env_dbg = max(1, (episodes_hint + int(num_envs) - 1) // int(num_envs))
-                total_eps_dbg = eps_per_env_dbg * int(num_envs)
-                print(f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
-                      f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}", flush=True)
-            except Exception:
-                pass
+            eps_per_env_dbg = max(1, (episodes_hint + int(num_envs) - 1) // int(num_envs))
+            total_eps_dbg = eps_per_env_dbg * int(num_envs)
+            tqdm.write(f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
+                        f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}")
             # Abilita/disabilita MCTS in parallelo in base al flag di training
             parallel_use_mcts = bool(mcts_train)
-            batch = collect_trajectory_parallel(agent,
-                                                num_envs=int(num_envs),
-                                                episodes_total_hint=episodes_hint,
-                                                k_history=k_history,
-                                                gamma=1.0,
-                                                lam=0.95,
-                                                use_mcts=parallel_use_mcts,
-                                                train_both_teams=train_both_teams,
-                                                main_seats=main_seats,
-                                                mcts_sims=mcts_sims,
-                                                mcts_dets=mcts_dets,
-                                                mcts_c_puct=mcts_c_puct,
-                                                mcts_root_temp=mcts_root_temp,
-                                                mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                seed=int(seed),
-                                                show_progress_env=True,
-                                                tqdm_base_pos=3)
+            if dual_team_nets and (not opp_frozen_env):
+                # Collect for team A vs live team B
+                _t_c0 = time.time() if _PAR_TIMING else 0.0
+                batch_A = collect_trajectory_parallel(agent,
+                                                       num_envs=int(num_envs),
+                                                       episodes_total_hint=episodes_hint,
+                                                       k_history=k_history,
+                                                       gamma=1.0,
+                                                       lam=0.95,
+                                                       use_mcts=parallel_use_mcts,
+                                                       train_both_teams=False,
+                                                       main_seats=main_seats,
+                                                       mcts_sims=mcts_sims,
+                                                       mcts_dets=mcts_dets,
+                                                       mcts_c_puct=mcts_c_puct,
+                                                       mcts_root_temp=mcts_root_temp,
+                                                       mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                       mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                       seed=int(seed),
+                                                       show_progress_env=True,
+                                                       tqdm_base_pos=3)
+                # Collect for team B vs live team A (swap seats)
+                main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
+                batch_B = collect_trajectory_parallel(agent_teamB,
+                                                       num_envs=int(num_envs),
+                                                       episodes_total_hint=episodes_hint,
+                                                       k_history=k_history,
+                                                       gamma=1.0,
+                                                       lam=0.95,
+                                                       use_mcts=parallel_use_mcts,
+                                                       train_both_teams=False,
+                                                       main_seats=main_seats_B,
+                                                       mcts_sims=mcts_sims,
+                                                       mcts_dets=mcts_dets,
+                                                       mcts_c_puct=mcts_c_puct,
+                                                       mcts_root_temp=mcts_root_temp,
+                                                       mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                       mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                       seed=int(seed + 1),
+                                                       show_progress_env=True,
+                                                       tqdm_base_pos=4)
+                if _PAR_TIMING:
+                    _iter_t_collect = (time.time() - _t_c0)
+            elif dual_team_nets and opp_frozen_env:
+                # Alternate training: one team learns while the other team acts frozen (no update)
+                _t_c0 = time.time() if _PAR_TIMING else 0.0
+                if train_A_now:
+                    batch_A = collect_trajectory_parallel(agent,
+                                                           num_envs=int(num_envs),
+                                                           episodes_total_hint=episodes_hint,
+                                                           k_history=k_history,
+                                                           gamma=1.0,
+                                                           lam=0.95,
+                                                           use_mcts=parallel_use_mcts,
+                                                           train_both_teams=False,
+                                                           main_seats=main_seats,
+                                                           mcts_sims=mcts_sims,
+                                                           mcts_dets=mcts_dets,
+                                                           mcts_c_puct=mcts_c_puct,
+                                                           mcts_root_temp=mcts_root_temp,
+                                                           mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                           mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                           mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                           seed=int(seed),
+                                                           show_progress_env=True,
+                                                           tqdm_base_pos=3,
+                                                           frozen_actor=agent_teamB.actor,
+                                                           frozen_non_main=True)
+                else:
+                    batch_B = collect_trajectory_parallel(agent_teamB,
+                                                           num_envs=int(num_envs),
+                                                           episodes_total_hint=episodes_hint,
+                                                           k_history=k_history,
+                                                           gamma=1.0,
+                                                           lam=0.95,
+                                                           use_mcts=parallel_use_mcts,
+                                                           train_both_teams=False,
+                                                           main_seats=main_seats_B,
+                                                           mcts_sims=mcts_sims,
+                                                           mcts_dets=mcts_dets,
+                                                           mcts_c_puct=mcts_c_puct,
+                                                           mcts_root_temp=mcts_root_temp,
+                                                           mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                           mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                           mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                           seed=int(seed + 1),
+                                                           show_progress_env=True,
+                                                           tqdm_base_pos=4,
+                                                           frozen_actor=agent.actor,
+                                                           frozen_non_main=True)
+                if _PAR_TIMING:
+                    _iter_t_collect = (time.time() - _t_c0)
+            else:
+                _t_c0 = time.time() if _PAR_TIMING else 0.0
+                # Refresh shadow actor on schedule in selfplay+frozen
+                # SCOPONE_FROZEN_UPDATE_EVERY: in selfplay+frozen, how often to refresh the
+                #   "shadow" opponent from the current live net. The shadow remains fixed
+                #   between refreshes to create a stationary opponent for the non-main seats.
+                if use_selfplay and opp_frozen_env:
+                    if (shadow_actor is None) or ((it % shadow_every) == 0):
+                        # clone lightweight copy of actor state
+                        shadow_actor = ActionConditionedActor(obs_dim=obs_dim)
+                        shadow_actor.load_state_dict(agent.actor.state_dict())
+                batch = collect_trajectory_parallel(agent,
+                                                    num_envs=int(num_envs),
+                                                    episodes_total_hint=episodes_hint,
+                                                    k_history=k_history,
+                                                    gamma=1.0,
+                                                    lam=0.95,
+                                                    use_mcts=parallel_use_mcts,
+                                                    train_both_teams=train_both_teams,
+                                                    main_seats=main_seats,
+                                                    mcts_sims=mcts_sims,
+                                                    mcts_dets=mcts_dets,
+                                                    mcts_c_puct=mcts_c_puct,
+                                                    mcts_root_temp=mcts_root_temp,
+                                                    mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                    mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                    mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                    seed=int(seed),
+                                                    show_progress_env=True,
+                                                    tqdm_base_pos=3,
+                                                    frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None),
+                                                    frozen_non_main=bool(use_selfplay and opp_frozen_env))
+                if _PAR_TIMING:
+                    _iter_t_collect = (time.time() - _t_c0)
         else:
             # Strategia MCTS: warmup senza MCTS per le prime iterazioni, poi scala con il progresso mano
             mcts_train_factor = 0.0 if it < 500 else 1.0
-            batch = collect_trajectory(env, agent, horizon=horizon, partner_actor=partner_actor, opponent_actor=opponent_actor, main_seats=main_seats,
-                                       belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
-                                       episodes=None, final_reward_only=True,
-                                       use_mcts=bool(mcts_train),
-                                       mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
-                                       mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                       mcts_train_factor=mcts_train_factor,
-                                       mcts_progress_start=0.25, mcts_progress_full=0.75,
-                                       mcts_min_sims=0,
-                                       train_both_teams=train_both_teams,
-                                       gamma=1.0,
-                                       lam=0.95)
-        if len(batch['obs']) == 0:
-            continue
+            if dual_team_nets and (not opp_frozen_env):
+                _t_c0 = time.time() if _PAR_TIMING else 0.0
+                # Team A as main vs live team B
+                batch_A = collect_trajectory(env, agent, horizon=horizon, partner_actor=agent_teamB.actor, opponent_actor=agent_teamB.actor, main_seats=main_seats,
+                                             belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                             episodes=None, final_reward_only=True,
+                                             use_mcts=bool(mcts_train),
+                                             mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
+                                             mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                             mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                             mcts_train_factor=mcts_train_factor,
+                                             mcts_progress_start=0.25, mcts_progress_full=0.75,
+                                             mcts_min_sims=0,
+                                             train_both_teams=False,
+                                             gamma=1.0,
+                                             lam=0.95)
+                # Team B as main vs live team A (swap seats)
+                main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
+                batch_B = collect_trajectory(env, agent_teamB, horizon=horizon, partner_actor=agent.actor, opponent_actor=agent.actor, main_seats=main_seats_B,
+                                             belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                             episodes=None, final_reward_only=True,
+                                             use_mcts=bool(mcts_train),
+                                             mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
+                                             mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                             mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                             mcts_train_factor=mcts_train_factor,
+                                             mcts_progress_start=0.25, mcts_progress_full=0.75,
+                                             mcts_min_sims=0,
+                                             train_both_teams=False,
+                                             gamma=1.0,
+                                             lam=0.95)
+                if _PAR_TIMING:
+                    _iter_t_collect = (time.time() - _t_c0)
+            elif dual_team_nets and opp_frozen_env:
+                _t_c0 = time.time() if _PAR_TIMING else 0.0
+                if train_A_now:
+                    # Team A learns vs frozen Team B
+                    batch_A = collect_trajectory(env, agent, horizon=horizon, partner_actor=agent_teamB.actor, opponent_actor=agent_teamB.actor, main_seats=main_seats,
+                                                 belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                                 episodes=None, final_reward_only=True,
+                                                 use_mcts=bool(mcts_train),
+                                                 mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
+                                                 mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                 mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                 mcts_train_factor=mcts_train_factor,
+                                                 mcts_progress_start=0.25, mcts_progress_full=0.75,
+                                                 mcts_min_sims=0,
+                                                 train_both_teams=False,
+                                                 gamma=1.0,
+                                                 lam=0.95)
+                else:
+                    # Team B learns vs frozen Team A
+                    batch_B = collect_trajectory(env, agent_teamB, horizon=horizon, partner_actor=agent.actor, opponent_actor=agent.actor, main_seats=main_seats,
+                                                 belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                                 episodes=None, final_reward_only=True,
+                                                 use_mcts=bool(mcts_train),
+                                                 mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
+                                                 mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                 mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                 mcts_train_factor=mcts_train_factor,
+                                                 mcts_progress_start=0.25, mcts_progress_full=0.75,
+                                                 mcts_min_sims=0,
+                                                 train_both_teams=False,
+                                                 gamma=1.0,
+                                                 lam=0.95)
+                if _PAR_TIMING:
+                    _iter_t_collect = (time.time() - _t_c0)
+            else:
+                _t_c0 = time.time() if _PAR_TIMING else 0.0
+                batch = collect_trajectory(env, agent, horizon=horizon, partner_actor=partner_actor, opponent_actor=opponent_actor, main_seats=main_seats,
+                                           belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                           episodes=None, final_reward_only=True,
+                                           use_mcts=bool(mcts_train),
+                                           mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
+                                           mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                           mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                           mcts_train_factor=mcts_train_factor,
+                                           mcts_progress_start=0.25, mcts_progress_full=0.75,
+                                           mcts_min_sims=0,
+                                           train_both_teams=train_both_teams,
+                                           gamma=1.0,
+                                           lam=0.95)
+                if _PAR_TIMING:
+                    _iter_t_collect = (time.time() - _t_c0)
+        if dual_team_nets and (not opp_frozen_env):
+            if len(batch_A['obs']) == 0 or len(batch_B['obs']) == 0:
+                continue
+        elif dual_team_nets and opp_frozen_env:
+            if train_A_now:
+                if len(batch_A['obs']) == 0:
+                    continue
+            else:
+                if len(batch_B['obs']) == 0:
+                    continue
+        else:
+            if len(batch['obs']) == 0:
+                continue
         # normalizza vantaggi completamente su GPU (no sync)
-        adv = batch['adv']
-        if adv.numel() > 0:
-            mean = adv.mean()
-            std = adv.std()
-            std = torch.clamp(std, min=1e-8)
-            batch['adv'] = (adv - mean) / std
+        _t_p0 = time.time() if _PAR_TIMING else 0.0
+        if dual_team_nets and (not opp_frozen_env):
+            for _b in (batch_A, batch_B):
+                adv = _b['adv']
+                if adv.numel() > 0:
+                    mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
+                    _b['adv'] = (adv - mean) / std
+        elif dual_team_nets and opp_frozen_env:
+            if train_A_now:
+                adv = batch_A['adv']
+                if adv.numel() > 0:
+                    mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
+                    batch_A['adv'] = (adv - mean) / std
+            else:
+                adv = batch_B['adv']
+                if adv.numel() > 0:
+                    mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
+                    batch_B['adv'] = (adv - mean) / std
+        else:
+            adv = batch['adv']
+            if adv.numel() > 0:
+                mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
+                batch['adv'] = (adv - mean) / std
         # Ensure training mode on update
-        try:
-            agent.actor.train()
-            agent.critic.train()
-        except Exception:
-            pass
+        agent.actor.train()
+        agent.critic.train()
+        if dual_team_nets and (not opp_frozen_env):
+            agent_teamB.actor.train(); agent_teamB.critic.train()
         # Pre-filter: require all rows to have at least one legal action
-        lc = batch['legals_count']
-        keep = (lc > 0)
-        if bool((~keep).any().item()):
-            num_drop = int((~keep).sum().item())
-            total = int(lc.size(0))
-            bad_idx = torch.nonzero(~keep, as_tuple=False).flatten().tolist()[:10]
-            raise RuntimeError(f"train_ppo: refusing to drop transitions with zero legals (would drop {num_drop}/{total}); examples idx={bad_idx}")
+        def _ensure_legals(_b):
+            lc = _b['legals_count']
+            keep = (lc > 0)
+            if bool((~keep).any().item()):
+                num_drop = int((~keep).sum().item()); total = int(lc.size(0))
+                bad_idx = torch.nonzero(~keep, as_tuple=False).flatten().tolist()[:10]
+                raise RuntimeError(f"train_ppo: refusing to drop transitions with zero legals (would drop {num_drop}/{total}); examples idx={bad_idx}")
+        if dual_team_nets and (not opp_frozen_env):
+            _ensure_legals(batch_A); _ensure_legals(batch_B)
+        elif dual_team_nets and opp_frozen_env:
+            if train_A_now:
+                _ensure_legals(batch_A)
+            else:
+                _ensure_legals(batch_B)
+        else:
+            _ensure_legals(batch)
         # Enforce B multiple of minibatch_size by dropping tail
-        B_now = int(batch['obs'].size(0)) if 'obs' in batch and torch.is_tensor(batch['obs']) else 0
-        mb = minibatch_size  # from header-adjusted value above
-        drop = (B_now % mb)
-        if B_now > 0 and drop > 0:
-            raise RuntimeError(f"train_ppo: batch size {B_now} is not a multiple of minibatch_size={mb}; adjust horizon/collection to avoid dropping {drop} transitions")
+        def _ensure_mb(_b):
+            B_now = int(_b['obs'].size(0)) if 'obs' in _b and torch.is_tensor(_b['obs']) else 0
+            mb = minibatch_size
+            drop = (B_now % mb)
+            if B_now > 0 and drop > 0:
+                raise RuntimeError(f"train_ppo: batch size {B_now} is not a multiple of minibatch_size={mb}; adjust horizon/collection to avoid dropping {drop} transitions")
+        if dual_team_nets and (not opp_frozen_env):
+            _ensure_mb(batch_A); _ensure_mb(batch_B)
+        elif dual_team_nets and opp_frozen_env:
+            if train_A_now:
+                _ensure_mb(batch_A)
+            else:
+                _ensure_mb(batch_B)
+        else:
+            _ensure_mb(batch)
+        if _PAR_TIMING:
+            _iter_t_preproc = (time.time() - _t_p0)
         # Aumenta minibatch_size approfittando della VRAM ampia
-        info = agent.update(batch, epochs=4, minibatch_size=mb)
+        if dual_team_nets and (not opp_frozen_env):
+            _t_u0 = time.time() if _PAR_TIMING else 0.0
+            info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
+            info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
+            if _PAR_TIMING:
+                _iter_t_update = (time.time() - _t_u0)
+        elif dual_team_nets and opp_frozen_env:
+            _t_u0 = time.time() if _PAR_TIMING else 0.0
+            if train_A_now:
+                info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
+            else:
+                info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
+            if _PAR_TIMING:
+                _iter_t_update = (time.time() - _t_u0)
+        else:
+            _t_u0 = time.time() if _PAR_TIMING else 0.0
+            info = agent.update(batch, epochs=4, minibatch_size=minibatch_size)
+            if _PAR_TIMING:
+                _iter_t_update = (time.time() - _t_u0)
         dt = time.time() - t0
 
         # proxy per best: media return del batch
         # All device tensors; compute small stats without moving large arrays
-        if len(batch['ret']):
-            avg_return = float(batch['ret'].mean().detach().cpu().item())
+        if dual_team_nets and (not opp_frozen_env):
+            avg_return_A = float(batch_A['ret'].mean().detach().cpu().item()) if len(batch_A['ret']) else 0.0
+            avg_return_B = float(batch_B['ret'].mean().detach().cpu().item()) if len(batch_B['ret']) else 0.0
+            avg_return = avg_return_A
+            if avg_return_A > best_return:
+                best_return = avg_return_A
+                os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+                agent.save(best_ckpt_path.replace('.pth', '_teamA.pth'))
+            # Save best for team B separately
+            if avg_return_B > (globals().get('_best_return_B', -1e9)):
+                _best_return_B = avg_return_B
+                os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+                agent_teamB.save(best_ckpt_path.replace('.pth', '_teamB.pth'))
+        elif dual_team_nets and opp_frozen_env:
+            if train_A_now:
+                avg_return_A = float(batch_A['ret'].mean().detach().cpu().item()) if len(batch_A['ret']) else 0.0
+                avg_return = avg_return_A
+                if avg_return_A > best_return:
+                    best_return = avg_return_A
+                    os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+                    agent.save(best_ckpt_path.replace('.pth', '_teamA.pth'))
+            else:
+                avg_return_B = float(batch_B['ret'].mean().detach().cpu().item()) if len(batch_B['ret']) else 0.0
+                avg_return = avg_return_B
+                if avg_return_B > (globals().get('_best_return_B', -1e9)):
+                    _best_return_B = avg_return_B
+                    os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+                    agent_teamB.save(best_ckpt_path.replace('.pth', '_teamB.pth'))
         else:
-            avg_return = 0.0
-        if avg_return > best_return:
-            best_return = avg_return
-            os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-            agent.save(best_ckpt_path)
+            if len(batch['ret']):
+                avg_return = float(batch['ret'].mean().detach().cpu().item())
+            else:
+                avg_return = 0.0
+            if avg_return > best_return:
+                best_return = avg_return
+                os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+                agent.save(best_ckpt_path)
 
         # mini-eval periodica e Elo update
         if eval_every and (it + 1) % eval_every == 0 and len(league.history) >= 1:
             cur_tmp = ckpt_path.replace('.pth', f'_tmp_it{it+1}.pth')
             agent.save(cur_tmp)
             league.register(cur_tmp)
+            if dual_team_nets and (not opp_frozen_env):
+                cur_tmp_B = ckpt_path.replace('.pth', f'_tmpB_it{it+1}.pth')
+                agent_teamB.save(cur_tmp_B)
+                league.register(cur_tmp_B)
             prev_ckpt = league.history[-2] if len(league.history) >= 2 else None
             if prev_ckpt is not None:
                 mcts_cfg = None
@@ -2623,9 +3468,14 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 # Ensure deterministic MCTS during evaluation/post-game analysis
                 mcts_eval_seed = int(os.environ.get('MCTS_EVAL_SEED', resolve_seed(0)))
                 with temporary_seed(mcts_eval_seed):
-                    wr, _ = evaluate_pair_actors(cur_tmp, prev_ckpt, games=eval_games, k_history=k_history,
-                                                 mcts=mcts_cfg, belief_particles=(belief_particles if mcts_in_eval else 0), belief_ess_frac=belief_ess_frac)
-                league.update_elo(cur_tmp, prev_ckpt, wr)
+                    wr, bd = evaluate_pair_actors(cur_tmp, prev_ckpt, games=eval_games, k_history=k_history,
+                                                 mcts=_make_mcts_cfg_for_eval(),
+                                                 belief_particles=(belief_particles if mcts_in_eval else 0),
+                                                 belief_ess_frac=belief_ess_frac,
+                                                 tqdm_desc=f"Mini-eval: it{it+1}",
+                                                 tqdm_position=2)
+                diff = float(bd[0].get('total', 0.0)) - float(bd[1].get('total', 0.0))
+                league.update_elo_from_diff(cur_tmp, prev_ckpt, diff)
                 if writer is not None:
                     writer.add_scalar('league/mini_eval_wr', wr, it)
                     writer.add_scalar('league/elo_current', league.elo.get(cur_tmp, 1000.0), it)
@@ -2643,108 +3493,191 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 meets_threshold = lower >= 0.5  # lower bound sopra il 50%
                 if improved or meets_threshold:
                     best_wr = max(best_wr, wr)
-                    try:
-                        os.makedirs(os.path.dirname(best_wr_ckpt_path), exist_ok=True)
-                    except Exception:
-                        pass
+                    os.makedirs(os.path.dirname(best_wr_ckpt_path), exist_ok=True)
                     agent.save(best_wr_ckpt_path)
                 if wr > best_wr:
                     best_wr = wr
-                    try:
-                        os.makedirs(os.path.dirname(best_wr_ckpt_path), exist_ok=True)
-                    except Exception:
-                        pass
+                    os.makedirs(os.path.dirname(best_wr_ckpt_path), exist_ok=True)
                     agent.save(best_wr_ckpt_path)
 
         # Aggiorna output terminale ad ogni iterazione
-        try:
-            def _to_float(x):
-                return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
-            preview_keys = ['loss_pi', 'loss_v', 'approx_kl', 'clip_frac', 'avg_clip_frac', 'avg_kl']
+        def _to_float(x):
+            return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
+        preview_keys = ['loss_pi', 'loss_v', 'approx_kl', 'clip_frac', 'avg_clip_frac', 'avg_kl']
+        if dual_team_nets and (not opp_frozen_env):
+            preview_A = {k: round(_to_float(info_A[k]), 4) for k in preview_keys if k in info_A}
+            preview_A.update({'avg_ret': round(avg_return_A, 4)})
+            preview_B = {k: round(_to_float(info_B[k]), 4) for k in preview_keys if k in info_B}
+            preview_B.update({'avg_ret_B': round(avg_return_B, 4)})
+            preview = {**{f"A_{k}": v for k, v in preview_A.items()}, **{f"B_{k}": v for k, v in preview_B.items()}, 't_s': round(dt, 2)}
+        elif dual_team_nets and opp_frozen_env:
+            if train_A_now:
+                preview_A = {k: round(_to_float(info_A[k]), 4) for k in preview_keys if k in info_A}
+                preview_A.update({'avg_ret': round(avg_return, 4)})
+                preview = {**{f"A_{k}": v for k, v in preview_A.items()}, 't_s': round(dt, 2)}
+            else:
+                preview_B = {k: round(_to_float(info_B[k]), 4) for k in preview_keys if k in info_B}
+                preview_B.update({'avg_ret_B': round(avg_return, 4)})
+                preview = {**{f"B_{k}": v for k, v in preview_B.items()}, 't_s': round(dt, 2)}
+        else:
             preview = {k: round(_to_float(info[k]), 4) for k in preview_keys if k in info}
             preview.update({'avg_ret': round(avg_return, 4), 't_s': round(dt, 2)})
-            # In non-parallel mode evita duplicazione: mostra metriche solo nel postfix della progress bar
-            if use_parallel:
-                metrics_str = (
-                    f"it {it} | " +
-                    " ".join([f"{k}:{v}" for k, v in preview.items()])
-                )
-                metrics_bar.set_description_str(metrics_str, refresh=False)
-            pbar.set_postfix(preview)
-        except Exception:
-            pass
+        # In non-parallel mode evita duplicazione: mostra metriche solo nel postfix della progress bar
+        if use_parallel:
+            metrics_str = (
+                f"it {it} | " +
+                " ".join([f"{k}:{v}" for k, v in preview.items()])
+            )
+            metrics_bar.set_description_str(metrics_str, refresh=False)
+        pbar.set_postfix(preview)
+        # Iteration-level timing print (sums to dt)
+        if _PAR_TIMING:
+            _post = max(0.0, dt - (_iter_t_collect + _iter_t_preproc + _iter_t_update))
+            tqdm.write(f"[iter-timing] total={dt:.3f}s collect={_iter_t_collect:.3f} preproc={_iter_t_preproc:.3f} update={_iter_t_update:.3f} post={_post:.3f}")
+
         if writer is not None:
             def _to_float(x):
                 return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
-            for k, v in info.items():
-                writer.add_scalar(f'train/{k}', _to_float(v), it)
-            writer.add_scalar('train/episode_time_s', dt, it)
-            writer.add_scalar('train/avg_return', avg_return, it)
+            if dual_team_nets and (not opp_frozen_env):
+                for k, v in info_A.items():
+                    writer.add_scalar(f'train/A_{k}', _to_float(v), it)
+                for k, v in info_B.items():
+                    writer.add_scalar(f'train/B_{k}', _to_float(v), it)
+                writer.add_scalar('train/A_episode_time_s', dt, it)
+                writer.add_scalar('train/A_avg_return', avg_return_A, it)
+                writer.add_scalar('train/B_avg_return', avg_return_B, it)
+            elif dual_team_nets and opp_frozen_env:
+                if train_A_now:
+                    for k, v in info_A.items():
+                        writer.add_scalar(f'train/A_{k}', _to_float(v), it)
+                    writer.add_scalar('train/A_episode_time_s', dt, it)
+                    writer.add_scalar('train/A_avg_return', avg_return, it)
+                else:
+                    for k, v in info_B.items():
+                        writer.add_scalar(f'train/B_{k}', _to_float(v), it)
+                    writer.add_scalar('train/B_episode_time_s', dt, it)
+                    writer.add_scalar('train/B_avg_return', avg_return, it)
+            else:
+                for k, v in info.items():
+                    writer.add_scalar(f'train/{k}', _to_float(v), it)
+                writer.add_scalar('train/episode_time_s', dt, it)
+                writer.add_scalar('train/avg_return', avg_return, it)
             writer.add_text('train/main_seats', str(main_seats), it)
             # Log by seat completamente su GPU; singola sync per tutto il blocco
-            try:
-                seats_t = torch.argmax(batch['seat_team'][:, :4], dim=1)
-                ret_t = batch['ret']
-                mask_02_t = (seats_t == 0) | (seats_t == 2)
-                mask_13_t = (seats_t == 1) | (seats_t == 3)
-                cnt_02 = mask_02_t.float().sum()
-                cnt_13 = mask_13_t.float().sum()
-                sum_ret_02 = (ret_t * mask_02_t.float()).sum()
-                sum_ret_13 = (ret_t * mask_13_t.float()).sum()
-                mean_ret_02 = torch.where(cnt_02 > 0, sum_ret_02 / cnt_02, torch.zeros((), device=device, dtype=torch.float32))
-                mean_ret_13 = torch.where(cnt_13 > 0, sum_ret_13 / cnt_13, torch.zeros((), device=device, dtype=torch.float32))
-                diag = _compute_per_seat_diagnostics(agent, batch)
-                # Prepara chiavi e valori da sincronizzare in una volta
-                keys = [
-                    'by_seat/ret_02', 'by_seat/ret_13',
-                    'by_seat/kl_02', 'by_seat/kl_13',
-                    'by_seat/entropy_02', 'by_seat/entropy_13',
-                    'by_seat/clip_frac_02', 'by_seat/clip_frac_13'
-                ]
-                vals = [
-                    mean_ret_02.to(torch.float32),
-                    mean_ret_13.to(torch.float32),
-                    diag['by_seat/kl_02'].to(torch.float32),
-                    diag['by_seat/kl_13'].to(torch.float32),
-                    diag['by_seat/entropy_02'].to(torch.float32),
-                    diag['by_seat/entropy_13'].to(torch.float32),
-                    diag['by_seat/clip_frac_02'].to(torch.float32),
-                    diag['by_seat/clip_frac_13'].to(torch.float32),
-                ]
-                stacked = torch.stack(vals)
-                numbers = stacked.detach().cpu().tolist()  # unica sincronizzazione CPU
-                for key, num in zip(keys, numbers):
-                    writer.add_scalar(key, float(num), it)
-            except Exception:
-                # still write basic train scalars even if seat-diag fails
-                pass
-            try:
-                writer.flush()
-            except Exception:
-                pass
-        if (it + 1) % save_every == 0:
-            try:
-                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            except Exception:
-                pass
-            agent.save(ckpt_path)
-            try:
-                league.register(ckpt_path)
-            except Exception:
-                pass
+            if dual_team_nets and opp_frozen_env:
+                _b_used = (batch_A if train_A_now else batch_B)
+            elif dual_team_nets and (not opp_frozen_env):
+                _b_used = batch_A  # primary reference
+            else:
+                _b_used = batch
+            seats_t = torch.argmax(_b_used['seat_team'][:, :4], dim=1)
+            ret_t = _b_used['ret']
+            mask_02_t = (seats_t == 0) | (seats_t == 2)
+            mask_13_t = (seats_t == 1) | (seats_t == 3)
+            cnt_02 = mask_02_t.float().sum()
+            cnt_13 = mask_13_t.float().sum()
+            sum_ret_02 = (ret_t * mask_02_t.float()).sum()
+            sum_ret_13 = (ret_t * mask_13_t.float()).sum()
+            mean_ret_02 = torch.where(cnt_02 > 0, sum_ret_02 / cnt_02, torch.zeros((), device=device, dtype=torch.float32))
+            mean_ret_13 = torch.where(cnt_13 > 0, sum_ret_13 / cnt_13, torch.zeros((), device=device, dtype=torch.float32))
+            diag = _compute_per_seat_diagnostics(agent, _b_used)
+            # Prepara chiavi e valori da sincronizzare in una volta
+            keys = [
+                'by_seat/ret_02', 'by_seat/ret_13',
+                'by_seat/kl_02', 'by_seat/kl_13',
+                'by_seat/entropy_02', 'by_seat/entropy_13',
+                'by_seat/clip_frac_02', 'by_seat/clip_frac_13'
+            ]
+            vals = [
+                mean_ret_02.to(torch.float32),
+                mean_ret_13.to(torch.float32),
+                diag['by_seat/kl_02'].to(torch.float32),
+                diag['by_seat/kl_13'].to(torch.float32),
+                diag['by_seat/entropy_02'].to(torch.float32),
+                diag['by_seat/entropy_13'].to(torch.float32),
+                diag['by_seat/clip_frac_02'].to(torch.float32),
+                diag['by_seat/clip_frac_13'].to(torch.float32),
+            ]
+            stacked = torch.stack(vals)
+            numbers = stacked.detach().cpu().tolist()  # unica sincronizzazione CPU
+            for key, num in zip(keys, numbers):
+                writer.add_scalar(key, float(num), it)
+        # Save periodically every 'save_every' iters. Additionally, save on the last
+        # iteration to avoid runs with zero checkpoints.
+        if ((it + 1) % save_every == 0) or ((it + 1) == num_iterations):
+            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            # Timestamped filenames, with suffixes by mode
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+            if use_selfplay:
+                out_A = ckpt_path.replace('.pth', f'_selfplay_{ts}.pth')
+                agent.save(out_A)
+                # Register only non-bootstrap
+                league.register(out_A)
+                # Elo evaluation: current vs best historical reference (top Elo)
+                if len(league.history) >= 2:
+                    # pick highest-Elo historical different from current
+                    hist = [p for p in league.history if p != out_A]
+                    if hist:
+                        ref = max(hist, key=lambda p: float(league.elo.get(p, 1000.0)))
+                        wr, _ = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
+                                                    mcts=_make_mcts_cfg_for_eval(),
+                                                    belief_particles=(belief_particles if mcts_in_eval else 0),
+                                                    belief_ess_frac=belief_ess_frac,
+                                                    tqdm_desc=f"Eval: A vs ref",
+                                                    tqdm_position=2)
+                        league.update_elo(out_A, ref, wr)
+            else:
+                out_A = ckpt_path.replace('.pth', f'_teamA_{ts}.pth')
+                agent.save(out_A)
+                league.register(out_A)
+                out_B = ckpt_path.replace('.pth', f'_teamB_{ts}.pth') if dual_team_nets else None
+                if out_B:
+                    agent_teamB.save(out_B)
+                    league.register(out_B)
+                # Elo evaluation: A vs B (if both) and vs league top1
+                if out_B:
+                    wrAB, bdAB = evaluate_pair_actors(out_A, out_B, games=eval_games, k_history=k_history,
+                                                   mcts=_make_mcts_cfg_for_eval(),
+                                                   belief_particles=(belief_particles if mcts_in_eval else 0),
+                                                   belief_ess_frac=belief_ess_frac,
+                                                   tqdm_desc=f"Eval: A vs B",
+                                                   tqdm_position=2)
+                    diffAB = float(bdAB[0].get('total', 0.0)) - float(bdAB[1].get('total', 0.0))
+                    league.update_elo_from_diff(out_A, out_B, diffAB)
+                # pick highest-Elo historical reference different from the new ones
+                hist = [p for p in league.history if p not in ([out_A] + ([out_B] if out_B else []))]
+                if hist:
+                    ref = max(hist, key=lambda p: float(league.elo.get(p, 1000.0)))
+                    wrA, bdA = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
+                                                  mcts=_make_mcts_cfg_for_eval(),
+                                                  belief_particles=(belief_particles if mcts_in_eval else 0),
+                                                  belief_ess_frac=belief_ess_frac,
+                                                  tqdm_desc=f"Eval: A vs ref",
+                                                  tqdm_position=2)
+                    diffA = float(bdA[0].get('total', 0.0)) - float(bdA[1].get('total', 0.0))
+                    league.update_elo_from_diff(out_A, ref, diffA)
+                    if out_B:
+                        wrB, bdB = evaluate_pair_actors(out_B, ref, games=eval_games, k_history=k_history,
+                                                      mcts=_make_mcts_cfg_for_eval(),
+                                                      belief_particles=(belief_particles if mcts_in_eval else 0),
+                                                      belief_ess_frac=belief_ess_frac,
+                                                      tqdm_desc=f"Eval: B vs ref",
+                                                      tqdm_position=2)
+                        diffB = float(bdB[0].get('total', 0.0)) - float(bdB[1].get('total', 0.0))
+                        league.update_elo_from_diff(out_B, ref, diffB)
+            # After saving a real checkpoint, delete any bootstrap files present
+            _bootstrap_path = os.path.join('checkpoints', 'bootstrap_random.pth')
+            if os.path.isfile(_bootstrap_path):
+                os.remove(_bootstrap_path)
+                tqdm.write("[bootstrap] Removed bootstrap_random.pth after saving real checkpoint")
         # Optional profiler or external hook per-iteration
         if on_iter_end is not None:
-            try:
-                on_iter_end(it)
-            except Exception:
-                pass
+            on_iter_end(it)
     if writer is not None:
         writer.close()
-    try:
-        metrics_bar.close()
-        pbar.close()
-    except Exception:
-        pass
+    metrics_bar.close()
+    pbar.close()
 
 
 if __name__ == '__main__':

@@ -191,6 +191,7 @@ Comandi comuni:
 python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --cprofile --iters 1
 python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --line --profile-all  --line-full --iters 1
 python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --scalene --scalene-out html --iters 1
-python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --pytorch --iters 1 --horizon 2048
+python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --scalene --iters 1 --no-scalene-cpu-only --scalene-gpu-modes --scalene-out html
+python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --torch-profiler --iters 1 --horizon 2048
 
 Analizza i profiling del mio codice e dimmi dove viene speso più tempo. Poi ottimizza il mio codice in modo da risolvere il problema partendo dalle cose che perdono più tempo. Non usare fallback per gli errori (piuttosto causano raise, ma meglio che fallback).

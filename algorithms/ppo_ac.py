@@ -34,6 +34,16 @@ class ActionConditionedPPO:
         self.actor = ActionConditionedActor(obs_dim, action_dim, state_encoder=shared_enc)
         self.critic = CentralValueNet(obs_dim, state_encoder=shared_enc)
 
+        # Training device override: keep models on CPU for env/collection, move to GPU only in update if requested
+        train_dev_str = _os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu').strip().lower()
+        if train_dev_str.startswith('cuda') and (not torch.cuda.is_available()):
+            train_dev_str = 'cpu'
+        self.train_device = torch.device(train_dev_str)
+        # AMP GradScaler only when training on CUDA
+        self.scaler = None
+        if self.train_device.type == 'cuda':
+            self.scaler = torch.amp.GradScaler(device='cuda')
+
         # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) only when CUDA
         if device.type == 'cuda':
             with torch.enable_grad():
@@ -77,18 +87,15 @@ class ActionConditionedPPO:
         except Exception as e:
             raise RuntimeError('ppo.init.compile_compute_loss_failed') from e
 
+        # Ensure parameters start on the intended device for optimizer state placement
+        self.actor.to('cpu')
+        self.critic.to('cpu')
         # Optimizers with deduplicated shared encoder params to avoid double updates
         shared_ids = {id(p) for p in self.actor.state_enc.parameters()}
         actor_params = list(self.actor.parameters())
         critic_params = [p for p in self.critic.parameters() if id(p) not in shared_ids]
-        try:
-            self.opt_actor = optim.Adam(actor_params, lr=lr, fused=True)
-        except TypeError:
-            self.opt_actor = optim.Adam(actor_params, lr=lr, foreach=True)
-        try:
-            self.opt_critic = optim.Adam(critic_params, lr=lr, fused=True)
-        except TypeError:
-            self.opt_critic = optim.Adam(critic_params, lr=lr, foreach=True)
+        self.opt_actor = optim.Adam(actor_params, lr=lr, fused=(self.train_device.type == 'cuda'))
+        self.opt_critic = optim.Adam(critic_params, lr=lr, fused=(self.train_device.type == 'cuda'))
         self.clip_ratio = clip_ratio
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
@@ -123,18 +130,7 @@ class ActionConditionedPPO:
         except Exception as e:
             raise RuntimeError('ppo.init.set_matmul_precision_failed') from e
 
-        # Training device override: keep models on CPU for env/collection, move to GPU only in update if requested
-        train_dev_str = _os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu').strip().lower()
-        if train_dev_str.startswith('cuda') and (not torch.cuda.is_available()):
-            train_dev_str = 'cpu'
-        self.train_device = torch.device(train_dev_str)
-        # AMP GradScaler only when training on CUDA
-        self.scaler = None
-        if self.train_device.type == 'cuda':
-            try:
-                self.scaler = torch.amp.GradScaler(device='cuda')
-            except Exception:
-                self.scaler = torch.cuda.amp.GradScaler()
+        # (train_device and scaler already set above)
 
         # Pre-allocate pinned CPU buffers to cut repeated pin_memory/allocations in select_action
         # These are sized for single-step inference (batch size 1) and dynamic actions buffer
@@ -239,15 +235,9 @@ class ActionConditionedPPO:
                 A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
                 if A > 0:
                     if device.type == 'cuda':
-                        try:
-                            self._ensure_actions_pinned_capacity(A)
-                            self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                        except Exception:
-                            try:
-                                actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
-                            except Exception:
-                                actions_t = la_cpu.to(device=device)
+                        self._ensure_actions_pinned_capacity(A)
+                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
                     else:
                         actions_t = la_cpu
                 else:
@@ -262,15 +252,9 @@ class ActionConditionedPPO:
                     la_cpu = torch.stack([x.detach().to('cpu', dtype=torch.float32) for x in legal_actions], dim=0)
                     A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
                     if A > 0:
-                        try:
-                            self._ensure_actions_pinned_capacity(A)
-                            self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                        except Exception:
-                            try:
-                                actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
-                            except Exception:
-                                actions_t = la_cpu.to(device=device)
+                        self._ensure_actions_pinned_capacity(A)
+                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
                     else:
                         actions_t = la_cpu.to(device=device)
                 else:
@@ -287,15 +271,9 @@ class ActionConditionedPPO:
                 A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
                 if A > 0:
                     if device.type == 'cuda':
-                        try:
-                            self._ensure_actions_pinned_capacity(A)
-                            self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                            actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                        except Exception:
-                            try:
-                                actions_t = la_cpu.pin_memory().to(device=device, non_blocking=True)
-                            except Exception:
-                                actions_t = la_cpu.to(device=device)
+                        self._ensure_actions_pinned_capacity(A)
+                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
+                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
                     else:
                         actions_t = la_cpu
                 else:
@@ -482,11 +460,8 @@ class ActionConditionedPPO:
             else:
                 x_cpu = torch.as_tensor(x, dtype=dtype, device='cpu')
             if device.type == 'cuda':
-                try:
-                    import torch._dynamo as _dyn  # type: ignore
-                    is_compiling = bool(getattr(_dyn, 'is_compiling', lambda: False)())
-                except Exception:
-                    is_compiling = False
+                import torch._dynamo as _dyn  # type: ignore
+                is_compiling = bool(getattr(_dyn, 'is_compiling', lambda: False)())
                 if is_compiling or (x_cpu.numel() == 0):
                     return x_cpu.to(device=device, dtype=dtype, non_blocking=True)
                 return x_cpu.pin_memory().to(device=device, dtype=dtype, non_blocking=True)
@@ -848,6 +823,19 @@ class ActionConditionedPPO:
         if models_were_cpu:
             self.actor.to(self.train_device)
             self.critic.to(self.train_device)
+            # Move optimizer state to the same device as parameters to avoid CPU/GPU mismatch under fused Adam
+            if self.train_device.type == 'cuda':
+                for opt in (self.opt_actor, self.opt_critic):
+                    for group in opt.param_groups:
+                        for p in group['params']:
+                            if p is None:
+                                continue
+                            state = opt.state.get(p)
+                            if not state:
+                                continue
+                            for key, val in list(state.items()):
+                                if torch.is_tensor(val) and val.device.type != self.train_device.type:
+                                    state[key] = val.to(self.train_device)
         num_samples = len(batch['obs'])
         last_info = {}
         avg_kl_acc, avg_clip_acc, count_mb = 0.0, 0.0, 0
@@ -1058,6 +1046,19 @@ class ActionConditionedPPO:
         if models_were_cpu:
             self.actor.to('cpu')
             self.critic.to('cpu')
+            # Move optimizer state back to CPU to match parameters for next collection iteration
+            if self.train_device.type == 'cuda':
+                for opt in (self.opt_actor, self.opt_critic):
+                    for group in opt.param_groups:
+                        for p in group['params']:
+                            if p is None:
+                                continue
+                            state = opt.state.get(p)
+                            if not state:
+                                continue
+                            for key, val in list(state.items()):
+                                if torch.is_tensor(val) and val.device.type != 'cpu':
+                                    state[key] = val.to('cpu')
         return last_info
 
     def add_lr_schedulers(self, actor_scheduler, critic_scheduler):
@@ -1079,12 +1080,36 @@ class ActionConditionedPPO:
 
     def load(self, path: str, map_location=None):
         ckpt = torch.load(path, map_location=map_location or device)
-        self.actor.load_state_dict(ckpt['actor'])
-        self.critic.load_state_dict(ckpt['critic'])
-        try:
-            self.opt_actor.load_state_dict(ckpt['opt_actor'])
-            self.opt_critic.load_state_dict(ckpt['opt_critic'])
-        except Exception as e:
-            raise RuntimeError('ppo.load.optim_state_load_failed') from e
-        self.run_config = ckpt.get('run_config', self.run_config)
-        self.update_steps = ckpt.get('update_steps', 0)
+        # Support multiple checkpoint formats:
+        # 1) Full PPO checkpoint: {'actor','critic','opt_actor','opt_critic',...}
+        # 2) Actor-only checkpoint: {'actor', ...}
+        # 3) Raw actor state_dict (plain mapping)
+        if isinstance(ckpt, dict) and ('actor' in ckpt or 'critic' in ckpt or 'opt_actor' in ckpt or 'run_config' in ckpt):
+            # Load actor (required in this branch)
+            if 'actor' in ckpt:
+                self.actor.load_state_dict(ckpt['actor'])
+            else:
+                # Some older actor-only checkpoints may have saved the actor dict at top-level (handled below)
+                pass
+            # Load critic if present; otherwise keep randomly initialized critic
+            if 'critic' in ckpt:
+                self.critic.load_state_dict(ckpt['critic'])
+            # Load optimizers only if both are present (skip safely otherwise)
+            if ('opt_actor' in ckpt) and ('opt_critic' in ckpt):
+                try:
+                    self.opt_actor.load_state_dict(ckpt['opt_actor'])
+                    self.opt_critic.load_state_dict(ckpt['opt_critic'])
+                except Exception as e:
+                    raise RuntimeError('ppo.load.optim_state_load_failed') from e
+            # Restore metadata if present
+            self.run_config = ckpt.get('run_config', self.run_config)
+            self.update_steps = ckpt.get('update_steps', 0)
+        else:
+            # Fallback: attempt to treat checkpoint as a raw actor state_dict
+            # This covers files like bootstrap_random.pth with only actor weights.
+            try:
+                self.actor.load_state_dict(ckpt)
+            except Exception as e:
+                raise RuntimeError('ppo.load.unsupported_checkpoint_format') from e
+            # Keep critic/optimizers as freshly initialized
+            # Metadata not available in this format

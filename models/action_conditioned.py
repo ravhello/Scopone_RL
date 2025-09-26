@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+import time
 import os
 from contextlib import nullcontext
 from typing import Dict, Tuple, Optional
@@ -8,12 +9,6 @@ from utils.device import get_compute_device, get_amp_dtype
 from utils.fallback import notify_fallback
 try:
     # Prefer new SDPA backend selector if available (PyTorch >= 2.3)
-    from torch.nn.attention import sdpa_kernel as _sdpa_kernel_ctx, SDPBackend as _SDPBackend  # type: ignore
-except Exception:
-    _sdpa_kernel_ctx = None  # type: ignore
-    _SDPBackend = None  # type: ignore
-try:
-    # New API (PyTorch >= 2.3): prefer explicit SDPA backend selection
     from torch.nn.attention import sdpa_kernel as _sdpa_kernel_ctx, SDPBackend as _SDPBackend  # type: ignore
 except Exception:
     _sdpa_kernel_ctx = None  # type: ignore
@@ -121,22 +116,27 @@ class StateEncoderCompact(nn.Module):
                           q_present: torch.Tensor, k_present: torch.Tensor) -> torch.Tensor:
         """Compute MHA and return masked mean over query tokens using a single key_padding_mask path.
         Returns shape (B, E)."""
-        _, _, E = q.shape
+        B, _, E = q.shape
         kpm = (~k_present)
-        with self._attn_ctx():
-            o, _ = mha(query=q, key=k, value=v, key_padding_mask=kpm, need_weights=False)
-        if o.dtype != q.dtype:
-            o = o.to(dtype=q.dtype)
-        # Zero-out rows where queries or keys are entirely absent to avoid NaNs propagating
+        # Compute per-row validity and, if possible, avoid MHA on fully-masked rows
         q_any = q_present.any(dim=1)
         k_any = k_present.any(dim=1)
-        invalid_rows = (~q_any) | (~k_any)
-        if invalid_rows.dtype != torch.bool:
-            invalid_rows = invalid_rows.to(torch.bool)
-        # Out-of-place mask to avoid autograd versioning issues
-        o = torch.where(invalid_rows.view(-1, 1, 1), torch.zeros_like(o), o)
-        m = q_present.unsqueeze(-1).to(o.dtype)
-        summed = (o * m).sum(dim=1)
+        valid_rows = (q_any & k_any)
+        out = torch.zeros((B, q.size(1), E), dtype=q.dtype, device=q.device)
+        if bool(valid_rows.any()):
+            idx = valid_rows.nonzero(as_tuple=True)[0]
+            q_sel = q.index_select(0, idx)
+            k_sel = k.index_select(0, idx)
+            v_sel = v.index_select(0, idx)
+            kpm_sel = kpm.index_select(0, idx)
+            with self._attn_ctx():
+                o_sel, _ = mha(query=q_sel, key=k_sel, value=v_sel, key_padding_mask=kpm_sel, need_weights=False)
+            if o_sel.dtype != out.dtype:
+                o_sel = o_sel.to(dtype=out.dtype)
+            out.index_copy_(0, idx, o_sel)
+        # Mask invalid rows to zeros (already zero) and compute masked mean across query tokens
+        m = q_present.unsqueeze(-1).to(out.dtype)
+        summed = (out * m).sum(dim=1)
         denom = m.sum(dim=1).clamp_min(1.0)
         return summed / denom
 
@@ -313,7 +313,9 @@ class StateEncoderCompact(nn.Module):
                 pos_idx = self._hist_pos_ids[:k].unsqueeze(0).expand(B, k)
                 hpos = self.hist_pos_emb(pos_idx)
                 hseq = hproj + hpos
-                henc = self.hist_encoder(hseq)                       # (B,k,64)
+                # Enable efficient SDPA kernels during history attention when available
+                with self._attn_ctx():
+                    henc = self.hist_encoder(hseq)                   # (B,k,64)
                 hist_feat = henc.mean(dim=1)                         # (B,64)
             else:
                 hist_feat = torch.zeros((B, 64), dtype=obs.dtype, device=obs.device)
@@ -469,13 +471,13 @@ class BeliefNet(nn.Module):
         if visible_mask_40 is not None:
             if visible_mask_40.dim() == 1:
                 visible_mask_40 = visible_mask_40.unsqueeze(0)
-            # azzera probabilità per carte visibili
+            # Azzera probabilità per carte visibili e rinormalizza solo dove la somma per carta > 0
             m = visible_mask_40.to(probs.dtype).unsqueeze(1)  # (B,1,40)
             probs = probs * (1.0 - m)
-        # Normalize across players for each card (avoid zero rows)
-        denom = probs.sum(dim=1, keepdim=True)
-        denom = torch.clamp_min(denom, 1e-12)
-        probs = probs / denom
+            sums = probs.sum(dim=1, keepdim=True)  # (B,1,40)
+            nz = (sums > 0)
+            # Broadcast-safe: divide solo sulle posizioni nz, altrimenti lascia 0
+            probs = torch.where(nz.expand_as(probs), probs / torch.clamp_min(sums, 1e-12), probs)
         return probs.view(B, 120)
 
 
@@ -532,6 +534,10 @@ class ActionConditionedActor(torch.nn.Module):
 
     def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
         target_device = next(self.parameters()).device
+        _par = (os.environ.get('SCOPONE_PAR_PROFILE', '0') != '0')
+        t_state_enc = 0.0; t_belief_logits = 0.0; t_belief_probs = 0.0
+        t_partner = 0.0; t_opp = 0.0; t_merge = 0.0; t_proj = 0.0
+        _t0 = time.time() if _par else 0.0
         if torch.is_tensor(obs):
             if (obs.device == target_device) and (obs.dtype == torch.float32):
                 x_obs = obs
@@ -551,7 +557,9 @@ class ActionConditionedActor(torch.nn.Module):
                 seat_team_vec = seat_team_vec.unsqueeze(0)
             if (seat_team_vec.device != x_obs.device) or (seat_team_vec.dtype != torch.float32):
                 seat_team_vec = seat_team_vec.to(x_obs.device, dtype=torch.float32)
+        t1 = time.time() if _par else 0.0
         state_feat = self.state_enc(x_obs, seat_team_vec)  # (B,256)
+        if _par: t_state_enc += (time.time() - t1)
         if STRICT:
             torch._assert(torch.isfinite(state_feat).all(), "state_enc produced non-finite features")
             if state_feat.numel() > 0:
@@ -562,12 +570,16 @@ class ActionConditionedActor(torch.nn.Module):
             state_feat = state_feat.to(dtype=bn_dtype)
         # belief neurale interno con maschera carte visibili
         visible_mask = self._visible_mask_from_obs(x_obs)
+        t1 = time.time() if _par else 0.0
         belief_logits = self.belief_net(state_feat)        # (B,120)
+        if _par: t_belief_logits += (time.time() - t1)
         # Safety clamp before softmax to avoid NaNs from extreme values
         belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
         if STRICT:
             torch._assert(torch.isfinite(belief_logits).all(), "BeliefNet produced non-finite logits")
+        t1 = time.time() if _par else 0.0
         belief_probs_flat = self.belief_net.probs(belief_logits, visible_mask)
+        if _par: t_belief_probs += (time.time() - t1)
         belief_probs_flat = torch.nan_to_num(belief_probs_flat, nan=0.0, posinf=0.0, neginf=0.0)
         if STRICT:
             torch._assert(torch.isfinite(belief_probs_flat).all(), "BeliefNet.probs produced non-finite probabilities")
@@ -582,10 +594,14 @@ class ActionConditionedActor(torch.nn.Module):
         partner_slice = belief_probs_flat[:, 40:80]
         opps_slice = belief_probs_flat[:, 0:40] + belief_probs_flat[:, 80:120]
         emb = self.belief_card_emb
+        t1 = time.time() if _par else 0.0
         partner_feat = torch.matmul(partner_slice, emb)     # (B,32)
         opp_feat = torch.matmul(opps_slice, emb)            # (B,32)
+        if _par: t_partner += (time.time() - t1)
+        t1 = time.time() if _par else 0.0
         pg = self.partner_gate(state_feat)
         og = self.opp_gate(state_feat)
+        if _par: t_opp += (time.time() - t1)
         # Gating range guards
         if STRICT:
             torch._assert(((pg >= 0).all() & (pg <= 1).all()), "compute_state_proj: partner_gate out of [0,1]")
@@ -600,6 +616,7 @@ class ActionConditionedActor(torch.nn.Module):
             if opp_feat.numel() > 0:
                 torch._assert((opp_feat.abs().amax() <= 1e6), "compute_state_proj: opp_feat magnitude too large (>1e6)")
         B_ctx = state_feat.size(0)
+        t1 = time.time() if _par else 0.0
         ctx_in = torch.empty((B_ctx, 256 + 64 + 32 + 32), dtype=state_feat.dtype, device=state_feat.device)
         p = 0
         ctx_in[:, p:p+256] = state_feat; p += 256
@@ -611,12 +628,15 @@ class ActionConditionedActor(torch.nn.Module):
             if ctx_in.numel() > 0:
                 torch._assert((ctx_in.abs().amax() <= 1e6), "merge input (ctx_in) magnitude too large (>1e6)")
         state_ctx = self.merge(ctx_in)  # (B,256)
+        if _par: t_merge += (time.time() - t1)
         if STRICT:
             torch._assert(torch.isfinite(state_ctx).all(), "merge produced non-finite state_ctx")
             # Guard extremely large activations (tensor assert)
             if state_ctx.numel() > 0:
                 torch._assert((state_ctx.abs().amax() <= 1e6), "merge produced extremely large state_ctx (>1e6)")
+        t1 = time.time() if _par else 0.0
         state_proj = self.state_to_action(state_ctx)  # (B,64)
+        if _par: t_proj += (time.time() - t1)
         if STRICT:
             torch._assert(torch.isfinite(state_proj).all(), "state_to_action produced non-finite state_proj")
             if state_proj.numel() > 0:
@@ -625,6 +645,10 @@ class ActionConditionedActor(torch.nn.Module):
         # Evita sync CPU: controlla in modo leggero
         if STRICT:
             torch._assert((self.card_emb_play.abs().amax() <= 1e3), "card_emb_play parameter magnitude exploded (>1e3)")
+        # Export sub-timers via a lightweight global (avoid imports to trainer)
+        if _par:
+            from utils.prof import accum_actor_stateproj
+            accum_actor_stateproj(t_state_enc, t_belief_logits, t_belief_probs, t_partner + t_opp, t_merge, t_proj)
         return state_proj
 
     def compute_state_features(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:

@@ -67,39 +67,27 @@ def run_is_mcts(env: ScoponeEnvMA,
     obs = root_env._get_observation(root_env.current_player)
     legals = root_env.get_valid_actions()
     # Support both Tensor (A,80) and list outputs without ambiguous truthiness
-    try:
-        is_empty = (hasattr(legals, 'numel') and legals.numel() == 0) or (hasattr(legals, '__len__') and len(legals) == 0)
-    except Exception:
-        is_empty = False
+    is_empty = (hasattr(legals, 'numel') and legals.numel() == 0) or (hasattr(legals, '__len__') and len(legals) == 0)
     if is_empty:
         raise ValueError("No legal actions for IS-MCTS")
 
     # Helpers per chiavi
     def action_key(vec):
-        try:
-            import torch as _torch
-            import numpy as _np
-            if _torch.is_tensor(vec):
-                nz = _torch.nonzero(vec > 0, as_tuple=False).flatten().tolist()
-                return tuple(int(i) for i in nz)
-            else:
-                return tuple(_np.flatnonzero(vec).tolist())
-        except Exception:
-            return tuple()
+        import torch as _torch
+        import numpy as _np
+        if _torch.is_tensor(vec):
+            nz = _torch.nonzero(vec > 0, as_tuple=False).flatten().tolist()
+            return tuple(int(i) for i in nz)
+        else:
+            return tuple(_np.flatnonzero(vec).tolist())
     def public_key(state_env: ScoponeEnvMA):
-        try:
-            cur = state_env.current_player
-            table_ids = tuple(sorted(state_env.game_state.get('table', [])))
-            return (cur, table_ids)
-        except Exception:
-            return (state_env.current_player, ())
+        cur = state_env.current_player
+        table_ids = tuple(sorted(state_env.game_state.get('table', [])))
+        return (cur, table_ids)
 
     # Ordine chiavi azioni alla radice (per aggregazione stabile delle visite)
     ak_order = []
-    try:
-        ak_order = [action_key(a) for a in legals]
-    except Exception:
-        ak_order = []
+    ak_order = [action_key(a) for a in legals]
 
     # Prior iniziali (supporta tensori torch su CUDA)
     try:
@@ -162,17 +150,11 @@ def run_is_mcts(env: ScoponeEnvMA,
             sim_env = root_env.clone()
             # Determinizzazione: SOLO tramite belief_sampler neurale se fornito
             if callable(belief_sampler):
-                try:
-                    det = belief_sampler(sim_env)
-                except Exception:
-                    det = None
+                det = belief_sampler(sim_env)
                 if isinstance(det, dict):
                     for pid, ids in det.items():
                         sim_env.game_state['hands'][pid] = list(ids)
-                    try:
-                        sim_env._rebuild_id_caches()
-                    except Exception:
-                        pass
+                    sim_env._rebuild_id_caches()
             # Selection (ensure chosen child action is legal under current determinization)
             node = root
             while True:
@@ -188,14 +170,10 @@ def run_is_mcts(env: ScoponeEnvMA,
                     break
                 node = max(legal_children, key=lambda n: n.ucb_score(c_puct))
                 if node.action is not None:
-                    try:
-                        _, _, done, _ = sim_env.step(node.action)
-                        if done:
-                            break
-                    except ValueError:
-                        # Azione risultata illegale sotto questa determinizzazione: interrompi selection
-                        # e passa a expansion sullo stato corrente
+                    _, _, done, _ = sim_env.step(node.action)
+                    if done:
                         break
+
             # Expansion
             if not sim_env.done:
                 obs_s = sim_env._get_observation(sim_env.current_player)
@@ -228,19 +206,16 @@ def run_is_mcts(env: ScoponeEnvMA,
                         legals_sel = [legals_s[int(i)] for i in top_idx.tolist()]
                         priors_sel = priors_s[top_idx].detach().cpu().numpy()
                     # Public key arricchita
-                    try:
-                        cur = sim_env.current_player
-                        table_ids = tuple(sorted(sim_env.game_state.get('table', [])))
-                        cs = sim_env.game_state.get('captured_squads', [[], []])
-                        if isinstance(cs, dict):
-                            cs0 = tuple(sorted(cs.get(0, [])))
-                            cs1 = tuple(sorted(cs.get(1, [])))
-                        else:
-                            cs0 = tuple(sorted(cs[0]))
-                            cs1 = tuple(sorted(cs[1]))
-                        pk = (cur, table_ids, cs0, cs1)
-                    except Exception:
-                        pk = (sim_env.current_player, ())
+                    cur = sim_env.current_player
+                    table_ids = tuple(sorted(sim_env.game_state.get('table', [])))
+                    cs = sim_env.game_state.get('captured_squads', [[], []])
+                    if isinstance(cs, dict):
+                        cs0 = tuple(sorted(cs.get(0, [])))
+                        cs1 = tuple(sorted(cs.get(1, [])))
+                    else:
+                        cs0 = tuple(sorted(cs[0]))
+                        cs1 = tuple(sorted(cs[1]))
+                    pk = (cur, table_ids, cs0, cs1)
                     for a, p in zip(legals_sel, (priors_sel.tolist() if hasattr(priors_sel, 'tolist') else priors_sel)):
                         ak = action_key(a)
                         key = (pk, ak)
@@ -269,63 +244,54 @@ def run_is_mcts(env: ScoponeEnvMA,
                 node = node.parent
 
     # Scelta finale: robust child o soft a seconda di temperature (preferisci torch su CUDA)
-    try:
-        device = get_compute_device()
-        if root_temperature and root_temperature > 1e-6:
-            visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
-            logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))
-            probs_t = logits / torch.clamp_min(logits.sum(), 1e-9)
-            # sanitize
-            probs_t = probs_t.nan_to_num(0.0)
-            probs_t = torch.clamp(probs_t, min=0.0)
-            s = probs_t.sum()
-            if not torch.isfinite(s) or s <= 0:
-                raise RuntimeError("IS-MCTS: invalid root selection probabilities (NaN/Inf or zero-sum)")
-            else:
-                probs_t = probs_t / s
-            try:
-                idx = int(torch.multinomial(probs_t, num_samples=1).item())
-            except Exception:
-                idx = int(torch.argmax(probs_t).item())
-            if return_stats:
-                # Aggrega probabilità per ciascuna azione legale alla radice
-                import numpy as _np
-                ch_keys = [action_key(ch.action) for ch in root.children]
-                probs_np = probs_t.detach().cpu().numpy()
-                agg = {}
-                for k, p in zip(ch_keys, probs_np):
-                    agg[k] = float(agg.get(k, 0.0) + float(p))
-                if ak_order:
-                    p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
-                    s = float(p_vec.sum())
-                    if s > 0:
-                        p_vec = p_vec / s
-                else:
-                    p_vec = probs_np
-                return root.children[idx].action, p_vec
-            return root.children[idx].action
+    device = get_compute_device()
+    if root_temperature and root_temperature > 1e-6:
+        visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
+        logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))
+        probs_t = logits / torch.clamp_min(logits.sum(), 1e-9)
+        # sanitize
+        probs_t = probs_t.nan_to_num(0.0)
+        probs_t = torch.clamp(probs_t, min=0.0)
+        s = probs_t.sum()
+        if not torch.isfinite(s) or s <= 0:
+            raise RuntimeError("IS-MCTS: invalid root selection probabilities (NaN/Inf or zero-sum)")
         else:
-            best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
-            if return_stats:
-                visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
-                probs_t = visits_t / torch.clamp_min(visits_t.sum(), 1e-9)
-                import numpy as _np
-                ch_keys = [action_key(ch.action) for ch in root.children]
-                probs_np = probs_t.detach().cpu().numpy()
-                agg = {}
-                for k, p in zip(ch_keys, probs_np):
-                    agg[k] = float(agg.get(k, 0.0) + float(p))
-                if ak_order:
-                    p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
-                    s = float(p_vec.sum())
-                    if s > 0:
-                        p_vec = p_vec / s
-                else:
-                    p_vec = probs_np
-                return best.action, p_vec
-            return best.action
-    except Exception:
-        # Nessun fallback consentito: propaga l'errore per diagnosi
-        raise
-
-
+            probs_t = probs_t / s
+        idx = int(torch.multinomial(probs_t, num_samples=1).item())
+        if return_stats:
+            # Aggrega probabilità per ciascuna azione legale alla radice
+            import numpy as _np
+            ch_keys = [action_key(ch.action) for ch in root.children]
+            probs_np = probs_t.detach().cpu().numpy()
+            agg = {}
+            for k, p in zip(ch_keys, probs_np):
+                agg[k] = float(agg.get(k, 0.0) + float(p))
+            if ak_order:
+                p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
+                s = float(p_vec.sum())
+                if s > 0:
+                    p_vec = p_vec / s
+            else:
+                p_vec = probs_np
+            return root.children[idx].action, p_vec
+        return root.children[idx].action
+    else:
+        best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
+        if return_stats:
+            visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
+            probs_t = visits_t / torch.clamp_min(visits_t.sum(), 1e-9)
+            import numpy as _np
+            ch_keys = [action_key(ch.action) for ch in root.children]
+            probs_np = probs_t.detach().cpu().numpy()
+            agg = {}
+            for k, p in zip(ch_keys, probs_np):
+                agg[k] = float(agg.get(k, 0.0) + float(p))
+            if ak_order:
+                p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
+                s = float(p_vec.sum())
+                if s > 0:
+                    p_vec = p_vec / s
+            else:
+                p_vec = probs_np
+            return best.action, p_vec
+        return best.action

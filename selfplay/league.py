@@ -35,6 +35,26 @@ class League:
         self.elo[ckpt_b] = rb + k * ((1.0 - result_a) - eb)
         self._save()
 
+    def update_elo_from_diff(self, ckpt_a: str, ckpt_b: str, avg_point_diff_a: float, k: float = 16.0, tau: float = None):
+        """
+        Aggiorna l'Elo usando la differenza media di punti (reward) invece del win-rate.
+        Mappa la differenza di punti in uno "score" continuo in [0,1] tramite una funzione logistica
+        s = sigmoid(diff / tau), con tau controllabile via env SCOPONE_ELO_DIFF_TAU (default=2.0).
+        """
+        try:
+            _tau_env = float(os.environ.get('SCOPONE_ELO_DIFF_TAU', '2.0'))
+        except Exception:
+            _tau_env = 2.0
+        _tau = float(tau) if (tau is not None) else float(_tau_env)
+        _tau = max(1e-6, _tau)
+        try:
+            d = float(avg_point_diff_a)
+        except Exception:
+            d = 0.0
+        # Logistic mapping to [0,1], symmetric around 0 -> 0.5
+        score_a = 1.0 / (1.0 + math.exp(-(d / _tau)))
+        return self.update_elo(ckpt_a, ckpt_b, score_a, k=k)
+
     def _softmax_sample(self, items: List[str], temp: float = 1.0) -> str:
         if not items:
             return None
@@ -62,22 +82,16 @@ class League:
         return partner, opponent
 
     def _save(self):
-        try:
-            data = {"history": self.history, "elo": self.elo}
-            with open(self._state_path, 'w') as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+        data = {"history": self.history, "elo": self.elo}
+        with open(self._state_path, 'w') as f:
+            json.dump(data, f)
 
     def _load(self):
-        try:
-            if os.path.isfile(self._state_path):
-                with open(self._state_path, 'r') as f:
-                    data = json.load(f)
-                self.history = data.get('history', [])
-                self.elo = {k: float(v) for k, v in data.get('elo', {}).items()}
-        except Exception:
-            pass
+        if os.path.isfile(self._state_path):
+            with open(self._state_path, 'r') as f:
+                data = json.load(f)
+            self.history = data.get('history', [])
+            self.elo = {k: float(v) for k, v in data.get('elo', {}).items()}
 
 
 

@@ -37,12 +37,8 @@ def notify_fallback(key: str, details: Optional[str] = None, *, raise_error: Opt
             msg = f"{msg}\nStack (most recent call last):\n{tb}"
         raise FallbackUsedError(msg)
     # Print to stderr so it's visible in logs even without logging setup
-    try:
-        sys.stderr.write(msg + "\n")
-        if _should_trace():
-            traceback.print_stack(limit=12, file=sys.stderr)
-    except Exception:
-        # Last resort: silent failure of the notifier should not affect program flow
-        pass
+    sys.stderr.write(msg + "\n")
+    if _should_trace():
+        traceback.print_stack(limit=12, file=sys.stderr)
 
 

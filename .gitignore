@@ -35,6 +35,8 @@ events.out.tfevents.*
 # Profiler outputs
 profiles/
 profiles/**
+runs/profiler
+runs/profiler/**
 # cProfile / line-profiler stats
 *.prof
 *.lprof

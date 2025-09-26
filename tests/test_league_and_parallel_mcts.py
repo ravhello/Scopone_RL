@@ -24,7 +24,7 @@ def test_league_register_sample_and_update_elo(tmp_path=None):
     league.register(ck2)
     p, o = league.sample_pair()
     assert p in league.history and o in league.history
-    league.update_elo(ck1, ck2, result_a=1.0)
+    league.update_elo_from_diff(ck1, ck2, avg_point_diff_a=2.0)
     assert ck1 in league.elo and ck2 in league.elo
 
 
