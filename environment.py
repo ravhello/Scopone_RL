@@ -101,6 +101,8 @@ class ScoponeEnvMA(gym.Env):
         self._one_i64 = torch.tensor(1, dtype=torch.int64, device=device)
         # Precompute id range to avoid per-call allocations
         self._id_range = torch.arange(40, dtype=torch.int64, device=device)
+        # Precompute one-hot matrix for card IDs (40×40) to spare scatter/equality kernels per step
+        self._card_eye = torch.eye(40, dtype=torch.float32, device=device)
         # Derived features mirrors (kept as tensors for compile-friendly observation):
         self._progress_t = torch.zeros(1, dtype=torch.float32, device=device)
         self._last_capturing_team_t = torch.zeros(2, dtype=torch.float32, device=device)
@@ -283,9 +285,8 @@ class ScoponeEnvMA(gym.Env):
             if sums is None:
                 sums = torch.matmul(sel, table_ranks.unsqueeze(1).to(torch.float32)).squeeze(1).to(torch.int64)
             if table_one_hot is None:
-                # Build (n,40) one-hot using scatter instead of F.one_hot to reduce overhead
-                table_one_hot = torch.zeros((n, 40), dtype=torch.float32, device=device)
-                table_one_hot.scatter_(1, table_ids_t.view(-1, 1), 1.0)
+                # Build (n,40) one-hot via precomputed identity matrix to avoid per-call scatter
+                table_one_hot = self._card_eye.index_select(0, table_ids_t)
             # Nota: capture_hot_by_mask calcolato lazy solo se necessario (vedi sotto)
         else:
             masks_all = torch.empty(0, dtype=torch.long, device=device)
@@ -303,8 +304,7 @@ class ScoponeEnvMA(gym.Env):
             h_idx_d, tpos_idx = direct_mat.nonzero(as_tuple=True)
             pid_rows_direct = hand_ids_t[h_idx_d]
             cap_ids_direct = table_ids_t[tpos_idx]
-            captured_hot_direct = torch.zeros((pid_rows_direct.numel(), 40), dtype=torch.float32, device=device)
-            captured_hot_direct[torch.arange(pid_rows_direct.numel(), device=device), cap_ids_direct] = 1.0
+            captured_hot_direct = self._card_eye.index_select(0, cap_ids_direct)
         else:
             pid_rows_direct = torch.empty((0,), dtype=torch.long, device=device)
             captured_hot_direct = torch.empty((0,40), dtype=torch.float32, device=device)
@@ -316,18 +316,17 @@ class ScoponeEnvMA(gym.Env):
             if bool(use_mask.any()):
                 h_idx_s, m_idx = use_mask.nonzero(as_tuple=True)
                 pid_rows_sum = hand_ids_t[h_idx_s]
-                # Calcola capture_hot_by_mask solo per i mask necessari
-                if 'capture_hot_by_mask' in locals() and capture_hot_by_mask is not None:
-                    captured_hot_sum = capture_hot_by_mask[m_idx]
-                else:
-                    captured_hot_sum = sel[m_idx].to(torch.float32) @ table_one_hot
+                # Calcola capture_hot_by_mask solo una volta e riutilizzalo
+                if capture_hot_by_mask is None:
+                    capture_hot_by_mask = sel.to(torch.float32) @ table_one_hot
+                captured_hot_sum = capture_hot_by_mask[m_idx]
                 # Aggiorna cache invarianti per questo tavolo
                 self._table_invariants_cache[tbl_bits_key] = {
                     'n': n,
                     'sel': sel,
                     'sums': sums,
                     'table_one_hot': table_one_hot,
-                    'capture_hot_by_mask': capture_hot_by_mask if capture_hot_by_mask is not None else (sel.to(torch.float32) @ table_one_hot)
+                    'capture_hot_by_mask': capture_hot_by_mask
                 }
             else:
                 pid_rows_sum = torch.empty((0,), dtype=torch.long, device=device)
@@ -353,8 +352,8 @@ class ScoponeEnvMA(gym.Env):
             num_ace = int(is_ace.sum().item())
             if num_ace > 0:
                 pid_rows_ap = hand_ids_t[is_ace]
-                captured_hot_ap = torch.zeros((num_ace, 40), dtype=torch.float32, device=device)
-                captured_hot_ap[:, table_ids_t] = 1.0
+                table_capture_row = (table_one_hot.sum(dim=0, keepdim=True) > 0).to(torch.float32)
+                captured_hot_ap = table_capture_row.expand(num_ace, -1).clone()
 
         # Assemble all actions (played one-hot + captured multi-hot)
         pid_all = torch.cat([pid_rows_direct, pid_rows_sum, pid_rows_empty, pid_rows_ap], dim=0)
@@ -363,8 +362,8 @@ class ScoponeEnvMA(gym.Env):
         if A == 0:
             actions = torch.zeros((0, 80), dtype=torch.float32, device=device)
         else:
-            # Replace one_hot with equality against cached id range to avoid kernel overhead
-            played_oh = (self._id_range.unsqueeze(0) == pid_all.unsqueeze(1)).to(torch.float32)
+            # Replace per-call equality with gather from precomputed identity matrix
+            played_oh = self._card_eye.index_select(0, pid_all)
             actions = torch.cat([played_oh, (cap_hot_all > 0).to(torch.float32)], dim=1)
 
         # AP filter: se AP attivo ma posa asso non è consentita (e tavolo non vuoto), rimuovi azioni "asso + no capture"
@@ -831,7 +830,3 @@ class ScoponeEnvMA(gym.Env):
             if total_cache > 0:
                 hit_rate = self._cache_hits / total_cache * 100
                 print(f"  Action cache hit rate: {hit_rate:.1f}% ({self._cache_hits}/{total_cache})")
-
-
-
-
