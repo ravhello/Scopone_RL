@@ -37,6 +37,12 @@ torch.set_float32_matmul_precision('high')
 _PAR_TIMING = (os.environ.get('SCOPONE_PAR_PROFILE', '0') != '0')
 _PAR_DEBUG = (os.environ.get('SCOPONE_PAR_DEBUG', '0') in ['1','true','yes','on'])
 
+# Reuse cached tensors to limit per-step allocations inside workers
+_SEAT_VEC_CACHE: Dict[int, torch.Tensor] = {}
+_BELIEF_ZERO = torch.zeros(120, dtype=torch.float32)
+_OTHERS_HANDS_ZERO = torch.zeros((3, 40), dtype=torch.float32)
+_EMPTY_LEGAL = torch.zeros((0, 80), dtype=torch.float32)
+
 def _dbg(msg: str) -> None:
     if _PAR_DEBUG:
         try:
@@ -82,11 +88,23 @@ _HORIZON_ADJUST_LOGGED = False
 
 
 def _seat_vec_for(cp: int) -> torch.Tensor:
-    v = torch.zeros(6, dtype=torch.float32)
-    v[cp] = 1.0
-    v[4] = 1.0 if cp in [0, 2] else 0.0
-    v[5] = 1.0 if cp in [1, 3] else 0.0
+    v = _SEAT_VEC_CACHE.get(cp)
+    if v is None:
+        base = torch.zeros(6, dtype=torch.float32)
+        base[cp] = 1.0
+        base[4] = 1.0 if cp in [0, 2] else 0.0
+        base[5] = 1.0 if cp in [1, 3] else 0.0
+        _SEAT_VEC_CACHE[cp] = base
+        v = base
     return v
+
+
+def _to_cpu_float32(tensor_like: torch.Tensor) -> torch.Tensor:
+    if torch.is_tensor(tensor_like):
+        if tensor_like.device.type == 'cpu' and tensor_like.dtype == torch.float32:
+            return tensor_like.detach()
+        return tensor_like.detach().to('cpu', dtype=torch.float32)
+    return torch.as_tensor(tensor_like, dtype=torch.float32)
 
 
 def _env_worker(worker_id: int,
@@ -127,6 +145,9 @@ def _env_worker(worker_id: int,
     mcts_progress_start = float(cfg.get('mcts_progress_start', 0.25))
     mcts_progress_full = float(cfg.get('mcts_progress_full', 0.75))
     mcts_min_sims = int(cfg.get('mcts_min_sims', 0))
+    rpc_timeout_s = float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30'))
+    episode_put_timeout_s = float(os.environ.get('SCOPONE_EP_PUT_TIMEOUT_S', '15'))
+    belief_aux_coef = float(os.environ.get('BELIEF_AUX_COEF', '0.1'))
 
     # Torch profiler in worker: enabled by default when torch profiler mode is active in the main process
     _tp_active = (os.environ.get('SCOPONE_TORCH_PROF', '0') == '1')
@@ -186,12 +207,21 @@ def _env_worker(worker_id: int,
                 raise RuntimeError(f"worker {worker_id}: no legal actions at episode start (player={env.current_player})")
             cp = env.current_player
             seat_vec = _seat_vec_for(cp)
+            seat_cpu = seat_vec
+            obs_cpu = _to_cpu_float32(obs)
+            if torch.is_tensor(legal):
+                legal_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
+                legal_cpu_entries = list(legal_cpu_tensor.unbind(0))
+            else:
+                legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
+                legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
+            legal_count = len(legal_cpu_entries)
             is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
             # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
             if is_main and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
                 # Build helper RPCs to master for batched scoring
                 if send_legals:
-                    leg_serial = [ (x.tolist() if torch.is_tensor(x) else list(x)) for x in legal ]
+                    leg_serial = [x.tolist() for x in legal_cpu_entries]
                 else:
                     leg_serial = []
                 def policy_fn_mcts(_obs, _legals):
@@ -207,10 +237,10 @@ def _env_worker(worker_id: int,
                         'wid': worker_id,
                         'obs': o_cpu,
                         'legals': leg_cpu,
-                        'seat': seat_vec.clone(),
+                        'seat': seat_cpu,
                     })
                     try:
-                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                        resp = action_q.get(timeout=rpc_timeout_s)
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_policy priors") from e
                     t_rpc_local = (time.time() - t1)
@@ -235,7 +265,7 @@ def _env_worker(worker_id: int,
                         'seat': s_vec,
                     })
                     try:
-                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                        resp = action_q.get(timeout=rpc_timeout_s)
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_value") from e
                     if step_idx < 3:
@@ -254,7 +284,7 @@ def _env_worker(worker_id: int,
                         'seat': s_vec,
                     })
                     try:
-                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                        resp = action_q.get(timeout=rpc_timeout_s)
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_belief") from e
                     if step_idx < 3:
@@ -355,19 +385,16 @@ def _env_worker(worker_id: int,
                     # Sims ended up <= 0 despite mcts_sims > 0 — log, optionally raise for debug, then fall back to master step
                     if os.environ.get('SCOPONE_RAISE_ON_INVALID_SIMS', '0') == '1':
                         raise RuntimeError(f"invalid sims_scaled: sims_scaled={sims_scaled} mcts_sims={mcts_sims} progress_start={mcts_progress_start} progress_full={mcts_progress_full} history_len={len(env.game_state.get('history', [])) if isinstance(env.game_state.get('history', []), list) else 'n/a'} alpha={alpha}")
-                    if send_legals:
-                        leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
-                    else:
-                        leg_serial = torch.zeros((0,80), dtype=torch.float32)
+                    leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
                     request_q.put({
                         'type': 'step',
                         'wid': worker_id,
-                        'obs': (obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)),
+                        'obs': obs_cpu,
                         'legals': leg_serial,
-                        'seat': seat_vec.clone(),
+                        'seat': seat_cpu,
                     })
                     try:
-                        resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                        resp = action_q.get(timeout=rpc_timeout_s)
                         idx = int(resp.get('idx', 0))
                     except queue.Empty as e:
                         raise TimeoutError('Timeout waiting for step index for MCTS (invalid_sims_scaled)') from e
@@ -376,7 +403,7 @@ def _env_worker(worker_id: int,
                     with _record_function('env.step'):
                         next_obs, rew, done, info = env.step(act_t)
                     # No distillation target
-                    mcts_policy_list.extend([0.0] * len(legal))
+                    mcts_policy_list.extend([0.0] * legal_count)
                     mcts_weight_list.append(0.0)
                 else:
                     from algorithms.is_mcts import run_is_mcts
@@ -436,21 +463,18 @@ def _env_worker(worker_id: int,
                     mcts_weight_list.append(1.0)
             else:
                 # Request action selection from master (GPU)
-                if send_legals:
-                    leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
-                else:
-                    leg_serial = torch.zeros((0,80), dtype=torch.float32)
+                leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
                 if step_idx < 3:
                     _wdbg(f"ep {ep} step {step_idx}: STEP -> send, waiting idx (A={len(legal)})")
                 t1 = time.time(); request_q.put({
                     'type': 'step',
                     'wid': worker_id,
-                    'obs': (obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)),
+                    'obs': obs_cpu,
                     'legals': leg_serial,
-                    'seat': seat_vec.clone(),
+                    'seat': seat_cpu,
                 })
                 try:
-                    resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                    resp = action_q.get(timeout=rpc_timeout_s)
                     idx = int(resp.get('idx', 0))
                 except queue.Empty as e:
                     raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (main path)") from e
@@ -467,28 +491,30 @@ def _env_worker(worker_id: int,
                 step_idx += 1
                 t_step += (time.time() - t1) if _PAR_TIMING else 0.0
                 # No distillation target
-                mcts_policy_list.extend([0.0] * len(legal))
+                mcts_policy_list.extend([0.0] * legal_count)
                 mcts_weight_list.append(0.0)
 
-            obs_list.append(torch.as_tensor(obs, dtype=torch.float32) if not torch.is_tensor(obs) else obs.clone().detach().to('cpu', dtype=torch.float32))
-            next_obs_list.append(torch.as_tensor(next_obs, dtype=torch.float32) if not torch.is_tensor(next_obs) else next_obs.clone().detach().to('cpu', dtype=torch.float32))
-            act_list.append(act_t.clone().detach().to('cpu', dtype=torch.float32))
+            next_obs_cpu = _to_cpu_float32(next_obs)
+            act_cpu = _to_cpu_float32(act_t)
+            obs_list.append(obs_cpu)
+            next_obs_list.append(next_obs_cpu)
+            act_list.append(act_cpu)
             rew_list.append(float(rew))
             done_list.append(bool(done))
-            seat_team_list.append(seat_vec.clone().detach().to('cpu'))
+            seat_team_list.append(seat_cpu)
             # belief summary disabled in workers by default (zeros placeholder)
-            belief_sum_list.append(torch.zeros(120, dtype=torch.float32))
+            belief_sum_list.append(_BELIEF_ZERO)
             legals_offset.append(len(legals_list))
-            legals_count.append(len(legal))
+            legals_count.append(legal_count)
             if send_legals:
-                legals_list.extend([torch.as_tensor(x, dtype=torch.float32) for x in legal])
+                legals_list.extend(legal_cpu_entries)
             else:
                 from utils.fallback import notify_fallback
                 notify_fallback('trainer.collect_trajectory.legals_missing_for_store')
             chosen_index_list.append(int(idx))
             # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
-            if float(os.environ.get('BELIEF_AUX_COEF', '0.1')) <= 0.0:
-                others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
+            if belief_aux_coef <= 0.0:
+                others_hands_list.append(_OTHERS_HANDS_ZERO)
             else:
                 hands = env.game_state.get('hands', None)
                 if hands is not None:
@@ -505,7 +531,7 @@ def _env_worker(worker_id: int,
                             target[i, int(cid)] = 1.0
                     others_hands_list.append(target)
                 else:
-                    others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
+                    others_hands_list.append(_OTHERS_HANDS_ZERO)
 
         # Ensure at least one step per episode to avoid empty payloads
         if len(obs_list) == 0:
@@ -515,19 +541,24 @@ def _env_worker(worker_id: int,
             if not is_empty:
                 cp = env.current_player
                 seat_vec = _seat_vec_for(cp)
-                if send_legals:
-                    leg_serial = torch.stack([ (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal ], dim=0)
+                seat_cpu = seat_vec
+                obs_cpu = _to_cpu_float32(obs)
+                if torch.is_tensor(legal):
+                    legals_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
+                    legal_entries = list(legals_cpu_tensor.unbind(0))
                 else:
-                    leg_serial = torch.zeros((0,80), dtype=torch.float32)
+                    legal_entries = [_to_cpu_float32(x) for x in legal]
+                    legals_cpu_tensor = torch.stack(legal_entries, dim=0) if len(legal_entries) > 0 else _EMPTY_LEGAL
+                leg_serial = legals_cpu_tensor if send_legals else _EMPTY_LEGAL
                 request_q.put({
                     'type': 'step',
                     'wid': worker_id,
-                    'obs': (obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)),
+                    'obs': obs_cpu,
                     'legals': leg_serial,
-                    'seat': seat_vec.clone(),
+                    'seat': seat_cpu,
                 })
                 try:
-                    resp = action_q.get(timeout=float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30')))
+                    resp = action_q.get(timeout=rpc_timeout_s)
                     idx = int(resp.get('idx', 0))
                 except queue.Empty as e:
                     raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (forced first step)") from e
@@ -535,20 +566,22 @@ def _env_worker(worker_id: int,
                 act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
                 with _record_function('env.step'):
                     next_obs, rew, done, info = env.step(act_t)
-                obs_list.append(torch.as_tensor(obs, dtype=torch.float32) if not torch.is_tensor(obs) else obs.clone().detach().to('cpu', dtype=torch.float32))
-                next_obs_list.append(torch.as_tensor(next_obs, dtype=torch.float32) if not torch.is_tensor(next_obs) else next_obs.clone().detach().to('cpu', dtype=torch.float32))
-                act_list.append(act_t.clone().detach().to('cpu', dtype=torch.float32))
+                next_obs_cpu = _to_cpu_float32(next_obs)
+                act_cpu = _to_cpu_float32(act_t)
+                obs_list.append(obs_cpu)
+                next_obs_list.append(next_obs_cpu)
+                act_list.append(act_cpu)
                 rew_list.append(float(rew))
                 done_list.append(bool(done))
-                seat_team_list.append(seat_vec.clone().detach().to('cpu'))
-                belief_sum_list.append(torch.zeros(120, dtype=torch.float32))
+                seat_team_list.append(seat_cpu)
+                belief_sum_list.append(_BELIEF_ZERO)
                 legals_offset.append(len(legals_list))
                 legals_count.append(len(legal))
                 if send_legals:
-                    legals_list.extend([torch.as_tensor(x, dtype=torch.float32) for x in legal])
+                    legals_list.extend(legal_entries)
                 chosen_index_list.append(int(idx))
                 # default others_hands zero target for this forced step
-                others_hands_list.append(torch.zeros((3,40), dtype=torch.float32))
+                others_hands_list.append(_OTHERS_HANDS_ZERO)
         
         # Episode payload back to master using NumPy arrays (avoid Torch resource_sharer FDs entirely)
         import numpy as _np
@@ -609,7 +642,7 @@ def _env_worker(worker_id: int,
             if len(obs_list) == 0:
                 raise RuntimeError(f"worker {worker_id}: episode finished with zero steps — invalid episode")
             _wdbg(f"ep {ep} putting episode payload (steps={len(obs_list)})")
-            episode_q.put(payload, timeout=float(os.environ.get('SCOPONE_EP_PUT_TIMEOUT_S', '15')))
+            episode_q.put(payload, timeout=episode_put_timeout_s)
             _wdbg(f"ep {ep} payload put ok")
         except Exception as e:
             raise RuntimeError(f"worker {worker_id}: episode_q.put failed") from e
