@@ -2850,25 +2850,23 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     for npth in added_paths:
                         if npth == ref:
                             continue
-                        wr, bd = evaluate_pair_actors(npth, ref, games=eval_games, k_history=k_history,
+                        diff, bd = evaluate_pair_actors(npth, ref, games=eval_games, k_history=k_history,
                                                      mcts=_make_mcts_cfg_for_eval(),
                                                      belief_particles=(belief_particles if mcts_in_eval else 0),
                                                      belief_ess_frac=belief_ess_frac,
                                                      tqdm_desc=f"League refresh: {os.path.basename(npth)} vs top",
                                                      tqdm_position=2)
-                        diff = float(bd[0].get('total', 0.0)) - float(bd[1].get('total', 0.0))
                         _league.update_elo_from_diff(npth, ref, diff)
                 elif len(added_paths) >= 2:
                     # Evaluate sequentially among new paths to seed relative Elo
                     anchor = added_paths[0]
                     for npth in added_paths[1:]:
-                        wr, bd = evaluate_pair_actors(npth, anchor, games=eval_games, k_history=k_history,
+                        diff, bd = evaluate_pair_actors(npth, anchor, games=eval_games, k_history=k_history,
                                                      mcts=_make_mcts_cfg_for_eval(),
                                                      belief_particles=(belief_particles if mcts_in_eval else 0),
                                                      belief_ess_frac=belief_ess_frac,
                                                      tqdm_desc=f"League refresh: {os.path.basename(npth)} vs anchor",
                                                      tqdm_position=2)
-                        diff = float(bd[0].get('total', 0.0)) - float(bd[1].get('total', 0.0))
                         _league.update_elo_from_diff(npth, anchor, diff)
 
         _LP = globals().get('LINE_PROFILE_DECORATOR', None)
@@ -3468,15 +3466,16 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 # Ensure deterministic MCTS during evaluation/post-game analysis
                 mcts_eval_seed = int(os.environ.get('MCTS_EVAL_SEED', resolve_seed(0)))
                 with temporary_seed(mcts_eval_seed):
-                    wr, bd = evaluate_pair_actors(cur_tmp, prev_ckpt, games=eval_games, k_history=k_history,
+                    diff, bd = evaluate_pair_actors(cur_tmp, prev_ckpt, games=eval_games, k_history=k_history,
                                                  mcts=_make_mcts_cfg_for_eval(),
                                                  belief_particles=(belief_particles if mcts_in_eval else 0),
                                                  belief_ess_frac=belief_ess_frac,
                                                  tqdm_desc=f"Mini-eval: it{it+1}",
                                                  tqdm_position=2)
-                diff = float(bd[0].get('total', 0.0)) - float(bd[1].get('total', 0.0))
                 league.update_elo_from_diff(cur_tmp, prev_ckpt, diff)
                 if writer is not None:
+                    wr = float((bd.get('meta') or {}).get('win_rate', 0.0))
+                    writer.add_scalar('league/mini_eval_diff', diff, it)
                     writer.add_scalar('league/mini_eval_wr', wr, it)
                     writer.add_scalar('league/elo_current', league.elo.get(cur_tmp, 1000.0), it)
                     writer.add_scalar('league/elo_previous', league.elo.get(prev_ckpt, 1000.0), it)
@@ -3529,7 +3528,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 " ".join([f"{k}:{v}" for k, v in preview.items()])
             )
             metrics_bar.set_description_str(metrics_str, refresh=False)
-        pbar.set_postfix(preview)
+        else:
+            pbar.set_postfix(preview)
         # Iteration-level timing print (sums to dt)
         if _PAR_TIMING:
             _post = max(0.0, dt - (_iter_t_collect + _iter_t_preproc + _iter_t_update))
@@ -3620,13 +3620,13 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     hist = [p for p in league.history if p != out_A]
                     if hist:
                         ref = max(hist, key=lambda p: float(league.elo.get(p, 1000.0)))
-                        wr, _ = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
+                        diff, _ = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
                                                     mcts=_make_mcts_cfg_for_eval(),
                                                     belief_particles=(belief_particles if mcts_in_eval else 0),
                                                     belief_ess_frac=belief_ess_frac,
                                                     tqdm_desc=f"Eval: A vs ref",
                                                     tqdm_position=2)
-                        league.update_elo(out_A, ref, wr)
+                        league.update_elo_from_diff(out_A, ref, diff)
             else:
                 out_A = ckpt_path.replace('.pth', f'_teamA_{ts}.pth')
                 agent.save(out_A)
@@ -3637,34 +3637,31 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     league.register(out_B)
                 # Elo evaluation: A vs B (if both) and vs league top1
                 if out_B:
-                    wrAB, bdAB = evaluate_pair_actors(out_A, out_B, games=eval_games, k_history=k_history,
+                    diffAB, bdAB = evaluate_pair_actors(out_A, out_B, games=eval_games, k_history=k_history,
                                                    mcts=_make_mcts_cfg_for_eval(),
                                                    belief_particles=(belief_particles if mcts_in_eval else 0),
                                                    belief_ess_frac=belief_ess_frac,
                                                    tqdm_desc=f"Eval: A vs B",
                                                    tqdm_position=2)
-                    diffAB = float(bdAB[0].get('total', 0.0)) - float(bdAB[1].get('total', 0.0))
                     league.update_elo_from_diff(out_A, out_B, diffAB)
                 # pick highest-Elo historical reference different from the new ones
                 hist = [p for p in league.history if p not in ([out_A] + ([out_B] if out_B else []))]
                 if hist:
                     ref = max(hist, key=lambda p: float(league.elo.get(p, 1000.0)))
-                    wrA, bdA = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
+                    diffA, bdA = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
                                                   mcts=_make_mcts_cfg_for_eval(),
                                                   belief_particles=(belief_particles if mcts_in_eval else 0),
                                                   belief_ess_frac=belief_ess_frac,
                                                   tqdm_desc=f"Eval: A vs ref",
                                                   tqdm_position=2)
-                    diffA = float(bdA[0].get('total', 0.0)) - float(bdA[1].get('total', 0.0))
                     league.update_elo_from_diff(out_A, ref, diffA)
                     if out_B:
-                        wrB, bdB = evaluate_pair_actors(out_B, ref, games=eval_games, k_history=k_history,
+                        diffB, bdB = evaluate_pair_actors(out_B, ref, games=eval_games, k_history=k_history,
                                                       mcts=_make_mcts_cfg_for_eval(),
                                                       belief_particles=(belief_particles if mcts_in_eval else 0),
                                                       belief_ess_frac=belief_ess_frac,
                                                       tqdm_desc=f"Eval: B vs ref",
                                                       tqdm_position=2)
-                        diffB = float(bdB[0].get('total', 0.0)) - float(bdB[1].get('total', 0.0))
                         league.update_elo_from_diff(out_B, ref, diffB)
             # After saving a real checkpoint, delete any bootstrap files present
             _bootstrap_path = os.path.join('checkpoints', 'bootstrap_random.pth')

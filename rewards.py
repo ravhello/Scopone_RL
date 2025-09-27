@@ -72,8 +72,8 @@ def compute_final_score_breakdown(game_state, rules=None):
             return 0
         if ids_t.numel() == 0:
             return 0
-        ranks = RANK_OF_ID[ids_t].to(torch.long)
-        suits = SUITCOL_OF_ID[ids_t].to(torch.long)
+        ranks = RID[ids_t].to(torch.long)
+        suits = SUID[ids_t].to(torch.long)
         denari_ranks = ranks[suits == 0]
         if denari_ranks.numel() == 0:
             return 0

@@ -182,6 +182,37 @@ class ScoponeEnvMA(gym.Env):
             cloned._rebuild_id_caches()
         except Exception:
             raise RuntimeError('Failed to rebuild id caches')
+
+        # Replica gli specchi tensoriali e i contatori runtime per mantenere coerenza nello stato.
+        mirror_attrs = (
+            '_progress_t',
+            '_last_capturing_team_t',
+            '_hist_buf_t',
+            '_hist_head_t',
+            '_history_len_t',
+            '_played_bits_by_player_t',
+            '_scopa_counts_t',
+            '_consec_scopa_team_t',
+            '_inferred_probs_t',
+            '_rank_probs_by_player_t',
+            '_rank_presence_from_inferred_t',
+            '_scopa_probs_t',
+        )
+        for attr in mirror_attrs:
+            val = getattr(self, attr, None)
+            if torch.is_tensor(val):
+                setattr(cloned, attr, val.clone())
+
+        # Copia anche le metriche di performance rilevanti per analisi successive.
+        cloned._step_count = self._step_count
+        cloned._get_obs_time = self._get_obs_time
+        cloned._get_valid_actions_time = self._get_valid_actions_time
+        cloned._step_time = self._step_time
+        cloned._cache_hits = self._cache_hits
+        cloned._cache_misses = self._cache_misses
+
+        # Ogni clone deve allocare il proprio buffer di osservazione quando necessario.
+        cloned._obs_out_buf = None
         return cloned
 
     def get_valid_actions(self):
@@ -727,8 +758,10 @@ class ScoponeEnvMA(gym.Env):
                 fixed = 43 + 40 + 82 + 61 * self.k_history + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
                 exp = fixed + (120 if include_inferred else 0) + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if include_dealer else 0)
                 self._obs_out_buf = torch.empty((exp,), dtype=torch.float32, device=device)
-            result = self._encode_obs(self.game_state, player_id, k_history=self.k_history, out=self._obs_out_buf)
-            
+            encoded = self._encode_obs(self.game_state, player_id, k_history=self.k_history, out=self._obs_out_buf)
+            # Decouple cached tensors from the shared staging buffer to avoid aliasing corruption.
+            result = encoded.clone()
+
             # Salva in cache (LRU) senza forzare CPU: lascia il tensore sul suo device
             self._observation_cache[cache_key] = result
             self._observation_cache.move_to_end(cache_key)

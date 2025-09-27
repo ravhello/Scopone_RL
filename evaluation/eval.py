@@ -5,6 +5,7 @@ os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 import torch
+import random
 import time
 import platform
 import multiprocessing as mp
@@ -84,11 +85,14 @@ def _fit_desc(desc: str, reserve: int = 48) -> str:
 def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int = 12,
                tqdm_desc: str = None, tqdm_position: int = 0, tqdm_disable: bool = False) -> Tuple[float, dict]:
     """
-    Gioca N partite e ritorna win-rate team0 e breakdown medio dei punteggi.
+    Gioca N partite e ritorna diff media (punti actor0 − punti actor1) e breakdown medio dei punteggi.
+    Il team che inizia è sorteggiato alla prima partita e poi alternato; inoltre, le posizioni
+    dei team ai posti (0/2 vs 1/3) vengono invertite a ogni partita per equità.
     agent_fn_*: callable(env) -> action (usa env.get_valid_actions())
     """
     # Evaluation runs strictly on CPU (independent from training device)
     wins = 0
+    actor_tot_sum = {0: 0.0, 1: 0.0}
     breakdown_sum = {0: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0},
                      1: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0}}
     def _to_float_scalar(x):
@@ -97,9 +101,19 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int =
     bar_desc = _fit_desc(tqdm_desc or 'Eval matches')
     _ncols = _terminal_ncols()
     _disable = bool(os.environ.get('TQDM_DISABLE','0') in ['1','true','yes','on']) or bool(tqdm_disable)
-    for _ in tqdm(range(games), desc=bar_desc, position=tqdm_position, dynamic_ncols=False, ncols=_ncols,
+    # Estrai team iniziale che parte (0 o 1) e alterna ad ogni partita
+    start_team = int(random.random() < 0.5)
+    for gi in tqdm(range(games), desc=bar_desc, position=tqdm_position, dynamic_ncols=False, ncols=_ncols,
                   leave=True, disable=_disable, miniters=1, mininterval=0.05, smoothing=0):
         env = ScoponeEnvMA(k_history=k_history)
+        invert_seats = (gi % 2) == 1  # inverti mappatura posti: (0,2)<->(1,3)
+        team_start = start_team ^ (gi & 1)
+        # Calcola starting_player coerente con inversione posti
+        if not invert_seats:
+            starting_player = (0 if team_start == 0 else 1)
+        else:
+            starting_player = (1 if team_start == 0 else 0)
+        env.reset(starting_player=starting_player)
         done = False
         info = {}
         while not done:
@@ -116,10 +130,17 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int =
                 _empty = (len(legals) == 0)
             if _empty:
                 break
-            if env.current_player in [0, 2]:
-                action = agent_fn_team0(env)
+            # Se invert_seats, il team0 actor gioca sui posti 1/3 (parità invertita)
+            if not invert_seats:
+                if env.current_player in [0, 2]:
+                    action = agent_fn_team0(env)
+                else:
+                    action = agent_fn_team1(env)
             else:
-                action = agent_fn_team1(env)
+                if env.current_player in [0, 2]:
+                    action = agent_fn_team1(env)
+                else:
+                    action = agent_fn_team0(env)
             _, _, done, info = env.step(action)
         if 'score_breakdown' in info:
             bd = info['score_breakdown']
@@ -128,19 +149,38 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int =
                     breakdown_sum[t][k] += _to_float_scalar(bd[t].get(k, 0))
             _t0 = _to_float_scalar(bd[0].get('total', 0))
             _t1 = _to_float_scalar(bd[1].get('total', 0))
-            if _t0 > _t1:
-                wins += 1
+            if not invert_seats:
+                actor_tot_sum[0] += _t0
+                actor_tot_sum[1] += _t1
+                if _t0 > _t1:
+                    wins += 1
+            else:
+                actor_tot_sum[0] += _t1
+                actor_tot_sum[1] += _t0
+                if _t1 > _t0:
+                    wins += 1
         elif 'team_rewards' in info:
             tr = info['team_rewards']
             _r0 = _to_float_scalar(tr[0])
             _r1 = _to_float_scalar(tr[1])
-            if _r0 > _r1:
-                wins += 1
+            if not invert_seats:
+                actor_tot_sum[0] += _r0
+                actor_tot_sum[1] += _r1
+                if _r0 > _r1:
+                    wins += 1
+            else:
+                actor_tot_sum[0] += _r1
+                actor_tot_sum[1] += _r0
+                if _r1 > _r0:
+                    wins += 1
     # medie
     for t in [0, 1]:
         for k in breakdown_sum[t].keys():
             breakdown_sum[t][k] /= games
-    return wins / games, breakdown_sum
+    wr = wins / games if games > 0 else 0.0
+    breakdown_sum['meta'] = {'win_rate': float(wr)}
+    diff_avg = (actor_tot_sum[0] - actor_tot_sum[1]) / float(games) if games > 0 else 0.0
+    return float(diff_avg), breakdown_sum
 
 
 def series_to_points(win_func, target_points=11):
@@ -178,7 +218,7 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                          belief_particles: int = 0, belief_ess_frac: float = 0.5,
                          tqdm_desc: str = None, tqdm_position: int = 0, tqdm_disable: bool = False):
     """
-    Valuta due checkpoint (A vs B) giocando N partite. Ritorna win-rate di A e breakdown medio.
+    Valuta due checkpoint (A vs B) giocando N partite. Ritorna diff media (punti A − punti B) e breakdown medio.
     - Se mcts è fornito, usa IS-MCTS con i parametri dati per la selezione.
     - belief_particles>0 abilita belief a particelle per prior MCTS.
     """
@@ -345,19 +385,19 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                 mc['dets'] = int(max(1, d))
                 mcts_list.append(mc)
             _dbg(f"distributing dets across workers: total={dets_total} list={[mc['dets'] for mc in mcts_list]}")
-            wr, bd = evaluate_pair_actors_parallel_dist(ckpt_a, ckpt_b, games=games, k_history=k_history,
-                                                      mcts_list=mcts_list, belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
-                                                      num_workers=num_workers_env,
-                                                      tqdm_desc=tqdm_desc, tqdm_position=int(tqdm_position or 0), tqdm_disable=bool(tqdm_disable))
+            diff, bd = evaluate_pair_actors_parallel_dist(ckpt_a, ckpt_b, games=games, k_history=k_history,
+                                                          mcts_list=mcts_list, belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                                          num_workers=num_workers_env,
+                                                          tqdm_desc=tqdm_desc, tqdm_position=int(tqdm_position or 0), tqdm_disable=bool(tqdm_disable))
             elapsed = time.time() - t_eval_start
             try:
                 tqdm.write(f"[eval] {tqdm_desc}: {int(games)} games in {elapsed:.2f}s (workers={num_workers_env}, dist-dets)")
             except Exception:
                 print(f"[eval] {tqdm_desc}: {int(games)} games in {elapsed:.2f}s (workers={num_workers_env}, dist-dets)", flush=True)
-            return wr, bd
+            return diff, bd
         # Nessuna multi-dets: usa parallelo standard
         _dbg("starting parallel eval without multi-dets distribution")
-        wr, bd = evaluate_pair_actors_parallel(ckpt_a, ckpt_b, games=games, k_history=k_history,
+        diff, bd = evaluate_pair_actors_parallel(ckpt_a, ckpt_b, games=games, k_history=k_history,
                                              mcts=mcts, belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
                                              num_workers=num_workers_env,
                                              tqdm_desc=tqdm_desc, tqdm_position=int(tqdm_position or 0), tqdm_disable=bool(tqdm_disable))
@@ -366,16 +406,16 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
             tqdm.write(f"[eval] {tqdm_desc}: {int(games)} games in {elapsed:.2f}s (workers={num_workers_env})")
         except Exception:
             print(f"[eval] {tqdm_desc}: {int(games)} games in {elapsed:.2f}s (workers={num_workers_env})", flush=True)
-        return wr, bd
+        return diff, bd
     else:
-        wr, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, k_history=k_history,
+        diff, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, k_history=k_history,
                             tqdm_desc=tqdm_desc, tqdm_position=int(tqdm_position or 0), tqdm_disable=bool(tqdm_disable))
         elapsed = time.time() - t_eval_start
         try:
             tqdm.write(f"[eval] {tqdm_desc}: {int(games)} games in {elapsed:.2f}s (workers=1)")
         except Exception:
             print(f"[eval] {tqdm_desc}: {int(games)} games in {elapsed:.2f}s (workers=1)", flush=True)
-        return wr, bd
+        return diff, bd
 
 
 def _eval_pair_chunk_worker(args):
@@ -519,16 +559,18 @@ def _eval_pair_chunk_worker(args):
 
     agent_fn_team0 = make_agent_fn(actor_a)
     agent_fn_team1 = make_agent_fn(actor_b)
-    wr, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, k_history=k_history,
+    diff, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, k_history=k_history,
                         tqdm_desc=None, tqdm_position=0, tqdm_disable=True)
     # Converti breakdown medio in somma per aggregazione
     bd_sum = {0: {}, 1: {}}
     for t in [0, 1]:
         for k in bd[t].keys():
             bd_sum[t][k] = float(bd[t][k]) * float(games)
+    wr = float((bd.get('meta') or {}).get('win_rate', 0.0))
     wins_int = int(round(wr * games))
-    _dbg(f"worker[{wid}] done: wins={wins_int}/{int(games)}")
-    return wins_int, bd_sum, int(games)
+    diff_sum = float(diff) * float(games)
+    _dbg(f"worker[{wid}] done: wins={wins_int}/{int(games)} diff_sum={diff_sum:.2f}")
+    return diff_sum, bd_sum, wins_int, int(games)
 
 
 def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
@@ -564,13 +606,13 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
                 _dbg(f"waiting result {idx+1}/{len(args_list)} …")
                 item = async_res.next(timeout=float(os.environ.get('SCOPONE_EVAL_POOL_TIMEOUT_S','600')))
                 try:
-                    wins_i, bd_sum_i, games_i = item
+                    diff_sum_i, bd_sum_i, wins_i, games_i = item
                 except Exception as e:
                     _dbg(f"received malformed result {item!r}: {e}")
                     continue
                 if pbar is not None:
                     pbar.update(int(games_i))
-                results.append((wins_i, bd_sum_i, games_i))
+                results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
         except mp.TimeoutError as te:
             _dbg("pool timeout while waiting for results; terminating pool …")
             pool.terminate()
@@ -590,10 +632,12 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
     _dbg(f"aggregating {len(results)} results")
     total_games = 0
     total_wins = 0
+    total_diff_sum = 0.0
     agg = {0: {}, 1: {}}
-    for wins_i, bd_sum_i, games_i in results:
+    for diff_sum_i, bd_sum_i, wins_i, games_i in results:
         total_games += int(games_i)
         total_wins += int(wins_i)
+        total_diff_sum += float(diff_sum_i)
         for t in [0, 1]:
             for k, v in bd_sum_i[t].items():
                 agg[t][k] = agg[t].get(k, 0.0) + float(v)
@@ -605,7 +649,9 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
         for k, v in agg[t].items():
             bd_avg[t][k] = (float(v) / float(total_games))
     wr = float(total_wins) / float(total_games)
-    return wr, bd_avg
+    bd_avg['meta'] = {'win_rate': float(wr)}
+    diff_avg = float(total_diff_sum) / float(total_games)
+    return float(diff_avg), bd_avg
 
 
 def _eval_pair_chunk_worker_dist(args):
@@ -690,14 +736,16 @@ def _eval_pair_chunk_worker_dist(args):
 
     agent_fn_team0 = make_agent_fn(actor_a, mcts_per_worker)
     agent_fn_team1 = make_agent_fn(actor_b, mcts_per_worker)
-    wr, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, k_history=k_history,
+    diff, bd = play_match(agent_fn_team0, agent_fn_team1, games=games, k_history=k_history,
                         tqdm_desc=None, tqdm_position=0, tqdm_disable=True)
     bd_sum = {0: {}, 1: {}}
     for t in [0, 1]:
         for k in bd[t].keys():
             bd_sum[t][k] = float(bd[t][k]) * float(games)
+    wr = float((bd.get('meta') or {}).get('win_rate', 0.0))
     wins_int = int(round(wr * games))
-    return wins_int, bd_sum, int(games)
+    diff_sum = float(diff) * float(games)
+    return diff_sum, bd_sum, wins_int, int(games)
 
 
 def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10,
@@ -733,13 +781,13 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
                 _dbg(f"waiting dist result {idx+1}/{len(args_list)} …")
                 item = async_res.next(timeout=float(os.environ.get('SCOPONE_EVAL_POOL_TIMEOUT_S','600')))
                 try:
-                    wins_i, bd_sum_i, games_i = item
+                    diff_sum_i, bd_sum_i, wins_i, games_i = item
                 except Exception as e:
                     _dbg(f"received malformed result {item!r}: {e}")
                     continue
                 if pbar is not None:
                     pbar.update(int(games_i))
-                results.append((wins_i, bd_sum_i, games_i))
+                results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
         except mp.TimeoutError as te:
             _dbg("pool timeout (dist) while waiting for results; terminating pool …")
             pool.terminate()
@@ -757,10 +805,12 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
     _dbg(f"aggregating {len(results)} dist results")
     total_games = 0
     total_wins = 0
+    total_diff_sum = 0.0
     agg = {0: {}, 1: {}}
-    for wins_i, bd_sum_i, games_i in results:
+    for diff_sum_i, bd_sum_i, wins_i, games_i in results:
         total_games += int(games_i)
         total_wins += int(wins_i)
+        total_diff_sum += float(diff_sum_i)
         for t in [0, 1]:
             for k, v in bd_sum_i[t].items():
                 agg[t][k] = agg[t].get(k, 0.0) + float(v)
@@ -771,7 +821,9 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
         for k, v in agg[t].items():
             bd_avg[t][k] = (float(v) / float(total_games))
     wr = float(total_wins) / float(total_games)
-    return wr, bd_avg
+    bd_avg['meta'] = {'win_rate': float(wr)}
+    diff_avg = float(total_diff_sum) / float(total_games)
+    return float(diff_avg), bd_avg
 
 def league_eval_and_update(league_dir='checkpoints/league', games=20, target_points=11):
     """Esegue sfide tra ultimi due checkpoint registrati e aggiorna Elo nel league in base alla differenza media di punti (reward)."""
@@ -780,9 +832,8 @@ def league_eval_and_update(league_dir='checkpoints/league', games=20, target_poi
         return
     a, b = league.history[-2], league.history[-1]
     # Usa serie di partite per stimare la differenza media di punti di A contro B
-    _wr, bd = evaluate_pair_actors(a, b, games=games, k_history=12, mcts=None)
-    diff = float(bd[0].get('total', 0.0)) - float(bd[1].get('total', 0.0))
-    # Aggiorna Elo usando la differenza media di punti -> mapping logistico a score
+    diff, bd = evaluate_pair_actors(a, b, games=games, k_history=12, mcts=None)
+    # Aggiorna Elo usando la differenza media di punti -> mapping lineare a score
     league.update_elo_from_diff(a, b, diff)
     return league.elo
 

@@ -37,22 +37,27 @@ class League:
 
     def update_elo_from_diff(self, ckpt_a: str, ckpt_b: str, avg_point_diff_a: float, k: float = 16.0, tau: float = None):
         """
-        Aggiorna l'Elo usando la differenza media di punti (reward) invece del win-rate.
-        Mappa la differenza di punti in uno "score" continuo in [0,1] tramite una funzione logistica
-        s = sigmoid(diff / tau), con tau controllabile via env SCOPONE_ELO_DIFF_TAU (default=2.0).
+        Aggiorna l'Elo usando la differenza media di punti (reward) con mappatura LINEARE a score [0,1].
+        score = clamp(0.5 + diff / (2*scale), 0, 1)
+        Dove scale è controllabile via env SCOPONE_ELO_DIFF_SCALE e default=6.0.
         """
+        # Leggi la scala da env; consenti override via arg 'tau' (alias di scale)
         try:
-            _tau_env = float(os.environ.get('SCOPONE_ELO_DIFF_TAU', '2.0'))
+            _scale_env = float(os.environ.get('SCOPONE_ELO_DIFF_SCALE', '6.0'))
         except Exception:
-            _tau_env = 2.0
-        _tau = float(tau) if (tau is not None) else float(_tau_env)
-        _tau = max(1e-6, _tau)
+            _scale_env = 6.0
+        scale = float(tau) if (tau is not None) else float(_scale_env)
+        scale = max(1e-6, scale)
         try:
             d = float(avg_point_diff_a)
         except Exception:
             d = 0.0
-        # Logistic mapping to [0,1], symmetric around 0 -> 0.5
-        score_a = 1.0 / (1.0 + math.exp(-(d / _tau)))
+        # Linear mapping with hard clamp
+        score_a = 0.5 + (d / (2.0 * scale))
+        if score_a < 0.0:
+            score_a = 0.0
+        elif score_a > 1.0:
+            score_a = 1.0
         return self.update_elo(ckpt_a, ckpt_b, score_a, k=k)
 
     def _softmax_sample(self, items: List[str], temp: float = 1.0) -> str:

@@ -26,6 +26,7 @@ os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
 
+
 ## Autotune controllabile: di default ON su CPU beneficia di fusioni; può essere disattivato via env
 os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
@@ -52,12 +53,37 @@ os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
 os.environ.setdefault('ENV_DEVICE', 'cpu')
 
 # Training compute device (models stay on CPU during env collection; moved only inside update)
-os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cuda')
+os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
 
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
 os.environ.setdefault('SCOPONE_PAR_PROFILE', '0')
+
+# Additional trainer/eval tunables exposed via environment (defaults; override as needed)
+os.environ.setdefault('SCOPONE_PAR_DEBUG', '0')
+os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
+os.environ.setdefault('SCOPONE_TORCH_PROF', '0')
+os.environ.setdefault('SCOPONE_TORCH_TB_DIR', '')
+os.environ.setdefault('SCOPONE_RPC_TIMEOUT_S', '30')
+os.environ.setdefault('SCOPONE_RAISE_ON_INVALID_SIMS', '0')
+os.environ.setdefault('SCOPONE_EP_PUT_TIMEOUT_S', '15')
+os.environ.setdefault('SCOPONE_TORCH_PROF_DIR', 'profiles')
+os.environ.setdefault('SCOPONE_RAISE_ON_CKPT_FAIL', '0')
+os.environ.setdefault('ENABLE_BELIEF_SUMMARY', '0')
+os.environ.setdefault('DET_NOISE', '0.0')
+os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')
+os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')
+os.environ.setdefault('SCOPONE_COLLECTOR_STALL_S', '30')
+
+# Gameplay/training topology flags
+os.environ.setdefault('SCOPONE_START_OPP', os.environ.get('SCOPONE_START_OPP', 'top1'))
+
+# Evaluation process knobs
+os.environ.setdefault('SCOPONE_EVAL_DEBUG', '0')
+os.environ.setdefault('SCOPONE_EVAL_MP_START', os.environ.get('SCOPONE_MP_START', 'forkserver'))
+os.environ.setdefault('SCOPONE_EVAL_POOL_TIMEOUT_S', '600')
+os.environ.setdefault('SCOPONE_ELO_DIFF_SCALE', '6.0')
 
 # TQDM_DISABLE: 1=disattiva progress bar/logging di tqdm; 0=abilitato
 os.environ.setdefault('TQDM_DISABLE', '0')
@@ -92,6 +118,9 @@ os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)//
 _save_every = int(os.environ.get('SCOPONE_SAVE_EVERY','10'))
 os.environ.setdefault('SCOPONE_MINIBATCH', '4096')
 
+# Checkpoint path control
+os.environ.setdefault('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
+
 # Default to random seed for training runs (set -1); stable only if user sets it
 seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
 
@@ -99,6 +128,9 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
 iters = int(os.environ.get('SCOPONE_ITERS', '3'))
 horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
 num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '8'))
+
+# Read checkpoint path from env for training
+ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 
 # MCTS eval flags
 _eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '10'))
@@ -223,6 +255,7 @@ if __name__ == "__main__":
               mcts_sims=_mcts_sims,
               mcts_sims_eval=_eval_mcts_sims,
               save_every=_save_every,
+              ckpt_path=ckpt_path_env,
               entropy_schedule_type=_entropy_sched,
               eval_every=_eval_every,
               mcts_in_eval=_eval_use_mcts,
@@ -238,6 +271,5 @@ if __name__ == "__main__":
               seed=seed_env,
               use_selfplay=_selfplay,
               train_both_teams=_tfb)
-
 
 
