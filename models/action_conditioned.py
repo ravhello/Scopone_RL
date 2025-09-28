@@ -534,7 +534,7 @@ class ActionConditionedActor(torch.nn.Module):
 
     def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
         target_device = next(self.parameters()).device
-        _par = (os.environ.get('SCOPONE_PAR_PROFILE', '0') != '0')
+        _par = (os.environ.get('SCOPONE_PROFILE', '0') != '0')
         t_state_enc = 0.0; t_belief_logits = 0.0; t_belief_probs = 0.0
         t_partner = 0.0; t_opp = 0.0; t_merge = 0.0; t_proj = 0.0
         _t0 = time.time() if _par else 0.0
@@ -1098,6 +1098,5 @@ class CentralValueNet(torch.nn.Module):
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
         _ = strict  # keep arg for external callers; force non-strict loading
         return super().load_state_dict(state_dict, strict=False)
-
 
 

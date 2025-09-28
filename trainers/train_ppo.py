@@ -35,8 +35,8 @@ torch.backends.cudnn.enabled = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
 
-# Parallel profiling controls (single boolean -> full detail when enabled)
-_PAR_TIMING = (os.environ.get('SCOPONE_PAR_PROFILE', '0') != '0')
+# Profiling controls (single boolean -> full detail when enabled)
+_PAR_TIMING = (os.environ.get('SCOPONE_PROFILE', '0') != '0')
 _PAR_DEBUG = (os.environ.get('SCOPONE_PAR_DEBUG', '0') in ['1','true','yes','on'])
 
 # Reuse cached tensors to limit per-step allocations inside workers
@@ -3153,7 +3153,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     shadow_every = max(1, int(os.environ.get('SCOPONE_FROZEN_UPDATE_EVERY', '1')))
     for it in pbar:
         t0 = time.time()
-        # Iteration-level timing breakdown (enabled by SCOPONE_PAR_PROFILE=1)
+        # Iteration-level timing breakdown (enabled by SCOPONE_PROFILE=1)
         _iter_t_collect = 0.0
         _iter_t_preproc = 0.0
         _iter_t_update = 0.0
@@ -3701,15 +3701,12 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         else:
             preview = {k: round(_to_float(info[k]), 4) for k in preview_keys if k in info}
             preview.update({'avg_ret': round(avg_return, 4), 't_s': round(dt, 2)})
-        # In non-parallel mode evita duplicazione: mostra metriche solo nel postfix della progress bar
-        if use_parallel:
-            metrics_str = (
-                f"it {it} | " +
-                " ".join([f"{k}:{v}" for k, v in preview.items()])
-            )
-            metrics_bar.set_description_str(metrics_str, refresh=False)
-        else:
-            pbar.set_postfix(preview)
+        metrics_body = " ".join([f"{k}:{v}" for k, v in preview.items()]) if preview else ""
+        metrics_prefix = f"it {it + 1}/{num_iterations}"
+        metrics_bar.set_description_str(
+            f"{metrics_prefix} | {metrics_body}" if metrics_body else metrics_prefix,
+            refresh=False
+        )
         # Iteration-level timing print (sums to dt)
         if _PAR_TIMING:
             _post = max(0.0, dt - (_iter_t_collect + _iter_t_preproc + _iter_t_update))
