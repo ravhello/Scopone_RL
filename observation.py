@@ -25,6 +25,7 @@ OBS_INCLUDE_DEALER = os.environ.get('OBS_INCLUDE_DEALER', '1') == '1'
 
 # ===== ID/Bitset helpers (device = OBS_DEVICE) =====
 RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
+RANK_OF_ID_F32 = RANK_OF_ID.to(torch.float32)
 SUITCOL_OF_ID = torch.tensor([i % 4 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
 MASK_RANK = [(sum(1 << j for j in range(40) if (j // 4 + 1) == r)) for r in range(1, 11)]  # retained for potential bitset ops
 PRIMIERA_VAL_T = torch.tensor([0, 16, 12, 13, 14, 15, 18, 21, 10, 10, 10], dtype=torch.float32, device=OBS_DEVICE)
@@ -41,6 +42,8 @@ _RANK_BINS_CACHE = {}
 _IDX_1_10_CACHE = {}
 _BIT_ONE_CACHE = {}
 _MASK_BITS_CACHE = {}
+_OTHER_PLAYER_IDX_CACHE = {}
+_PLAYER_ARANGE_CACHE = {}
 
 def _get_rank_bins(device: torch.device) -> torch.Tensor:
     key = str(device)
@@ -74,15 +77,39 @@ def _get_mask_bits(device: torch.device) -> torch.Tensor:
         _MASK_BITS_CACHE[key] = t
     return t
 
+
+def _get_other_player_idx(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    t = _OTHER_PLAYER_IDX_CACHE.get(key)
+    if t is None or t.device != device:
+        t = torch.tensor([
+            [1, 2, 3],
+            [0, 2, 3],
+            [0, 1, 3],
+            [0, 1, 2],
+        ], dtype=torch.long, device=device)
+        _OTHER_PLAYER_IDX_CACHE[key] = t
+    return t
+
+
+def _get_players_arange(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    t = _PLAYER_ARANGE_CACHE.get(key)
+    if t is None or t.device != device:
+        t = torch.arange(4, device=device, dtype=torch.long)
+        _PLAYER_ARANGE_CACHE[key] = t
+    return t
+
 def set_obs_device(device: torch.device) -> None:
     """Rebuild observation constant tensors on the requested device.
     Call this when the environment/device changes to avoid CPU/CUDA mismatches.
     """
-    global OBS_DEVICE, RANK_OF_ID, SUITCOL_OF_ID, PRIMIERA_VAL_T, IDS_CUDA, IS_DENARI_MASK_40, PRIMIERA_PER_ID, ONE_HOT_PLAYERS, SUITS_OH_4x40
+    global OBS_DEVICE, RANK_OF_ID, RANK_OF_ID_F32, SUITCOL_OF_ID, PRIMIERA_VAL_T, IDS_CUDA, IS_DENARI_MASK_40, PRIMIERA_PER_ID, ONE_HOT_PLAYERS, SUITS_OH_4x40
     if device == OBS_DEVICE:
         return
     OBS_DEVICE = torch.device(device)
     RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
+    RANK_OF_ID_F32 = RANK_OF_ID.to(torch.float32)
     SUITCOL_OF_ID = torch.tensor([i % 4 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
     PRIMIERA_VAL_T = torch.tensor([0, 16, 12, 13, 14, 15, 18, 21, 10, 10, 10], dtype=torch.float32, device=OBS_DEVICE)
     IDS_CUDA = torch.arange(40, device=OBS_DEVICE, dtype=torch.int64)
@@ -845,31 +872,45 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     if hands_bits_t is None or table_bits_t is None or captured_bits_t is None:
         raise ValueError('encode_state_compact_for_player_fast requires bitset mirrors (_hands_bits_t, _table_bits_t, _captured_bits_t)')
 
+    # Ensure observation constants live on the same device to avoid per-call tensor copies
+    if IDS_CUDA.device != device:
+        set_obs_device(device)
+
+    ids = IDS_CUDA
+
+    # Expand bitset mirrors once so both boolean and float views can be derived without re-shifting
+    hands_bits_exp = hands_bits_t.to(torch.int64).unsqueeze(1)
+    hands_mask_int = (hands_bits_exp >> ids) & 1  # (4,40)
+    hands_mask_f = hands_mask_int.to(torch.float32)
+
+    table_bits_int = table_bits_t.to(torch.int64)
+    table_mask_int = (table_bits_int >> ids) & 1  # (40)
+    table_mask_f = table_mask_int.to(torch.float32)
+
+    captured_bits_exp = captured_bits_t.to(torch.int64).unsqueeze(1)
+    captured_mask_int = (captured_bits_exp >> ids) & 1  # (2,40)
+    captured_mask_f = captured_mask_int.to(torch.float32)
+    captured_mask_bool = captured_mask_int.to(torch.bool)
+
     # 1) Mani (43): 40 one-hot + 3 conteggi altri giocatori
-    hand_vec = (((hands_bits_t[player_id] >> IDS_CUDA) & 1).to(torch.float32))  # (40,)
+    hand_vec = hands_mask_f[player_id]
     if STRICT_CHECKS and (not torch.isfinite(hand_vec).all()):
         raise RuntimeError("Observation hand_vec contains non-finite values")
-    other_counts = []
-    for p in range(4):
-        if p == player_id:
-            continue
-        cnt = (((hands_bits_t[p] >> IDS_CUDA) & 1).to(torch.float32).sum() / 10.0)
-        other_counts.append(cnt)
-    other_counts_t = torch.stack(other_counts) if other_counts else torch.zeros(3, dtype=torch.float32, device=device)
+    hand_counts = (hands_mask_f.sum(dim=1) / 10.0)
+    other_idx = _get_other_player_idx(device)[player_id]
+    other_counts_t = hand_counts.index_select(0, other_idx)
     hands_enc = torch.cat([hand_vec.reshape(-1), other_counts_t.reshape(-1)], dim=0)
 
     # 2) Tavolo (40)
-    table_enc = (((table_bits_t >> IDS_CUDA) & 1).to(torch.float32))
+    table_enc = table_mask_f
     if STRICT_CHECKS and (not torch.isfinite(table_enc).all()):
         raise RuntimeError("Observation table_enc contains non-finite values")
 
     # 3) Catture squadre (82): 40 + 40 + 2
-    team0_vec = (((captured_bits_t[0] >> IDS_CUDA) & 1).to(torch.float32))
-    team1_vec = (((captured_bits_t[1] >> IDS_CUDA) & 1).to(torch.float32))
-    # Avoid tiny tensor constructors; compute then unsqueeze
-    team0_count = (team0_vec.sum() / 40.0).unsqueeze(0)
-    team1_count = (team1_vec.sum() / 40.0).unsqueeze(0)
-    captured_enc = torch.cat([team0_vec, team1_vec, team0_count, team1_count], dim=0)
+    team0_vec = captured_mask_f[0]
+    team1_vec = captured_mask_f[1]
+    team_counts = captured_mask_f.sum(dim=1) / 40.0
+    captured_enc = torch.cat([team0_vec, team1_vec, team_counts], dim=0)
     if STRICT_CHECKS and (not torch.isfinite(captured_enc).all()):
         raise RuntimeError("Observation captured_enc contains non-finite values")
 
@@ -879,8 +920,8 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
         raise RuntimeError("Observation history encoding contains non-finite values")
 
     # 5) Missing cards (40): inverti visibilità (mano osservatore + tavolo + captured)
-    visible_bits = hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
-    missing_vec = (1 - (((visible_bits >> IDS_CUDA) & 1).to(torch.float32)))
+    visible_bits = (hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]).to(torch.int64)
+    missing_vec = 1.0 - ((visible_bits >> ids) & 1).to(torch.float32)
     if STRICT_CHECKS and (not torch.isfinite(missing_vec).all()):
         raise RuntimeError("Observation missing_vec contains non-finite values")
 
@@ -888,52 +929,42 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     inferred_probs = (compute_inferred_probabilities(game_state, player_id)
                       if OBS_INCLUDE_INFERRED else None)
 
-    # 7) Primiera status (8) via bitset (evita .item()/.any() sync)
-    def _primiera_from_bits(bits_t):
-        present = (((bits_t >> IDS_CUDA) & 1).to(torch.bool))           # (40)
-        vals = PRIMIERA_PER_ID.to(device=device, dtype=torch.float32)   # (40)
-        suits_oh = SUITS_OH_4x40.to(device=device)
-        mask = present.unsqueeze(0) & suits_oh                          # (4,40)
-        masked_vals = vals.unsqueeze(0) * mask.to(vals.dtype)
-        prim = masked_vals.max(dim=1).values / 21.0
-        return prim
-    primiera_status = torch.cat([_primiera_from_bits(captured_bits_t[0]), _primiera_from_bits(captured_bits_t[1])])
+    suits_oh = SUITS_OH_4x40
+    prim_vals = PRIMIERA_PER_ID
+    prim_mask = captured_mask_bool.unsqueeze(1) & suits_oh.unsqueeze(0)  # (2,4,40)
+    prim_masked_vals = prim_mask.to(torch.float32) * prim_vals.view(1, 1, 40)
+    primiera_team = prim_masked_vals.max(dim=2).values / 21.0
+    primiera_status = primiera_team.reshape(-1)
 
     # 8) Denari count (2)
-    den0 = (present := (((captured_bits_t[0] >> IDS_CUDA) & 1).to(torch.bool)))
-    den1 = (((captured_bits_t[1] >> IDS_CUDA) & 1).to(torch.bool))
-    denari_count = torch.stack([
-        (den0 & IS_DENARI_MASK_40).to(torch.float32).sum() / 10.0,
-        (den1 & IS_DENARI_MASK_40).to(torch.float32).sum() / 10.0,
-    ])
+    denari_mask = IS_DENARI_MASK_40
+    denari_raw = (captured_mask_bool & denari_mask).sum(dim=1).to(torch.float32)
+    denari_count = denari_raw / 10.0
 
     # 9) Settebello (1)
     settebello_id = 24
-    have0 = (((captured_bits_t[0] >> settebello_id) & 1).to(torch.float32))
-    have1 = (((captured_bits_t[1] >> settebello_id) & 1).to(torch.float32))
-    on_tbl = (((table_bits_t >> settebello_id) & 1).to(torch.float32))
-    settebello_status = (have0 * 1.0 + have1 * 2.0 + on_tbl * 3.0).unsqueeze(0) / 3.0
+    have = captured_mask_f[:, settebello_id]
+    on_tbl = table_mask_f[settebello_id]
+    settebello_status = (have[0] + have[1] * 2.0 + on_tbl * 3.0).unsqueeze(0) / 3.0
 
     # 10) Score estimate (2) - tensor path using mirrors to stay compilable
     scopa_counts = game_state.get('_scopa_counts_t', None)
     if scopa_counts is None:
         scopa_counts = torch.zeros(2, dtype=torch.float32, device=device)
     # total cards winner
-    c0 = (team0_vec > 0.5).to(torch.float32).sum()
-    c1 = (team1_vec > 0.5).to(torch.float32).sum()
-    pt_c0 = (c0 > c1).to(torch.float32)
-    pt_c1 = (c1 > c0).to(torch.float32)
+    team_card_counts = captured_mask_f.sum(dim=1)
+    pt_c0 = (team_card_counts[0] > team_card_counts[1]).to(torch.float32)
+    pt_c1 = (team_card_counts[1] > team_card_counts[0]).to(torch.float32)
     # denari winner
-    d0 = (den0 & IS_DENARI_MASK_40).to(torch.float32).sum()
-    d1 = (den1 & IS_DENARI_MASK_40).to(torch.float32).sum()
-    pt_d0 = (d0 > d1).to(torch.float32)
-    pt_d1 = (d1 > d0).to(torch.float32)
+    pt_d0 = (denari_raw[0] > denari_raw[1]).to(torch.float32)
+    pt_d1 = (denari_raw[1] > denari_raw[0]).to(torch.float32)
     # settebello
-    sb0 = have0
-    sb1 = have1
+    sb0 = have[0]
+    sb1 = have[1]
     # primiera winner using per-suit maxima sums
-    prim0 = primiera_status[:4].sum()
-    prim1 = primiera_status[4:].sum()
+    prim_sums = primiera_team.sum(dim=1)
+    prim0 = prim_sums[0]
+    prim1 = prim_sums[1]
     pt_p0 = (prim0 > prim1).to(torch.float32)
     pt_p1 = (prim1 > prim0).to(torch.float32)
     total0 = pt_c0 + pt_d0 + sb0 + pt_p0 + scopa_counts[0]
@@ -941,9 +972,7 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     score_estimate = torch.stack([total0, total1]).to(torch.float32) / 12.0
 
     # 11) Table sum (1) via bitset
-    table_sum = (
-        (RANK_OF_ID.to(torch.int64)[IDS_CUDA].to(torch.float32) * (((table_bits_t >> IDS_CUDA) & 1).to(torch.float32))).sum() / 30.0
-    ).unsqueeze(0)
+    table_sum = (RANK_OF_ID_F32 * table_mask_f).sum().unsqueeze(0) / 30.0
 
     # 12) Scopa probs next (10) - opzionale; prefer mirror to stay compilable
     if OBS_INCLUDE_SCOPA_PROBS:
@@ -961,38 +990,16 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     # 14) Scopa counts (2)
     scopa_counts = compute_scopa_counts(game_state)
 
-    # 15) Table possible sums (10) — no Python branching on tensors
-    present_tbl = (((table_bits_t >> IDS_CUDA) & 1).to(torch.bool))  # (40)
-    ranks_all = RANK_OF_ID.to(torch.int64)[IDS_CUDA]  # (40)
-    rank_bins = _get_rank_bins(device)  # (10,1)
-    counts = ((ranks_all.unsqueeze(0) == rank_bins) & present_tbl.unsqueeze(0)).sum(dim=1).to(torch.int64)  # (10)
-    bitset = _get_bit_one(device)  # bit 0 attivo (somma 0)
-    mask_bits = _get_mask_bits(device)  # mantieni 11 bit (0..10)
-    # LUT per ripetizioni 0..4 del shift: precomputata in registro
-    r_vals = torch.arange(1, 11, dtype=torch.int64, device=device)
-    # Genera in parallelo i quattro step e seleziona con where senza branch Python
-    for ri in range(10):
-        r = r_vals[ri]
-        c = counts[ri]
-        s1 = torch.bitwise_and(bitset | torch.bitwise_left_shift(bitset, r), mask_bits)
-        s2 = torch.bitwise_and(s1    | torch.bitwise_left_shift(s1,    r), mask_bits)
-        s3 = torch.bitwise_and(s2    | torch.bitwise_left_shift(s2,    r), mask_bits)
-        s4 = torch.bitwise_and(s3    | torch.bitwise_left_shift(s3,    r), mask_bits)
-        # Applica il numero di ripetizioni richiesto (0..4) senza .item()
-        bitset = torch.where(c <= 0, bitset,
-                  torch.where(c == 1, s1,
-                  torch.where(c == 2, s2,
-                  torch.where(c == 3, s3, s4))))
-    # Estrai bit 1..10
-    sums_bits = bitset
-    idx = _get_idx_1_10(device)
-    vals = (torch.bitwise_and(torch.bitwise_right_shift(sums_bits, idx), 1)).to(torch.float32)
-    table_possible_sums = vals
+    # 15) Table possible sums (10) — reuse cached subset computation (CPU fast-path)
+    table_possible_sums = compute_table_possible_sums(game_state)
+    if table_possible_sums.device != device:
+        table_possible_sums = table_possible_sums.to(device=device)
     # 16) Progress (1) e 17) Last capturing team (2)
     p_m = game_state.get('_progress_t', None)
     lct_m = game_state.get('_last_capturing_team_t', None)
-    progress = p_m.to(device=device, dtype=torch.float32)
-    last_capturing_team = lct_m.to(device=device, dtype=torch.float32)
+    progress = p_m if (p_m.device == device and p_m.dtype == torch.float32) else p_m.to(device=device, dtype=torch.float32)
+    last_capturing_team = (lct_m if (lct_m.device == device and lct_m.dtype == torch.float32)
+                           else lct_m.to(device=device, dtype=torch.float32))
 
     # Prealloc result and write slices to reduce cat overhead
     include_scopa = OBS_INCLUDE_SCOPA_PROBS
@@ -1005,8 +1012,6 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     else:
         result = torch.empty((expected_dim,), dtype=torch.float32, device=device)
     pos = 0
-    # Preallocate a small zero buffer for occasional zero fills to avoid creating many tiny tensors
-    zero_buf = torch.zeros((1,), dtype=torch.float32, device=device)
     def _w(t):
         nonlocal pos
         # Assume all tensors are already float32 on correct device to avoid per-slice conversions
@@ -1040,10 +1045,9 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
         hlen_mod4 = (hlen_t.to(torch.long) % 4) if torch.is_tensor(hlen_t) else torch.zeros((), dtype=torch.long, device=device)
         starting_seat = torch.remainder(curr - hlen_mod4, 4)
         dealer_idx = torch.remainder(starting_seat - 1, 4)
-        dealer_vec = (torch.arange(4, device=device, dtype=torch.long) == dealer_idx).to(torch.float32)
+        dealer_vec = (_get_players_arange(device) == dealer_idx).to(torch.float32)
         _w(dealer_vec)
     # rank_presence_from_inferred (30) always appended at end for fast-path coherence
     rpf = game_state.get('_rank_presence_from_inferred_t', None)
     _w(rpf)
     return result
-
