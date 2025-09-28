@@ -1,32 +1,52 @@
 import os
 import sys
 import argparse
+import threading
+import torch as _torch
 
 # Ensure project root on sys.path for module imports
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+_train_dev = os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')
+if (_train_dev.startswith('cuda') and _torch.cuda.is_available()):
+    _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', '2'))
+    _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', '1'))
+else:
+    _cores = int(max(1, (os.cpu_count() or 1)))
+    _target = max(1, int(_cores * 0.60))
+    _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', str(_target)))
+    _n_interop_default = max(1, _n_threads // 8)
+    _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', str(_n_interop_default)))
+
 # Silence TensorFlow/absl noise before any heavy imports
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # hide INFO/WARNING/ERROR from TF C++ logs
 os.environ.setdefault('ABSL_LOGGING_MIN_LOG_LEVEL', '3')  # absl logs: only FATAL
 os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # disable oneDNN custom ops info spam
+
 # Abilita TensorBoard di default (override con SCOPONE_DISABLE_TB=1 per disattivarlo)
 os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
+
 ## Abilita torch.compile di default per l'intero progetto (override via env)
 os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'reduce-overhead')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_COMPILE_VERBOSE', '1')
+
 ## Autotune controllabile: di default ON su CPU beneficia di fusioni; può essere disattivato via env
 os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE_GEMM', '0')
+
 ## Evita graph break su .item() catturando scalari nei grafi
 os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
+
 ## Abilita dynamic shapes per ridurre errori di symbolic shapes FX
 os.environ.setdefault('TORCHDYNAMO_DYNAMIC_SHAPES', '0')
+
 ## Alza il limite del cache di Dynamo per ridurre recompilazioni
 os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
+
 ## Non impostare TORCH_LOGS ad un valore invalido; lascia al default o definisci mapping esplicito se necessario
 # Abilita e blocca i flag dell'osservazione all'avvio (usati da observation/environment al load)
 # Se l'utente li ha già impostati nel proprio run, li rispettiamo (setdefault)
@@ -34,55 +54,123 @@ os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
 os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
 os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
 os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
+
 # Imposta ENV_DEVICE una sola volta coerente con SCOPONE_DEVICE o disponibilità CUDA
 os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
 os.environ.setdefault('ENV_DEVICE', 'cpu')
+
 # Training compute device (models stay on CPU during env collection; moved only inside update)
-os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cuda')
+os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
+
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
-os.environ.setdefault('SCOPONE_PAR_PROFILE', '0')
+os.environ.setdefault('SCOPONE_PAR_PROFILE', '1')
+
+# Additional trainer/eval tunables exposed via environment (defaults; override as needed)
+os.environ.setdefault('SCOPONE_PAR_DEBUG', '0')
+os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
+os.environ.setdefault('SCOPONE_TORCH_PROF', '0')
+os.environ.setdefault('SCOPONE_TORCH_TB_DIR', '')
+os.environ.setdefault('SCOPONE_RPC_TIMEOUT_S', '30')
+os.environ.setdefault('SCOPONE_RAISE_ON_INVALID_SIMS', '0')
+os.environ.setdefault('SCOPONE_EP_PUT_TIMEOUT_S', '15')
+os.environ.setdefault('SCOPONE_TORCH_PROF_DIR', 'profiles')
+os.environ.setdefault('SCOPONE_RAISE_ON_CKPT_FAIL', '0')
+os.environ.setdefault('ENABLE_BELIEF_SUMMARY', '0')
+os.environ.setdefault('DET_NOISE', '0.0')
+os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')
+os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')
+os.environ.setdefault('SCOPONE_COLLECTOR_STALL_S', '30')
+
+# Gameplay/training topology flags
+os.environ.setdefault('SCOPONE_START_OPP', os.environ.get('SCOPONE_START_OPP', 'top1'))
+
+# Evaluation process knobs
+os.environ.setdefault('SCOPONE_EVAL_DEBUG', '0')
+os.environ.setdefault('SCOPONE_EVAL_MP_START', os.environ.get('SCOPONE_MP_START', 'forkserver'))
+os.environ.setdefault('SCOPONE_EVAL_POOL_TIMEOUT_S', '600')
+os.environ.setdefault('SCOPONE_ELO_DIFF_SCALE', '6.0')
+
 # TQDM_DISABLE: 1=disattiva progress bar/logging di tqdm; 0=abilitato
 os.environ.setdefault('TQDM_DISABLE', '0')
+
 # SELFPLAY: 1=single net (self-play), 0=dual nets (Team A/B)
-os.environ.setdefault('SCOPONE_SELFPLAY', '1')
-# SCOPONE_TRAIN_FROM_BOTH_TEAMS: ONLY when SELFPLAY=1 and OPP_FROZEN=0; use both teams' transitions
-os.environ.setdefault('SCOPONE_TRAIN_FROM_BOTH_TEAMS', '1')
-os.environ.setdefault('SCOPONE_OPP_FROZEN', '1')
+_selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
+_selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
+
+# SCOPONE_OPP_FROZEN: 1=freeze the opponent, 0=co-train with the opponent
+_opp_frozen = os.environ.get('SCOPONE_OPP_FROZEN', '0') in ['1', 'true', 'yes', 'on']
+
+# SCOPONE_TRAIN_FROM_BOTH_TEAMS: effective ONLY when SELFPLAY=1 and OPP_FROZEN=0.
+# Uses transitions from both teams for the single net; otherwise ignored (on-policy).
+_tfb = os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS', '0') in ['1', 'true', 'yes', 'on']
+
 # Warm-start policy controlled by SCOPONE_WARM_START: '0' start-from-scratch, '1' force top1 clone, '2' use top2 if available
 os.environ.setdefault('SCOPONE_WARM_START', '2')
-# SCOPONE_ALTERNATE_ITERS: dual-nets+frozen alternation period (A↔B)
+
+# SCOPONE_ALTERNATE_ITERS: in dual-nets+frozen, train A for N iters then swap to B (and vice versa)
 os.environ.setdefault('SCOPONE_ALTERNATE_ITERS', '1')
-# SCOPONE_FROZEN_UPDATE_EVERY: selfplay+frozen shadow refresh period
+
+# SCOPONE_FROZEN_UPDATE_EVERY: in selfplay+frozen, refresh the shadow (frozen) opponent every N iters
 os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
+
 # Refresh League from disk at startup (scan checkpoints/). 1=ON, 0=OFF
 os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '1')
-# Evaluation games for Elo mini-evals and refresh assessments
-os.environ.setdefault('SCOPONE_EVAL_GAMES', '100')
-# Workers paralleli per eval: 1=seriale; >1 usa multiprocessing
+
+# Parallel eval workers: 1=serial, >1 parallel via multiprocessing
 os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)//2)))
-# MCTS eval flags
-os.environ.setdefault('SCOPONE_EVAL_USE_MCTS', '0')
-os.environ.setdefault('SCOPONE_EVAL_MCTS_SIMS', '128')
-os.environ.setdefault('SCOPONE_EVAL_MCTS_DETS', '1')
-os.environ.setdefault('SCOPONE_EVAL_K_HISTORY', '39')
+
 # Training flags (manual overrides available via env)
-os.environ.setdefault('SCOPONE_SAVE_EVERY', '10')
-os.environ.setdefault('SCOPONE_MCTS_TRAIN', '1')
-os.environ.setdefault('SCOPONE_MCTS_SIMS', '128')
-os.environ.setdefault('SCOPONE_MCTS_DETS', '4')
+_save_every = int(os.environ.get('SCOPONE_SAVE_EVERY', '10'))
 os.environ.setdefault('SCOPONE_MINIBATCH', '4096')
+
+# Checkpoint path control
+os.environ.setdefault('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
+
 # Default to random seed for training runs (set -1); stable only if user sets it
 seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
-# Allow configuring iterations/horizon/num_envs via env; sensible defaults
-iters = int(os.environ.get('SCOPONE_ITERS', '0'))
-horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
-num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '1'))
 
-# Disable the stderr filtering thread when running under Scalene to avoid
-# attributing time to this file instead of user modules.
-_SILENCE_ABSL = (os.environ.get('SCALENE_RUNNING', '0') != '1') and (os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1')
+# Allow configuring iterations/horizon/num_envs via env; sensible defaults
+iters = int(os.environ.get('SCOPONE_ITERS', '3'))
+horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
+_DEFAULT_NUM_ENVS = int(os.environ.get('SCOPONE_NUM_ENVS', '1'))
+
+# Read checkpoint path from env for training
+ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
+
+# MCTS eval flags
+_eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '10'))
+_eval_c_puct = float(os.environ.get('SCOPONE_EVAL_MCTS_C_PUCT', '1.0'))
+_eval_root_temp = float(os.environ.get('SCOPONE_EVAL_MCTS_ROOT_TEMP', '0.0'))
+_eval_prior_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_PRIOR_SMOOTH_EPS', '0.0'))
+_eval_dir_alpha = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_ALPHA', '0.25'))
+_eval_dir_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_EPS', '0.25'))
+_eval_belief_particles = int(os.environ.get('SCOPONE_EVAL_BELIEF_PARTICLES', '0'))
+_eval_belief_ess = float(os.environ.get('SCOPONE_EVAL_BELIEF_ESS_FRAC', '0.5'))
+_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS', '0').lower() in ['1', 'true', 'yes', 'on']
+_eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS', '128'))
+_eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS', '1'))
+_eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY', '39'))
+_eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES', '1000'))
+
+# Training config flags (from env)
+_entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED', 'linear')
+_belief_particles = int(os.environ.get('SCOPONE_BELIEF_PARTICLES', '512'))
+_belief_ess = float(os.environ.get('SCOPONE_BELIEF_ESS_FRAC', '0.5'))
+_mcts_c_puct = float(os.environ.get('SCOPONE_MCTS_C_PUCT', '1.0'))
+_mcts_root_temp = float(os.environ.get('SCOPONE_MCTS_ROOT_TEMP', '0.0'))
+_mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS', '0.0'))
+_mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA', '0.25'))
+_mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS', '0.25'))
+_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN', '0') in ['1', 'true', 'yes', 'on']
+_mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS', '128'))
+_mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS', '4'))
+
+# Targeted FD-level stderr filter to drop absl/TF CUDA registration warnings from C++
+_SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
+if os.environ.get('SCALENE_RUNNING', '0') == '1':  # scalene needs raw stderr
+    _SILENCE_ABSL = False
 if _SILENCE_ABSL:
     _SUPPRESS_SUBSTRINGS = (
         "All log messages before absl::InitializeLog() is called are written to STDERR",
@@ -91,8 +179,7 @@ if _SILENCE_ABSL:
         "cuda_dnn.cc",
         "cuda_blas.cc",
     )
-    # Install OS-level fd2 filter like main.py so native C++ logs are filtered
-    import threading  # local import to avoid changing global import order
+
     _orig_fd2 = os.dup(2)
     _r_fd, _w_fd = os.pipe()
     os.dup2(_w_fd, 2)
@@ -118,7 +205,10 @@ if _SILENCE_ABSL:
     _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
     _t.start()
 
-import threading
+os.environ.setdefault('ENV_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu'))
+## Imposta metodo mp sicuro per CUDA: forkserver (override con SCOPONE_MP_START)
+os.environ.setdefault('SCOPONE_MP_START', 'forkserver')
+
 import io
 import torch
 import subprocess
@@ -132,16 +222,27 @@ from trainers.train_ppo import train_ppo
 from utils.seed import resolve_seed
 
 
+def _resolve_num_envs(args, clamp: int | None = None) -> int:
+    raw = getattr(args, 'num_envs', None)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        val = _DEFAULT_NUM_ENVS
+    if clamp is not None:
+        val = min(val, clamp)
+    return max(1, val)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Profile short PPO run (torch or line-level).')
-    parser.add_argument('--iters', type=int, default=int(os.environ.get('SCOPONE_ITERS', '0')), help='Iterations to run')
-    parser.add_argument('--horizon', type=int, default=int(os.environ.get('SCOPONE_HORIZON', '16384')), help='Rollout horizon per iteration')
+    parser.add_argument('--iters', type=int, default=iters, help='Iterations to run (default from SCOPONE_ITERS)')
+    parser.add_argument('--horizon', type=int, default=horizon, help='Rollout horizon per iteration (default from SCOPONE_HORIZON)')
     parser.add_argument('--line', dest='line', action='store_true', default=False, help='Enable line-by-line profiler with per-line timings (default: on)')
     parser.add_argument('--no-line', dest='line', action='store_false', help='Disable line-by-line profiler')
     parser.add_argument('--wrap-update', dest='wrap_update', action='store_true', default=True, help='Also profile ActionConditionedPPO.update (default: on; slower)')
     parser.add_argument('--no-wrap-update', dest='wrap_update', action='store_false', help='Disable profiling of ActionConditionedPPO.update')
     parser.add_argument('--report', action='store_true', help='Print extended line-profiler report')
-    parser.add_argument('--num-envs', type=int, default=int(os.environ.get('SCOPONE_NUM_ENVS', '16')), help='Number of parallel environments (default from env SCOPONE_NUM_ENVS)')
+    parser.add_argument('--num-envs', type=int, default=_DEFAULT_NUM_ENVS, help='Number of parallel environments (default from SCOPONE_NUM_ENVS)')
     # Line-profiler scope controls
     parser.add_argument('--add-func', action='append', default=[], help='Qualified function or method to include, e.g. pkg.mod:Class.method or algorithms.ppo_ac:ActionConditionedPPO.update')
     parser.add_argument('--add-module', action='append', default=[], help='Module to include all functions from, e.g. algorithms.ppo_ac or environment')
@@ -208,7 +309,7 @@ def main():
         if want_html and html_path:
             out_dir = os.path.dirname(html_path) or DEFAULT_PROFILES_DIR
             os.makedirs(out_dir, exist_ok=True)
-        ne = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
+        ne = _resolve_num_envs(args)
         scalene_cmd = [sys.executable, '-m', 'scalene']
         if getattr(args, 'scalene_cpu_only', True):
             scalene_cmd.append('--cpu-only')
@@ -455,7 +556,7 @@ def main():
 
     # Inner run invoked by Scalene: execute training without additional profilers.
     if getattr(args, 'scalene_run', False):
-        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
+        num_envs_eff = _resolve_num_envs(args)
         _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
         _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
         # Training flags for profiling as well
@@ -463,7 +564,7 @@ def main():
         _entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED','linear')
         _belief_particles = int(os.environ.get('SCOPONE_BELIEF_PARTICLES','512'))
         _belief_ess = float(os.environ.get('SCOPONE_BELIEF_ESS_FRAC','0.5'))
-        _mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']
+        _mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','0') in ['1','true','yes','on']
         _mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','128'))
         _mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','4'))
         _mcts_c_puct = float(os.environ.get('SCOPONE_MCTS_C_PUCT','1.0'))
@@ -471,8 +572,8 @@ def main():
         _mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS','0.0'))
         _mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA','0.25'))
         _mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS','0.25'))
-        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
-        train_ppo(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs,
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))
+        train_ppo(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs_eff,
                   mcts_sims=_mcts_sims, mcts_sims_eval=0, save_every=_save_every,
                   entropy_schedule_type=_entropy_sched,
                   eval_every=0, eval_games=_eval_games, mcts_in_eval=False, seed=seed, use_selfplay=_selfplay)
@@ -484,15 +585,12 @@ def main():
         import pstats
 
         prof = cProfile.Profile()
-        # Keep run short to avoid OOM without scheduler
-        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
-
         # Honor training/profile env config (consistent with other modes)
         _save_every = int(os.environ.get('SCOPONE_SAVE_EVERY','10'))
         _entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED','linear')
         _belief_particles = int(os.environ.get('SCOPONE_BELIEF_PARTICLES','512'))
         _belief_ess = float(os.environ.get('SCOPONE_BELIEF_ESS_FRAC','0.5'))
-        _mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']
+        _mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','0') in ['1','true','yes','on']
         _mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','128'))
         _mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','4'))
         _mcts_c_puct = float(os.environ.get('SCOPONE_MCTS_C_PUCT','1.0'))
@@ -500,12 +598,14 @@ def main():
         _mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS','0.0'))
         _mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA','0.25'))
         _mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS','0.25'))
-        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))
+
+        num_envs_eff = _resolve_num_envs(args)
 
         def _run():
             _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
             _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
-            train_ppo(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs,
+            train_ppo(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs_eff,
                       save_every=_save_every,
                       entropy_schedule_type=_entropy_sched,
                       belief_particles=_belief_particles, belief_ess_frac=_belief_ess,
@@ -753,11 +853,11 @@ def main():
             global_profiler.allowed_codes.add(train_mod.collect_trajectory.__code__)
             global_profiler.allowed_codes.add(train_mod.train_ppo.__code__)
         # Use the same default as other modes for apples-to-apples comparisons
-        num_envs = max(1, int(args.num_envs)) if getattr(args, 'num_envs', None) is not None else 1
+        num_envs_eff = _resolve_num_envs(args)
         _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
         _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
         # Eval parity with main: read eval flags from env
-        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))
         _eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','0').lower() in ['1','true','yes','on']
         _eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS','128'))
         _eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS','1'))
@@ -766,7 +866,7 @@ def main():
         _eval_prior_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_PRIOR_SMOOTH_EPS','0.0'))
         _eval_dir_alpha = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_ALPHA','0.25'))
         _eval_dir_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_EPS','0.25'))
-        train_fn(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs,
+        train_fn(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs_eff,
                  mcts_sims=0, mcts_sims_eval=_eval_mcts_sims, eval_every=0, eval_games=_eval_games,
                  mcts_in_eval=_eval_use_mcts, mcts_dets=_eval_mcts_dets, mcts_c_puct=_eval_c_puct,
                  mcts_root_temp=_eval_root_temp, mcts_prior_smooth_eps=_eval_prior_eps,
@@ -941,7 +1041,7 @@ def main():
     _profiles_dir = os.path.abspath(os.path.join(ROOT, 'profiles'))
     os.makedirs(_profiles_dir, exist_ok=True)
     os.environ['SCOPONE_TORCH_PROF'] = '1'
-    os.environ.setdefault('SCOPONE_TORCH_PROF_DIR', _profiles_dir)
+    os.environ['SCOPONE_TORCH_PROF_DIR'] = _profiles_dir
     from datetime import datetime as _dt
     _run_tag = _dt.now().strftime('%Y%m%d_%H%M%S')
     os.environ['SCOPONE_TORCH_PROF_RUN'] = _run_tag
@@ -954,9 +1054,9 @@ def main():
     _tb_handler_main = _tb_handler(_tb_dir, worker_name=f"main-pid{os.getpid()}")
 
     # Relax timeouts and workload for profiling stability
-    os.environ.setdefault('SCOPONE_RPC_TIMEOUT_S', '300')
-    os.environ.setdefault('SCOPONE_COLLECTOR_STALL_S', '300')
-    os.environ.setdefault('SCOPONE_EP_PUT_TIMEOUT_S', '60')
+    os.environ['SCOPONE_RPC_TIMEOUT_S'] = '300'
+    os.environ['SCOPONE_COLLECTOR_STALL_S'] = '300'
+    os.environ['SCOPONE_EP_PUT_TIMEOUT_S'] = '60'
 
     with torch.profiler.profile(
         activities=[
@@ -973,15 +1073,15 @@ def main():
         # Constrain workload under profiler
         _prof_max_envs = int(os.environ.get('SCOPONE_PROF_NUM_ENVS', '8'))
         _prof_max_horizon = int(os.environ.get('SCOPONE_PROF_HORIZON', '2048'))
-        num_envs = max(1, int(min(int(args.num_envs), _prof_max_envs))) if getattr(args, 'num_envs', None) is not None else 1
+        num_envs_eff = _resolve_num_envs(args, clamp=_prof_max_envs)
         _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
         _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
         def _on_iter_end_cb(it_idx: int):
             prof.step()
         _h_eff = int(min(max(40, args.horizon), _prof_max_horizon))
-        print(f"[torch-profiler] Effective profiling config: num_envs={num_envs}, horizon={_h_eff}, RPC_TIMEOUT_S={os.environ.get('SCOPONE_RPC_TIMEOUT_S')}")
-        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','100'))
-        train_ppo(num_iterations=max(0, args.iters), horizon=_h_eff, k_history=39, num_envs=num_envs,
+        print(f"[torch-profiler] Effective profiling config: num_envs={num_envs_eff}, horizon={_h_eff}, RPC_TIMEOUT_S={os.environ.get('SCOPONE_RPC_TIMEOUT_S')}")
+        _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))
+        train_ppo(num_iterations=max(0, args.iters), horizon=_h_eff, k_history=39, num_envs=num_envs_eff,
                   mcts_sims=0, mcts_sims_eval=0, eval_every=0, eval_games=_eval_games, mcts_in_eval=False, seed=seed, use_selfplay=_selfplay,
                   on_iter_end=_on_iter_end_cb)
 
@@ -1189,5 +1289,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
