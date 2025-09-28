@@ -1,12 +1,14 @@
 import torch
 from tqdm import tqdm
-from typing import Dict, List, Callable, Optional, Tuple
+from typing import Any, Dict, List, Callable, Optional, Tuple
 import os
 import time
 import sys
 import multiprocessing as mp
 import platform
 import queue
+import random
+import numpy as np
 
 # Ensure project root is on sys.path when running as script
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +44,79 @@ _SEAT_VEC_CACHE: Dict[int, torch.Tensor] = {}
 _BELIEF_ZERO = torch.zeros(120, dtype=torch.float32)
 _OTHERS_HANDS_ZERO = torch.zeros((3, 40), dtype=torch.float32)
 _EMPTY_LEGAL = torch.zeros((0, 80), dtype=torch.float32)
+
+_SERIAL_RNG_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
+    if seed is None:
+        return None
+    try:
+        seed_key = int(seed)
+    except Exception:
+        return None
+    if seed_key < 0:
+        return None
+    py_outer = random.getstate()
+    try:
+        np_outer = np.random.get_state()
+    except AttributeError:
+        np_outer = None
+    torch_outer = torch.get_rng_state()
+    cuda_outer = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    stored = _SERIAL_RNG_STATE.get(seed_key)
+    if stored is None:
+        set_global_seeds(seed_key)
+    else:
+        py_state = stored.get('py')
+        if py_state is not None:
+            random.setstate(py_state)
+        np_state = stored.get('np')
+        if np_state is not None:
+            np.random.set_state(np_state)  # type: ignore[arg-type]
+        torch_state = stored.get('torch')
+        if torch_state is not None:
+            torch.set_rng_state(torch_state)
+        cuda_state = stored.get('cuda')
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)  # type: ignore[arg-type]
+
+    return {
+        'seed': seed_key,
+        'py_outer': py_outer,
+        'np_outer': np_outer,
+        'torch_outer': torch_outer,
+        'cuda_outer': cuda_outer,
+    }
+
+
+def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
+    if token is None:
+        return
+    seed_key = int(token['seed'])
+    try:
+        np_new = np.random.get_state()
+    except AttributeError:
+        np_new = None
+    _SERIAL_RNG_STATE[seed_key] = {
+        'py': random.getstate(),
+        'np': np_new,
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    py_outer = token.get('py_outer')
+    if py_outer is not None:
+        random.setstate(py_outer)
+    np_outer = token.get('np_outer')
+    if np_outer is not None:
+        np.random.set_state(np_outer)  # type: ignore[arg-type]
+    torch_outer = token.get('torch_outer')
+    if torch_outer is not None:
+        torch.set_rng_state(torch_outer)
+    cuda_outer = token.get('cuda_outer')
+    if cuda_outer is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_outer)  # type: ignore[arg-type]
 
 def _dbg(msg: str) -> None:
     if _PAR_DEBUG:
@@ -1158,7 +1233,7 @@ def _load_frozen_actor(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
     return actor
 
 
-def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: int = 128,
+def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: int = 128,
                        gamma: float = 1.0, lam: float = 0.95,
                        partner_actor: ActionConditionedActor = None,
                        opponent_actor: ActionConditionedActor = None,
@@ -1210,18 +1285,13 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     # supervision per belief aux: per ogni sample, vettore (3,40) one-hot di mani reali altrui
     others_hands_targets = []
 
-    
+
     routing_log = []  # (player_id, source)
 
+    belief_aux_coef = float(os.environ.get('BELIEF_AUX_COEF', '0.1'))
+    skip_step_validation = (os.environ.get('SCOPONE_SKIP_STEP_VALIDATION', '1') == '1')
+
     steps = 0
-    # Cache seat vectors (CPU) to avoid per-step allocations
-    _seat_cache = []
-    for cp_i in range(4):
-        v = torch.zeros(6, dtype=torch.float32)
-        v[cp_i] = 1.0
-        v[4] = 1.0 if cp_i in [0, 2] else 0.0
-        v[5] = 1.0 if cp_i in [1, 3] else 0.0
-        _seat_cache.append(v)
     if final_reward_only:
         # Raccogli per episodi completi: per-episodio util = 40 se alleni entrambe le squadre, altrimenti 20
         _per_ep_util = (40 if bool(train_both_teams) else 20)
@@ -1250,16 +1320,41 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             raise RuntimeError(f"collect_trajectory: get_valid_actions returned 0 legals; player={cp}, hand={hand_ids_dbg}, table={table_ids_dbg}, done={bool(env.done)}, history_len={hist_len}, rules={rules_dbg}")
 
         cp = env.current_player
-        seat_vec = _seat_cache[cp]
+        seat_vec = _seat_vec_for(cp)
 
         # Selezione azione: se train_both_teams è True, tutti i seat sono "main"
         is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
+        bsum_tensor = _BELIEF_ZERO
+        use_mcts_cur = False
+        sims_scaled = 0
+        alpha = 0.0
+        root_temp_dyn = float(mcts_root_temp)
         if is_main:
+            # MCTS sempre attivo (stile AlphaZero): poche simulazioni sempre, scala con il progresso della mano
+            progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
+            if use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
+                if mcts_train_factor is None or float(mcts_train_factor) > 0.0:
+                    denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
+                    alpha = min(1.0, max(0.0, (progress - mcts_progress_start) / denom))
+                    import math
+                    sims_base = int(math.ceil(float(mcts_sims) * (0.25 + 0.75 * alpha)))
+                    if mcts_train_factor is not None:
+                        sims_base = int(math.ceil(sims_base * float(mcts_train_factor)))
+                    base_min = int(mcts_min_sims) if (mcts_min_sims is not None and int(mcts_min_sims) >= 0) else 0
+                    sims_scaled = max(base_min, sims_base)
+                    if int(mcts_sims) > 0 and sims_scaled <= 0:
+                        sims_scaled = 1
+                    use_mcts_cur = sims_scaled > 0
+                else:
+                    sims_scaled = 0
+            if use_mcts_cur:
+                root_temp_dyn = float(mcts_root_temp) if float(mcts_root_temp) > 0 else float(max(0.0, 1.0 - alpha))
+
             # Belief summary per il giocatore corrente: opzionale (disabilitato di default)
             _enable_bsum = (os.environ.get('ENABLE_BELIEF_SUMMARY', '0') == '1')
-            if _enable_bsum:
+            if _enable_bsum and use_mcts_cur:
                 o_cpu = obs.clone().detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device='cpu')
-                s_cpu = seat_vec.clone().detach().to('cpu', dtype=torch.float32)
+                s_cpu = seat_vec.detach().to('cpu', dtype=torch.float32)
                 if device.type == 'cuda':
                     o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
                     s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
@@ -1280,26 +1375,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                     cap1_mask = captured[:, 40:80] > 0.5
                     visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
                     probs_flat = agent.actor.belief_net.probs(logits, visible_mask)
-                bsum = probs_flat.squeeze(0).detach().to('cpu')
-            else:
-                bsum = torch.zeros(120, dtype=torch.float32)
-            # MCTS sempre attivo (stile AlphaZero): poche simulazioni sempre, scala con il progresso della mano
-            progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
-            use_mcts_cur = bool(use_mcts and len(legal) > 0)
-            if use_mcts_cur:
-                # Se il fattore di training è 0, disabilita MCTS del tutto (nessun minimo forzato)
-                if mcts_train_factor is not None and float(mcts_train_factor) <= 0.0:
-                    sims_scaled = 0
-                    use_mcts_cur = False
-                else:
-                    # scala simulazioni in base al progresso
-                    denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
-                    alpha = min(1.0, max(0.0, (progress - mcts_progress_start) / denom))
-                    import math
-                    sims_scaled = int(math.ceil(mcts_sims * (0.25 + 0.75 * alpha) * float(mcts_train_factor)))
-                    if int(mcts_sims) > 0 and sims_scaled <= 0:
-                        sims_scaled = 1
-                    use_mcts_cur = sims_scaled > 0
+                bsum_tensor = probs_flat.squeeze(0).detach().to('cpu')
             if use_mcts_cur:
                 # MCTS con determinizzazione dal belief del giocatore corrente
                 from algorithms.is_mcts import run_is_mcts
@@ -1571,26 +1647,30 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             rew_list.append(rew)
             done_list.append(done)
             seat_team_list.append(seat_vec)
-            belief_sum_list.append(bsum)
+            belief_sum_list.append(bsum_tensor)
             legals_offset.append(len(legals_list))
             legals_count.append(len(legal))
             chosen_index_t_list.append(idx_t)
             legals_list.extend(legal)
             # costruisci target mani reali altrui (3x40) vettoriale sfruttando bitset CPU
-            others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-            # usa mirror bitset CPU se disponibile per evitare loop Python
-            if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
-                ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
-                target = torch.zeros((3,40), dtype=torch.float32)
-                for i, pid in enumerate(others):
-                    bits_t = env._hands_bits_t[pid]
-                    bits = int(bits_t.item()) if torch.is_tensor(bits_t) else int(bits_t)
-                    mask = (((torch.tensor(bits, dtype=torch.int64) >> ids) & 1).to(torch.float32))
-                    target[i] = mask
-                others_hands_targets.append(target)
+            if belief_aux_coef <= 0.0:
+                others_hands_targets.append(_OTHERS_HANDS_ZERO)
             else:
-                from utils.fallback import notify_fallback
-                notify_fallback('trainer.others_hands_targets.slow_game_state_path')
+                others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                # usa mirror bitset CPU se disponibile per evitare loop Python
+                if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
+                    ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
+                    target = _OTHERS_HANDS_ZERO.clone()
+                    for i, pid in enumerate(others):
+                        bits_t = env._hands_bits_t[pid]
+                        bits = int(bits_t.item()) if torch.is_tensor(bits_t) else int(bits_t)
+                        mask = (((torch.tensor(bits, dtype=torch.int64) >> ids) & 1).to(torch.float32))
+                        target[i] = mask
+                    others_hands_targets.append(target)
+                else:
+                    from utils.fallback import notify_fallback
+                    notify_fallback('trainer.others_hands_targets.slow_game_state_path')
+                    others_hands_targets.append(_OTHERS_HANDS_ZERO)
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
             is_partner_seat = (cp in [0, 2] and (main_seats == [1, 3])) or (cp in [1, 3] and (main_seats == [0, 2]))
@@ -1644,7 +1724,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             # Per i seat non-main mantieni l'allineamento dei target
             mcts_policy_flat.extend([0.0] * len(legal))
             mcts_weight_list.append(0.0)
-        
+
 
         steps += 1
         # Condizioni di uscita: per episodi o per passi
@@ -1664,20 +1744,29 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             if steps >= horizon:
                 break
 
+    # Precompute others_hands tensor (CPU) for CTDE targets and critic calls
+    oh_cpu_tensor = torch.stack(others_hands_targets, dim=0) if len(others_hands_targets) > 0 else None
+
     # CTDE: stima V(next) vettorizzata su GPU
     next_val_t = None
+    oh_dev_tensor: Optional[torch.Tensor] = None
     if len(next_obs_list) > 0:
         with torch.no_grad():
             next_obs_t = torch.stack([torch.as_tensor(no, dtype=torch.float32, device=device) for no in next_obs_list], dim=0)
             s_all = torch.stack(seat_team_list, dim=0)
-            # others_hands per-step (CTDE)
-            if len(others_hands_targets) > 0:
-                oh_all = torch.stack(others_hands_targets, dim=0)
-            else:
-                oh_all = torch.zeros((0,3,40), dtype=torch.float32, device=device)
             done_mask_bool = torch.as_tensor([bool(d) for d in done_list], dtype=torch.bool, device=device)
-            # CTDE: passa others_hands del prossimo stato (zero su terminali)
-            next_val_t = agent.critic(next_obs_t, s_all, oh_all)
+            if oh_cpu_tensor is not None:
+                if device.type == 'cuda':
+                    oh_dev_tensor = oh_cpu_tensor.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
+                else:
+                    oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32)
+                oh_next = torch.zeros_like(oh_dev_tensor)
+                if oh_next.size(0) > 1:
+                    oh_next[:-1] = oh_dev_tensor[1:]
+            else:
+                oh_dev_tensor = None
+                oh_next = None
+            next_val_t = agent.critic(next_obs_t, s_all, oh_next)
             next_val_t = torch.where(done_mask_bool, torch.zeros_like(next_val_t), next_val_t)
 
     # Compute V(obs) in batch su GPU e GAE
@@ -1729,11 +1818,12 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
             o_all = torch.stack([torch.as_tensor(o, dtype=torch.float32, device=device) for o in obs_list], dim=0)
             s_all = torch.stack(seat_team_list, dim=0)
             # others_hands per-step (CTDE)
-            if len(others_hands_targets) > 0:
-                oh_all = torch.stack(others_hands_targets, dim=0)
-            else:
-                oh_all = torch.zeros((0,3,40), dtype=torch.float32, device=device)
-            val_t = agent.critic(o_all, s_all, oh_all)
+            if oh_dev_tensor is None and oh_cpu_tensor is not None:
+                if device.type == 'cuda':
+                    oh_dev_tensor = oh_cpu_tensor.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
+                else:
+                    oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32)
+            val_t = agent.critic(o_all, s_all, oh_dev_tensor)
             nval_t = next_val_t if next_val_t is not None else torch.zeros_like(val_t)
     else:
         val_t = torch.zeros((0,), dtype=torch.float32, device=device)
@@ -1750,7 +1840,7 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     # Build CPU tensors first, then pin and transfer as a batch later in update
     obs_cpu = torch.stack([o if torch.is_tensor(o) else torch.as_tensor(o, dtype=torch.float32) for o in obs_list], dim=0) if len(obs_list)>0 else torch.zeros((0, env.observation_space.shape[0]), dtype=torch.float32)
     act_cpu = torch.stack([a if torch.is_tensor(a) else torch.as_tensor(a, dtype=torch.float32) for a in act_list], dim=0) if len(act_list)>0 else torch.zeros((0, 80), dtype=torch.float32)
-    legals_cpu = torch.stack([l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.float32) for l in legals_list], dim=0) if legals_list else torch.zeros((0, 80), dtype=torch.float32)
+    legals_cpu = torch.stack([l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.float32) for l in legals_list], dim=0) if legals_list else _EMPTY_LEGAL
     seat_team_cpu = torch.stack(seat_team_list, dim=0) if len(seat_team_list)>0 else torch.zeros((0,6), dtype=torch.float32)
     belief_sum_cpu = torch.stack(belief_sum_list, dim=0) if len(belief_sum_list)>0 else torch.zeros((0,120), dtype=torch.float32)
     legals_offset_cpu = torch.as_tensor(legals_offset, dtype=torch.long) if len(legals_offset)>0 else torch.zeros((0,), dtype=torch.long)
@@ -1759,7 +1849,10 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
     # Evita tensori inutili pieni di zeri quando MCTS non è usato
     mcts_policy_cpu = torch.as_tensor(mcts_policy_flat, dtype=torch.float32) if any((x != 0.0) for x in mcts_policy_flat) else torch.zeros((0,), dtype=torch.float32)
     mcts_weight_cpu = torch.as_tensor(mcts_weight_list, dtype=torch.float32) if any((x != 0.0) for x in mcts_weight_list) else torch.zeros((0,), dtype=torch.float32)
-    others_hands_cpu = torch.stack(others_hands_targets, dim=0) if len(others_hands_targets)>0 else torch.zeros((0,3,40), dtype=torch.float32)
+    if oh_cpu_tensor is not None:
+        others_hands_cpu = oh_cpu_tensor
+    else:
+        others_hands_cpu = torch.zeros((0,3,40), dtype=torch.float32)
     # Sanitizza lunghezze: policy_flat deve avere somma(cnts) elementi e weight deve avere len(obs)
     total_legals = int(legals_count_cpu.sum().item()) if len(legals_count_cpu) > 0 else 0
     if mcts_policy_cpu.numel() != total_legals:
@@ -1883,18 +1976,19 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
 
     # Validate batch structure sizes/coherence before returning
-    B = int(obs_cpu.size(0)) if torch.is_tensor(obs_cpu) else len(obs_cpu)
-    def _len(x):
-        return (int(x.size(0)) if torch.is_tensor(x) else len(x))
-    # next_obs length equals obs length by construction
-    if not (B == _len(act_cpu) == _len(done_t) == _len(seat_team_cpu)):
-        raise RuntimeError("collect_trajectory: per-step arrays length mismatch among obs/act/next_obs/done/seat")
-    if int(legals_count_cpu.sum().item()) != int(legals_cpu.size(0)):
-        raise RuntimeError("collect_trajectory: sum(legals_count) != len(legals)")
-    if (chosen_index_cpu < 0).any() or ((chosen_index_cpu >= legals_count_cpu) & (legals_count_cpu > 0)).any():
-        raise RuntimeError("collect_trajectory: chosen_index out of range for some rows")
-    if seat_team_cpu.size(1) != 6 or not (seat_team_cpu[:, :4].sum(dim=1) == 1).all():
-        raise RuntimeError("collect_trajectory: seat_team must be (B,6) with one-hot seat")
+    if not skip_step_validation:
+        B = int(obs_cpu.size(0)) if torch.is_tensor(obs_cpu) else len(obs_cpu)
+        def _len(x):
+            return (int(x.size(0)) if torch.is_tensor(x) else len(x))
+        # next_obs length equals obs length by construction
+        if not (B == _len(act_cpu) == _len(done_t) == _len(seat_team_cpu)):
+            raise RuntimeError("collect_trajectory: per-step arrays length mismatch among obs/act/next_obs/done/seat")
+        if int(legals_count_cpu.sum().item()) != int(legals_cpu.size(0)):
+            raise RuntimeError("collect_trajectory: sum(legals_count) != len(legals)")
+        if (chosen_index_cpu < 0).any() or ((chosen_index_cpu >= legals_count_cpu) & (legals_count_cpu > 0)).any():
+            raise RuntimeError("collect_trajectory: chosen_index out of range for some rows")
+        if seat_team_cpu.size(1) != 6 or not (seat_team_cpu[:, :4].sum(dim=1) == 1).all():
+            raise RuntimeError("collect_trajectory: seat_team must be (B,6) with one-hot seat")
 
     # Mantieni batch già tensori CPU; l'update ora li mapperà tutti su CUDA in un solo passaggio
     batch = {
@@ -1918,6 +2012,54 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         'routing_log': routing_log,
     }
     return batch
+
+
+def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: int = 128,
+                       gamma: float = 1.0, lam: float = 0.95,
+                       partner_actor: ActionConditionedActor = None,
+                       opponent_actor: ActionConditionedActor = None,
+                       main_seats: List[int] = None,
+                       belief_particles: int = 512, belief_ess_frac: float = 0.5,
+                       episodes: int = None, final_reward_only: bool = True,
+                       use_mcts: bool = True,
+                       mcts_sims: int = 128, mcts_dets: int = 4, mcts_c_puct: float = 1.0,
+                       mcts_root_temp: float = 0.0, mcts_prior_smooth_eps: float = 0.0,
+                       mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.0,
+                       mcts_train_factor: float = 1.0,
+                       mcts_progress_start: float = 0.25,
+                       mcts_progress_full: float = 0.75,
+                       mcts_min_sims: int = 0,
+                       train_both_teams: bool = False,
+                       seed: Optional[int] = None) -> Dict:
+    seed_token = _serial_seed_enter(seed)
+    try:
+        return _collect_trajectory_impl(env=env,
+                                        agent=agent,
+                                        horizon=horizon,
+                                        gamma=gamma,
+                                        lam=lam,
+                                        partner_actor=partner_actor,
+                                        opponent_actor=opponent_actor,
+                                        main_seats=main_seats,
+                                        belief_particles=belief_particles,
+                                        belief_ess_frac=belief_ess_frac,
+                                        episodes=episodes,
+                                        final_reward_only=final_reward_only,
+                                        use_mcts=use_mcts,
+                                        mcts_sims=mcts_sims,
+                                        mcts_dets=mcts_dets,
+                                        mcts_c_puct=mcts_c_puct,
+                                        mcts_root_temp=mcts_root_temp,
+                                        mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                        mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                        mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                        mcts_train_factor=mcts_train_factor,
+                                        mcts_progress_start=mcts_progress_start,
+                                        mcts_progress_full=mcts_progress_full,
+                                        mcts_min_sims=mcts_min_sims,
+                                        train_both_teams=train_both_teams)
+    finally:
+        _serial_seed_exit(seed_token)
 
 
 def collect_trajectory_parallel(agent: ActionConditionedPPO,
@@ -3254,33 +3396,35 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
                 # Team A as main vs live team B
                 batch_A = collect_trajectory(env, agent, horizon=horizon, partner_actor=agent_teamB.actor, opponent_actor=agent_teamB.actor, main_seats=main_seats,
-                                             belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
-                                             episodes=None, final_reward_only=True,
-                                             use_mcts=bool(mcts_train),
-                                             mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
-                                             mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                             mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                             mcts_train_factor=mcts_train_factor,
-                                             mcts_progress_start=0.25, mcts_progress_full=0.75,
-                                             mcts_min_sims=0,
-                                             train_both_teams=False,
-                                             gamma=1.0,
-                                             lam=0.95)
+                                                 belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                                 episodes=None, final_reward_only=True,
+                                                 use_mcts=bool(mcts_train),
+                                                 mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
+                                                 mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                 mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                 mcts_train_factor=mcts_train_factor,
+                                                 mcts_progress_start=0.25, mcts_progress_full=0.75,
+                                                 mcts_min_sims=0,
+                                                 train_both_teams=False,
+                                                 gamma=1.0,
+                                                 lam=0.95,
+                                                 seed=int(seed))
                 # Team B as main vs live team A (swap seats)
                 main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
                 batch_B = collect_trajectory(env, agent_teamB, horizon=horizon, partner_actor=agent.actor, opponent_actor=agent.actor, main_seats=main_seats_B,
-                                             belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
-                                             episodes=None, final_reward_only=True,
-                                             use_mcts=bool(mcts_train),
-                                             mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
-                                             mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                             mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                             mcts_train_factor=mcts_train_factor,
-                                             mcts_progress_start=0.25, mcts_progress_full=0.75,
-                                             mcts_min_sims=0,
-                                             train_both_teams=False,
-                                             gamma=1.0,
-                                             lam=0.95)
+                                                 belief_particles=belief_particles, belief_ess_frac=belief_ess_frac,
+                                                 episodes=None, final_reward_only=True,
+                                                 use_mcts=bool(mcts_train),
+                                                 mcts_sims=mcts_sims, mcts_dets=mcts_dets, mcts_c_puct=mcts_c_puct,
+                                                 mcts_root_temp=mcts_root_temp, mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                 mcts_dirichlet_alpha=mcts_dirichlet_alpha, mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                 mcts_train_factor=mcts_train_factor,
+                                                 mcts_progress_start=0.25, mcts_progress_full=0.75,
+                                                 mcts_min_sims=0,
+                                                 train_both_teams=False,
+                                                 gamma=1.0,
+                                                 lam=0.95,
+                                                 seed=int(seed + 1))
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             elif dual_team_nets and opp_frozen_env:
@@ -3299,7 +3443,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  mcts_min_sims=0,
                                                  train_both_teams=False,
                                                  gamma=1.0,
-                                                 lam=0.95)
+                                                 lam=0.95,
+                                                 seed=int(seed))
                 else:
                     # Team B learns vs frozen Team A
                     batch_B = collect_trajectory(env, agent_teamB, horizon=horizon, partner_actor=agent.actor, opponent_actor=agent.actor, main_seats=main_seats,
@@ -3314,7 +3459,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  mcts_min_sims=0,
                                                  train_both_teams=False,
                                                  gamma=1.0,
-                                                 lam=0.95)
+                                                 lam=0.95,
+                                                 seed=int(seed + 1))
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             else:
@@ -3331,7 +3477,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                            mcts_min_sims=0,
                                            train_both_teams=train_both_teams,
                                            gamma=1.0,
-                                           lam=0.95)
+                                           lam=0.95,
+                                           seed=int(seed))
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
         if dual_team_nets and (not opp_frozen_env):
