@@ -38,6 +38,7 @@ torch.set_float32_matmul_precision('high')
 # Profiling controls (single boolean -> full detail when enabled)
 _PAR_TIMING = (os.environ.get('SCOPONE_PROFILE', '0') != '0')
 _PAR_DEBUG = (os.environ.get('SCOPONE_PAR_DEBUG', '0') in ['1','true','yes','on'])
+_PPO_DEBUG = (os.environ.get('SCOPONE_PPO_DEBUG', '0').strip().lower() in ['1', 'true', 'yes', 'on'])
 
 # Reuse cached tensors to limit per-step allocations inside workers
 _SEAT_VEC_CACHE: Dict[int, torch.Tensor] = {}
@@ -124,6 +125,166 @@ def _dbg(msg: str) -> None:
             tqdm.write(str(msg))
         except Exception:
             print(str(msg), flush=True)
+
+
+def _flatten_cpu(tensor: Optional[torch.Tensor], dtype: Optional[torch.dtype] = torch.float32) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    if not torch.is_tensor(tensor):
+        tensor = torch.as_tensor(tensor)
+    if tensor.numel() == 0:
+        return tensor.detach().to('cpu', dtype=dtype) if dtype is not None else tensor.detach().to('cpu')
+    out = tensor.detach().to('cpu')
+    if dtype is not None and out.dtype != dtype:
+        out = out.to(dtype=dtype)
+    return out.reshape(-1)
+
+
+def _tensor_basic_stats(tensor: Optional[torch.Tensor]) -> Dict[str, float]:
+    if tensor is None:
+        return {'count': 0}
+    numel = int(tensor.numel())
+    if numel == 0:
+        return {'count': 0}
+    mean = float(tensor.mean().item())
+    std = float(tensor.std(unbiased=False).item()) if numel > 1 else 0.0
+    min_v = float(tensor.min().item())
+    max_v = float(tensor.max().item())
+    abs_mean = float(tensor.abs().mean().item())
+    return {
+        'count': numel,
+        'mean': mean,
+        'std': std,
+        'min': min_v,
+        'max': max_v,
+        'abs_mean': abs_mean,
+    }
+
+
+def _format_stats(name: str, stats: Dict[str, float]) -> str:
+    if stats.get('count', 0) == 0:
+        return f"{name}=c0"
+    return (
+        f"{name}=c{stats['count']} μ{stats['mean']:.4f} σ{stats['std']:.4f} "
+        f"|μ|{stats['abs_mean']:.4f} min{stats['min']:.4f} max{stats['max']:.4f}"
+    )
+
+
+def _maybe_log_ppo_batch(
+    label: str,
+    rew: Optional[torch.Tensor],
+    ret: Optional[torch.Tensor],
+    adv: Optional[torch.Tensor],
+    val: Optional[torch.Tensor],
+    next_val: Optional[torch.Tensor],
+    done_mask: Optional[torch.Tensor],
+    *,
+    old_logp: Optional[torch.Tensor] = None,
+    seat_tensor: Optional[torch.Tensor] = None,
+    episode_lengths: Optional[List[int]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not _PPO_DEBUG:
+        return
+    try:
+        rew_cpu = _flatten_cpu(rew)
+        ret_cpu = _flatten_cpu(ret)
+        adv_cpu = _flatten_cpu(adv)
+        val_cpu = _flatten_cpu(val)
+        next_cpu = _flatten_cpu(next_val)
+        logp_cpu = _flatten_cpu(old_logp) if old_logp is not None else None
+        done_cpu = _flatten_cpu(done_mask, dtype=torch.float32)
+        seat_cpu = _flatten_cpu(seat_tensor, dtype=torch.float32) if seat_tensor is not None else None
+
+        rew_stats = _tensor_basic_stats(rew_cpu)
+        ret_stats = _tensor_basic_stats(ret_cpu)
+        adv_stats = _tensor_basic_stats(adv_cpu)
+        val_stats = _tensor_basic_stats(val_cpu)
+        next_stats = _tensor_basic_stats(next_cpu)
+        logp_stats = _tensor_basic_stats(logp_cpu) if logp_cpu is not None else {'count': 0}
+
+        batch_size = ret_stats.get('count', 0)
+        msg_parts = [f"[ppo-debug {label}] B={batch_size}"]
+        msg_parts.append(_format_stats('rew', rew_stats))
+        msg_parts.append(_format_stats('ret', ret_stats))
+        msg_parts.append(_format_stats('val', val_stats))
+        msg_parts.append(_format_stats('adv', adv_stats))
+        msg_parts.append(_format_stats('next', next_stats))
+        if logp_stats.get('count', 0) > 0:
+            msg_parts.append(_format_stats('old_logp', logp_stats))
+
+        if ret_cpu is not None and val_cpu is not None and ret_stats.get('count', 0) == val_stats.get('count', 0) and ret_stats.get('count', 0) > 0:
+            diff = ret_cpu - val_cpu
+            mse = float((diff.pow(2).mean()).item())
+            l1 = float(diff.abs().mean().item())
+            msg_parts.append(f"ret-v mse={mse:.4f} l1={l1:.4f}")
+
+        if adv_cpu is not None and adv_stats.get('count', 0) > 0:
+            adv_abs_max = float(adv_cpu.abs().max().item())
+            msg_parts.append(f"adv|max|={adv_abs_max:.4f}")
+
+        if done_cpu is not None and done_cpu.numel() > 0:
+            done_sum = float(done_cpu.sum().item())
+            done_frac = done_sum / float(done_cpu.numel())
+            msg_parts.append(f"done_sum={done_sum:.0f} done_frac={done_frac:.4f}")
+
+        if seat_tensor is not None and seat_cpu is not None and seat_cpu.numel() > 0 and ret_cpu is not None and rew_cpu is not None:
+            seat_cpu_mat = seat_cpu.view(-1, 6)
+            seat_idx = torch.argmax(seat_cpu_mat[:, :4], dim=1)
+            seat_counts = tuple(int((seat_idx == i).sum().item()) for i in range(4))
+            team0_mask = seat_cpu_mat[:, 4] > 0.5
+            team1_mask = seat_cpu_mat[:, 5] > 0.5
+            team_counts = (int(team0_mask.sum().item()), int(team1_mask.sum().item()))
+            team_reward = (
+                float(rew_cpu[team0_mask].sum().item()) if team_counts[0] > 0 else 0.0,
+                float(rew_cpu[team1_mask].sum().item()) if team_counts[1] > 0 else 0.0,
+            )
+            msg_parts.append(f"seat_counts={seat_counts} team_counts={team_counts} team_rew={team_reward}")
+
+        if episode_lengths:
+            ep_count = len(episode_lengths)
+            ep_min = min(episode_lengths)
+            ep_max = max(episode_lengths)
+            ep_mean = sum(episode_lengths) / float(ep_count)
+            msg_parts.append(f"ep_len(c={ep_count} min={ep_min} max={ep_max} mean={ep_mean:.2f})")
+
+        if extra:
+            extra_str = ' '.join([f"{k}={v}" for k, v in extra.items()])
+            if extra_str:
+                msg_parts.append(extra_str)
+
+        try:
+            tqdm.write(' '.join(msg_parts))
+        except Exception:
+            print(' '.join(msg_parts), flush=True)
+    except Exception as exc:
+        try:
+            tqdm.write(f"[ppo-debug {label}] logging failed: {exc}")
+        except Exception:
+            print(f"[ppo-debug {label}] logging failed: {exc}", flush=True)
+
+
+def _normalize_adv_tensor(label: str, adv_tensor: torch.Tensor) -> torch.Tensor:
+    if adv_tensor.numel() == 0:
+        return adv_tensor
+    dbg_before = _tensor_basic_stats(_flatten_cpu(adv_tensor)) if _PPO_DEBUG else None
+    mean = adv_tensor.mean()
+    std = adv_tensor.std(unbiased=False)
+    std = torch.clamp(std, min=1e-8)
+    normalized = (adv_tensor - mean) / std
+    if _PPO_DEBUG and dbg_before is not None:
+        dbg_after = _tensor_basic_stats(_flatten_cpu(normalized))
+        mean_val = float(mean.item()) if torch.is_tensor(mean) else float(mean)
+        std_val = float(std.item()) if torch.is_tensor(std) else float(std)
+        msg = (
+            f"[ppo-debug adv-norm {label}] {_format_stats('adv_pre', dbg_before)} "
+            f"{_format_stats('adv_post', dbg_after)} mean_before={mean_val:.4f} std_before={std_val:.4f}"
+        )
+        try:
+            tqdm.write(msg)
+        except Exception:
+            print(msg, flush=True)
+    return normalized
 
 # Sub-profilers (used whenever _PAR_TIMING is True)
 _BATCHSEL_PROF = {
@@ -293,6 +454,10 @@ def _env_worker(worker_id: int,
                 legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
             legal_count = len(legal_cpu_entries)
             is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
+            store_sample = bool(train_both_teams or is_main)
+            policy_entries: List[float] = []
+            policy_weight = 0.0
+            bsum_tensor = _BELIEF_ZERO
             # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
             if is_main and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
                 # Build helper RPCs to master for batched scoring
@@ -485,8 +650,8 @@ def _env_worker(worker_id: int,
                     with _record_function('env.step'):
                         next_obs, rew, done, info = env.step(act_t)
                     # No distillation target
-                    mcts_policy_list.extend([0.0] * legal_count)
-                    mcts_weight_list.append(0.0)
+                    policy_entries = [0.0] * legal_count
+                    policy_weight = 0.0
                 else:
                     from algorithms.is_mcts import run_is_mcts
                     # Dynamic defaults for smoothing and root Dirichlet based on context
@@ -541,8 +706,8 @@ def _env_worker(worker_id: int,
                     ssum = float(mcts_probs.sum().item())
                     if ssum > 0:
                         mcts_probs = mcts_probs / ssum
-                    mcts_policy_list.extend((mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs)))
-                    mcts_weight_list.append(1.0)
+                    policy_entries = (mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs))
+                    policy_weight = 1.0
             else:
                 # Request action selection from master (GPU)
                 leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
@@ -573,47 +738,57 @@ def _env_worker(worker_id: int,
                 step_idx += 1
                 t_step += (time.time() - t1) if _PAR_TIMING else 0.0
                 # No distillation target
-                mcts_policy_list.extend([0.0] * legal_count)
-                mcts_weight_list.append(0.0)
+                policy_entries = [0.0] * legal_count
+                policy_weight = 0.0
 
             next_obs_cpu = _to_cpu_float32(next_obs)
             act_cpu = _to_cpu_float32(act_t)
-            obs_list.append(obs_cpu)
-            next_obs_list.append(next_obs_cpu)
-            act_list.append(act_cpu)
-            rew_list.append(float(rew))
-            done_list.append(bool(done))
-            seat_team_list.append(seat_cpu)
-            # belief summary disabled in workers by default (zeros placeholder)
-            belief_sum_list.append(_BELIEF_ZERO)
-            legals_offset.append(len(legals_list))
-            legals_count.append(legal_count)
-            if send_legals:
-                legals_list.extend(legal_cpu_entries)
-            else:
-                from utils.fallback import notify_fallback
-                notify_fallback('trainer.collect_trajectory.legals_missing_for_store')
-            chosen_index_list.append(int(idx))
-            # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
-            if belief_aux_coef <= 0.0:
-                others_hands_list.append(_OTHERS_HANDS_ZERO)
-            else:
-                hands = env.game_state.get('hands', None)
-                if hands is not None:
-                    others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-                    target = torch.zeros((3,40), dtype=torch.float32)
-                    for i,pid in enumerate(others):
-                        for c in hands[pid]:
-                            if isinstance(c, int):
-                                cid = c
-                            else:
-                                r, s = c
-                                suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                                cid = int((r - 1) * 4 + suit_to_int[s])
-                            target[i, int(cid)] = 1.0
-                    others_hands_list.append(target)
+
+            if store_sample:
+                obs_list.append(obs_cpu)
+                next_obs_list.append(next_obs_cpu)
+                act_list.append(act_cpu)
+                rew_list.append(float(rew))
+                done_list.append(bool(done))
+                seat_team_list.append(seat_cpu)
+                belief_sum_list.append(bsum_tensor)
+                legals_offset.append(len(legals_list))
+                legals_count.append(legal_count)
+                if send_legals:
+                    legals_list.extend(legal_cpu_entries)
                 else:
+                    from utils.fallback import notify_fallback
+                    notify_fallback('trainer.collect_trajectory.legals_missing_for_store')
+                chosen_index_list.append(int(idx))
+                entries = policy_entries if len(policy_entries) > 0 else ([0.0] * legal_count)
+                mcts_policy_list.extend(entries)
+                mcts_weight_list.append(policy_weight if len(policy_entries) > 0 else 0.0)
+                # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
+                if belief_aux_coef <= 0.0:
                     others_hands_list.append(_OTHERS_HANDS_ZERO)
+                else:
+                    hands = env.game_state.get('hands', None)
+                    if hands is not None:
+                        others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                        target = torch.zeros((3,40), dtype=torch.float32)
+                        for i,pid in enumerate(others):
+                            for c in hands[pid]:
+                                if isinstance(c, int):
+                                    cid = c
+                                else:
+                                    r, s = c
+                                    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+                                    cid = int((r - 1) * 4 + suit_to_int[s])
+                                target[i, int(cid)] = 1.0
+                        others_hands_list.append(target)
+                    else:
+                        others_hands_list.append(_OTHERS_HANDS_ZERO)
+            else:
+                # Non-main seats skipped when training only main seats; ensure last stored sample closes episode
+                if done and len(done_list) > 0:
+                    done_list[-1] = True
+                    if len(next_obs_list) > 0:
+                        next_obs_list[-1] = next_obs_cpu
 
         # Ensure at least one step per episode to avoid empty payloads
         if len(obs_list) == 0:
@@ -1786,6 +1961,17 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             mcts_policy_flat.extend([0.0] * len(legal))
             mcts_weight_list.append(0.0)
 
+            # Quando l'episodio termina su un seat non-main, marca l'ultimo
+            # sample "main" come terminale e azzera la sua next_obs per evitare
+            # che il GAE bootstrappi sul valore dello stato dell'avversario.
+            if done and len(done_list) > 0:
+                done_list[-1] = True
+                try:
+                    final_obs = _to_cpu_float32(next_obs)
+                except Exception:
+                    final_obs = torch.zeros_like(next_obs_list[-1]) if len(next_obs_list) > 0 else _to_cpu_float32(next_obs)
+                if len(next_obs_list) > 0:
+                    next_obs_list[-1] = final_obs
 
         steps += 1
         # Condizioni di uscita: per episodi o per passi
@@ -1858,6 +2044,20 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 f"episodes_completed={len(ep_slices)} (requested={int(episodes)}), per_ep_expected={per_ep_util}, "
                 f"length_stats={freq}, seat_counts={seat_counts}"
             )
+        # I done provenienti dall'env possono rimanere tutti False quando l'ultimo
+        # step utile dell'episodio è giocato da un seat non-main. In tal caso il
+        # loop salta quel passo e la flag done non viene mai registrata, causando
+        # un'unica traccia lunga attraverso più episodi. Forza quindi il flag
+        # done sull'ultimo sample di ciascun episodio raccolto, così che il GAE
+        # venga azzerato correttamente tra un episodio e il successivo.
+        if len(ep_slices) > 0 and len(done_list) > 0:
+            for start, end in ep_slices:
+                if end > start:
+                    done_list[end - 1] = True
+            if next_val_t is not None:
+                # Assicura che le stime V(s') dei terminali rispettino il flag done forzato
+                updated_done_mask = torch.as_tensor(done_list, dtype=torch.bool, device=next_val_t.device)
+                next_val_t = torch.where(updated_done_mask, torch.zeros_like(next_val_t), next_val_t)
     # Costruisci reward flat ±1 per tutte le transizioni dell'episodio, per entrambi i team
     if T > 0 and len(ep_slices) > 0:
         flat_rew = [0.0] * T
@@ -2039,6 +2239,21 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
     else:
         old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
+
+    ep_debug_lengths = [int(end - start) for (start, end) in ep_slices] if len(ep_slices) > 0 else None
+    _maybe_log_ppo_batch(
+        'serial',
+        rew_t,
+        ret_vec,
+        adv_vec,
+        val_t,
+        nval_t,
+        done_mask,
+        old_logp=old_logp_t,
+        seat_tensor=seat_team_cpu,
+        episode_lengths=ep_debug_lengths,
+        extra={'episodes': len(ep_slices)} if len(ep_slices) > 0 else None,
+    )
 
     # Validate batch structure sizes/coherence before returning
     if not skip_step_validation:
@@ -2937,6 +3152,21 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     if _PAR_TIMING:
         t_oldlogp = (time.time() - _t_olp0)
 
+    ep_debug_lengths = episode_lengths if len(episode_lengths) > 0 else None
+    _maybe_log_ppo_batch(
+        'parallel',
+        rew_t,
+        ret_vec,
+        adv_vec,
+        val_t,
+        nval_t,
+        done_mask,
+        old_logp=old_logp_t,
+        seat_tensor=seat_cpu_t,
+        episode_lengths=ep_debug_lengths,
+        extra={'episodes': episodes},
+    )
+
     batch = {
         'obs': obs_cpu_t,
         'act': act_cpu_t,
@@ -3640,27 +3870,23 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         # normalizza vantaggi completamente su GPU (no sync)
         _t_p0 = time.time() if _PAR_TIMING else 0.0
         if dual_team_nets and (not opp_frozen_env):
-            for _b in (batch_A, batch_B):
+            for label, _b in (('dual-teamA', batch_A), ('dual-teamB', batch_B)):
                 adv = _b['adv']
                 if adv.numel() > 0:
-                    mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
-                    _b['adv'] = (adv - mean) / std
+                    _b['adv'] = _normalize_adv_tensor(label, adv)
         elif dual_team_nets and opp_frozen_env:
             if train_A_now:
                 adv = batch_A['adv']
                 if adv.numel() > 0:
-                    mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
-                    batch_A['adv'] = (adv - mean) / std
+                    batch_A['adv'] = _normalize_adv_tensor('frozen-teamA', adv)
             else:
                 adv = batch_B['adv']
                 if adv.numel() > 0:
-                    mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
-                    batch_B['adv'] = (adv - mean) / std
+                    batch_B['adv'] = _normalize_adv_tensor('frozen-teamB', adv)
         else:
             adv = batch['adv']
             if adv.numel() > 0:
-                mean = adv.mean(); std = adv.std(); std = torch.clamp(std, min=1e-8)
-                batch['adv'] = (adv - mean) / std
+                batch['adv'] = _normalize_adv_tensor('single', adv)
         # Ensure training mode on update
         agent.actor.train()
         agent.critic.train()

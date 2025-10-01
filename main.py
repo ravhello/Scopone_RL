@@ -62,6 +62,7 @@ os.environ.setdefault('SCOPONE_PROFILE', '0')
 
 # Additional trainer/eval tunables exposed via environment (defaults; override as needed)
 os.environ.setdefault('SCOPONE_PAR_DEBUG', '0')
+os.environ.setdefault('SCOPONE_PPO_DEBUG', '0')
 os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
 os.environ.setdefault('SCOPONE_TORCH_PROF', '0')
 os.environ.setdefault('SCOPONE_TORCH_TB_DIR', '')
