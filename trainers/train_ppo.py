@@ -1291,6 +1291,22 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     belief_aux_coef = float(os.environ.get('BELIEF_AUX_COEF', '0.1'))
     skip_step_validation = (os.environ.get('SCOPONE_SKIP_STEP_VALIDATION', '1') == '1')
 
+    # Profiling accumulators (shared naming with parallel collector for consistency)
+    t_collect_start = time.time() if _PAR_TIMING else 0.0
+    t_env_reset = 0.0
+    t_get_obs = 0.0
+    t_get_legals = 0.0
+    t_mcts = 0.0
+    t_step = 0.0
+    t_select = 0.0
+    t_build = 0.0
+    t_state_proj = 0.0
+    t_action_enc = 0.0
+    t_sampling = 0.0
+    t_values_gae = 0.0
+    t_oldlogp = 0.0
+    env_reset_count = 0
+
     steps = 0
     if final_reward_only:
         # Raccogli per episodi completi: per-episodio util = 40 se alleni entrambe le squadre, altrimenti 20
@@ -1303,14 +1319,26 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     ep_team_rewards: List[List[float]] = []
     while True:
         if env.done:
+            if _PAR_TIMING:
+                _t0_env_reset = time.time()
             env.reset()
+            if _PAR_TIMING:
+                t_env_reset += (time.time() - _t0_env_reset)
+                env_reset_count += 1
             current_ep_start_idx = len(obs_list)
-            
 
         # All env logic on CPU
+        if _PAR_TIMING:
+            _t0_get_obs = time.time()
         obs = env._get_observation(env.current_player)
+        if _PAR_TIMING:
+            t_get_obs += (time.time() - _t0_get_obs)
         # Fast-path: get_valid_actions already caches by state; avoid recomputing identical lists
+        if _PAR_TIMING:
+            _t0_get_legals = time.time()
         legal = env.get_valid_actions()
+        if _PAR_TIMING:
+            t_get_legals += (time.time() - _t0_get_legals)
         if torch.is_tensor(legal) and (legal.size(0) == 0):
             cp = env.current_player
             hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
@@ -1377,6 +1405,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     probs_flat = agent.actor.belief_net.probs(logits, visible_mask)
                 bsum_tensor = probs_flat.squeeze(0).detach().to('cpu')
             if use_mcts_cur:
+                if _PAR_TIMING:
+                    _t0_mcts = time.time()
                 # MCTS con determinizzazione dal belief del giocatore corrente
                 from algorithms.is_mcts import run_is_mcts
                 import numpy as _np
@@ -1623,7 +1653,11 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 matches = (codes == code_ch)
                 nz = torch.nonzero(matches, as_tuple=False).flatten()
                 idx_t = (nz[0] if nz.numel() > 0 else torch.tensor(0, dtype=torch.long))
+                if _PAR_TIMING:
+                    _t0_step = time.time()
                 next_obs, rew, done, info = env.step(chosen_act)
+                if _PAR_TIMING:
+                    t_step += (time.time() - _t0_step)
                 routing_log.append((cp, 'mcts'))
                 # registra target distillazione per questo sample (ordine legali corrente)
                 mcts_probs = torch.as_tensor(mcts_visits, dtype=torch.float32)
@@ -1633,9 +1667,25 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     mcts_probs = mcts_probs / s
                 mcts_policy_flat.extend((mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs)))
                 mcts_weight_list.append(1.0)
+                if _PAR_TIMING:
+                    t_mcts += (time.time() - _t0_mcts)
             else:
-                chosen_act, _logp, idx_t = agent.select_action(obs, legal, seat_vec)
+                if _PAR_TIMING:
+                    prof_bins = {'state_proj': 0.0, 'action_enc': 0.0, 'sampling': 0.0}
+                    _t0_select = time.time()
+                else:
+                    prof_bins = None
+                chosen_act, _logp, idx_t = agent.select_action(obs, legal, seat_vec, profiling_bins=prof_bins)
+                if _PAR_TIMING:
+                    select_elapsed = time.time() - _t0_select
+                    t_select += select_elapsed
+                    t_state_proj += prof_bins.get('state_proj', 0.0)
+                    t_action_enc += prof_bins.get('action_enc', 0.0)
+                    t_sampling += prof_bins.get('sampling', 0.0)
+                    _t0_step = time.time()
                 next_obs, rew, done, info = env.step(chosen_act)
+                if _PAR_TIMING:
+                    t_step += (time.time() - _t0_step)
                 routing_log.append((cp, 'main'))
                 # Per mantenere l'allineamento per-sample della distillazione, aggiungi zeri
                 mcts_policy_flat.extend([0.0] * len(legal))
@@ -1719,7 +1769,11 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 matches = (codes == code_ch)
                 nz = torch.nonzero(matches, as_tuple=False).flatten()
                 idx_t = (nz[0] if nz.numel() > 0 else torch.tensor(0, dtype=torch.long))
+            if _PAR_TIMING:
+                _t0_step = time.time()
             next_obs, rew, done, info = env.step(act)
+            if _PAR_TIMING:
+                t_step += (time.time() - _t0_step)
             routing_log.append((cp, 'partner' if is_partner_seat else 'opponent'))
             # Per i seat non-main mantieni l'allineamento dei target
             mcts_policy_flat.extend([0.0] * len(legal))
@@ -1838,6 +1892,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
 
     # Keep batch entirely as torch tensors on CUDA
     # Build CPU tensors first, then pin and transfer as a batch later in update
+    if _PAR_TIMING:
+        _t0_build = time.time()
     obs_cpu = torch.stack([o if torch.is_tensor(o) else torch.as_tensor(o, dtype=torch.float32) for o in obs_list], dim=0) if len(obs_list)>0 else torch.zeros((0, env.observation_space.shape[0]), dtype=torch.float32)
     act_cpu = torch.stack([a if torch.is_tensor(a) else torch.as_tensor(a, dtype=torch.float32) for a in act_list], dim=0) if len(act_list)>0 else torch.zeros((0, 80), dtype=torch.float32)
     legals_cpu = torch.stack([l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.float32) for l in legals_list], dim=0) if legals_list else _EMPTY_LEGAL
@@ -1853,6 +1909,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         others_hands_cpu = oh_cpu_tensor
     else:
         others_hands_cpu = torch.zeros((0,3,40), dtype=torch.float32)
+    if _PAR_TIMING:
+        t_build += (time.time() - _t0_build)
     # Sanitizza lunghezze: policy_flat deve avere somma(cnts) elementi e weight deve avere len(obs)
     total_legals = int(legals_count_cpu.sum().item()) if len(legals_count_cpu) > 0 else 0
     if mcts_policy_cpu.numel() != total_legals:
@@ -1991,6 +2049,61 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             raise RuntimeError("collect_trajectory: seat_team must be (B,6) with one-hot seat")
 
     # Mantieni batch già tensori CPU; l'update ora li mapperà tutti su CUDA in un solo passaggio
+    if _PAR_TIMING:
+        total_collect = time.time() - t_collect_start
+        episodes_total = len(ep_slices) if len(ep_slices) > 0 else (1 if len(obs_list) > 0 else 0)
+        tqdm.write(
+            f"[serial-collect] steps={len(obs_list)} episodes={episodes_total} resets={env_reset_count} "
+            f"t_reset={t_env_reset:.3f}s t_obs={t_get_obs:.3f}s t_legals={t_get_legals:.3f}s "
+            f"t_mcts={t_mcts:.3f}s t_select={t_select:.3f}s state={t_state_proj:.3f}s action_enc={t_action_enc:.3f}s sample={t_sampling:.3f}s t_step={t_step:.3f}s build={t_build:.3f}s "
+            f"values={t_values_gae:.3f}s old_logp={t_oldlogp:.3f}s total={total_collect:.3f}s"
+        )
+        profiling_payload = {
+            'serial/steps': len(obs_list),
+            'serial/episodes': episodes_total,
+            'serial/resets': env_reset_count,
+            'serial/t_env_reset': t_env_reset,
+            'serial/t_get_obs': t_get_obs,
+            'serial/t_get_legals': t_get_legals,
+            'serial/t_mcts': t_mcts,
+            'serial/t_select': t_select,
+            'serial/t_state_proj': t_state_proj,
+            'serial/t_action_enc': t_action_enc,
+            'serial/t_sampling': t_sampling,
+            'serial/t_step': t_step,
+            'serial/t_build': t_build,
+            'serial/t_values_gae': t_values_gae,
+            'serial/t_oldlogp': t_oldlogp,
+            'serial/t_total': total_collect,
+        }
+        env_profile = {}
+        consume_env = getattr(env, 'consume_profile_stats', None)
+        if callable(consume_env):
+            try:
+                env_profile = consume_env() or {}
+            except Exception as exc:
+                tqdm.write(f"[serial-collect] env profiling failed: {exc}")
+                env_profile = {}
+        if env_profile:
+            msg_parts = []
+            step_count = env_profile.get('step/count', 0)
+            if step_count:
+                msg_parts.append(
+                    f"step_total={env_profile.get('step/total', 0.0):.3f}s decode={env_profile.get('step/decode_total', 0.0):.3f}s "
+                    f"validate={env_profile.get('step/validate_total', 0.0):.3f}s apply={env_profile.get('step/apply_total', 0.0):.3f}s avg={env_profile.get('step/total_avg', 0.0)*1000:.2f}ms"
+                )
+            leg_calls = env_profile.get('legals/calls', 0)
+            if leg_calls:
+                msg_parts.append(
+                    f"legals_total={env_profile.get('legals/total', 0.0):.3f}s avg={env_profile.get('legals/avg', 0.0)*1000:.2f}ms"
+                )
+            if msg_parts:
+                tqdm.write(f"[env-profile] {' '.join(msg_parts)}")
+            profiling_payload.update({f'env/{k}': v for k, v in env_profile.items()})
+    else:
+        profiling_payload = None
+        env_profile = {}
+
     batch = {
         'obs': obs_cpu,
         'act': act_cpu,
@@ -2011,6 +2124,10 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         'others_hands': others_hands_cpu,
         'routing_log': routing_log,
     }
+    if profiling_payload is not None:
+        batch.setdefault('profiling', {}).update(profiling_payload)
+    elif env_profile:
+        batch.setdefault('profiling', {}).update({f'env/{k}': v for k, v in env_profile.items()})
     return batch
 
 

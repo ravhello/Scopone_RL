@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import List, Tuple
+import time
+from typing import List, Tuple, Optional, Dict
 from contextlib import nullcontext
 
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
@@ -171,7 +172,7 @@ class ActionConditionedPPO:
             self._actions_cpu_buf = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32)
             self._actions_cpu_buf_capacity = new_cap
 
-    def select_action(self, obs, legal_actions: List, seat_team_vec = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def select_action(self, obs, legal_actions: List, seat_team_vec = None, profiling_bins: Optional[Dict[str, float]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
             raise ValueError("No legal actions")
         # Validate legal actions dimensionality (accept list of (80,) or tensor (A,80))
@@ -323,7 +324,10 @@ class ActionConditionedPPO:
 
         # inference_mode disables autograd and some dispatcher overhead vs no_grad
         with torch.inference_mode():
-            chosen_act_d, logp_total_d, idx_t_d = self._select_action_core(obs_t, actions_t, st)
+            if profiling_bins is not None:
+                chosen_act_d, logp_total_d, idx_t_d = self._select_action_core_profiled(obs_t, actions_t, st, profiling_bins=profiling_bins)
+            else:
+                chosen_act_d, logp_total_d, idx_t_d = self._select_action_core(obs_t, actions_t, st)
         # Move chosen action and metadata back to CPU for env.step
         chosen_act = chosen_act_d.detach().to('cpu', non_blocking=True)
         return chosen_act, logp_total_d.detach().to('cpu'), idx_t_d.detach().to('cpu')
@@ -410,6 +414,92 @@ class ActionConditionedPPO:
         logp_cap_sel = torch.log_softmax(cap_logits_grp, dim=0)[idx_in_group]
         logp_total = (logp_card_sel + logp_cap_sel).detach()
         chosen_act = actions_t[idx_t].detach()
+        return chosen_act, logp_total, idx_t
+
+    def _select_action_core_profiled(self, obs_t: torch.Tensor, actions_t: torch.Tensor, seat_team_t: torch.Tensor = None,
+                                     profiling_bins: Dict[str, float] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if profiling_bins is None:
+            return self._select_action_core(obs_t, actions_t, seat_team_t)
+        profiling_bins.setdefault('state_proj', 0.0)
+        profiling_bins.setdefault('action_enc', 0.0)
+        profiling_bins.setdefault('sampling', 0.0)
+
+        if obs_t.dim() != 2 or obs_t.size(0) != 1:
+            raise ValueError(f"_select_action_core expects obs_t with shape (1, D), got {tuple(obs_t.shape)}")
+        if actions_t.dim() != 2 or actions_t.size(1) != self.run_config['action_dim']:
+            raise ValueError(f"_select_action_core expects actions_t with shape (A, {self.run_config['action_dim']}), got {tuple(actions_t.shape)}")
+        if seat_team_t is not None and (seat_team_t.dim() != 2 or seat_team_t.size(1) != 6):
+            raise ValueError(f"_select_action_core expects seat_team_t with shape (1, 6), got {None if seat_team_t is None else tuple(seat_team_t.shape)}")
+
+        cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
+        t_state = time.perf_counter()
+        with cm:
+            state_proj = self.actor.compute_state_proj(obs_t, seat_team_t)  # (1,64)
+            card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t()).squeeze(0)  # (40)
+        profiling_bins['state_proj'] += (time.perf_counter() - t_state)
+
+        if STRICT_CHECKS and (not torch.isfinite(state_proj).all()):
+            bad = state_proj[~torch.isfinite(state_proj)]
+            raise RuntimeError(f"Actor state_proj contains non-finite values (count={int(bad.numel())})")
+        if STRICT_CHECKS and (not torch.isfinite(card_logits_all).all()):
+            bad = card_logits_all[~torch.isfinite(card_logits_all)]
+            raise RuntimeError(f"Actor card_logits_all contains non-finite values (count={int(bad.numel())})")
+
+        played_ids_all = torch.argmax(actions_t[:, :40], dim=1)
+        ones_per_row = actions_t[:, :40].sum(dim=1)
+        if STRICT_CHECKS:
+            if not torch.allclose(ones_per_row, torch.ones_like(ones_per_row)):
+                raise RuntimeError(f"Invalid legal actions: expected exactly one played card per row, got sums={ones_per_row.tolist()}")
+
+        logp_cards_all = torch.log_softmax(card_logits_all, dim=0)  # (40)
+        unique_cards, inv_idx = torch.unique(played_ids_all, sorted=False, return_inverse=True)
+        logp_cards_allowed = logp_cards_all[unique_cards]
+        probs_card_allowed = torch.softmax(logp_cards_allowed, dim=0)
+        cdf_c = torch.cumsum(probs_card_allowed, dim=0)
+        last_c = torch.clamp(cdf_c[-1], min=torch.finfo(cdf_c.dtype).eps)
+        if STRICT_CHECKS:
+            torch._assert(torch.isfinite(last_c), "Invalid card CDF: non-finite last element")
+        u_c = torch.rand((), device=cdf_c.device, dtype=cdf_c.dtype) * last_c
+        sel_card_pos = torch.searchsorted(cdf_c, u_c, right=True)
+        sel_card_pos = torch.clamp(sel_card_pos, max=cdf_c.numel() - 1)
+        sel_card_id = unique_cards[sel_card_pos]
+
+        group_mask = (played_ids_all == sel_card_id)
+        group_idx = torch.nonzero(group_mask, as_tuple=False).flatten()
+        if group_idx.numel() <= 0:
+            raise RuntimeError("Two-stage sampling: empty group for selected card")
+        actions_grp = actions_t[group_idx]
+
+        t_action = time.perf_counter()
+        a_tbl = self.actor.get_action_emb_table_cached(device=actions_t.device, dtype=state_proj.dtype)
+        a_emb_grp = actions_grp.to(dtype=a_tbl.dtype) @ a_tbl  # (Gk,64)
+        profiling_bins['action_enc'] += (time.perf_counter() - t_action)
+
+        if STRICT_CHECKS and (not torch.isfinite(a_emb_grp).all()):
+            bad = a_emb_grp[~torch.isfinite(a_emb_grp)]
+            raise RuntimeError(f"Action embeddings (group) contain non-finite values (count={int(bad.numel())})")
+
+        t_sampling = time.perf_counter()
+        cap_logits_grp = torch.matmul(a_emb_grp, state_proj.squeeze(0).to(dtype=a_emb_grp.dtype))  # (Gk)
+        if STRICT_CHECKS and (not torch.isfinite(cap_logits_grp).all()):
+            bad = cap_logits_grp[~torch.isfinite(cap_logits_grp)]
+            raise RuntimeError(f"Capture logits (group) contain non-finite values (count={int(bad.numel())})")
+        probs_cap_grp = torch.softmax(cap_logits_grp, dim=0)
+        probs_cap_grp = probs_cap_grp.nan_to_num(0.0)
+        s_g = probs_cap_grp.sum()
+        if STRICT_CHECKS and ((not torch.isfinite(s_g)) or (s_g <= 0)):
+            raise RuntimeError("Invalid group probabilities for capture selection")
+        cdf_g = torch.cumsum(probs_cap_grp, dim=0)
+        u_g = torch.rand((), device=cdf_g.device, dtype=cdf_g.dtype) * cdf_g[-1]
+        idx_in_group = torch.searchsorted(cdf_g, u_g, right=True)
+        idx_in_group = torch.clamp(idx_in_group, max=cdf_g.numel() - 1)
+
+        idx_t = group_idx[idx_in_group]
+        logp_card_sel = logp_cards_all[sel_card_id]
+        logp_cap_sel = torch.log_softmax(cap_logits_grp, dim=0)[idx_in_group]
+        logp_total = (logp_card_sel + logp_cap_sel).detach()
+        chosen_act = actions_t[idx_t].detach()
+        profiling_bins['sampling'] += (time.perf_counter() - t_sampling)
         return chosen_act, logp_total, idx_t
 
     def compute_loss(self, batch):

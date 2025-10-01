@@ -58,7 +58,7 @@ os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
-os.environ.setdefault('SCOPONE_PAR_PROFILE', '0')
+os.environ.setdefault('SCOPONE_PROFILE', '0')
 
 # Additional trainer/eval tunables exposed via environment (defaults; override as needed)
 os.environ.setdefault('SCOPONE_PAR_DEBUG', '0')
@@ -109,7 +109,7 @@ os.environ.setdefault('SCOPONE_ALTERNATE_ITERS', '1')
 os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
 
 # Refresh League from disk at startup (scan checkpoints/). 1=ON, 0=OFF
-os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '1')
+os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '0')
 
 # Parallel eval workers: 1=serial, >1 parallel via multiprocessing
 os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)//2)))
@@ -127,7 +127,7 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
 iters = int(os.environ.get('SCOPONE_ITERS', '3'))
 horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
-num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '8'))
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '1'))
 
 # Read checkpoint path from env for training
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
@@ -241,7 +241,7 @@ if __name__ == "__main__":
     tqdm.write(f"Training threads: num_threads={_n_threads} interop={_n_interop}")
     _maybe_launch_tensorboard()
 
-    tqdm.write(f"Parallel envs: {num_envs}  (SCOPONE_PAR_PROFILE={os.environ.get('SCOPONE_PAR_PROFILE','0')})")
+    tqdm.write(f"Parallel envs: {num_envs}  (SCOPONE_PROFILE={os.environ.get('SCOPONE_PROFILE','0')})")
     tqdm.write(f"Train from both team transitions: {'ON' if _tfb else 'OFF'}")
     tqdm.write(f"Opponent frozen: {'ON' if _opp_frozen else 'OFF'}")
     tqdm.write(f"Warm start mode: {os.environ.get('SCOPONE_WARM_START','2')}")
@@ -271,5 +271,3 @@ if __name__ == "__main__":
               seed=seed_env,
               use_selfplay=_selfplay,
               train_both_teams=_tfb)
-
-

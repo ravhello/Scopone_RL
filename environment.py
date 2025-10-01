@@ -104,6 +104,16 @@ class ScoponeEnvMA(gym.Env):
         self._id_range = torch.arange(40, dtype=torch.int64, device=device)
         # Precompute one-hot matrix for card IDs (40×40) to spare scatter/equality kernels per step
         self._card_eye = torch.eye(40, dtype=torch.float32, device=device)
+        # Profiling flags
+        self._profiling = (os.environ.get('SCOPONE_PROFILE', '0') != '0')
+        self._prof_step_total = 0.0
+        self._prof_step_decode = 0.0
+        self._prof_step_validate = 0.0
+        self._prof_step_apply = 0.0
+        self._prof_step_count = 0
+        self._prof_legals_total = 0.0
+        self._prof_legals_calls = 0
+
         # Derived features mirrors (kept as tensors for compile-friendly observation):
         self._progress_t = torch.zeros(1, dtype=torch.float32, device=device)
         self._last_capturing_team_t = torch.zeros(2, dtype=torch.float32, device=device)
@@ -251,6 +261,8 @@ class ScoponeEnvMA(gym.Env):
         # Usa la variante tensor-native (device-agnostica) per codificare le azioni
         from actions import encode_action_from_ids_tensor as encode_action_from_ids
 
+        _t_legals_start = time.time() if self._profiling else 0.0
+
         # Chiave di cache LRU basata su (giocatore, mano, tavolo, regole AP)
         ap_enabled = bool(self.rules.get("asso_piglia_tutto", False))
         ap_posabile = bool(self.rules.get("asso_piglia_tutto_posabile", False))
@@ -265,6 +277,9 @@ class ScoponeEnvMA(gym.Env):
         if cached is not None:
             self._cache_hits += 1
             self._get_valid_actions_time += time.time() - start_time
+            if self._profiling:
+                self._prof_legals_total += time.time() - _t_legals_start
+                self._prof_legals_calls += 1
             return cached
 
         # Estrai ID mano e tavolo da bitset mirror
@@ -278,6 +293,9 @@ class ScoponeEnvMA(gym.Env):
 
         if hand_ids_t.numel() == 0:
             self._get_valid_actions_time += time.time() - start_time
+            if self._profiling:
+                self._prof_legals_total += time.time() - _t_legals_start
+                self._prof_legals_calls += 1
             return torch.zeros((0, 80), dtype=torch.float32, device=device)
 
         # Precompute invariants for this table state
@@ -410,6 +428,9 @@ class ScoponeEnvMA(gym.Env):
             self._valid_actions_cache.popitem(last=False)
         self._cache_misses += 1
         self._get_valid_actions_time += time.time() - start_time
+        if self._profiling:
+            self._prof_legals_total += time.time() - _t_legals_start
+            self._prof_legals_calls += 1
         return actions
     
     def step(self, action_vec):
@@ -422,7 +443,10 @@ class ScoponeEnvMA(gym.Env):
         
         if self.done:
             raise ValueError("Partita già finita: non puoi fare altri step.")
-        
+
+        _t_step_start = time.time() if self._profiling else 0.0
+        _t_prev = _t_step_start
+
         # Validazione forma vettore azione (deve essere 80)
         import torch as _torch
         if hasattr(action_vec, 'shape') and getattr(action_vec, 'ndim', 1) >= 1:
@@ -434,6 +458,11 @@ class ScoponeEnvMA(gym.Env):
 
         # Decodifica l'azione in ID (sempre su CPU per evitare micro-copie GPU)
         pid, cap_ids = decode_action_ids(action_vec)
+        if self._profiling:
+            _now = time.time()
+            self._prof_step_decode += (_now - _t_prev)
+            _t_prev = _now
+
         
         # Verifica validità (come prima)
         current_player = self.current_player
@@ -448,6 +477,8 @@ class ScoponeEnvMA(gym.Env):
 
         table_ids_list = self._table_ids if self._use_id_cache else [_card_to_id(c) for c in table]
 
+        if self._profiling:
+            _t_validate_start = time.time()
         if not _SKIP_STEP_VALIDATION:
             # Verifica carte da catturare (ID) via bitset CPU (evita sync GPU)
             for cid in cap_ids:
@@ -496,6 +527,11 @@ class ScoponeEnvMA(gym.Env):
                     if sum_chosen != rank:
                         raise ValueError(f"La somma delle carte catturate ({sum_chosen}) deve essere uguale al rank ({rank}).")
         
+        if self._profiling:
+            _now = time.time()
+            self._prof_step_validate += (_now - _t_validate_start)
+            _t_prev = _now
+
         # OTTIMIZZAZIONE: Esegui l'azione in modo più efficiente
         capture_type = "no_capture"
         
@@ -698,7 +734,12 @@ class ScoponeEnvMA(gym.Env):
             obs_final = torch.zeros(self.observation_space.shape, dtype=torch.float32, device=device)
             
             # Aggiorna il tempo di esecuzione
-            self._step_time += time.time() - step_start_time
+            _end = time.time()
+            if self._profiling:
+                self._prof_step_apply += (_end - _t_prev)
+                self._prof_step_total += (_end - _t_step_start)
+                self._prof_step_count += 1
+            self._step_time += _end - step_start_time
             
             # Restituisci la ricompensa finale per il team del giocatore corrente
             current_team = 0 if current_player in [0, 2] else 1
@@ -713,7 +754,12 @@ class ScoponeEnvMA(gym.Env):
             next_obs = self._get_observation(self.current_player)
             
             # Aggiorna il tempo di esecuzione
-            self._step_time += time.time() - step_start_time
+            _end = time.time()
+            if self._profiling:
+                self._prof_step_apply += (_end - _t_prev)
+                self._prof_step_total += (_end - _t_step_start)
+                self._prof_step_count += 1
+            self._step_time += _end - step_start_time
             
             return next_obs, shaped_reward, False, {"last_move": move_info}
     
@@ -849,6 +895,40 @@ class ScoponeEnvMA(gym.Env):
         # Ottieni l'osservazione iniziale
         return self._get_observation(self.current_player)
     
+    def consume_profile_stats(self):
+        if not self._profiling:
+            return {}
+        out = {}
+        if self._prof_step_count > 0:
+            count = self._prof_step_count
+            out.update({
+                'step/count': count,
+                'step/total': self._prof_step_total,
+                'step/decode_total': self._prof_step_decode,
+                'step/validate_total': self._prof_step_validate,
+                'step/apply_total': self._prof_step_apply,
+                'step/decode_avg': self._prof_step_decode / count,
+                'step/validate_avg': self._prof_step_validate / count,
+                'step/apply_avg': self._prof_step_apply / count,
+                'step/total_avg': self._prof_step_total / count,
+            })
+        if self._prof_legals_calls > 0:
+            calls = self._prof_legals_calls
+            out.update({
+                'legals/calls': calls,
+                'legals/total': self._prof_legals_total,
+                'legals/avg': self._prof_legals_total / calls,
+            })
+        # Reset accumulators
+        self._prof_step_total = 0.0
+        self._prof_step_decode = 0.0
+        self._prof_step_validate = 0.0
+        self._prof_step_apply = 0.0
+        self._prof_step_count = 0
+        self._prof_legals_total = 0.0
+        self._prof_legals_calls = 0
+        return out
+
     def print_stats(self):
         """Stampa statistiche di performance"""
         if self._step_count > 0:

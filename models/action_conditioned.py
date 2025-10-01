@@ -449,7 +449,13 @@ class BeliefNet(nn.Module):
         return logits  # (B,120) logits per 3x40
 
     def temperature(self) -> torch.Tensor:
-        return torch.clamp(torch.exp(self._log_temp), 0.25, 4.0)
+        log_temp = self._log_temp
+        if not torch.isfinite(log_temp).all():
+            raise RuntimeError("BeliefNet.temperature: _log_temp contains non-finite values")
+        temp = torch.exp(log_temp)
+        if STRICT:
+            torch._assert(torch.isfinite(temp).all(), "BeliefNet.temperature: exp(log_temp) produced non-finite values")
+        return torch.clamp(temp, 0.25, 4.0)
 
     def probs(self, logits: torch.Tensor, visible_mask_40: torch.Tensor = None) -> torch.Tensor:
         """
@@ -1098,5 +1104,4 @@ class CentralValueNet(torch.nn.Module):
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
         _ = strict  # keep arg for external callers; force non-strict loading
         return super().load_state_dict(state_dict, strict=False)
-
 
