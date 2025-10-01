@@ -1,5 +1,6 @@
 # observation.py - Versione Torch CUDA (no NumPy)
 import os
+from typing import Optional
 import torch
 import torch.nn.functional as F
 import torch._dynamo as _dynamo  # type: ignore
@@ -853,8 +854,7 @@ def encode_recent_history_k(game_state, k=12):
         seg = torch.cat([pad, seg], dim=0)
     return seg.reshape(-1)
  
-
-def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, out: torch.Tensor = None):
+def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, out: Optional[torch.Tensor] = None):
     """
     Variante interamente GPU-driven che usa i bitset mirror già residenti su CUDA
     (inseriti dall'ambiente come _hands_bits_t, _table_bits_t, _captured_bits_t)

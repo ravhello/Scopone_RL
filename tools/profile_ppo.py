@@ -65,7 +65,7 @@ os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
-os.environ.setdefault('SCOPONE_PROFILE', '1')
+os.environ.setdefault('SCOPONE_PROFILE', '0')
 
 # Additional trainer/eval tunables exposed via environment (defaults; override as needed)
 os.environ.setdefault('SCOPONE_PAR_DEBUG', '0')
@@ -116,7 +116,7 @@ os.environ.setdefault('SCOPONE_ALTERNATE_ITERS', '1')
 os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
 
 # Refresh League from disk at startup (scan checkpoints/). 1=ON, 0=OFF
-os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '1')
+os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '0')
 
 # Parallel eval workers: 1=serial, >1 parallel via multiprocessing
 os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)//2)))
@@ -132,7 +132,7 @@ os.environ.setdefault('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
 
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
-iters = int(os.environ.get('SCOPONE_ITERS', '3'))
+iters = int(os.environ.get('SCOPONE_ITERS', '1'))
 horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
 _DEFAULT_NUM_ENVS = int(os.environ.get('SCOPONE_NUM_ENVS', '1'))
 
@@ -224,10 +224,13 @@ from utils.seed import resolve_seed
 
 def _resolve_num_envs(args, clamp: int | None = None) -> int:
     raw = getattr(args, 'num_envs', None)
-    try:
-        val = int(raw)
-    except (TypeError, ValueError):
+    if raw is None:
         val = _DEFAULT_NUM_ENVS
+    else:
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            val = _DEFAULT_NUM_ENVS
     if clamp is not None:
         val = min(val, clamp)
     return max(1, val)
@@ -397,6 +400,7 @@ def main():
 
                 # Print compact, line-profiler-like summary at the bottom
                 print("\n===== Scalene — Compact summary (by file) =====")
+                clean_output = full_cli_output  # ensure defined for fallback paths
                 try:
                     import re as _re
 
@@ -540,8 +544,8 @@ def main():
                         tail = '\n'.join(clean_output.splitlines()[-80:])
                         print(tail)
                 except Exception:
-                    # On parser error, still show the tail of cleaned output
-                    tail = '\n'.join(clean_output.splitlines()[-80:])
+                    # On parser error, still show the tail of cleaned output or raw output
+                    tail = '\n'.join((clean_output or full_cli_output).splitlines()[-80:])
                     print(tail)
 
             if want_html and html_path:
@@ -660,6 +664,11 @@ def main():
     if args.line:
         # Lightweight line-by-line profiling for Python code with file:line output
         from profilers.line_profiler import profile as line_profile, global_profiler
+        # Helper to preserve original callable signatures for the type checker
+        from typing import Any, Callable, TypeVar, cast
+        _F = TypeVar('_F', bound=Callable[..., object])
+        def _lp(fn: _F) -> _F:
+            return cast(_F, line_profile(fn))
 
         # Optional: register additional targets for profiling before running training
         def _resolve_attr(path: str):
@@ -739,77 +748,77 @@ def main():
                     for fn in _iter_package_functions(mod):
                         line_profile(fn)
                         any_registered = True
-                else:
-                    for fn in _iter_module_functions(mod):
-                        line_profile(fn)
-                        any_registered = True
-
         # Wrap hotspots and also enable global tracing fallback
         import trainers.train_ppo as train_mod
-        train_mod.collect_trajectory = line_profile(train_mod.collect_trajectory)
-        train_fn = line_profile(train_mod.train_ppo)
+        train_mod.collect_trajectory = _lp(train_mod.collect_trajectory)
+        train_fn = _lp(train_mod.train_ppo)
         # Trainer data path internals
-        train_mod.collect_trajectory_parallel = line_profile(train_mod.collect_trajectory_parallel)
-        train_mod._batched_select_indices = line_profile(train_mod._batched_select_indices)
-        train_mod._batched_select_indices_with_actor = line_profile(train_mod._batched_select_indices_with_actor)
-        train_mod._batched_service = line_profile(train_mod._batched_service)
+        train_mod.collect_trajectory_parallel = _lp(train_mod.collect_trajectory_parallel)
+        train_mod._batched_select_indices = _lp(train_mod._batched_select_indices)
+        train_mod._batched_select_indices_with_actor = _lp(train_mod._batched_select_indices_with_actor)
+        train_mod._batched_service = _lp(train_mod._batched_service)
         # Worker loop
         if hasattr(train_mod, '_env_worker'):
-            train_mod._env_worker = line_profile(train_mod._env_worker)
+            train_mod._env_worker = _lp(train_mod._env_worker)
         # Trainer parallel/batching internals
         if hasattr(train_mod, 'collect_trajectory_parallel'):
-            train_mod.collect_trajectory_parallel = line_profile(train_mod.collect_trajectory_parallel)
+            train_mod.collect_trajectory_parallel = _lp(train_mod.collect_trajectory_parallel)
         for _name in ['_batched_select_indices', '_batched_select_indices_with_actor', '_batched_service']:
             if hasattr(train_mod, _name):
-                setattr(train_mod, _name, line_profile(getattr(train_mod, _name)))
+                setattr(train_mod, _name, _lp(getattr(train_mod, _name)))
 
         # Always profile eval, environment and MCTS stack by default under --line
         import evaluation.eval as eval_mod
-        eval_mod.evaluate_pair_actors = line_profile(eval_mod.evaluate_pair_actors)
-        eval_mod.play_match = line_profile(eval_mod.play_match)
+        eval_mod.evaluate_pair_actors = _lp(eval_mod.evaluate_pair_actors)
+        eval_mod.play_match = _lp(eval_mod.play_match)
         # Environment hotspots
         import environment as env_mod
         if hasattr(env_mod, 'ScoponeEnvMA'):
             _Env = env_mod.ScoponeEnvMA
             if hasattr(_Env, 'step'):
-                _Env.step = line_profile(_Env.step)
+                setattr(cast(Any, _Env), 'step', _lp(_Env.step))
             if hasattr(_Env, 'get_valid_actions'):
-                _Env.get_valid_actions = line_profile(_Env.get_valid_actions)
+                setattr(cast(Any, _Env), 'get_valid_actions', _lp(_Env.get_valid_actions))
             if hasattr(_Env, '_get_observation'):
-                _Env._get_observation = line_profile(_Env._get_observation)
+                setattr(cast(Any, _Env), '_get_observation', _lp(_Env._get_observation))
             if hasattr(_Env, 'reset'):
-                _Env.reset = line_profile(_Env.reset)
+                setattr(cast(Any, _Env), 'reset', _lp(_Env.reset))
         import algorithms.is_mcts as mcts_mod
         if hasattr(mcts_mod, 'run_is_mcts'):
-            mcts_mod.run_is_mcts = line_profile(mcts_mod.run_is_mcts)
+            mcts_mod.run_is_mcts = _lp(mcts_mod.run_is_mcts)
         # If IS-MCTS exposes subroutines, profile them too (best-effort)
         for sub_name in ['tree_policy', 'expand', 'simulate', 'backpropagate', 'select_child']:
             if hasattr(mcts_mod, sub_name):
-                setattr(mcts_mod, sub_name, line_profile(getattr(mcts_mod, sub_name)))
+                setattr(mcts_mod, sub_name, _lp(getattr(mcts_mod, sub_name)))
         # Model forward paths (actor/belief)
         import models.action_conditioned as ac_mod
         if hasattr(ac_mod, 'ActionConditionedActor'):
             _Act = ac_mod.ActionConditionedActor
             if hasattr(_Act, 'forward'):
-                _Act.forward = line_profile(_Act.forward)
+                setattr(cast(Any, _Act), 'forward', _lp(_Act.forward))
         if hasattr(ac_mod, 'CentralValueNet'):
             _Crit = ac_mod.CentralValueNet
             if hasattr(_Crit, 'forward'):
-                _Crit.forward = line_profile(_Crit.forward)
+                setattr(cast(Any, _Crit), 'forward', _lp(_Crit.forward))
         # PPO core
         import algorithms.ppo_ac as ppo_mod
         if hasattr(ppo_mod, 'ActionConditionedPPO'):
             _PPO = ppo_mod.ActionConditionedPPO
             if hasattr(_PPO, 'update'):
-                _PPO.update = line_profile(_PPO.update)
+                setattr(cast(Any, _PPO), 'update', _lp(_PPO.update))
             if hasattr(_PPO, 'compute_loss'):
-                _PPO.compute_loss = line_profile(_PPO.compute_loss)
+                setattr(cast(Any, _PPO), 'compute_loss', _lp(_PPO.compute_loss))
             if hasattr(_PPO, 'select_action'):
-                _PPO.select_action = line_profile(_PPO.select_action)
+                setattr(cast(Any, _PPO), 'select_action', _lp(_PPO.select_action))
             if hasattr(_PPO, '_select_action_core'):
-                _PPO._select_action_core = line_profile(_PPO._select_action_core)
+                setattr(cast(Any, _PPO), '_select_action_core', _lp(_PPO._select_action_core))
             # Try common names for submodules
             for attr in ['state_enc', 'belief_net']:
+                if hasattr(_Act, attr):
+                    sub = getattr(_Act, attr)
+                    # If it's a Module class attribute, decorate .forward
+                    if hasattr(sub, 'forward'):
+                        setattr(cast(Any, sub), 'forward', _lp(sub.forward))
                 if hasattr(_Act, attr):
                     sub = getattr(_Act, attr)
                     # If it's a Module class attribute, decorate .forward
@@ -838,9 +847,9 @@ def main():
             if hasattr(_PPO, 'compute_loss'):
                 _PPO.compute_loss = line_profile(_PPO.compute_loss)
 
-        # Actions/state helpers (if used by env)
-        import actions as actions_mod
-        if hasattr(actions_mod, 'decode_action_ids'):
+        if args.wrap_update:
+            import algorithms.ppo_ac as ppo_mod
+            setattr(cast(Any, ppo_mod.ActionConditionedPPO), 'update', _lp(ppo_mod.ActionConditionedPPO.update))
             actions_mod.decode_action_ids = line_profile(actions_mod.decode_action_ids)
 
         if args.wrap_update:
