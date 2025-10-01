@@ -139,6 +139,8 @@ _DEFAULT_NUM_ENVS = int(os.environ.get('SCOPONE_NUM_ENVS', '1'))
 # Read checkpoint path from env for training
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 
+_mcts_warmup_iters = int(os.environ.get('SCOPONE_MCTS_WARMUP_ITERS', '500'))
+
 # MCTS eval flags
 _eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '10'))
 _eval_c_puct = float(os.environ.get('SCOPONE_EVAL_MCTS_C_PUCT', '1.0'))
@@ -580,7 +582,8 @@ def main():
         train_ppo(num_iterations=max(0, args.iters), horizon=max(40, args.horizon), k_history=39, num_envs=num_envs_eff,
                   mcts_sims=_mcts_sims, mcts_sims_eval=0, save_every=_save_every,
                   entropy_schedule_type=_entropy_sched,
-                  eval_every=0, eval_games=_eval_games, mcts_in_eval=False, seed=seed, use_selfplay=_selfplay)
+                  eval_every=0, eval_games=_eval_games, mcts_in_eval=False, seed=seed, use_selfplay=_selfplay,
+                  mcts_warmup_iters=_mcts_warmup_iters)
         return
 
     # cProfile mode takes precedence over line/torch profiler
@@ -618,7 +621,8 @@ def main():
                       mcts_root_temp=_mcts_root_temp, mcts_prior_smooth_eps=_mcts_prior_eps,
                       mcts_dirichlet_alpha=_mcts_dir_alpha, mcts_dirichlet_eps=_mcts_dir_eps,
                       eval_every=0, eval_games=_eval_games,
-                      seed=seed, use_selfplay=_selfplay)
+                      seed=seed, use_selfplay=_selfplay,
+                      mcts_warmup_iters=_mcts_warmup_iters)
 
         prof.enable()
         try:
@@ -1092,7 +1096,8 @@ def main():
         _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))
         train_ppo(num_iterations=max(0, args.iters), horizon=_h_eff, k_history=39, num_envs=num_envs_eff,
                   mcts_sims=0, mcts_sims_eval=0, eval_every=0, eval_games=_eval_games, mcts_in_eval=False, seed=seed, use_selfplay=_selfplay,
-                  on_iter_end=_on_iter_end_cb)
+                  on_iter_end=_on_iter_end_cb,
+                  mcts_warmup_iters=_mcts_warmup_iters)
 
     # Export chrome trace for main process
     out_main = os.path.abspath(os.path.join(_profiles_dir, f"tp_main_{os.getpid()}_{os.environ.get('SCOPONE_TORCH_PROF_RUN','run')}.json"))

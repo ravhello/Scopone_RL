@@ -220,6 +220,7 @@ def _env_worker(worker_id: int,
     mcts_progress_start = float(cfg.get('mcts_progress_start', 0.25))
     mcts_progress_full = float(cfg.get('mcts_progress_full', 0.75))
     mcts_min_sims = int(cfg.get('mcts_min_sims', 0))
+    mcts_train_factor = float(cfg.get('mcts_train_factor', 1.0))
     rpc_timeout_s = float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30'))
     episode_put_timeout_s = float(os.environ.get('SCOPONE_EP_PUT_TIMEOUT_S', '15'))
     belief_aux_coef = float(os.environ.get('BELIEF_AUX_COEF', '0.1'))
@@ -451,9 +452,15 @@ def _env_worker(worker_id: int,
                 # Permetti 0 simulazioni se mcts_min_sims==0
                 base_min = int(mcts_min_sims) if (mcts_min_sims is not None and int(mcts_min_sims) >= 0) else 0
                 import math
-                sims_scaled = int(max(base_min, math.ceil(mcts_sims * (0.25 + 0.75 * alpha))))
-                if int(mcts_sims) > 0 and sims_scaled <= 0:
-                    sims_scaled = 1
+                if mcts_train_factor is not None and float(mcts_train_factor) <= 0.0:
+                    sims_scaled = 0
+                else:
+                    sims_base = math.ceil(mcts_sims * (0.25 + 0.75 * alpha))
+                    if mcts_train_factor is not None:
+                        sims_base = math.ceil(sims_base * float(mcts_train_factor))
+                    sims_scaled = int(max(base_min, sims_base))
+                    if int(mcts_sims) > 0 and sims_scaled <= 0:
+                        sims_scaled = 1
                 root_temp_dyn = float(mcts_root_temp) if float(mcts_root_temp) > 0 else float(max(0.0, 1.0 - alpha))
 
                 if sims_scaled <= 0:
@@ -2198,6 +2205,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                                 mcts_progress_start: float = 0.25,
                                 mcts_progress_full: float = 0.75,
                                 mcts_min_sims: int = 0,
+                                mcts_train_factor: float = 1.0,
                                 seed: int = 0,
                                 show_progress_env: bool = True,
                                 tqdm_base_pos: int = 2,
@@ -2268,6 +2276,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'mcts_progress_start': float(mcts_progress_start),
         'mcts_progress_full': float(mcts_progress_full),
         'mcts_min_sims': int(mcts_min_sims),
+        'mcts_train_factor': float(mcts_train_factor),
         'seed': int(seed),
     }
     for wid in range(num_envs):
@@ -2326,9 +2335,15 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     wid = int(ep.get('wid', -1))
                     if 0 <= wid < len(_done_flags):
                         _done_flags[wid] = True
-                        if produced_count[wid] == 0:
-                            raise RuntimeError(f"collector: worker wid={wid} signaled done without producing any episode")
+                        expected_eps = episodes_per_env_list[wid] if 0 <= wid < len(episodes_per_env_list) else None
+                        if (expected_eps is None) or (expected_eps > 0):
+                            if produced_count[wid] == 0:
+                                raise RuntimeError(f"collector: worker wid={wid} signaled done without producing any episode")
+                        if 0 <= wid < len(env_pbars) and env_pbars[wid] is not None:
+                            env_pbars[wid].close()
+                            env_pbars[wid] = None
                     drained_any = True
+                    continue
                 elif _PAR_TIMING and isinstance(ep, dict) and ep.get('type') == 'timing':
                     timing_from_workers.append(ep)
                     drained_any = True
@@ -2952,6 +2967,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
               num_envs: int = 32,
               train_both_teams: bool = True,
               use_selfplay: bool = True,
+              mcts_warmup_iters: Optional[int] = 500,
               on_iter_end: Optional[Callable[[int], None]] = None):
     # Enforce minimum horizon of 40 and align horizon to minibatch size
     horizon = max(40, int(horizon))
@@ -3005,6 +3021,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         _all = [p for p in _glob.glob(os.path.join('checkpoints', '*.pth')) if (not _is_bootstrap_path(p)) and os.path.isfile(p) and os.path.getsize(p) > 0]
         if _all:
             resume_ckpt = max(_all, key=lambda p: os.path.getmtime(p))
+
+    warmup_iters = 0 if mcts_warmup_iters is None else max(0, int(mcts_warmup_iters))
 
     # Cosine annealing LR schedulers
     actor_sched = optim.lr_scheduler.CosineAnnealingLR(agent.opt_actor, T_max=max(1, num_iterations))
@@ -3357,6 +3375,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         # Complementary seats for the other team (used when swapping A<->B)
         main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
         use_parallel = (num_envs is not None and int(num_envs) > 1)
+        if bool(mcts_train):
+            mcts_train_factor = 0.0 if it < warmup_iters else 1.0
+        else:
+            mcts_train_factor = 0.0
         # Eval mode during data collection (dropout/BN off)
         agent.actor.eval()
         agent.critic.eval()
@@ -3377,7 +3399,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             tqdm.write(f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
                         f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}")
             # Abilita/disabilita MCTS in parallelo in base al flag di training
-            parallel_use_mcts = bool(mcts_train)
+            parallel_use_mcts = bool(mcts_train and mcts_train_factor > 0.0)
             if dual_team_nets and (not opp_frozen_env):
                 # Collect for team A vs live team B
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
@@ -3397,6 +3419,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                        mcts_prior_smooth_eps=mcts_prior_smooth_eps,
                                                        mcts_dirichlet_alpha=mcts_dirichlet_alpha,
                                                        mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                       mcts_train_factor=mcts_train_factor,
                                                        seed=int(seed),
                                                        show_progress_env=True,
                                                        tqdm_base_pos=3)
@@ -3418,6 +3441,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                        mcts_prior_smooth_eps=mcts_prior_smooth_eps,
                                                        mcts_dirichlet_alpha=mcts_dirichlet_alpha,
                                                        mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                       mcts_train_factor=mcts_train_factor,
                                                        seed=int(seed + 1),
                                                        show_progress_env=True,
                                                        tqdm_base_pos=4)
@@ -3443,6 +3467,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                            mcts_prior_smooth_eps=mcts_prior_smooth_eps,
                                                            mcts_dirichlet_alpha=mcts_dirichlet_alpha,
                                                            mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                           mcts_train_factor=mcts_train_factor,
                                                            seed=int(seed),
                                                            show_progress_env=True,
                                                            tqdm_base_pos=3,
@@ -3465,6 +3490,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                            mcts_prior_smooth_eps=mcts_prior_smooth_eps,
                                                            mcts_dirichlet_alpha=mcts_dirichlet_alpha,
                                                            mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                           mcts_train_factor=mcts_train_factor,
                                                            seed=int(seed + 1),
                                                            show_progress_env=True,
                                                            tqdm_base_pos=4,
@@ -3499,6 +3525,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                     mcts_prior_smooth_eps=mcts_prior_smooth_eps,
                                                     mcts_dirichlet_alpha=mcts_dirichlet_alpha,
                                                     mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                    mcts_train_factor=mcts_train_factor,
                                                     seed=int(seed),
                                                     show_progress_env=True,
                                                     tqdm_base_pos=3,
@@ -3508,7 +3535,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     _iter_t_collect = (time.time() - _t_c0)
         else:
             # Strategia MCTS: warmup senza MCTS per le prime iterazioni, poi scala con il progresso mano
-            mcts_train_factor = 0.0 if it < 500 else 1.0
             if dual_team_nets and (not opp_frozen_env):
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
                 # Team A as main vs live team B
