@@ -765,8 +765,22 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
     chunks = [c for c in chunks if c > 0]
     # Allinea mcts_list ai worker (se meno, ricicla gli ultimi; se più, tronca)
     mcts_eff = (mcts_list + mcts_list[-1:]*num_workers)[:num_workers]
-    args_list = [(ckpt_a, ckpt_b, chunks[i], k_history, mcts_eff[i], belief_particles, belief_ess_frac) for i in range(len(chunks))]
-    _dbg(f"parallel-dist setup: workers={num_workers} chunks={chunks} dets={[m.get('dets',1) for m in mcts_eff]}")
+    max_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '32'))
+    if max_chunk <= 0:
+        max_chunk = None
+    args_list: list = []
+    for i, games_i in enumerate(chunks):
+        if games_i <= 0:
+            continue
+        cfg = mcts_eff[min(i, len(mcts_eff) - 1)] if len(mcts_eff) > 0 else None
+        remaining = games_i
+        while remaining > 0:
+            take = remaining if max_chunk is None else min(remaining, max_chunk)
+            args_list.append((ckpt_a, ckpt_b, int(take), k_history, cfg, belief_particles, belief_ess_frac))
+            remaining -= take
+    if len(args_list) == 0:
+        return 0.0, {0: {}, 1: {}}
+    _dbg(f"parallel-dist setup: workers={num_workers} chunks={chunks} tasks={len(args_list)} dets={[m.get('dets',1) for m in mcts_eff]} max_chunk={max_chunk if max_chunk is not None else 'inf'}")
     # Progress bar aggregata
     total_games = sum(chunks)
     pbar = None
@@ -774,7 +788,8 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
         pbar = tqdm(total=total_games, desc=(tqdm_desc or 'Eval'), position=int(tqdm_position or 0), dynamic_ncols=True, leave=True)
     ctx = _get_mp_ctx()
     results = []
-    with ctx.Pool(processes=len(args_list)) as pool:
+    pool_size = max(1, min(num_workers, len(args_list)))
+    with ctx.Pool(processes=pool_size) as pool:
         try:
             async_res = pool.imap_unordered(_eval_pair_chunk_worker_dist, args_list)
             for idx in range(len(args_list)):
@@ -836,6 +851,4 @@ def league_eval_and_update(league_dir='checkpoints/league', games=20, target_poi
     # Aggiorna Elo usando la differenza media di punti -> mapping lineare a score
     league.update_elo_from_diff(a, b, diff)
     return league.elo
-
-
 

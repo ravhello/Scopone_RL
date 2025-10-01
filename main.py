@@ -141,11 +141,12 @@ _eval_dir_alpha = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_ALPHA','0.25
 _eval_dir_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_EPS','0.25'))
 _eval_belief_particles = int(os.environ.get('SCOPONE_EVAL_BELIEF_PARTICLES','0'))
 _eval_belief_ess = float(os.environ.get('SCOPONE_EVAL_BELIEF_ESS_FRAC','0.5'))
-_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','0').lower() in ['1','true','yes','on']
+_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','1').lower() in ['1','true','yes','on']
 _eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS','128'))
 _eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS','1'))
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))
 _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))
+_eval_max_games_per_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '32'))
 
 # Training config flags (from env)
 _entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED','linear')
@@ -156,7 +157,7 @@ _mcts_root_temp = float(os.environ.get('SCOPONE_MCTS_ROOT_TEMP','0.0'))
 _mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS','0.0'))
 _mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA','0.25'))
 _mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS','0.25'))
-_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','0') in ['1','true','yes','on']
+_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']
 _mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','128'))
 _mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','4'))
 
