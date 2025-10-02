@@ -2526,8 +2526,10 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     # Optional per-env progress bars
     env_pbars = []
     _TQDM_DISABLE = (os.environ.get('TQDM_DISABLE','0') in ['1','true','yes','on'])
+    # Respect global per-env tqdm policy via env; default ON unless explicitly disabled
+    _PER_ENV_TQDM = (str(os.environ.get('SCOPONE_PER_ENV_TQDM', '1')).strip().lower() in ['1','true','yes','on'])
     # Hide per-env progress bars when debug logs are enabled to avoid clutter
-    _SHOW_PB = bool(show_progress_env) and (not _TQDM_DISABLE) and (not _PAR_DEBUG)
+    _SHOW_PB = bool(show_progress_env) and _PER_ENV_TQDM and (not _TQDM_DISABLE) and (not _PAR_DEBUG)
     if _SHOW_PB:
         for wid in range(num_envs):
             b = tqdm(total=int(episodes_per_env_list[wid]), desc=f"env {wid}", position=(tqdm_base_pos + wid), leave=False, dynamic_ncols=True, disable=_TQDM_DISABLE)

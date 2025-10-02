@@ -92,8 +92,10 @@ os.environ.setdefault('SCOPONE_EVAL_MP_START', os.environ.get('SCOPONE_MP_START'
 os.environ.setdefault('SCOPONE_EVAL_POOL_TIMEOUT_S', '600')
 os.environ.setdefault('SCOPONE_ELO_DIFF_SCALE', '6.0')
 
-# TQDM_DISABLE: 1=disattiva progress bar/logging di tqdm; 0=abilitato
+# TQDM_DISABLE: 1=disattiva tutte le barre/logging di tqdm; 0=abilitato
 os.environ.setdefault('TQDM_DISABLE', '0')
+## SCOPONE_PER_ENV_TQDM: 1=mostra barre per-env; 0=nascondi barre per-env (lascia barra globale)
+os.environ.setdefault('SCOPONE_PER_ENV_TQDM', os.environ.get('SCOPONE_PER_ENV_TQDM', '0'))
 
 # SELFPLAY: 1=single net (self-play), 0=dual nets (Team A/B)
 _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
@@ -353,7 +355,10 @@ def main():
         env['SCOPONE_SEED'] = str(seed)
         env['SCALENE_RUNNING'] = '1'
         env['SCOPONE_SILENCE_ABSL'] = '0'
-        env['TQDM_DISABLE'] = '0'
+        env['TQDM_DISABLE'] = env.get('TQDM_DISABLE','0')
+        # propagate per-env policy
+        if 'SCOPONE_PER_ENV_TQDM' not in env:
+            env['SCOPONE_PER_ENV_TQDM'] = ('0' if int(ne) > 1 else '1')
         # read desired selfplay from env or default to ON; do not override here
         # keep SCOPONE_SELFPLAY as-is so outer env controls behavior
         print("Running under Scalene... this may add overhead.")

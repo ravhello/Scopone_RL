@@ -86,8 +86,10 @@ os.environ.setdefault('SCOPONE_EVAL_MP_START', os.environ.get('SCOPONE_MP_START'
 os.environ.setdefault('SCOPONE_EVAL_POOL_TIMEOUT_S', '600')
 os.environ.setdefault('SCOPONE_ELO_DIFF_SCALE', '6.0')
 
-# TQDM_DISABLE: 1=disattiva progress bar/logging di tqdm; 0=abilitato
+# TQDM_DISABLE: 1=disattiva tutte le barre/logging di tqdm; 0=abilitato
 os.environ.setdefault('TQDM_DISABLE', '0')
+## SCOPONE_PER_ENV_TQDM: 1=mostra barre per-env; 0=nascondi barre per-env (lascia barra globale)
+os.environ.setdefault('SCOPONE_PER_ENV_TQDM', os.environ.get('SCOPONE_PER_ENV_TQDM', '0'))
 
 # SELFPLAY: 1=single net (self-play), 0=dual nets (Team A/B)
 _selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
@@ -128,7 +130,7 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
 iters = int(os.environ.get('SCOPONE_ITERS', '3'))
 horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))
-num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '8'))
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '1'))
 
 # Read checkpoint path from env for training
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')

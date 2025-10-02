@@ -4,6 +4,8 @@ __pycache__/
 __pycache__/**
 .venv/**
 .venv/
+.vscode/
+.vscode/**
 all_code.py
 .pytest_cache/
 .pytest_cache/**
