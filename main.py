@@ -135,7 +135,7 @@ num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environmen
 # Read checkpoint path from env for training
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 
-_mcts_warmup_iters = int(os.environ.get('SCOPONE_MCTS_WARMUP_ITERS', '500'))  # iterazioni con MCTS disattivato in train
+_mcts_warmup_iters = int(os.environ.get('SCOPONE_MCTS_WARMUP_ITERS', '0'))  # iterazioni con MCTS disattivato in train
 
 # MCTS eval flags
 _eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '10'))  # esegui eval ogni N iterazioni
@@ -147,8 +147,8 @@ _eval_dir_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_EPS','0.25')) 
 _eval_belief_particles = int(os.environ.get('SCOPONE_EVAL_BELIEF_PARTICLES','0'))  # particelle belief per prior MCTS (eval)
 _eval_belief_ess = float(os.environ.get('SCOPONE_EVAL_BELIEF_ESS_FRAC','0.5'))  # soglia ESS per resampling belief (eval)
 _eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','1').lower() in ['1','true','yes','on']  # abilita MCTS in eval
-_eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS','128'))  # simulazioni base per mossa (pre-scaling)
-_eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS','1'))  # determinizzazioni per mossa (IS-MCTS)
+_eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS','4'))  # simulazioni base per mossa (pre-scaling)
+_eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS','2'))  # determinizzazioni per mossa (IS-MCTS)
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))  # ampiezza cronologia osservazioni (k_history)
 _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))  # numero partite per valutazione
 os.environ.setdefault('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '16')  # partite per task/worker (granularità progress)
@@ -170,8 +170,8 @@ _mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS','0.0'))  
 _mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA','0.25'))  # alpha Dirichlet root (train)
 _mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS','0.25'))  # mixing epsilon rumore Dirichlet (train)
 _mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']  # abilita MCTS nella raccolta
-_mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','128'))  # simulazioni base per mossa in training
-_mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','4'))  # determinizzazioni per mossa (train)
+_mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','4'))  # simulazioni base per mossa in training
+_mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','2'))  # determinizzazioni per mossa (train)
 ## Training MCTS scaling controls (used by trainer if supported)
 os.environ.setdefault('SCOPONE_MCTS_PROGRESS_START', '0.25')  # inizio finestra progress per scaling (train)
 os.environ.setdefault('SCOPONE_MCTS_PROGRESS_FULL', '0.75')  # fine finestra progress per scaling (train)
