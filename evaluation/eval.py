@@ -68,6 +68,78 @@ def _get_mp_ctx():
     _dbg("using mp start method: forkserver (default)")
     return mp.get_context('forkserver')
 
+def _get_eval_pool_timeout_seconds():
+    """
+    Parse SCOPONE_EVAL_POOL_TIMEOUT_S from environment.
+    Returns:
+        float timeout in seconds if > 0; None to indicate 'wait indefinitely'.
+    Accepted 'off' values: '0', 'none', 'inf', 'infinity', negatives.
+    """
+    try:
+        raw = str(os.environ.get('SCOPONE_EVAL_POOL_TIMEOUT_S', '600')).strip().lower()
+        if raw in ('none', 'inf', 'infinity'):
+            return None
+        val = float(raw)
+        if val <= 0.0:
+            return None
+        return float(val)
+    except Exception:
+        return 600.0
+
+def _true_env(val: str) -> bool:
+    return str(val).strip().lower() in _DEF_TRUE
+
+def _eval_progress_alpha(env, start: float, full: float) -> float:
+    try:
+        hist = env.game_state.get('history', []) if hasattr(env, 'game_state') and isinstance(env.game_state, dict) else []
+        progress = float(min(1.0, max(0.0, (len(hist) if isinstance(hist, list) else 0) / 40.0)))
+    except Exception:
+        progress = 0.0
+    denom = max(1e-6, float(full) - float(start))
+    alpha = min(1.0, max(0.0, (progress - float(start)) / denom))
+    return float(alpha)
+
+def _eval_resolve_mcts_params(env, mcts_cfg: dict | None):
+    """Return (sims_scaled, root_temp_dyn) for eval MCTS, mirroring training scaling.
+    Uses env overrides when available:
+      - SCOPONE_EVAL_MCTS_SCALING (default '1')
+      - SCOPONE_EVAL_MCTS_PROGRESS_START (default '0.25')
+      - SCOPONE_EVAL_MCTS_PROGRESS_FULL (default '0.75')
+      - SCOPONE_EVAL_MCTS_MIN_SIMS (default '0')
+      - SCOPONE_EVAL_MCTS_TRAIN_FACTOR (default '1.0')
+    """
+    if mcts_cfg is None:
+        return 0, 0.0
+    try:
+        sims_def = int(mcts_cfg.get('sims', 128))
+    except Exception:
+        sims_def = 128
+    scaling_on = _true_env(os.environ.get('SCOPONE_EVAL_MCTS_SCALING', '1'))
+    try:
+        ps = float(mcts_cfg.get('progress_start', os.environ.get('SCOPONE_EVAL_MCTS_PROGRESS_START', '0.25')))
+        pf = float(mcts_cfg.get('progress_full', os.environ.get('SCOPONE_EVAL_MCTS_PROGRESS_FULL', '0.75')))
+        min_sims = int(mcts_cfg.get('min_sims', os.environ.get('SCOPONE_EVAL_MCTS_MIN_SIMS', '0')))
+        train_factor = float(mcts_cfg.get('train_factor', os.environ.get('SCOPONE_EVAL_MCTS_TRAIN_FACTOR', '1.0')))
+    except Exception:
+        ps, pf, min_sims, train_factor = 0.25, 0.75, 0, 1.0
+    alpha = _eval_progress_alpha(env, ps, pf)
+    if not scaling_on:
+        sims_scaled = int(max(0, sims_def))
+    else:
+        import math as _math
+        sims_base = int(_math.ceil(float(sims_def) * (0.25 + 0.75 * alpha)))
+        sims_base = int(_math.ceil(float(sims_base) * float(train_factor)))
+        sims_scaled = int(max(int(min_sims), sims_base))
+        if int(sims_def) > 0 and sims_scaled <= 0:
+            sims_scaled = 1
+    # Dynamic root temperature like training: if root_temp<=0, use (1 - alpha)
+    try:
+        rt = float(mcts_cfg.get('root_temp', 0.0))
+    except Exception:
+        rt = 0.0
+    root_temp_dyn = float(rt) if float(rt) > 0.0 else float(max(0.0, 1.0 - alpha))
+    return int(sims_scaled), float(root_temp_dyn)
+
 def _terminal_ncols() -> int:
     try:
         return max(60, int(shutil.get_terminal_size(fallback=(120, 20)).columns))
@@ -315,19 +387,23 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                             det[others[j]].append(cid)
                             caps[j] -= 1
                     return det
+                sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
+                mc = dict(mcts)
+                mc['sims'] = int(sims_scaled)
+                mc['root_temp'] = float(root_temp_dyn)
                 action = run_is_mcts(
                     env,
                     policy_fn=policy_fn,
                     value_fn=lambda _o, _e: 0.0,  # solo policy-guided in eval rapida
-                    num_simulations=int(mcts.get('sims', 128)),
-                    c_puct=float(mcts.get('c_puct', 1.0)),
+                    num_simulations=int(mc.get('sims', 128)),
+                    c_puct=float(mc.get('c_puct', 1.0)),
                     belief=None,
-                    num_determinization=int(mcts.get('dets', 1)),
-                    root_temperature=float(mcts.get('root_temp', 0.0)),
-                    prior_smooth_eps=float(mcts.get('prior_smooth_eps', 0.0)),
+                    num_determinization=int(mc.get('dets', 1)),
+                    root_temperature=float(mc.get('root_temp', 0.0)),
+                    prior_smooth_eps=float(mc.get('prior_smooth_eps', 0.0)),
                     robust_child=True,
-                    root_dirichlet_alpha=float(mcts.get('root_dirichlet_alpha', 0.25)),
-                    root_dirichlet_eps=float(mcts.get('root_dirichlet_eps', 0.25)),
+                    root_dirichlet_alpha=float(mc.get('root_dirichlet_alpha', 0.25)),
+                    root_dirichlet_eps=float(mc.get('root_dirichlet_eps', 0.25)),
                     belief_sampler=belief_sampler_neural
                 )
                 return action
@@ -524,19 +600,23 @@ def _eval_pair_chunk_worker(args):
                             caps[j] -= 1
                     return det
                 from algorithms.is_mcts import run_is_mcts
+                sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
+                mc = dict(mcts)
+                mc['sims'] = int(sims_scaled)
+                mc['root_temp'] = float(root_temp_dyn)
                 action = run_is_mcts(
                     env,
                     policy_fn=policy_fn,
                     value_fn=lambda _o, _e: 0.0,
-                    num_simulations=int(mcts.get('sims', 128)),
-                    c_puct=float(mcts.get('c_puct', 1.0)),
+                    num_simulations=int(mc.get('sims', 128)),
+                    c_puct=float(mc.get('c_puct', 1.0)),
                     belief=None,
-                    num_determinization=int(mcts.get('dets', 1)),
-                    root_temperature=float(mcts.get('root_temp', 0.0)),
-                    prior_smooth_eps=float(mcts.get('prior_smooth_eps', 0.0)),
+                    num_determinization=int(mc.get('dets', 1)),
+                    root_temperature=float(mc.get('root_temp', 0.0)),
+                    prior_smooth_eps=float(mc.get('prior_smooth_eps', 0.0)),
                     robust_child=True,
-                    root_dirichlet_alpha=float(mcts.get('root_dirichlet_alpha', 0.25)),
-                    root_dirichlet_eps=float(mcts.get('root_dirichlet_eps', 0.25)),
+                    root_dirichlet_alpha=float(mc.get('root_dirichlet_alpha', 0.25)),
+                    root_dirichlet_eps=float(mc.get('root_dirichlet_eps', 0.25)),
                     belief_sampler=belief_sampler_neural
                 )
                 return action
@@ -602,17 +682,27 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
     with ctx.Pool(processes=len(args_list)) as pool:
         try:
             async_res = pool.imap_unordered(_eval_pair_chunk_worker, args_list)
+            timeout_s = _get_eval_pool_timeout_seconds()
             for idx in range(len(args_list)):
                 _dbg(f"waiting result {idx+1}/{len(args_list)} …")
-                item = async_res.next(timeout=float(os.environ.get('SCOPONE_EVAL_POOL_TIMEOUT_S','600')))
-                try:
-                    diff_sum_i, bd_sum_i, wins_i, games_i = item
-                except Exception as e:
-                    _dbg(f"received malformed result {item!r}: {e}")
-                    continue
-                if pbar is not None:
-                    pbar.update(int(games_i))
-                results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
+                while True:
+                    try:
+                        item = async_res.next() if timeout_s is None else async_res.next(timeout=timeout_s)
+                    except mp.TimeoutError as te:
+                        # If timeout is disabled, keep waiting indefinitely
+                        if timeout_s is None:
+                            _dbg("no result yet; keep waiting …")
+                            continue
+                        raise
+                    try:
+                        diff_sum_i, bd_sum_i, wins_i, games_i = item
+                    except Exception as e:
+                        _dbg(f"received malformed result {item!r}: {e}")
+                        break
+                    if pbar is not None:
+                        pbar.update(int(games_i))
+                    results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
+                    break
         except mp.TimeoutError as te:
             _dbg("pool timeout while waiting for results; terminating pool …")
             pool.terminate()
@@ -702,19 +792,23 @@ def _eval_pair_chunk_worker_dist(args):
                         probs = torch.softmax(logits, dim=0).detach().cpu().numpy()
                     return probs
                 from algorithms.is_mcts import run_is_mcts
+                sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts_local))
+                mc = dict(mcts_local)
+                mc['sims'] = int(sims_scaled)
+                mc['root_temp'] = float(root_temp_dyn)
                 action = run_is_mcts(
                     env,
                     policy_fn=policy_fn,
                     value_fn=lambda _o, _e: 0.0,
-                    num_simulations=int(mcts_local.get('sims', 128)),
-                    c_puct=float(mcts_local.get('c_puct', 1.0)),
+                    num_simulations=int(mc.get('sims', 128)),
+                    c_puct=float(mc.get('c_puct', 1.0)),
                     belief=None,
-                    num_determinization=int(mcts_local.get('dets', 1)),
-                    root_temperature=float(mcts_local.get('root_temp', 0.0)),
-                    prior_smooth_eps=float(mcts_local.get('prior_smooth_eps', 0.0)),
+                    num_determinization=int(mc.get('dets', 1)),
+                    root_temperature=float(mc.get('root_temp', 0.0)),
+                    prior_smooth_eps=float(mc.get('prior_smooth_eps', 0.0)),
                     robust_child=True,
-                    root_dirichlet_alpha=float(mcts_local.get('root_dirichlet_alpha', 0.25)),
-                    root_dirichlet_eps=float(mcts_local.get('root_dirichlet_eps', 0.25)),
+                    root_dirichlet_alpha=float(mc.get('root_dirichlet_alpha', 0.25)),
+                    root_dirichlet_eps=float(mc.get('root_dirichlet_eps', 0.25)),
                 )
                 return action
             obs = env._get_observation(cp)
@@ -792,17 +886,26 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
     with ctx.Pool(processes=pool_size) as pool:
         try:
             async_res = pool.imap_unordered(_eval_pair_chunk_worker_dist, args_list)
+            timeout_s = _get_eval_pool_timeout_seconds()
             for idx in range(len(args_list)):
                 _dbg(f"waiting dist result {idx+1}/{len(args_list)} …")
-                item = async_res.next(timeout=float(os.environ.get('SCOPONE_EVAL_POOL_TIMEOUT_S','600')))
-                try:
-                    diff_sum_i, bd_sum_i, wins_i, games_i = item
-                except Exception as e:
-                    _dbg(f"received malformed result {item!r}: {e}")
-                    continue
-                if pbar is not None:
-                    pbar.update(int(games_i))
-                results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
+                while True:
+                    try:
+                        item = async_res.next() if timeout_s is None else async_res.next(timeout=timeout_s)
+                    except mp.TimeoutError as te:
+                        if timeout_s is None:
+                            _dbg("no dist result yet; keep waiting …")
+                            continue
+                        raise
+                    try:
+                        diff_sum_i, bd_sum_i, wins_i, games_i = item
+                    except Exception as e:
+                        _dbg(f"received malformed result {item!r}: {e}")
+                        break
+                    if pbar is not None:
+                        pbar.update(int(games_i))
+                    results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
+                    break
         except mp.TimeoutError as te:
             _dbg("pool timeout (dist) while waiting for results; terminating pool …")
             pool.terminate()

@@ -89,7 +89,7 @@ os.environ.setdefault('SCOPONE_START_OPP', os.environ.get('SCOPONE_START_OPP', '
 # Evaluation process knobs
 os.environ.setdefault('SCOPONE_EVAL_DEBUG', '0')
 os.environ.setdefault('SCOPONE_EVAL_MP_START', os.environ.get('SCOPONE_MP_START', 'forkserver'))
-os.environ.setdefault('SCOPONE_EVAL_POOL_TIMEOUT_S', '600')
+os.environ.setdefault('SCOPONE_EVAL_POOL_TIMEOUT_S', '0')
 os.environ.setdefault('SCOPONE_ELO_DIFF_SCALE', '6.0')
 
 # TQDM_DISABLE: 1=disattiva tutte le barre/logging di tqdm; 0=abilitato
