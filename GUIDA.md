@@ -195,3 +195,6 @@ python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --scalene --iters 1 --no-s
 python /home/rikyravi/Scopone_RL/tools/profile_ppo.py --torch-profiler --iters 1 --horizon 2048
 
 Analizza i profiling del mio codice e dimmi dove viene speso più tempo. Poi ottimizza il mio codice in modo da risolvere il problema partendo dalle cose che perdono più tempo. Non usare fallback per gli errori (piuttosto causano raise, ma meglio che fallback).
+
+Attivazione server:
+gcloud compute config-ssh
