@@ -459,7 +459,8 @@ def _env_worker(worker_id: int,
             policy_weight = 0.0
             bsum_tensor = _BELIEF_ZERO
             # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
-            if is_main and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
+            _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
+            if (is_main or _both_sides) and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
                 # Build helper RPCs to master for batched scoring
                 if send_legals:
                     leg_serial = [x.tolist() for x in legal_cpu_entries]
@@ -610,23 +611,29 @@ def _env_worker(worker_id: int,
                         else:
                             det[others[2]].append(cid)
                     return det
-                # Progress-based scaling (uniform with single-env)
+                # Progress-based scaling (uniform with single-env) — optionally gated by env
                 progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
                 denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
                 alpha = min(1.0, max(0.0, (progress - mcts_progress_start) / denom))
+                scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
                 # Permetti 0 simulazioni se mcts_min_sims==0
                 base_min = int(mcts_min_sims) if (mcts_min_sims is not None and int(mcts_min_sims) >= 0) else 0
                 import math
                 if mcts_train_factor is not None and float(mcts_train_factor) <= 0.0:
                     sims_scaled = 0
                 else:
-                    sims_base = math.ceil(mcts_sims * (0.25 + 0.75 * alpha))
-                    if mcts_train_factor is not None:
+                    if scaling_on:
+                        sims_base = math.ceil(mcts_sims * (0.25 + 0.75 * alpha))
+                    else:
+                        sims_base = math.ceil(mcts_sims * float(mcts_train_factor if mcts_train_factor is not None else 1.0))
+                    if mcts_train_factor is not None and scaling_on:
                         sims_base = math.ceil(sims_base * float(mcts_train_factor))
                     sims_scaled = int(max(base_min, sims_base))
                     if int(mcts_sims) > 0 and sims_scaled <= 0:
                         sims_scaled = 1
-                root_temp_dyn = float(mcts_root_temp) if float(mcts_root_temp) > 0 else float(max(0.0, 1.0 - alpha))
+                # Root temperature dynamic only when scaling is enabled (or explicitly overridden)
+                root_temp_dyn = (float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0)
+                                 else float(max(0.0, 1.0 - alpha)))
 
                 if sims_scaled <= 0:
                     # Sims ended up <= 0 despite mcts_sims > 0 — log, optionally raise for debug, then fall back to master step
@@ -1539,7 +1546,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         sims_scaled = 0
         alpha = 0.0
         root_temp_dyn = float(mcts_root_temp)
-        if is_main:
+        _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
+        if is_main or _both_sides:
             # MCTS sempre attivo (stile AlphaZero): poche simulazioni sempre, scala con il progresso della mano
             progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
             if use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
@@ -1547,9 +1555,13 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
                     alpha = min(1.0, max(0.0, (progress - mcts_progress_start) / denom))
                     import math
-                    sims_base = int(math.ceil(float(mcts_sims) * (0.25 + 0.75 * alpha)))
-                    if mcts_train_factor is not None:
-                        sims_base = int(math.ceil(sims_base * float(mcts_train_factor)))
+                    scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
+                    if scaling_on:
+                        sims_base = int(math.ceil(float(mcts_sims) * (0.25 + 0.75 * alpha)))
+                        if mcts_train_factor is not None:
+                            sims_base = int(math.ceil(sims_base * float(mcts_train_factor)))
+                    else:
+                        sims_base = int(math.ceil(float(mcts_sims) * float(mcts_train_factor if mcts_train_factor is not None else 1.0)))
                     base_min = int(mcts_min_sims) if (mcts_min_sims is not None and int(mcts_min_sims) >= 0) else 0
                     sims_scaled = max(base_min, sims_base)
                     if int(mcts_sims) > 0 and sims_scaled <= 0:
@@ -1558,7 +1570,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 else:
                     sims_scaled = 0
             if use_mcts_cur:
-                root_temp_dyn = float(mcts_root_temp) if float(mcts_root_temp) > 0 else float(max(0.0, 1.0 - alpha))
+                scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
+                root_temp_dyn = float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0) else float(max(0.0, 1.0 - alpha))
 
             # Belief summary per il giocatore corrente: opzionale (disabilitato di default)
             _enable_bsum = (os.environ.get('ENABLE_BELIEF_SUMMARY', '0') == '1')
@@ -1774,8 +1787,9 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                         else:
                             det[others[2]].append(cid)
                     return det
-                # temperatura radice dinamica: alta a inizio mano, bassa verso la fine
-                root_temp_dyn = float(mcts_root_temp) if float(mcts_root_temp) > 0 else float(max(0.0, 1.0 - alpha))
+                # temperatura radice dinamica: alta a inizio mano, bassa verso la fine (solo se scaling attivo)
+                scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
+                root_temp_dyn = float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0) else float(max(0.0, 1.0 - alpha))
                 # Auto-tune exploration at root: smoothing and Dirichlet
                 priors_probe = policy_fn_mcts(obs, legal)
                 pri_t = (priors_probe if torch.is_tensor(priors_probe) else torch.as_tensor(priors_probe, dtype=torch.float32))

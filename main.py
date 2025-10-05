@@ -115,7 +115,7 @@ os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
 os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '0')
 
 # Parallel eval workers: 1=serial, >1 parallel via multiprocessing
-os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)//2)))  # numero processi worker per eval
+os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)))  # numero processi worker per eval
 
 # Training flags (manual overrides available via env)
 _save_every = int(os.environ.get('SCOPONE_SAVE_EVERY','10'))  # salva checkpoint ogni N iterazioni
@@ -151,8 +151,8 @@ _eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS','4'))  # simulazio
 _eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS','2'))  # determinizzazioni per mossa (IS-MCTS)
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))  # ampiezza cronologia osservazioni (k_history)
 _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))  # numero partite per valutazione
-os.environ.setdefault('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '16')  # partite per task/worker (granularità progress)
-_eval_max_games_per_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '16'))  # letta per logging
+os.environ.setdefault('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4')  # partite per task/worker (granularità progress)
+_eval_max_games_per_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4'))  # letta per logging
 ## Eval MCTS scaling controls
 os.environ.setdefault('SCOPONE_EVAL_MCTS_SCALING', '1')  # abilita scaling per-mano di sims/root_temp in eval
 os.environ.setdefault('SCOPONE_EVAL_MCTS_PROGRESS_START', '0.25')  # inizio finestra di progress (alpha=0)
@@ -177,6 +177,8 @@ os.environ.setdefault('SCOPONE_MCTS_PROGRESS_START', '0.25')  # inizio finestra 
 os.environ.setdefault('SCOPONE_MCTS_PROGRESS_FULL', '0.75')  # fine finestra progress per scaling (train)
 os.environ.setdefault('SCOPONE_MCTS_MIN_SIMS', '0')  # soglia minima simulazioni in training
 os.environ.setdefault('SCOPONE_MCTS_TRAIN_FACTOR', '1.0')  # moltiplicatore globale simulazioni (train)
+os.environ.setdefault('SCOPONE_MCTS_SCALING', '1')  # abilita scaling per-mano di sims/root_temp in training
+os.environ.setdefault('SCOPONE_MCTS_BOTH_SIDES', '1')  # applica MCTS su entrambi i lati (non solo main) durante training
 
 
 # Targeted FD-level stderr filter to drop absl/TF CUDA registration warnings from C++
