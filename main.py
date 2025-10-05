@@ -115,7 +115,7 @@ os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
 os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '0')
 
 # Parallel eval workers: 1=serial, >1 parallel via multiprocessing
-os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1)))  # numero processi worker per eval
+os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1))))  # numero processi worker per eval
 
 # Training flags (manual overrides available via env)
 _save_every = int(os.environ.get('SCOPONE_SAVE_EVERY','10'))  # salva checkpoint ogni N iterazioni
