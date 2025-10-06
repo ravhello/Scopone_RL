@@ -12,9 +12,12 @@ from observation import (
     encode_state_compact_for_player_fast as _encode_state_compact_for_player_fast,
     RANK_OF_ID,
     OBS_INCLUDE_INFERRED,
+    OBS_INCLUDE_INFERRED_L2,
+    OBS_INCLUDE_INFERRED_L3,
     OBS_INCLUDE_RANK_PROBS,
     OBS_INCLUDE_SCOPA_PROBS,
     OBS_INCLUDE_DEALER,
+    get_compact_obs_dim,
 )
 from utils.compile import maybe_compile_function
 import torch.nn.functional as F
@@ -54,14 +57,7 @@ class ScoponeEnvMA(gym.Env):
         #            + 120 (inferred) + 8 (primiera) + 2 (denari) + 1 (settebello) + 2 (score)
         #            + 1 (table sum) + 10 (table possible sums) + 2 (scopa counts)
         #            + 30 (rank_presence_from_inferred) + 1 (progress) + 2 (last capturing team)
-        include_rank = bool(OBS_INCLUDE_RANK_PROBS)
-        include_scopa = bool(OBS_INCLUDE_SCOPA_PROBS)
-        include_inferred = bool(OBS_INCLUDE_INFERRED)
-        include_dealer = bool(OBS_INCLUDE_DEALER)
-        # Parti fisse comuni (senza inferred): 43+40+82 + 61*k + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
-        fixed = 43 + 40 + 82 + 61 * self.k_history + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
-        base = fixed + (120 if include_inferred else 0)
-        obs_dim = base + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if include_dealer else 0)
+        obs_dim = get_compact_obs_dim(self.k_history)
         # Observation space con la rappresentazione selezionata
         self.observation_space = spaces.Box(low=0, high=1, shape=(obs_dim,))
         
@@ -129,6 +125,8 @@ class ScoponeEnvMA(gym.Env):
         self._consec_scopa_team_t = torch.zeros(2, dtype=torch.int32, device=device)
         # Optional mirrors for probabilistic features (populated eagerly when enabled)
         self._inferred_probs_t = torch.zeros(120, dtype=torch.float32, device=device)
+        self._inferred_probs_l2_t = torch.zeros(120, dtype=torch.float32, device=device)
+        self._inferred_probs_l3_t = torch.zeros(120, dtype=torch.float32, device=device)
         self._rank_probs_by_player_t = torch.zeros(150, dtype=torch.float32, device=device)
         self._rank_presence_from_inferred_t = torch.zeros(30, dtype=torch.float32, device=device)
         self._scopa_probs_t = torch.zeros(10, dtype=torch.float32, device=device)
@@ -194,6 +192,8 @@ class ScoponeEnvMA(gym.Env):
         self.game_state['_scopa_counts_t'] = self._scopa_counts_t
         self.game_state['_consec_scopa_team_t'] = self._consec_scopa_team_t
         self.game_state['_inferred_probs_t'] = self._inferred_probs_t
+        self.game_state['_inferred_probs_l2_t'] = self._inferred_probs_l2_t
+        self.game_state['_inferred_probs_l3_t'] = self._inferred_probs_l3_t
         self.game_state['_rank_probs_by_player_t'] = self._rank_probs_by_player_t
         self.game_state['_rank_presence_from_inferred_t'] = self._rank_presence_from_inferred_t
         self.game_state['_scopa_probs_t'] = self._scopa_probs_t
@@ -227,6 +227,8 @@ class ScoponeEnvMA(gym.Env):
             '_scopa_counts_t',
             '_consec_scopa_team_t',
             '_inferred_probs_t',
+            '_inferred_probs_l2_t',
+            '_inferred_probs_l3_t',
             '_rank_probs_by_player_t',
             '_rank_presence_from_inferred_t',
             '_scopa_probs_t',
@@ -800,11 +802,24 @@ class ScoponeEnvMA(gym.Env):
             self.game_state['_played_bits_by_player_t'] = self._played_bits_by_player_t
             self.game_state['_scopa_counts_t'] = self._scopa_counts_t
             # probabilistic feature mirrors (if OBS_* enabled, compute eagerly once here)
-            if bool(OBS_INCLUDE_INFERRED):
-                from observation import compute_inferred_probabilities
-                ip = compute_inferred_probabilities(self.game_state, player_id)
-                ip_t = ip if torch.is_tensor(ip) else torch.as_tensor(ip, dtype=torch.float32, device=device)
-                self._inferred_probs_t.copy_(ip_t.to(dtype=torch.float32, device=device))
+            if bool(OBS_INCLUDE_INFERRED) or bool(OBS_INCLUDE_INFERRED_L2) or bool(OBS_INCLUDE_INFERRED_L3):
+                from observation import (
+                    compute_inferred_probabilities,
+                    compute_inferred_probabilities_level2,
+                    compute_inferred_probabilities_level3,
+                )
+                if bool(OBS_INCLUDE_INFERRED):
+                    ip = compute_inferred_probabilities(self.game_state, player_id)
+                    ip_t = ip if torch.is_tensor(ip) else torch.as_tensor(ip, dtype=torch.float32, device=device)
+                    self._inferred_probs_t.copy_(ip_t.to(dtype=torch.float32, device=device))
+                if bool(OBS_INCLUDE_INFERRED_L2):
+                    ip2 = compute_inferred_probabilities_level2(self.game_state, player_id)
+                    ip2_t = ip2 if torch.is_tensor(ip2) else torch.as_tensor(ip2, dtype=torch.float32, device=device)
+                    self._inferred_probs_l2_t.copy_(ip2_t.to(dtype=torch.float32, device=device))
+                if bool(OBS_INCLUDE_INFERRED_L3):
+                    ip3 = compute_inferred_probabilities_level3(self.game_state, player_id)
+                    ip3_t = ip3 if torch.is_tensor(ip3) else torch.as_tensor(ip3, dtype=torch.float32, device=device)
+                    self._inferred_probs_l3_t.copy_(ip3_t.to(dtype=torch.float32, device=device))
             if bool(OBS_INCLUDE_RANK_PROBS):
                 from observation import compute_rank_probabilities_by_player
                 rpb = compute_rank_probabilities_by_player(self.game_state, player_id).flatten()

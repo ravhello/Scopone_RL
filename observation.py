@@ -4,6 +4,12 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 import torch._dynamo as _dynamo  # type: ignore
+from belief.hierarchy import (
+    compute_level1,
+    compute_level2,
+    compute_level3,
+    compute_belief_hierarchy,
+)
 _dynamo_disable = _dynamo.disable  # type: ignore[attr-defined]
 
 SUITS = ['denari', 'coppe', 'spade', 'bastoni']
@@ -20,9 +26,30 @@ import os as _os
 OBS_DEVICE = torch.device(_os.environ.get('OBS_DEVICE', _os.environ.get('SCOPONE_DEVICE', 'cpu')))
 # Disabilita di default le feature probabilistiche per lasciare che la rete impari il belief
 OBS_INCLUDE_INFERRED = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
+OBS_INCLUDE_INFERRED_L2 = os.environ.get('OBS_INCLUDE_INFERRED_L2', '0') == '1'
+OBS_INCLUDE_INFERRED_L3 = os.environ.get('OBS_INCLUDE_INFERRED_L3', '0') == '1'
 OBS_INCLUDE_RANK_PROBS = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'
 OBS_INCLUDE_SCOPA_PROBS = os.environ.get('OBS_INCLUDE_SCOPA_PROBS', '0') == '1'
 OBS_INCLUDE_DEALER = os.environ.get('OBS_INCLUDE_DEALER', '1') == '1'
+
+
+def get_compact_obs_dim(k_history: int) -> int:
+    """Return the observation dimensionality for the compact encoder."""
+    fixed = 43 + 40 + 82 + 61 * int(k_history) + 40 + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+    total = fixed
+    if OBS_INCLUDE_INFERRED:
+        total += 120
+    if OBS_INCLUDE_INFERRED_L2:
+        total += 120
+    if OBS_INCLUDE_INFERRED_L3:
+        total += 120
+    if OBS_INCLUDE_SCOPA_PROBS:
+        total += 10
+    if OBS_INCLUDE_RANK_PROBS:
+        total += 150
+    if OBS_INCLUDE_DEALER:
+        total += 4
+    return total
 
 # ===== ID/Bitset helpers (device = OBS_DEVICE) =====
 RANK_OF_ID = torch.tensor([i // 4 + 1 for i in range(40)], dtype=torch.int16, device=OBS_DEVICE)
@@ -279,40 +306,75 @@ def compute_missing_cards_matrix(game_state, player_id):
 # Cache per probabilità inferite
 inferred_probs_cache = {}
 
+
+def _card_to_id_obs(card) -> int:
+    if isinstance(card, int):
+        return int(card)
+    rank, suit = card
+    return int((int(rank) - 1) * 4 + suit_to_col[str(suit)])
+
+
+def _played_bits(game_state, player_id: int) -> int:
+    played = game_state.get('_played_bits_by_player_t')
+    if torch.is_tensor(played):
+        return int(played[player_id].item())
+    if isinstance(played, dict) and player_id in played:
+        val = played[player_id]
+        if torch.is_tensor(val):
+            return int(val.item())
+        return int(val)
+    return 0
+
+
+def _hierarchy_cache_key(game_state, player_id: int):
+    hands = game_state.get('hands', {})
+    hand_self = tuple(sorted(_card_to_id_obs(c) for c in hands.get(player_id, [])))
+    table = tuple(sorted(_card_to_id_obs(c) for c in game_state.get('table', [])))
+    captured = game_state.get('captured_squads', {})
+    if isinstance(captured, dict):
+        team0 = tuple(sorted(_card_to_id_obs(c) for c in captured.get(0, [])))
+        team1 = tuple(sorted(_card_to_id_obs(c) for c in captured.get(1, [])))
+    else:
+        team0 = tuple()
+        team1 = tuple()
+    hand_sizes = tuple(len(hands.get(p, [])) for p in range(4))
+    played_bits = tuple(int(_played_bits(game_state, p)) for p in range(4))
+    return (player_id, hand_self, table, team0, team1, hand_sizes, played_bits)
+
+
+def _get_hierarchy_cached(game_state, player_id: int):
+    key = _hierarchy_cache_key(game_state, player_id)
+    cached = inferred_probs_cache.get(key)
+    if cached is None:
+        hier = compute_belief_hierarchy(game_state, player_id)
+        cached = {
+            'level1': hier['level1'].to(device=OBS_DEVICE, dtype=torch.float32).clone(),
+            'level2': hier['level2'].to(device=OBS_DEVICE, dtype=torch.float32).clone(),
+            'level3': hier['level3'].to(device=OBS_DEVICE, dtype=torch.float32).clone(),
+        }
+        inferred_probs_cache[key] = cached
+        if len(inferred_probs_cache) > 128:
+            import random
+            for ck in random.sample(list(inferred_probs_cache.keys()), 64):
+                if ck != key:
+                    inferred_probs_cache.pop(ck, None)
+    return cached
+
+
 def compute_inferred_probabilities(game_state, player_id):
-    """
-    Versione mirror-only e compile-friendly: richiede i mirror tensoriali
-    (_hands_bits_t, _table_bits_t, _captured_bits_t, _played_bits_by_player_t).
-    Output: (3*40,) flatten per i tre avversari (10x4 per ciascuno).
-    """
-    hands_bits_t = game_state.get('_hands_bits_t', None)
-    table_bits_t = game_state.get('_table_bits_t', None)
-    captured_bits_t = game_state.get('_captured_bits_t', None)
-    played_bits_by_player_t = game_state.get('_played_bits_by_player_t', None)
-    torch._assert(torch.is_tensor(hands_bits_t), "_hands_bits_t required")
-    torch._assert(torch.is_tensor(table_bits_t), "_table_bits_t required")
-    torch._assert(torch.is_tensor(captured_bits_t), "_captured_bits_t required")
-    torch._assert(torch.is_tensor(played_bits_by_player_t), "_played_bits_by_player_t required")
+    """Return level-1 belief probabilities flattened as (120,)."""
+    cached = _get_hierarchy_cached(game_state, player_id)
+    return cached['level1'].reshape(-1).clone()
 
-    visible_bits = hands_bits_t[player_id] | table_bits_t | captured_bits_t[0] | captured_bits_t[1]
-    vis = (((visible_bits >> IDS_CUDA) & 1).to(torch.bool))
-    invisible = ~vis
-    total_unknown = invisible.to(torch.float32).sum().clamp(min=1.0)
 
-    probs = []
-    other_players = [p for p in range(4) if p != player_id]
-    for p in other_players:
-        hand_size = (((hands_bits_t[p] >> IDS_CUDA) & 1).to(torch.float32).sum())
-        pm = torch.zeros((10, 4), dtype=torch.float32, device=OBS_DEVICE)
-        played_mask = (((played_bits_by_player_t[p] >> IDS_CUDA) & 1).to(torch.bool))
-        possible_mask = invisible & (~played_mask)
-        idx = torch.nonzero(possible_mask, as_tuple=False).flatten()
-        if idx.numel() > 0:
-            rows = (RANK_OF_ID[idx].to(torch.long) - 1).clamp(0, 9)
-            cols = SUITCOL_OF_ID[idx].to(torch.long).clamp(0, 3)
-            pm[rows, cols] = (hand_size / total_unknown)
-        probs.append(pm.reshape(-1))
-    return torch.cat(probs)
+def compute_inferred_probabilities_level2(game_state, player_id):
+    cached = _get_hierarchy_cached(game_state, player_id)
+    return cached['level2'].reshape(-1).clone()
+
+
+def compute_inferred_probabilities_level3(game_state, player_id):
+    cached = _get_hierarchy_cached(game_state, player_id)
+    return cached['level3'].reshape(-1).clone()
 
 # Cache per primiera
 primiera_cache = {}
@@ -928,6 +990,10 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     # 6) Inferred probs (120) - opzionale
     inferred_probs = (compute_inferred_probabilities(game_state, player_id)
                       if OBS_INCLUDE_INFERRED else None)
+    inferred_probs_l2 = (compute_inferred_probabilities_level2(game_state, player_id)
+                         if OBS_INCLUDE_INFERRED_L2 else None)
+    inferred_probs_l3 = (compute_inferred_probabilities_level3(game_state, player_id)
+                         if OBS_INCLUDE_INFERRED_L3 else None)
 
     suits_oh = SUITS_OH_4x40
     prim_vals = PRIMIERA_PER_ID
@@ -1005,8 +1071,16 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     include_scopa = OBS_INCLUDE_SCOPA_PROBS
     include_rank = OBS_INCLUDE_RANK_PROBS
     include_inferred = OBS_INCLUDE_INFERRED
-    expected_dim = (43 + 40 + 82 + 61 * k_history + 40 + (120 if include_inferred else 0) + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
-                    + (10 if include_scopa else 0) + (150 if include_rank else 0) + (4 if OBS_INCLUDE_DEALER else 0))
+    include_inferred_l2 = OBS_INCLUDE_INFERRED_L2
+    include_inferred_l3 = OBS_INCLUDE_INFERRED_L3
+    expected_dim = (43 + 40 + 82 + 61 * k_history + 40
+                    + (120 if include_inferred else 0)
+                    + (120 if include_inferred_l2 else 0)
+                    + (120 if include_inferred_l3 else 0)
+                    + 8 + 2 + 1 + 2 + 1 + 10 + 2 + 30 + 3
+                    + (10 if include_scopa else 0)
+                    + (150 if include_rank else 0)
+                    + (4 if OBS_INCLUDE_DEALER else 0))
     if (out is not None) and torch.is_tensor(out) and out.shape == (expected_dim,) and out.dtype == torch.float32 and out.device == device:
         result = out
     else:
@@ -1025,6 +1099,10 @@ def encode_state_compact_for_player_fast(game_state, player_id, k_history=12, ou
     _w(missing_vec)
     if include_inferred and inferred_probs is not None:
         _w(inferred_probs if torch.is_tensor(inferred_probs) else torch.as_tensor(inferred_probs, dtype=torch.float32, device=device))
+    if include_inferred_l2 and inferred_probs_l2 is not None:
+        _w(inferred_probs_l2 if torch.is_tensor(inferred_probs_l2) else torch.as_tensor(inferred_probs_l2, dtype=torch.float32, device=device))
+    if include_inferred_l3 and inferred_probs_l3 is not None:
+        _w(inferred_probs_l3 if torch.is_tensor(inferred_probs_l3) else torch.as_tensor(inferred_probs_l3, dtype=torch.float32, device=device))
     _w(primiera_status)
     _w(denari_count)
     _w(settebello_status)

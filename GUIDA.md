@@ -173,6 +173,7 @@ Opzioni CLI e significato:
 - Osservazione compatta: usare `--compact` e regolare `--k-history` per bilanciare informatività e costo computazionale. Valori tipici: 12–39.
 - Entropia: il coefficiente di entropia segue uno schedule (`linear` o `cosine`) per facilitare esplorazione iniziale e stabilizzazione successiva.
 - Belief + IS-MCTS: aumentare `--belief-particles`, `--dets` e `--sims` migliora la qualità della ricerca ma scala i tempi.
+- Gerarchia belief (livelli 1-3): abilita `OBS_INCLUDE_INFERRED_L2`/`OBS_INCLUDE_INFERRED_L3` per avere le feature dei livelli extra in osservazione; MCTS usa automaticamente il blend controllato da `SCOPONE_BELIEF_BLEND_ALPHA` (default 0.65).
 - Riproducibilità: impostare sempre `--seed`. Se si passa un seed negativo, il codice genera un seed casuale non-negativo e lo stampa. I checkpoint includono un `run_config` minimale.
 - Dipendenze: la repo usa `gymnasium` (non `gym`).
 - Dispositivi/AMP: su CUDA, il trainer usa AMP con GradScaler (API unificata); su CPU la mixed precision è disabilitata.

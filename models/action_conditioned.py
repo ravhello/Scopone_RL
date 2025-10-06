@@ -22,13 +22,21 @@ STRICT = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
 # Observation flags are now imported from observation.py to ensure consistency.
 from observation import (
     OBS_INCLUDE_INFERRED as _OBS_INCLUDE_INFERRED,
+    OBS_INCLUDE_INFERRED_L2 as _OBS_INCLUDE_INFERRED_L2,
+    OBS_INCLUDE_INFERRED_L3 as _OBS_INCLUDE_INFERRED_L3,
     OBS_INCLUDE_RANK_PROBS as _OBS_INCLUDE_RANK_PROBS,
     OBS_INCLUDE_SCOPA_PROBS as _OBS_INCLUDE_SCOPA_PROBS,
     OBS_INCLUDE_DEALER as _OBS_INCLUDE_DEALER,
+    get_compact_obs_dim as _get_compact_obs_dim,
 )
 
 import torch._dynamo as _dynamo  # type: ignore
 _dynamo_disable = _dynamo.disable  # type: ignore[attr-defined]
+
+
+
+def _default_k_history() -> int:
+    return int(os.environ.get('SCOPONE_K_HISTORY', os.environ.get('SCOPONE_EVAL_K_HISTORY', '39')))
 
 
 
@@ -69,6 +77,8 @@ class StateEncoderCompact(nn.Module):
         # Stats and seat/team: fix input dim deterministically from flags to avoid LazyLinear pitfalls
         self.stats_in_dim = 99 \
             + (120 if _OBS_INCLUDE_INFERRED else 0) \
+            + (120 if _OBS_INCLUDE_INFERRED_L2 else 0) \
+            + (120 if _OBS_INCLUDE_INFERRED_L3 else 0) \
             + (10 if _OBS_INCLUDE_SCOPA_PROBS else 0) \
             + (150 if _OBS_INCLUDE_RANK_PROBS else 0) \
             + (4 if _OBS_INCLUDE_DEALER else 0)
@@ -154,11 +164,14 @@ class StateEncoderCompact(nn.Module):
         B = obs.size(0)
         D = obs.size(1)
         # Deterministic k inference from flags and total observation size.
-        # D = 165 + 61*k + stats_len, stats_len = 99 + [inferred(120)] + [scopa(10)] + [rank(150)] + [dealer(4)]
+        # D = 165 + 61*k + stats_len, stats_len = 99 + [inferred(120)] + [l2(120)] + [l3(120)]
+        #                            + [scopa(10)] + [rank(150)] + [dealer(4)]
         base_prefix = 165
         base_stats = 99
         stats_len = base_stats \
             + (120 if _OBS_INCLUDE_INFERRED else 0) \
+            + (120 if _OBS_INCLUDE_INFERRED_L2 else 0) \
+            + (120 if _OBS_INCLUDE_INFERRED_L3 else 0) \
             + (10 if _OBS_INCLUDE_SCOPA_PROBS else 0) \
             + (150 if _OBS_INCLUDE_RANK_PROBS else 0) \
             + (4 if _OBS_INCLUDE_DEALER else 0)
@@ -179,20 +192,28 @@ class StateEncoderCompact(nn.Module):
                         continue
                     delta = rem2 - base_stats
                     # Option dims: inferred(120), scopa(10), rank(150), dealer(4)
-                    option_dims = [120, 10, 150, 4]
+                    option_dims = []
+                    if _OBS_INCLUDE_INFERRED:
+                        option_dims.append(120)
+                    if _OBS_INCLUDE_INFERRED_L2:
+                        option_dims.append(120)
+                    if _OBS_INCLUDE_INFERRED_L3:
+                        option_dims.append(120)
+                    if _OBS_INCLUDE_SCOPA_PROBS:
+                        option_dims.append(10)
+                    if _OBS_INCLUDE_RANK_PROBS:
+                        option_dims.append(150)
+                    if _OBS_INCLUDE_DEALER:
+                        option_dims.append(4)
                     ok = False
-                    for a in (0, 1):
-                        for b in (0, 1):
-                            for c in (0, 1):
-                                for d in (0, 1):
-                                    if (a * option_dims[0] + b * option_dims[1] + c * option_dims[2] + d * option_dims[3]) == delta:
-                                        ok = True
-                                        break
-                                if ok:
-                                    break
-                            if ok:
-                                break
-                        if ok:
+                    n_opts = len(option_dims)
+                    for mask in range(1 << n_opts):
+                        total = 0
+                        for j in range(n_opts):
+                            if mask & (1 << j):
+                                total += option_dims[j]
+                        if total == delta:
+                            ok = True
                             break
                     if ok:
                         k = kk
@@ -494,8 +515,10 @@ class ActionConditionedActor(torch.nn.Module):
       - Belief head (120 → 64)
       - Proiezione stato → 64 e scoring via prodotto scalare con embedding azione (80 → 64)
     """
-    def __init__(self, obs_dim=10823, action_dim=80, state_encoder: StateEncoderCompact = None):
+    def __init__(self, obs_dim: Optional[int] = None, action_dim: int = 80, state_encoder: StateEncoderCompact = None):
         super().__init__()
+        if obs_dim is None:
+            obs_dim = _get_compact_obs_dim(_default_k_history())
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         # Encoders
@@ -946,8 +969,10 @@ class CentralValueNet(torch.nn.Module):
     """
     Critico condizionato: usa StateEncoderCompact (256) + belief (120→64).
     """
-    def __init__(self, obs_dim=10823, state_encoder: StateEncoderCompact = None):
+    def __init__(self, obs_dim: Optional[int] = None, state_encoder: StateEncoderCompact = None):
         super().__init__()
+        if obs_dim is None:
+            obs_dim = _get_compact_obs_dim(_default_k_history())
         self.state_enc = state_encoder if state_encoder is not None else StateEncoderCompact()
         self.belief_head = nn.Sequential(nn.Linear(120, 64), nn.ReLU())
         self.belief_net = BeliefNet(in_dim=256, hidden_dim=512)
@@ -1104,4 +1129,3 @@ class CentralValueNet(torch.nn.Module):
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
         _ = strict  # keep arg for external callers; force non-strict loading
         return super().load_state_dict(state_dict, strict=False)
-

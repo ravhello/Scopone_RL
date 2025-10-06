@@ -20,6 +20,7 @@ import torch
 
 from environment import ScoponeEnvMA
 from algorithms.is_mcts import run_is_mcts
+from belief import sample_determinization
 from models.action_conditioned import ActionConditionedActor, CentralValueNet
 
 
@@ -104,50 +105,9 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
                         return critic(o_t.unsqueeze(0), s.unsqueeze(0)).item()
                 # belief sampler neurale per determinizzazione
                 def belief_sampler_neural(_env):
-                    try:
-                        cp = _env.current_player
-                        obs_cur = _env._get_observation(cp)
-                        o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
-                        if torch.is_tensor(o_cpu):
-                            o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
-                        s_cpu = torch.zeros(6, dtype=torch.float32)
-                        s_cpu[cp] = 1.0
-                        s_cpu[4] = 1.0 if cp in [0, 2] else 0.0
-                        s_cpu[5] = 1.0 if cp in [1, 3] else 0.0
-                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        with torch.no_grad():
-                            state_feat = actor.state_enc(o_t, s_t)
-                            logits = actor.belief_net(state_feat)
-                            hand_table = o_t[:, :83]
-                            hand_mask = hand_table[:, :40] > 0.5
-                            table_mask = hand_table[:, 43:83] > 0.5
-                            captured = o_t[:, 83:165]
-                            cap0_mask = captured[:, :40] > 0.5
-                            cap1_mask = captured[:, 40:80] > 0.5
-                            visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
-                            probs_flat = actor.belief_net.probs(logits, visible_mask)
-                        probs = probs_flat.view(3, 40).detach().cpu().numpy()
-                        vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
-                        unknown_ids = [cid for cid in range(40) if not vis[cid]]
-                        others = [(cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4]
-                        det = {pid: [] for pid in others}
-                        counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
-                        caps = [int(counts.get(pid, 0)) for pid in others]
-                        n = len(unknown_ids)
-                        if sum(caps) != n:
-                            caps[2] = max(0, n - caps[0] - caps[1])
-                        for cid in unknown_ids:
-                            pc = probs[:, cid]
-                            s = pc.sum()
-                            ps = pc / (s if s > 0 else 1e-9)
-                            j = int(torch.argmax(torch.tensor(ps)).item())
-                            if caps[j] > 0:
-                                det[others[j]].append(cid)
-                                caps[j] -= 1
-                        return det
-                    except Exception:
-                        return None
+                    alpha = float(os.environ.get('SCOPONE_BELIEF_BLEND_ALPHA', '0.65'))
+                    noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
+                    return sample_determinization(_env, alpha=alpha, noise_scale=noise_scale)
                 action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=c_puct,
                                      belief=None, num_determinization=dets, root_temperature=root_temp,
                                      prior_smooth_eps=prior_smooth_eps, robust_child=robust_child,
@@ -231,5 +191,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 

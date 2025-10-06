@@ -21,6 +21,7 @@ from algorithms.ppo_ac import ActionConditionedPPO
 from utils.device import get_compute_device
  
 from selfplay.league import League
+from belief import sample_determinization
 from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
 from utils.seed import set_global_seeds, resolve_seed, temporary_seed
@@ -118,6 +119,8 @@ def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
     cuda_outer = token.get('cuda_outer')
     if cuda_outer is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(cuda_outer)  # type: ignore[arg-type]
+
+
 
 def _dbg(msg: str) -> None:
     if _PAR_DEBUG:
@@ -514,103 +517,9 @@ def _env_worker(worker_id: int,
                         _wdbg(f"ep {ep} step {step_idx}: MCTS value <- got value")
                     return float(resp.get('value', 0.0))
                 def belief_sampler_neural(_env):
-                    o_cur = _env._get_observation(_env.current_player)
-                    s_vec = _seat_vec_for(_env.current_player)
-                    o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS belief -> send, waiting probs")
-                    request_q.put({
-                        'type': 'score_belief',
-                        'wid': worker_id,
-                        'obs': o_cpu,
-                        'seat': s_vec,
-                    })
-                    try:
-                        resp = action_q.get(timeout=rpc_timeout_s)
-                    except queue.Empty as e:
-                        raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_belief") from e
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS belief <- got probs")
-                    probs_flat = resp.get('belief_probs', None)
-                    if probs_flat is None:
-                        return None
-                    import numpy as _np
-                    probs = _np.asarray(probs_flat, dtype=_np.float32).reshape(3, 40)
-                    # visible mask from obs on worker side
-                    if torch.is_tensor(o_cur):
-                        o_t = o_cur.detach().to('cpu', dtype=torch.float32).unsqueeze(0)
-                    else:
-                        o_t = torch.as_tensor(o_cur, dtype=torch.float32).unsqueeze(0)
-                    hand_table = o_t[:, :83]
-                    hand_mask = hand_table[:, :40] > 0.5
-                    table_mask = hand_table[:, 43:83] > 0.5
-                    captured = o_t[:, 83:165]
-                    cap0_mask = captured[:, :40] > 0.5
-                    cap1_mask = captured[:, 40:80] > 0.5
-                    vis = (hand_mask | table_mask | cap0_mask | cap1_mask).squeeze(0).numpy().astype(bool)
-                    unknown_ids = [cid for cid in range(40) if not vis[cid]]
-                    others = [(_env.current_player + 1) % 4, (_env.current_player + 2) % 4, (_env.current_player + 3) % 4]
-                    counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
-                    caps = [int(counts.get(pid, 0)) for pid in others]
-                    n = len(unknown_ids)
-                    if sum(caps) != n:
-                        caps[2] = max(0, n - caps[0] - caps[1])
-                        if sum(caps) != n:
-                            base = n // 3
-                            rem = n - 3 * base
-                            caps = [base, base, base]
-                            for i in range(rem):
-                                caps[i] += 1
-                    import numpy as _np
+                    alpha = float(os.environ.get('SCOPONE_BELIEF_BLEND_ALPHA', '0.65'))
                     noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
-                    costs = []
-                    for cid in unknown_ids:
-                        pc = probs[:, cid]
-                        ps = pc / max(1e-12, pc.sum())
-                        c = [-_np.log(max(1e-12, ps[i])) for i in range(3)]
-                        if noise_scale > 0:
-                            u = _np.random.uniform(1e-9, 1.0-1e-9, size=3)
-                            g = -_np.log(-_np.log(u)) * noise_scale
-                            c = [c[i] + float(g[i]) for i in range(3)]
-                        costs.append(c)
-                    INF = 1e12
-                    cap0, cap1, cap2 = caps
-                    dp = [[[INF]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                    bk = [[[-1]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                    dp[0][0][0] = 0.0
-                    for t in range(n):
-                        c0, c1, c2 = costs[t]
-                        for a in range(0, min(t, cap0)+1):
-                            for b in range(0, min(t-a, cap1)+1):
-                                cur = dp[t][a][b]
-                                if cur >= INF:
-                                    continue
-                                if a+1 <= cap0 and dp[t+1][a+1][b] > cur + c0:
-                                    dp[t+1][a+1][b] = cur + c0
-                                    bk[t+1][a+1][b] = 0
-                                if b+1 <= cap1 and dp[t+1][a][b+1] > cur + c1:
-                                    dp[t+1][a][b+1] = cur + c1
-                                    bk[t+1][a][b+1] = 1
-                                assigned2 = t - a - b
-                                if assigned2 + 1 <= cap2 and dp[t+1][a][b] > cur + c2:
-                                    dp[t+1][a][b] = cur + c2
-                                    bk[t+1][a][b] = 2
-                    if dp[n][cap0][cap1] >= INF:
-                        return None
-                    det = {pid: [] for pid in others}
-                    a, b = cap0, cap1
-                    for t in range(n, 0, -1):
-                        choice = bk[t][a][b]
-                        cid = unknown_ids[t-1]
-                        if choice == 0:
-                            det[others[0]].append(cid)
-                            a -= 1
-                        elif choice == 1:
-                            det[others[1]].append(cid)
-                            b -= 1
-                        else:
-                            det[others[2]].append(cid)
-                    return det
+                    return sample_determinization(_env, alpha=alpha, noise_scale=noise_scale)
                 # Progress-based scaling (uniform with single-env) — optionally gated by env
                 progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
                 denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
@@ -1685,108 +1594,11 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                         oh = probs_flat.view(1, 3, 40)
                         v = agent.critic(o_t, s_t, oh)
                     return float(v.squeeze(0).detach().cpu().item())
-                # Belief determinization sampler dal BeliefNet: campiona assignment coerenti
+                # Belief determinization sampler gerarchico
                 def belief_sampler_neural(_env):
-                    # Costruisci marginali 3x40 dal BeliefNet
-                    obs_cur = _env._get_observation(_env.current_player)
-                    o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
-                    if torch.is_tensor(o_cpu):
-                        o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
-                    s_cpu = _seat_vec_for(_env.current_player).detach().to('cpu', dtype=torch.float32)
-                    if device.type == 'cuda':
-                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                    else:
-                        o_t = o_cpu.unsqueeze(0).to(device=device)
-                        s_t = s_cpu.unsqueeze(0).to(device=device)
-                    with torch.no_grad():
-                        state_feat = agent.actor.state_enc(o_t, s_t)
-                        bn_dtype = agent.actor.belief_net.fc_in.weight.dtype
-                        if state_feat.dtype != bn_dtype:
-                            state_feat = state_feat.to(dtype=bn_dtype)
-                        logits = agent.actor.belief_net(state_feat)  # (1,120)
-                        # Visibilità dall'osservazione
-                        hand_table = o_t[:, :83]
-                        hand_mask = hand_table[:, :40] > 0.5
-                        table_mask = hand_table[:, 43:83] > 0.5
-                        captured = o_t[:, 83:165]
-                        cap0_mask = captured[:, :40] > 0.5
-                        cap1_mask = captured[:, 40:80] > 0.5
-                        visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)  # (1,40)
-                        probs_flat = agent.actor.belief_net.probs(logits, visible_mask)  # (1,120)
-                    probs = probs_flat.view(3, 40).detach().cpu().numpy()  # (3,40)
-                    vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
-                    unknown_ids = [cid for cid in range(40) if not vis[cid]]
-                    # Capacità (conteggi mano) correnti degli altri giocatori
-                    others = [(_env.current_player + 1) % 4, (_env.current_player + 2) % 4, (_env.current_player + 3) % 4]
-                    counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
-                    caps = [int(counts.get(pid, 0)) for pid in others]
-                    n = len(unknown_ids)
-                    # riallinea capacità se necessario
-                    if sum(caps) != n:
-                        caps[2] = max(0, n - caps[0] - caps[1])
-                        if sum(caps) != n:
-                            from utils.fallback import notify_fallback
-                            notify_fallback('trainer.worker.belief_sampler.uniform_caps')
-                    # Costi = -log p con piccolo rumore per diversità
+                    alpha = float(os.environ.get('SCOPONE_BELIEF_BLEND_ALPHA', '0.65'))
                     noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
-                    costs = []  # shape (n,3)
-                    for cid in unknown_ids:
-                        pc = probs[:, cid]
-                        ps = pc / max(1e-12, pc.sum())
-                        c = [-_np.log(max(1e-12, ps[i])) for i in range(3)]
-                        if noise_scale > 0:
-                            u = _np.random.uniform(1e-9, 1.0-1e-9, size=3)
-                            g = -_np.log(-_np.log(u)) * noise_scale
-                            c = [c[i] + float(g[i]) for i in range(3)]
-                        costs.append(c)
-                    # DP ottimo per 3 giocatori con capacità note
-                    INF = 1e12
-                    cap0, cap1, cap2 = caps
-                    dp = [[[INF]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                    bk = [[[-1]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                    dp[0][0][0] = 0.0
-                    for t in range(n):
-                        c0, c1, c2 = costs[t]
-                        for a in range(0, min(t, cap0)+1):
-                            for b in range(0, min(t-a, cap1)+1):
-                                cur = dp[t][a][b]
-                                if cur >= INF: 
-                                    continue
-                                # assign to player 0
-                                if a+1 <= cap0:
-                                    if dp[t+1][a+1][b] > cur + c0:
-                                        dp[t+1][a+1][b] = cur + c0
-                                        bk[t+1][a+1][b] = 0
-                                # assign to player 1
-                                if b+1 <= cap1:
-                                    if dp[t+1][a][b+1] > cur + c1:
-                                        dp[t+1][a][b+1] = cur + c1
-                                        bk[t+1][a][b+1] = 1
-                                # assign to player 2 (implicit count)
-                                assigned2 = t - a - b
-                                if assigned2 + 1 <= cap2:
-                                    if dp[t+1][a][b] > cur + c2:
-                                        dp[t+1][a][b] = cur + c2
-                                        bk[t+1][a][b] = 2
-                    if dp[n][cap0][cap1] >= INF:
-                        from utils.fallback import notify_fallback
-                        notify_fallback('trainer.belief_sampler.dp_infeasible')
-                    # Ricostruisci percorso
-                    det = {pid: [] for pid in others}
-                    a, b = cap0, cap1
-                    for t in range(n, 0, -1):
-                        choice = bk[t][a][b]
-                        cid = unknown_ids[t-1]
-                        if choice == 0:
-                            det[others[0]].append(cid)
-                            a -= 1
-                        elif choice == 1:
-                            det[others[1]].append(cid)
-                            b -= 1
-                        else:
-                            det[others[2]].append(cid)
-                    return det
+                    return sample_determinization(_env, alpha=alpha, noise_scale=noise_scale)
                 # temperatura radice dinamica: alta a inizio mano, bassa verso la fine (solo se scaling attivo)
                 scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
                 root_temp_dyn = float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0) else float(max(0.0, 1.0 - alpha))

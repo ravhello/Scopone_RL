@@ -45,6 +45,8 @@ os.environ.setdefault('TORCHDYNAMO_CACHE_SIZE_LIMIT', '32')
 # Se l'utente li ha già impostati nel proprio run, li rispettiamo (setdefault)
 os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
 os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
+os.environ.setdefault('OBS_INCLUDE_INFERRED_L2', '1')
+os.environ.setdefault('OBS_INCLUDE_INFERRED_L3', '0')
 os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
 os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
 
@@ -72,6 +74,7 @@ os.environ.setdefault('SCOPONE_EP_PUT_TIMEOUT_S', '15')  # timeout inserimento e
 os.environ.setdefault('SCOPONE_TORCH_PROF_DIR', 'profiles')  # cartella output per tracce profiler JSON
 os.environ.setdefault('SCOPONE_RAISE_ON_CKPT_FAIL', '0')  # solleva se fallisce il load del checkpoint
 os.environ.setdefault('ENABLE_BELIEF_SUMMARY', '0')  # stampa riassunti belief (diagnostica)
+os.environ.setdefault('SCOPONE_BELIEF_BLEND_ALPHA', '0.65')
 os.environ.setdefault('DET_NOISE', '0.0')  # rumore per determinizzazioni MCTS (IS-MCTS)
 os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')  # minima dimensione batch prima di flush del collector
 os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')  # latenza massima (ms) prima del flush del collector
@@ -146,7 +149,7 @@ _eval_dir_alpha = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_ALPHA','0.25
 _eval_dir_eps = float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_EPS','0.25'))  # mixing epsilon del rumore Dirichlet
 _eval_belief_particles = int(os.environ.get('SCOPONE_EVAL_BELIEF_PARTICLES','0'))  # particelle belief per prior MCTS (eval)
 _eval_belief_ess = float(os.environ.get('SCOPONE_EVAL_BELIEF_ESS_FRAC','0.5'))  # soglia ESS per resampling belief (eval)
-_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','1').lower() in ['1','true','yes','on']  # abilita MCTS in eval
+_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','0').lower() in ['1','true','yes','on']  # abilita MCTS in eval
 _eval_mcts_sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS','4'))  # simulazioni base per mossa (pre-scaling)
 _eval_mcts_dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS','2'))  # determinizzazioni per mossa (IS-MCTS)
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))  # ampiezza cronologia osservazioni (k_history)
@@ -169,7 +172,7 @@ _mcts_root_temp = float(os.environ.get('SCOPONE_MCTS_ROOT_TEMP','0.0'))  # tempe
 _mcts_prior_eps = float(os.environ.get('SCOPONE_MCTS_PRIOR_SMOOTH_EPS','0.0'))  # smoothing epsilon dei prior (train)
 _mcts_dir_alpha = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_ALPHA','0.25'))  # alpha Dirichlet root (train)
 _mcts_dir_eps = float(os.environ.get('SCOPONE_MCTS_DIRICHLET_EPS','0.25'))  # mixing epsilon rumore Dirichlet (train)
-_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']  # abilita MCTS nella raccolta
+_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','0') in ['1','true','yes','on']  # abilita MCTS nella raccolta
 _mcts_sims = int(os.environ.get('SCOPONE_MCTS_SIMS','4'))  # simulazioni base per mossa in training
 _mcts_dets = int(os.environ.get('SCOPONE_MCTS_DETS','2'))  # determinizzazioni per mossa (train)
 ## Training MCTS scaling controls (used by trainer if supported)

@@ -1051,7 +1051,7 @@ def test_policy_prefers_optimal_ace_king_sequence_with_checkpoint():
         'SCOPONE_DEVICE',
         ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
     ))
-    actor = ActionConditionedActor(obs_dim=10823, action_dim=80)
+    actor = ActionConditionedActor(action_dim=80)
     if ckpt_path and os.path.isfile(ckpt_path):
         try:
             state = torch.load(ckpt_path, map_location=device)

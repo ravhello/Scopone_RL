@@ -22,7 +22,7 @@ class ActionConditionedPPO:
     (passando solo le azioni legali). Non è CTDE completo, ma prepara la struttura.
     """
     def __init__(self,
-                 obs_dim: int = 10823,
+                 obs_dim: Optional[int] = None,
                  action_dim: int = 80,
                  lr: float = 3e-4,
                  clip_ratio: float = 0.2,
@@ -33,7 +33,9 @@ class ActionConditionedPPO:
                  k_history: int = None):
         shared_enc = StateEncoderCompact(k_history=k_history)
         self.actor = ActionConditionedActor(obs_dim, action_dim, state_encoder=shared_enc)
-        self.critic = CentralValueNet(obs_dim, state_encoder=shared_enc)
+        obs_dim_val = self.actor.obs_dim
+        self.obs_dim = obs_dim_val
+        self.critic = CentralValueNet(obs_dim_val, state_encoder=shared_enc)
 
         # Training device override: keep models on CPU for env/collection, move to GPU only in update if requested
         train_dev_str = _os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu').strip().lower()
@@ -48,7 +50,7 @@ class ActionConditionedPPO:
         # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) only when CUDA
         if device.type == 'cuda':
             with torch.enable_grad():
-                _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
+                _obs_w = torch.zeros((2, obs_dim_val), dtype=torch.float32, device=device, requires_grad=True)
                 _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device)
                 _seat_w[0, 0] = 1.0; _seat_w[0, 4] = 1.0
                 _seat_w[1, 1] = 1.0; _seat_w[1, 5] = 1.0
