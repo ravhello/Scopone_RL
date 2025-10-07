@@ -5,6 +5,7 @@ os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 import torch
+import math
 import random
 import time
 import platform
@@ -379,6 +380,7 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                     if sum(caps) != n:
                         caps[2] = max(0, n - caps[0] - caps[1])
                     # semplice greedy per eval (si può allineare alla DP del trainer se serve)
+                    log_prob = 0.0
                     for cid in unknown_ids:
                         pc = probs[:, cid]
                         ps = pc / max(1e-9, pc.sum())
@@ -386,7 +388,8 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                         if caps[j] > 0:
                             det[others[j]].append(cid)
                             caps[j] -= 1
-                    return det
+                            log_prob += math.log(max(1e-12, float(ps[j])))
+                    return {'assignments': det, 'logp': log_prob}
                 sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
                 mc = dict(mcts)
                 mc['sims'] = int(sims_scaled)
@@ -591,6 +594,7 @@ def _eval_pair_chunk_worker(args):
                     n = len(unknown_ids)
                     if sum(caps) != n:
                         caps[2] = max(0, n - caps[0] - caps[1])
+                    log_prob = 0.0
                     for cid in unknown_ids:
                         pc = probs[:, cid]
                         ps = pc / max(1e-9, pc.sum())
@@ -598,7 +602,8 @@ def _eval_pair_chunk_worker(args):
                         if caps[j] > 0:
                             det[others[j]].append(cid)
                             caps[j] -= 1
-                    return det
+                            log_prob += math.log(max(1e-12, float(ps[j])))
+                    return {'assignments': det, 'logp': log_prob}
                 from algorithms.is_mcts import run_is_mcts
                 sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
                 mc = dict(mcts)
@@ -954,4 +959,3 @@ def league_eval_and_update(league_dir='checkpoints/league', games=20, target_poi
     # Aggiorna Elo usando la differenza media di punti -> mapping lineare a score
     league.update_elo_from_diff(a, b, diff)
     return league.elo
-

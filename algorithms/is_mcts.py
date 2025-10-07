@@ -1,13 +1,13 @@
 import math
-import random
-from typing import List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from environment import ScoponeEnvMA
-from utils.fallback import notify_fallback
 import os
 import torch
+
+from environment import ScoponeEnvMA
+from rewards import compute_final_score_breakdown
 from utils.device import get_compute_device
-# BeliefState legacy rimosso: MCTS usa SOLO belief_sampler neurale; nessun fallback a filtri particellari
+from utils.fallback import notify_fallback
 
 
 class ISMCTSNode:
@@ -16,9 +16,10 @@ class ISMCTSNode:
         self.action = action  # azione che ha portato a questo nodo (80-dim np.array)
         self.children: List[ISMCTSNode] = []
         self.N = 0  # visite
-        self.W = 0.0  # somma valori
+        self.W = 0.0  # somma valori (pesi inclusi)
         self.Q = 0.0  # valore medio
         self.P = 0.0  # prior (dalla policy)
+        self.weight = 0.0  # somma pesi determinizzazioni
 
     def ucb_score(self, c_puct: float = 1.0) -> float:
         if self.parent is None:
@@ -26,6 +27,231 @@ class ISMCTSNode:
         prior = self.P
         total_N = max(1, self.parent.N)
         return self.Q + c_puct * prior * math.sqrt(total_N) / (1 + self.N)
+
+
+def _extract_determinization(det_result: Any) -> Tuple[Optional[Dict[int, Iterable[int]]], Optional[float]]:
+    if det_result is None:
+        return None, None
+    if isinstance(det_result, tuple):
+        assignments = det_result[0]
+        logp = det_result[1] if len(det_result) > 1 else None
+    elif isinstance(det_result, dict):
+        if all(isinstance(k, int) for k in det_result.keys()):
+            assignments = det_result
+            logp = None
+        else:
+            assignments = det_result.get('assignments') or det_result.get('hands')
+            logp = det_result.get('logp')
+    else:
+        assignments = det_result
+        logp = None
+    if assignments is not None:
+        assignments = {int(pid): list(cards) for pid, cards in assignments.items()}
+    logp = float(logp) if logp is not None else None
+    return assignments, logp
+
+
+def _normalize_log_weights(log_weights: Sequence[float], count: int) -> Tuple[List[float], float]:
+    if count <= 0:
+        return [], 0.0
+    if not log_weights:
+        uniform = [1.0 / count] * count
+        return uniform, 1.0 if count > 1 else 0.0
+    finite_logs = [lw for lw in log_weights if math.isfinite(lw)]
+    if not finite_logs:
+        uniform = [1.0 / count] * count
+        return uniform, 1.0 if count > 1 else 0.0
+    max_log = max(finite_logs)
+    weights = [math.exp((lw - max_log)) if math.isfinite(lw) else 0.0 for lw in log_weights]
+    total = sum(weights)
+    if not math.isfinite(total) or total <= 0:
+        uniform = [1.0 / count] * count
+        return uniform, 1.0 if count > 1 else 0.0
+    weights = [w / total for w in weights]
+    entropy = 0.0
+    for w in weights:
+        if w > 1e-12:
+            entropy -= w * math.log(w)
+    if count > 1:
+        entropy /= math.log(count)
+    else:
+        entropy = 0.0
+    return weights, float(entropy)
+
+
+def _apply_determinization(env: ScoponeEnvMA, assignment: Optional[Dict[int, Iterable[int]]]) -> None:
+    if not assignment:
+        return
+    hands = env.game_state['hands']
+    for pid, cards in assignment.items():
+        hands[int(pid)] = list(cards)
+    env._rebuild_id_caches()
+
+
+def _final_score_diff(env: ScoponeEnvMA) -> float:
+    breakdown = compute_final_score_breakdown(env.game_state, env.rules)
+    return float(breakdown[0]['total'] - breakdown[1]['total'])
+
+
+def _remaining_moves(env: ScoponeEnvMA) -> int:
+    hands = env.game_state.get('hands', None)
+    if isinstance(hands, (list, tuple)):
+        return int(sum(len(h) for h in hands))
+    if isinstance(hands, dict):
+        return int(sum(len(h) for h in hands.values()))
+    return 0
+
+
+def _auto_exact_move_threshold(total_cards_in_hands: int) -> int:
+    if total_cards_in_hands <= 0:
+        return 0
+    heuristic = int(round(total_cards_in_hands * 0.45))
+    return max(6, min(16, heuristic))
+
+
+def _state_signature(env: ScoponeEnvMA) -> Tuple[Any, ...]:
+    table_bits = int(env._table_bits) if hasattr(env, '_table_bits') else int(env._table_bits_t.item())
+    if hasattr(env, '_hands_bits'):
+        hands_bits_ref = env._hands_bits
+        hands_bits = tuple(int(hands_bits_ref[pid]) for pid in range(4))
+    else:
+        hands_bits = tuple(int(env._hands_bits_t[pid].item()) for pid in range(4))
+    captured_bits = tuple(int(env._captured_bits_t[i].item()) for i in range(2))
+    history_len = len(env.game_state.get('history', [])) if isinstance(env.game_state, dict) else 0
+    return (int(env.current_player), table_bits, hands_bits, captured_bits, history_len, bool(env.done))
+
+
+def _ensure_tensor_action(action: Any) -> torch.Tensor:
+    if torch.is_tensor(action):
+        return action
+    return torch.as_tensor(action, dtype=torch.float32)
+
+
+def _solve_to_terminal(env: ScoponeEnvMA,
+                       cache: Dict[Tuple[Any, ...], Tuple[float, int]]) -> Tuple[float, int]:
+    if env.done:
+        return _final_score_diff(env), 1
+    key = _state_signature(env)
+    cached = cache.get(key) if cache is not None else None
+    if cached is not None:
+        return cached
+    legals = env.get_valid_actions()
+    if torch.is_tensor(legals):
+        legals_list = list(legals.unbind(0))
+    else:
+        legals_list = list(legals)
+    if not legals_list:
+        val = _final_score_diff(env)
+        out = (val, 1)
+        if cache is not None:
+            cache[key] = out
+        return out
+    team_sign = 1.0 if env.current_player in (0, 2) else -1.0
+    best_val = float('-inf') if team_sign > 0 else float('inf')
+    leaves_acc = 0
+    for act in legals_list:
+        child = env.clone()
+        child.step(_ensure_tensor_action(act))
+        val, leaves = _solve_to_terminal(child, cache)
+        leaves_acc += leaves
+        if team_sign > 0:
+            if val > best_val:
+                best_val = val
+        else:
+            if val < best_val:
+                best_val = val
+    if not math.isfinite(best_val):
+        best_val = _final_score_diff(env)
+    out = (best_val, leaves_acc)
+    if cache is not None:
+        cache[key] = out
+    return out
+
+
+def _auto_exact_temperature(values: Sequence[float], root_sign: float) -> float:
+    if len(values) <= 1:
+        return 0.0
+    signed = [root_sign * v for v in values]
+    best = max(signed)
+    remaining = [x for x in signed if x != best]
+    if not remaining:
+        return 0.0
+    second = max(remaining)
+    gap = best - second
+    if gap >= 3.0:
+        return 0.0
+    if gap >= 1.5:
+        return 0.05
+    if gap >= 0.75:
+        return 0.1
+    return 0.2
+
+
+def _try_exact_evaluation(root_env: ScoponeEnvMA,
+                          legals: Sequence[Any],
+                          det_pack: Sequence[Dict[str, Any]],
+                          root_player: int) -> Optional[Tuple[torch.Tensor, List[float]]]:
+    if not det_pack or not legals:
+        return None
+    legals_tensors = [_ensure_tensor_action(a) for a in legals]
+    caches = [dict() for _ in det_pack]
+    values = [0.0 for _ in legals_tensors]
+    weights = [max(0.0, float(det.get('weight', 0.0))) for det in det_pack]
+    sum_w = sum(weights)
+    if not math.isfinite(sum_w) or sum_w <= 0:
+        w_uniform = 1.0 / len(det_pack)
+        weights = [w_uniform for _ in det_pack]
+    else:
+        weights = [w / sum_w for w in weights]
+    for det_idx, det in enumerate(det_pack):
+        base_env = root_env.clone()
+        _apply_determinization(base_env, det.get('assignment'))
+        cache = caches[det_idx]
+        for idx, act in enumerate(legals_tensors):
+            sim_env = base_env.clone()
+            sim_env.step(act)
+            if sim_env.done:
+                val = _final_score_diff(sim_env)
+            else:
+                val, _ = _solve_to_terminal(sim_env, cache)
+            values[idx] += weights[det_idx] * val
+    root_sign = 1.0 if root_player in (0, 2) else -1.0
+    best_idx = 0
+    best_score = float('-inf')
+    for idx, val in enumerate(values):
+        score = root_sign * val
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    temp = _auto_exact_temperature(values, root_sign)
+    if temp > 1e-6:
+        logits = [root_sign * v / temp for v in values]
+        max_logit = max(logits)
+        exp_vals = [math.exp(l - max_logit) for l in logits]
+        total = sum(exp_vals)
+        if total > 0:
+            probs = [ev / total for ev in exp_vals]
+        else:
+            probs = [0.0] * len(values)
+            probs[best_idx] = 1.0
+    else:
+        probs = [0.0] * len(values)
+        probs[best_idx] = 1.0
+    return legals_tensors[best_idx], probs
+
+
+def _allocate_simulation_counts(total: int, weights: Sequence[float]) -> List[int]:
+    n = len(weights)
+    if n == 0 or total <= 0:
+        return [0] * n
+    if not any(w > 0 for w in weights):
+        weights = [1.0 / n] * n
+    scaled = [w * total for w in weights]
+    counts = [0] * n
+    for _ in range(total):
+        idx = max(range(n), key=lambda i: (scaled[i] - counts[i]))
+        counts[idx] += 1
+    return counts
 
 
 def run_is_mcts(env: ScoponeEnvMA,
@@ -42,12 +268,6 @@ def run_is_mcts(env: ScoponeEnvMA,
                 root_dirichlet_eps: float = 0.0,
                 return_stats: bool = False,
                 belief_sampler=None):
-    """
-    IS-MCTS con determinizzazioni multiple e PUCT.
-    - prior_smooth_eps: smoothing dei prior con (1-eps)*p + eps/|A|
-    - root_temperature: softmax su N^(1/T) per la scelta finale (0 => argmax N)
-    """
-    # Validate input hyperparameters
     if int(num_simulations) < 0:
         raise ValueError("IS-MCTS: num_simulations must be >= 0")
     if int(num_determinization) <= 0:
@@ -66,34 +286,25 @@ def run_is_mcts(env: ScoponeEnvMA,
     root_env = env.clone()
     obs = root_env._get_observation(root_env.current_player)
     legals = root_env.get_valid_actions()
-    # Support both Tensor (A,80) and list outputs without ambiguous truthiness
     is_empty = (hasattr(legals, 'numel') and legals.numel() == 0) or (hasattr(legals, '__len__') and len(legals) == 0)
     if is_empty:
         raise ValueError("No legal actions for IS-MCTS")
 
-    # Helpers per chiavi
     def action_key(vec):
         import torch as _torch
-        import numpy as _np
         if _torch.is_tensor(vec):
             nz = _torch.nonzero(vec > 0, as_tuple=False).flatten().tolist()
             return tuple(int(i) for i in nz)
         else:
-            return tuple(_np.flatnonzero(vec).tolist())
-    def public_key(state_env: ScoponeEnvMA):
-        cur = state_env.current_player
-        table_ids = tuple(sorted(state_env.game_state.get('table', [])))
-        return (cur, table_ids)
+            return tuple(i for i, v in enumerate(vec) if v > 0)
 
-    # Ordine chiavi azioni alla radice (per aggregazione stabile delle visite)
-    ak_order = []
-    ak_order = [action_key(a) for a in legals]
+    ak_order = [action_key(a) for a in (legals.unbind(0) if torch.is_tensor(legals) else legals)]
 
-    # Prior iniziali (supporta tensori torch su CUDA)
     try:
         priors = policy_fn(obs, legals)
     except Exception as e:
         raise RuntimeError("IS-MCTS: policy_fn failed to produce priors") from e
+
     import numpy as _np
     if isinstance(priors, _np.ndarray):
         priors_len = len(priors)
@@ -107,11 +318,8 @@ def run_is_mcts(env: ScoponeEnvMA,
             noise = _np.random.dirichlet([root_dirichlet_alpha] * priors_len)
             priors = (1 - root_dirichlet_eps) * priors + root_dirichlet_eps * noise
     else:
-        # Assume torch.Tensor path
-        import os as _os
         if not torch.is_tensor(priors):
-            from utils.device import get_compute_device as _get_compute_device
-            pri_dev = _get_compute_device()
+            pri_dev = get_compute_device()
             priors = torch.as_tensor(priors, dtype=torch.float32, device=pri_dev)
         device = priors.device
         priors_len = int(priors.numel())
@@ -127,10 +335,14 @@ def run_is_mcts(env: ScoponeEnvMA,
             priors = (1.0 - root_dirichlet_eps) * priors + root_dirichlet_eps * noise
     root = ISMCTSNode(parent=None, action=None)
     root.N = 0
-    node_cache = {}
-    pk_root = public_key(root_env)
+    node_cache: Dict[Tuple[Any, ...], ISMCTSNode] = {}
+    pk_root = (int(root_env.current_player), tuple(sorted(root_env.game_state.get('table', []))))
     prior_list = priors.tolist() if hasattr(priors, 'tolist') else list(priors)
-    for a, p in zip(legals, prior_list):
+    if torch.is_tensor(legals):
+        legals_iter = legals.unbind(0)
+    else:
+        legals_iter = legals
+    for a, p in zip(legals_iter, prior_list):
         ak = action_key(a)
         key = (pk_root, ak)
         if key in node_cache:
@@ -144,122 +356,188 @@ def run_is_mcts(env: ScoponeEnvMA,
             root.children.append(child)
             node_cache[key] = child
 
-    for _ in range(num_simulations):
-        # Esegui una o più determinizzazioni
-        for _det in range(max(1, num_determinization)):
-            sim_env = root_env.clone()
-            # Determinizzazione: SOLO tramite belief_sampler neurale se fornito
-            if callable(belief_sampler):
-                det = belief_sampler(sim_env)
-                if isinstance(det, dict):
-                    for pid, ids in det.items():
-                        sim_env.game_state['hands'][pid] = list(ids)
-                    sim_env._rebuild_id_caches()
-            # Selection (ensure chosen child action is legal under current determinization)
-            node = root
-            while True:
-                if not node.children:
-                    break
-                # Get current legals and legal keys
-                legals_cur = sim_env.get_valid_actions()
-                legal_keys = set(action_key(a) for a in legals_cur)
-                # Filter children to only those legal in this determinization
-                legal_children = [ch for ch in node.children if action_key(ch.action) in legal_keys or ch.action is None]
-                if not legal_children:
-                    # Stop selection and go to expansion with current legals
-                    break
-                node = max(legal_children, key=lambda n: n.ucb_score(c_puct))
-                if node.action is not None:
-                    _, _, done, _ = sim_env.step(node.action)
-                    if done:
-                        break
+    det_outputs = []
+    det_log_weights = []
+    if callable(belief_sampler):
+        for _ in range(int(num_determinization)):
+            det = belief_sampler(root_env)
+            assignments, logp = _extract_determinization(det)
+            det_outputs.append({'assignment': assignments, 'logp': logp})
+            det_log_weights.append(logp if logp is not None else 0.0)
+    if not det_outputs:
+        det_outputs = [{'assignment': None, 'logp': 0.0}]
+        det_log_weights = [0.0]
+    det_weights, entropy = _normalize_log_weights(det_log_weights, len(det_outputs))
+    for det, w in zip(det_outputs, det_weights):
+        det['weight'] = w
 
-            # Expansion
-            if not sim_env.done:
-                obs_s = sim_env._get_observation(sim_env.current_player)
-                legals_s = sim_env.get_valid_actions()
-                has_legals_s = (hasattr(legals_s, 'numel') and legals_s.numel() > 0) or (hasattr(legals_s, '__len__') and len(legals_s) > 0)
-                if has_legals_s:
-                    try:
-                        priors_s = policy_fn(obs_s, legals_s)
-                    except Exception as e:
-                        raise RuntimeError("IS-MCTS: policy_fn failed during expansion priors") from e
-                    if isinstance(priors_s, _np.ndarray):
-                        if prior_smooth_eps > 0 and len(priors_s) > 1:
-                            priors_s = (1 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / len(priors_s))
-                        # Progressive widening: seleziona top-K in base alle visite del nodo
-                        visits_here = max(1, node.N)
-                        k_allow = min(len(legals_s), int(3.0 * (visits_here ** 0.5)) + 1)
-                        top_idx = _np.argsort(-priors_s)[:k_allow]
-                        legals_sel = [legals_s[i] for i in top_idx]
-                        priors_sel = priors_s[top_idx]
-                    else:
-                        if not torch.is_tensor(priors_s):
-                            from utils.device import get_compute_device as _get_compute_device
-                            pri_dev2 = _get_compute_device()
-                            priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=pri_dev2)
-                        if prior_smooth_eps > 0 and priors_s.numel() > 1:
-                            priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
-                        visits_here = max(1, node.N)
-                        k_allow = min(int(priors_s.numel()), int(3.0 * (visits_here ** 0.5)) + 1)
-                        top_idx = torch.argsort(priors_s, descending=True)[:k_allow]
-                        legals_sel = [legals_s[int(i)] for i in top_idx.tolist()]
-                        priors_sel = priors_s[top_idx].detach().cpu().numpy()
-                    # Public key arricchita
-                    cur = sim_env.current_player
-                    table_ids = tuple(sorted(sim_env.game_state.get('table', [])))
-                    cs = sim_env.game_state.get('captured_squads', [[], []])
-                    if isinstance(cs, dict):
-                        cs0 = tuple(sorted(cs.get(0, [])))
-                        cs1 = tuple(sorted(cs.get(1, [])))
-                    else:
-                        cs0 = tuple(sorted(cs[0]))
-                        cs1 = tuple(sorted(cs[1]))
-                    pk = (cur, table_ids, cs0, cs1)
-                    for a, p in zip(legals_sel, (priors_sel.tolist() if hasattr(priors_sel, 'tolist') else priors_sel)):
-                        ak = action_key(a)
-                        key = (pk, ak)
-                        if key in node_cache:
-                            ch = node_cache[key]
-                            ch.P = float(p)
-                            if ch not in node.children:
-                                node.children.append(ch)
-                        else:
-                            ch = ISMCTSNode(parent=node, action=a)
-                            ch.P = float(p)
-                            node.children.append(ch)
-                            node_cache[key] = ch
-            # Evaluation
-            if sim_env.done:
-                v = 0.0
+    remaining_moves_root = _remaining_moves(root_env)
+    override_moves = os.environ.get('SCOPONE_MCTS_EXACT_MAX_MOVES', '').strip()
+    if override_moves:
+        try:
+            exact_move_threshold = max(0, int(override_moves))
+        except ValueError:
+            exact_move_threshold = _auto_exact_move_threshold(remaining_moves_root)
+    else:
+        exact_move_threshold = _auto_exact_move_threshold(remaining_moves_root)
+    if exact_move_threshold > 0 and remaining_moves_root <= exact_move_threshold and det_outputs:
+        exact_candidate = _try_exact_evaluation(root_env,
+                                                (legals.unbind(0) if torch.is_tensor(legals) else legals),
+                                                det_outputs,
+                                                int(root_env.current_player))
+        if exact_candidate is not None:
+            notify_fallback('is_mcts.exact.success')
+            best_action, probs = exact_candidate
+            if return_stats:
+                probs_t = torch.tensor(probs, dtype=torch.float32, device=get_compute_device())
+                ch_keys = [action_key(ch.action) for ch in root.children]
+                probs_np = probs_t.detach().cpu().numpy()
+                agg = {}
+                for k, p in zip(ch_keys, probs_np):
+                    agg[k] = float(agg.get(k, 0.0) + float(p))
+                import numpy as _np
+                if ak_order:
+                    p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
+                    s = float(p_vec.sum())
+                    if s > 0:
+                        p_vec = p_vec / s
+                else:
+                    p_vec = probs_np
+                return best_action, p_vec
+            return best_action
+
+    if int(num_simulations) <= 0:
+        best = max(root.children, key=(lambda n: n.P))
+        if return_stats:
+            import numpy as _np
+            probs_np = _np.zeros(len(ak_order), dtype=_np.float32)
+            if ak_order:
+                target_idx = ak_order.index(action_key(best.action))
+                probs_np[target_idx] = 1.0
+            return best.action, probs_np
+        return best.action
+
+    entropy_factor = max(0.0, 1.0 - entropy)
+    progress_factor = 0.0
+    if remaining_moves_root > 0:
+        progress_factor = max(0.0, 1.0 - min(1.0, remaining_moves_root / 40.0))
+    scale = 1.0 + 0.75 * entropy_factor + 0.25 * progress_factor
+    if remaining_moves_root <= 12:
+        scale += 0.15
+    scale = min(scale, 2.0)
+    sim_budget = max(1, int(round(int(num_simulations) * scale)))
+    det_counts = _allocate_simulation_counts(sim_budget, [det['weight'] for det in det_outputs])
+
+    def simulate_with_det(det_assignment: Optional[Dict[int, Iterable[int]]], det_weight: float) -> None:
+        nonlocal node_cache
+        sim_env = root_env.clone()
+        _apply_determinization(sim_env, det_assignment)
+        node = root
+        path = [node]
+        while True:
+            if not node.children:
+                break
+            legals_cur = sim_env.get_valid_actions()
+            if torch.is_tensor(legals_cur):
+                legals_list = list(legals_cur.unbind(0))
             else:
-                obs_v = sim_env._get_observation(sim_env.current_player)
-                # Pass anche l'env corrente al value_fn per consentire seat/belief
-                v = float(value_fn(obs_v, sim_env))
-            # Backup
-            while node is not None:
-                node.N += 1
-                node.W += v
-                node.Q = node.W / node.N
-                node = node.parent
+                legals_list = list(legals_cur)
+            legal_keys = set(action_key(a) for a in legals_list)
+            legal_children = [ch for ch in node.children if action_key(ch.action) in legal_keys or ch.action is None]
+            if not legal_children:
+                break
+            node = max(legal_children, key=lambda n: n.ucb_score(c_puct))
+            path.append(node)
+            if node.action is not None:
+                _, _, done_flag, _ = sim_env.step(_ensure_tensor_action(node.action))
+                if done_flag:
+                    break
+        if not sim_env.done:
+            obs_s = sim_env._get_observation(sim_env.current_player)
+            legals_s = sim_env.get_valid_actions()
+            if torch.is_tensor(legals_s):
+                legals_seq = list(legals_s.unbind(0))
+            else:
+                legals_seq = list(legals_s)
+            if legals_seq:
+                try:
+                    priors_s = policy_fn(obs_s, legals_s)
+                except Exception as e:
+                    raise RuntimeError("IS-MCTS: policy_fn failed during expansion priors") from e
+                if isinstance(priors_s, _np.ndarray):
+                    if prior_smooth_eps > 0 and len(priors_s) > 1:
+                        priors_s = (1 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / len(priors_s))
+                    visits_here = max(1, node.N)
+                    k_allow = min(len(legals_seq), int(3.0 * (visits_here ** 0.5)) + 1)
+                    top_idx = _np.argsort(-priors_s)[:k_allow]
+                    legals_sel = [legals_seq[i] for i in top_idx]
+                    priors_sel = priors_s[top_idx]
+                else:
+                    if not torch.is_tensor(priors_s):
+                        pri_dev2 = get_compute_device()
+                        priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=pri_dev2)
+                    if prior_smooth_eps > 0 and priors_s.numel() > 1:
+                        priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
+                    visits_here = max(1, node.N)
+                    k_allow = min(int(priors_s.numel()), int(3.0 * (visits_here ** 0.5)) + 1)
+                    top_idx = torch.argsort(priors_s, descending=True)[:k_allow]
+                    legals_sel = [legals_seq[int(i)] for i in top_idx.tolist()]
+                    priors_sel = priors_s[top_idx].detach().cpu().numpy()
+                cur = sim_env.current_player
+                table_ids = tuple(sorted(sim_env.game_state.get('table', [])))
+                cs = sim_env.game_state.get('captured_squads', [[], []])
+                if isinstance(cs, dict):
+                    cs0 = tuple(sorted(cs.get(0, [])))
+                    cs1 = tuple(sorted(cs.get(1, [])))
+                else:
+                    cs0 = tuple(sorted(cs[0]))
+                    cs1 = tuple(sorted(cs[1]))
+                pk = (cur, table_ids, cs0, cs1)
+                for a, p in zip(legals_sel, (priors_sel.tolist() if hasattr(priors_sel, 'tolist') else priors_sel)):
+                    ak = action_key(a)
+                    key = (pk, ak)
+                    if key in node_cache:
+                        ch = node_cache[key]
+                        ch.P = float(p)
+                        if ch not in node.children:
+                            node.children.append(ch)
+                    else:
+                        ch = ISMCTSNode(parent=node, action=a)
+                        ch.P = float(p)
+                        node.children.append(ch)
+                        node_cache[key] = ch
+        if sim_env.done:
+            v = _final_score_diff(sim_env)
+        else:
+            obs_v = sim_env._get_observation(sim_env.current_player)
+            v = float(value_fn(obs_v, sim_env))
+        weight = max(det_weight, 1e-6)
+        for n in reversed(path):
+            n.N += 1
+            n.W += weight * v
+            n.weight += weight
+            if n.weight > 0:
+                n.Q = n.W / n.weight
+            else:
+                n.Q = n.W / max(1, n.N)
 
-    # Scelta finale: robust child o soft a seconda di temperature (preferisci torch su CUDA)
+    for det, count in zip(det_outputs, det_counts):
+        for _ in range(count):
+            simulate_with_det(det.get('assignment'), float(det.get('weight', 1.0)))
+
     device = get_compute_device()
     if root_temperature and root_temperature > 1e-6:
         visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
         logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))
         probs_t = logits / torch.clamp_min(logits.sum(), 1e-9)
-        # sanitize
         probs_t = probs_t.nan_to_num(0.0)
         probs_t = torch.clamp(probs_t, min=0.0)
         s = probs_t.sum()
         if not torch.isfinite(s) or s <= 0:
             raise RuntimeError("IS-MCTS: invalid root selection probabilities (NaN/Inf or zero-sum)")
-        else:
-            probs_t = probs_t / s
+        probs_t = probs_t / s
         idx = int(torch.multinomial(probs_t, num_samples=1).item())
         if return_stats:
-            # Aggrega probabilità per ciascuna azione legale alla radice
             import numpy as _np
             ch_keys = [action_key(ch.action) for ch in root.children]
             probs_np = probs_t.detach().cpu().numpy()

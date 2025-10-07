@@ -12,6 +12,7 @@ Usage:
 
 import torch
 import os
+import math
 # Default compile-friendly settings for CLI run
 os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
@@ -189,6 +190,7 @@ def play_game(actor1, actor2, starting_player=0, use_mcts=False, sims=128, dets=
                 n = len(unknown_ids)
                 if sum(caps) != n:
                     caps[2] = max(0, n - caps[0] - caps[1])
+                log_prob = 0.0
                 for cid in unknown_ids:
                     pc = probs[:, cid]
                     s = pc.sum()
@@ -197,7 +199,8 @@ def play_game(actor1, actor2, starting_player=0, use_mcts=False, sims=128, dets=
                     if caps[j] > 0:
                         det[others[j]].append(cid)
                         caps[j] -= 1
-                return det
+                        log_prob += math.log(max(1e-12, float(ps[j])))
+                return {'assignments': det, 'logp': log_prob}
             action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=1.0, belief=None, num_determinization=dets,
                                     belief_sampler=belief_sampler_neural)
         else:
@@ -322,6 +325,7 @@ def main_cli():
                     n = len(unknown_ids)
                     if sum(caps) != n:
                         caps[2] = max(0, n - caps[0] - caps[1])
+                    log_prob = 0.0
                     for cid in unknown_ids:
                         pc = probs[:, cid]
                         s = pc.sum()
@@ -330,7 +334,8 @@ def main_cli():
                         if caps[j] > 0:
                             det[others[j]].append(cid)
                             caps[j] -= 1
-                    return det
+                            log_prob += math.log(max(1e-12, float(ps[j])))
+                    return {'assignments': det, 'logp': log_prob}
                 action = run_is_mcts(env, policy_fn, value_fn, num_simulations=args.sims, c_puct=1.0, belief=None, num_determinization=args.dets,
                                       belief_sampler=belief_sampler_neural)
             else:

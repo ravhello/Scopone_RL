@@ -17,6 +17,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+import math
 
 from environment import ScoponeEnvMA
 from algorithms.is_mcts import run_is_mcts
@@ -137,6 +138,7 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
                         n = len(unknown_ids)
                         if sum(caps) != n:
                             caps[2] = max(0, n - caps[0] - caps[1])
+                        log_prob = 0.0
                         for cid in unknown_ids:
                             pc = probs[:, cid]
                             s = pc.sum()
@@ -145,7 +147,8 @@ def run_benchmark(games=50, use_mcts=False, sims=128, dets=16, compact=True, k_h
                             if caps[j] > 0:
                                 det[others[j]].append(cid)
                                 caps[j] -= 1
-                        return det
+                                log_prob += math.log(max(1e-12, float(ps[j])))
+                        return {'assignments': det, 'logp': log_prob}
                     except Exception:
                         return None
                 action = run_is_mcts(env, policy_fn, value_fn, num_simulations=sims, c_puct=c_puct,
@@ -231,5 +234,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

@@ -610,7 +610,8 @@ def _env_worker(worker_id: int,
                             b -= 1
                         else:
                             det[others[2]].append(cid)
-                    return det
+                    logp = -float(dp[n][cap0][cap1])
+                    return {'assignments': det, 'logp': logp}
                 # Progress-based scaling (uniform with single-env) — optionally gated by env
                 progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
                 denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
@@ -1772,7 +1773,6 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     if dp[n][cap0][cap1] >= INF:
                         from utils.fallback import notify_fallback
                         notify_fallback('trainer.belief_sampler.dp_infeasible')
-                    # Ricostruisci percorso
                     det = {pid: [] for pid in others}
                     a, b = cap0, cap1
                     for t in range(n, 0, -1):
@@ -1786,7 +1786,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                             b -= 1
                         else:
                             det[others[2]].append(cid)
-                    return det
+                    logp = -float(dp[n][cap0][cap1])
+                    return {'assignments': det, 'logp': logp}
                 # temperatura radice dinamica: alta a inizio mano, bassa verso la fine (solo se scaling attivo)
                 scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
                 root_temp_dyn = float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0) else float(max(0.0, 1.0 - alpha))
