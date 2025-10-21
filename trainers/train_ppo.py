@@ -636,9 +636,36 @@ def _env_worker(worker_id: int,
                 root_temp_dyn = (float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0)
                                  else float(max(0.0, 1.0 - alpha)))
 
-                if sims_scaled <= 0:
+                # Exact-only mode: skip prior MCTS unless near end-of-hand
+                _exact_only = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
+                def _remaining_moves_training(_env):
+                    _hands = _env.game_state.get('hands', None)
+                    if isinstance(_hands, (list, tuple)):
+                        return int(sum(len(h) for h in _hands))
+                    if isinstance(_hands, dict):
+                        return int(sum(len(h) for h in _hands.values()))
+                    return 0
+                def _auto_exact_thresh(_rem):
+                    if _rem <= 0:
+                        return 0
+                    _h = int(round(_rem * 0.45))
+                    return max(6, min(16, _h))
+                _rem_moves = _remaining_moves_training(env)
+                _ovr = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', '')).strip()
+                if _ovr:
+                    try:
+                        _exact_thresh = max(0, int(_ovr))
+                    except ValueError:
+                        _exact_thresh = _auto_exact_thresh(_rem_moves)
+                else:
+                    _exact_thresh = _auto_exact_thresh(_rem_moves)
+                _near_end = (_exact_thresh > 0) and (_rem_moves <= _exact_thresh)
+                _use_mcts_here = sims_scaled > 0 and (not (_exact_only and (not _near_end)))
+
+                if not _use_mcts_here:
                     # Sims ended up <= 0 despite mcts_sims > 0 — log, optionally raise for debug, then fall back to master step
-                    if os.environ.get('SCOPONE_RAISE_ON_INVALID_SIMS', '0') == '1':
+                    if (os.environ.get('SCOPONE_RAISE_ON_INVALID_SIMS', '0') == '1'
+                            and not (_exact_only and (not _near_end))):
                         raise RuntimeError(f"invalid sims_scaled: sims_scaled={sims_scaled} mcts_sims={mcts_sims} progress_start={mcts_progress_start} progress_full={mcts_progress_full} history_len={len(env.game_state.get('history', [])) if isinstance(env.game_state.get('history', []), list) else 'n/a'} alpha={alpha}")
                     leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
                     request_q.put({
@@ -680,20 +707,31 @@ def _env_worker(worker_id: int,
                         dir_eps_eff = 0.25 * a_fac * sim_att * prog_att
                         dir_eps_eff = float(max(0.0, min(0.3, dir_eps_eff)))
 
+                    # Choose determinisations count depending on whether we expect exact solve (Train-specific only)
+                    _dets_prior = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_PRIOR', str(mcts_dets)))
+                    _dets_exact = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_EXACT', str(mcts_dets)))
+                    _dets_eff = int(_dets_exact if _near_end else _dets_prior)
+
+                    # Ensure per-context depth/exact settings propagate to MCTS core (no ENV fallbacks)
+                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_MAX_DEPTH', '0'))
+                    os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', ''))
+                    os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '0'))
+
                     mcts_action, mcts_visits = run_is_mcts(env,
                         policy_fn=policy_fn_mcts,
                         value_fn=value_fn_mcts,
                         num_simulations=int(sims_scaled),
                         c_puct=float(mcts_c_puct),
                         belief=None,
-                        num_determinization=int(mcts_dets),
+                        num_determinization=int(_dets_eff),
                         root_temperature=root_temp_dyn,
                         prior_smooth_eps=prior_eps_eff,
                         robust_child=True,
                         root_dirichlet_alpha=float(mcts_dirichlet_alpha),
                         root_dirichlet_eps=dir_eps_eff,
                         return_stats=True,
-                        belief_sampler=belief_sampler_neural)
+                        belief_sampler=belief_sampler_neural,
+                        exact_only=_exact_only and not _near_end)
                     chosen_act = mcts_action if torch.is_tensor(mcts_action) else torch.as_tensor(mcts_action, dtype=torch.float32)
                     def _act_key(x_t: torch.Tensor):
                         xt = x_t if torch.is_tensor(x_t) else torch.as_tensor(x_t, dtype=torch.float32)
@@ -1573,6 +1611,32 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             if use_mcts_cur:
                 scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
                 root_temp_dyn = float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0) else float(max(0.0, 1.0 - alpha))
+            # Exact-only mode: optionally disable prior MCTS unless near end
+                _exact_only2 = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
+            def _remaining_moves_train_b(_env):
+                _h = _env.game_state.get('hands', None)
+                if isinstance(_h, (list, tuple)):
+                    return int(sum(len(x) for x in _h))
+                if isinstance(_h, dict):
+                    return int(sum(len(x) for x in _h.values()))
+                return 0
+            def _auto_thresh_b(_rem):
+                if _rem <= 0:
+                    return 0
+                _hh = int(round(_rem * 0.45))
+                return max(6, min(16, _hh))
+            _rem_b = _remaining_moves_train_b(env)
+            _ovr_b = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', '')).strip()
+            if _ovr_b:
+                try:
+                    _thr_b = max(0, int(_ovr_b))
+                except ValueError:
+                    _thr_b = _auto_thresh_b(_rem_b)
+            else:
+                _thr_b = _auto_thresh_b(_rem_b)
+            _near_end_b = (_thr_b > 0) and (_rem_b <= _thr_b)
+            if _exact_only2 and (not _near_end_b):
+                use_mcts_cur = False
 
             # Belief summary per il giocatore corrente: opzionale (disabilitato di default)
             _enable_bsum = (os.environ.get('ENABLE_BELIEF_SUMMARY', '0') == '1')
@@ -1812,20 +1876,31 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 prior_eps_eff = float(mcts_prior_smooth_eps) if float(mcts_prior_smooth_eps) > 0 else prior_eps_dyn
                 dir_eps_eff = float(mcts_dirichlet_eps) if float(mcts_dirichlet_eps) > 0 else dir_eps_dyn
 
+                # choose det count depending on exact vs prior phase (Train-specific envs first)
+                _dets_prior_b = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_PRIOR', str(mcts_dets)))
+                _dets_exact_b = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_EXACT', str(mcts_dets)))
+                _dets_eff_b = int(_dets_exact_b if _near_end_b else _dets_prior_b)
+
+                # Ensure per-context depth/exact settings propagate to MCTS core (no ENV fallbacks)
+                os.environ['SCOPONE_MCTS_MAX_DEPTH'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_MAX_DEPTH', '0'))
+                os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', ''))
+                os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '0'))
+
                 mcts_action, mcts_visits = run_is_mcts(env,
                                           policy_fn=policy_fn_mcts,
                                           value_fn=value_fn_mcts,
                                           num_simulations=int(sims_scaled),
                                           c_puct=float(mcts_c_puct),
                                           belief=None,
-                                          num_determinization=int(mcts_dets),
+                                          num_determinization=int(_dets_eff_b),
                                           root_temperature=root_temp_dyn,
                                           prior_smooth_eps=prior_eps_eff,
                                           robust_child=True,
                                           root_dirichlet_alpha=float(mcts_dirichlet_alpha),
                                           root_dirichlet_eps=dir_eps_eff,
                                           return_stats=True,
-                                          belief_sampler=belief_sampler_neural)
+                                          belief_sampler=belief_sampler_neural,
+                                          exact_only=_exact_only2 and not _near_end_b)
                 chosen_act = mcts_action if torch.is_tensor(mcts_action) else torch.as_tensor(mcts_action, dtype=torch.float32)
                 # trova indice dell'azione scelta tra i legali in O(A) vettoriale
                 # Bitset hashing mapping: encode action as (played_id, capture_bits) to find index in O(A)

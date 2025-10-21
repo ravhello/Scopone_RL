@@ -51,32 +51,42 @@ def _extract_determinization(det_result: Any) -> Tuple[Optional[Dict[int, Iterab
     return assignments, logp
 
 
-def _normalize_log_weights(log_weights: Sequence[float], count: int) -> Tuple[List[float], float]:
+def _normalize_log_weights(log_weights: Sequence[float], count: int) -> Tuple[List[float], float, float]:
     if count <= 0:
-        return [], 0.0
+        return [], 0.0, 0.0
     if not log_weights:
-        uniform = [1.0 / count] * count
-        return uniform, 1.0 if count > 1 else 0.0
+        return [0.0] * count, (1.0 if count > 1 else 0.0), 0.0
     finite_logs = [lw for lw in log_weights if math.isfinite(lw)]
     if not finite_logs:
-        uniform = [1.0 / count] * count
-        return uniform, 1.0 if count > 1 else 0.0
-    max_log = max(finite_logs)
-    weights = [math.exp((lw - max_log)) if math.isfinite(lw) else 0.0 for lw in log_weights]
-    total = sum(weights)
-    if not math.isfinite(total) or total <= 0:
-        uniform = [1.0 / count] * count
-        return uniform, 1.0 if count > 1 else 0.0
-    weights = [w / total for w in weights]
+        return [0.0] * count, (1.0 if count > 1 else 0.0), 0.0
+
+    weights: List[float] = []
+    total_mass = 0.0
+    for lw in log_weights:
+        if math.isfinite(lw):
+            w = math.exp(lw)
+            if not math.isfinite(w):
+                w = 0.0
+        else:
+            w = 0.0
+        w = float(max(0.0, w))
+        weights.append(w)
+        total_mass += w
+
     entropy = 0.0
-    for w in weights:
-        if w > 1e-12:
-            entropy -= w * math.log(w)
-    if count > 1:
-        entropy /= math.log(count)
+    if total_mass > 0.0:
+        norm_w = [w / total_mass for w in weights]
+        for w in norm_w:
+            if w > 1e-12:
+                entropy -= w * math.log(w)
+        if count > 1:
+            entropy /= math.log(count)
+        else:
+            entropy = 0.0
     else:
-        entropy = 0.0
-    return weights, float(entropy)
+        entropy = 1.0 if count > 1 else 0.0
+
+    return weights, float(entropy), float(total_mass)
 
 
 def _apply_determinization(env: ScoponeEnvMA, assignment: Optional[Dict[int, Iterable[int]]]) -> None:
@@ -100,13 +110,6 @@ def _remaining_moves(env: ScoponeEnvMA) -> int:
     if isinstance(hands, dict):
         return int(sum(len(h) for h in hands.values()))
     return 0
-
-
-def _auto_exact_move_threshold(total_cards_in_hands: int) -> int:
-    if total_cards_in_hands <= 0:
-        return 0
-    heuristic = int(round(total_cards_in_hands * 0.45))
-    return max(6, min(16, heuristic))
 
 
 def _state_signature(env: ScoponeEnvMA) -> Tuple[Any, ...]:
@@ -199,10 +202,7 @@ def _try_exact_evaluation(root_env: ScoponeEnvMA,
     weights = [max(0.0, float(det.get('weight', 0.0))) for det in det_pack]
     sum_w = sum(weights)
     if not math.isfinite(sum_w) or sum_w <= 0:
-        w_uniform = 1.0 / len(det_pack)
-        weights = [w_uniform for _ in det_pack]
-    else:
-        weights = [w / sum_w for w in weights]
+        return None
     for det_idx, det in enumerate(det_pack):
         base_env = root_env.clone()
         _apply_determinization(base_env, det.get('assignment'))
@@ -215,6 +215,8 @@ def _try_exact_evaluation(root_env: ScoponeEnvMA,
             else:
                 val, _ = _solve_to_terminal(sim_env, cache)
             values[idx] += weights[det_idx] * val
+    if sum_w > 0:
+        values = [v / sum_w for v in values]
     root_sign = 1.0 if root_player in (0, 2) else -1.0
     best_idx = 0
     best_score = float('-inf')
@@ -267,7 +269,8 @@ def run_is_mcts(env: ScoponeEnvMA,
                 root_dirichlet_alpha: float = 0.0,
                 root_dirichlet_eps: float = 0.0,
                 return_stats: bool = False,
-                belief_sampler=None):
+                belief_sampler=None,
+                exact_only: bool = False):
     if int(num_simulations) < 0:
         raise ValueError("IS-MCTS: num_simulations must be >= 0")
     if int(num_determinization) <= 0:
@@ -282,6 +285,15 @@ def run_is_mcts(env: ScoponeEnvMA,
         raise ValueError("IS-MCTS: root_dirichlet_eps must be in [0,1]")
     if float(root_dirichlet_alpha) < 0:
         raise ValueError("IS-MCTS: root_dirichlet_alpha must be >= 0")
+
+    depth_limit_env = os.environ.get('SCOPONE_MCTS_MAX_DEPTH', '').strip()
+    if depth_limit_env:
+        try:
+            depth_limit = max(0, int(depth_limit_env))
+        except ValueError:
+            depth_limit = 0
+    else:
+        depth_limit = 0
 
     root_env = env.clone()
     obs = root_env._get_observation(root_env.current_player)
@@ -298,7 +310,12 @@ def run_is_mcts(env: ScoponeEnvMA,
         else:
             return tuple(i for i, v in enumerate(vec) if v > 0)
 
-    ak_order = [action_key(a) for a in (legals.unbind(0) if torch.is_tensor(legals) else legals)]
+    if torch.is_tensor(legals):
+        legals_seq = list(legals.unbind(0))
+    else:
+        legals_seq = list(legals)
+    if not legals_seq:
+        raise ValueError("No legal actions for IS-MCTS")
 
     try:
         priors = policy_fn(obs, legals)
@@ -308,8 +325,8 @@ def run_is_mcts(env: ScoponeEnvMA,
     import numpy as _np
     if isinstance(priors, _np.ndarray):
         priors_len = len(priors)
-        if priors_len != len(legals):
-            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals)}")
+        if priors_len != len(legals_seq):
+            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals_seq)}")
         if not _np.isfinite(priors).all():
             raise RuntimeError("IS-MCTS: priors contain non-finite values")
         if prior_smooth_eps > 0 and priors_len > 1:
@@ -323,8 +340,8 @@ def run_is_mcts(env: ScoponeEnvMA,
             priors = torch.as_tensor(priors, dtype=torch.float32, device=pri_dev)
         device = priors.device
         priors_len = int(priors.numel())
-        if priors_len != len(legals):
-            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals)}")
+        if priors_len != len(legals_seq):
+            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals_seq)}")
         if not torch.isfinite(priors).all():
             raise RuntimeError("IS-MCTS: priors contain non-finite values")
         if prior_smooth_eps > 0 and priors_len > 1:
@@ -338,11 +355,21 @@ def run_is_mcts(env: ScoponeEnvMA,
     node_cache: Dict[Tuple[Any, ...], ISMCTSNode] = {}
     pk_root = (int(root_env.current_player), tuple(sorted(root_env.game_state.get('table', []))))
     prior_list = priors.tolist() if hasattr(priors, 'tolist') else list(priors)
+    ak_order = [action_key(a) for a in legals_seq]
     if torch.is_tensor(legals):
-        legals_iter = legals.unbind(0)
+        legals_seq = list(legals.unbind(0))
     else:
-        legals_iter = legals
-    for a, p in zip(legals_iter, prior_list):
+        legals_seq = list(legals)
+    if not legals_seq:
+        raise ValueError("No legal actions for IS-MCTS")
+    if isinstance(priors, _np.ndarray):
+        if priors_len != len(legals_seq):
+            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals_seq)}")
+    else:
+        if priors_len != len(legals_seq):
+            raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals_seq)}")
+    ak_order = [action_key(a) for a in legals_seq]
+    for a, p in zip(legals_seq, prior_list):
         ak = action_key(a)
         key = (pk_root, ak)
         if key in node_cache:
@@ -367,26 +394,34 @@ def run_is_mcts(env: ScoponeEnvMA,
     if not det_outputs:
         det_outputs = [{'assignment': None, 'logp': 0.0}]
         det_log_weights = [0.0]
-    det_weights, entropy = _normalize_log_weights(det_log_weights, len(det_outputs))
+    det_weights, entropy, mass_observed = _normalize_log_weights(det_log_weights, len(det_outputs))
     for det, w in zip(det_outputs, det_weights):
         det['weight'] = w
 
+    cover_frac_env = os.environ.get('SCOPONE_MCTS_EXACT_COVER_FRAC', None)
+    try:
+        cover_frac = float(str(cover_frac_env).strip()) if cover_frac_env is not None else 0.0
+    except (ValueError, TypeError):
+        cover_frac = 0.0
+    if cover_frac > 1.0:
+        cover_frac = cover_frac / 100.0
+    if cover_frac < 0.0:
+        cover_frac = 0.0
+    cover_frac = min(1.0, cover_frac)
+    auto_exact_by_coverage = False
+    if cover_frac > 0.0 and det_outputs:
+        observed_mass = max(0.0, min(1.0, mass_observed))
+        if observed_mass >= cover_frac:
+            auto_exact_by_coverage = True
+
     remaining_moves_root = _remaining_moves(root_env)
-    override_moves = os.environ.get('SCOPONE_MCTS_EXACT_MAX_MOVES', '').strip()
-    if override_moves:
-        try:
-            exact_move_threshold = max(0, int(override_moves))
-        except ValueError:
-            exact_move_threshold = _auto_exact_move_threshold(remaining_moves_root)
-    else:
-        exact_move_threshold = _auto_exact_move_threshold(remaining_moves_root)
-    if exact_move_threshold > 0 and remaining_moves_root <= exact_move_threshold and det_outputs:
+    should_try_exact = bool(det_outputs) and auto_exact_by_coverage
+    if should_try_exact:
         exact_candidate = _try_exact_evaluation(root_env,
-                                                (legals.unbind(0) if torch.is_tensor(legals) else legals),
+                                                legals_seq,
                                                 det_outputs,
                                                 int(root_env.current_player))
         if exact_candidate is not None:
-            notify_fallback('is_mcts.exact.success')
             best_action, probs = exact_candidate
             if return_stats:
                 probs_t = torch.tensor(probs, dtype=torch.float32, device=get_compute_device())
@@ -405,6 +440,19 @@ def run_is_mcts(env: ScoponeEnvMA,
                     p_vec = probs_np
                 return best_action, p_vec
             return best_action
+    if exact_only and not should_try_exact:
+        # Fallback to greedy selection from prior
+        if isinstance(priors, _np.ndarray):
+            best_idx = int(_np.argmax(priors))
+        else:
+            best_idx = int(torch.argmax(priors).item())
+        best_idx = max(0, min(best_idx, len(legals_seq) - 1))
+        best_action = legals_seq[best_idx]
+        if return_stats:
+            probs_np = _np.zeros(len(legals_seq), dtype=_np.float32)
+            probs_np[best_idx] = 1.0
+            return best_action, probs_np
+        return best_action
 
     if int(num_simulations) <= 0:
         best = max(root.children, key=(lambda n: n.P))
@@ -434,7 +482,11 @@ def run_is_mcts(env: ScoponeEnvMA,
         _apply_determinization(sim_env, det_assignment)
         node = root
         path = [node]
+        reached_depth_cap = False
         while True:
+            if depth_limit > 0 and (len(path) - 1) >= depth_limit:
+                reached_depth_cap = True
+                break
             if not node.children:
                 break
             legals_cur = sim_env.get_valid_actions()
@@ -452,7 +504,7 @@ def run_is_mcts(env: ScoponeEnvMA,
                 _, _, done_flag, _ = sim_env.step(_ensure_tensor_action(node.action))
                 if done_flag:
                     break
-        if not sim_env.done:
+        if (not sim_env.done) and (not reached_depth_cap):
             obs_s = sim_env._get_observation(sim_env.current_player)
             legals_s = sim_env.get_valid_actions()
             if torch.is_tensor(legals_s):

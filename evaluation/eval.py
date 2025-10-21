@@ -390,10 +390,52 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                             caps[j] -= 1
                             log_prob += math.log(max(1e-12, float(ps[j])))
                     return {'assignments': det, 'logp': log_prob}
-                sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
+                # Exact-only handling: skip prior MCTS unless near end
+                def _remaining_moves_eval(_env):
+                    _h = _env.game_state.get('hands', None)
+                    if isinstance(_h, (list, tuple)):
+                        return int(sum(len(x) for x in _h))
+                    if isinstance(_h, dict):
+                        return int(sum(len(x) for x in _h.values()))
+                    return 0
+                def _auto_thresh_eval(_rem):
+                    if _rem <= 0:
+                        return 0
+                    _hh = int(round(_rem * 0.45))
+                    return max(6, min(16, _hh))
+                _exact_only = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
+                _rem = _remaining_moves_eval(env)
+                _ovr = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES', '')).strip()
+                if _ovr:
+                    try:
+                        _thr = max(0, int(_ovr))
+                    except ValueError:
+                        _thr = _auto_thresh_eval(_rem)
+                else:
+                    _thr = _auto_thresh_eval(_rem)
+                _near_end = (_thr > 0) and (_rem <= _thr)
+                if _exact_only:
+                    sims_scaled = 0
+                    root_temp_dyn = 0.0
+                else:
+                    sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
+                # Ensure per-context depth/exact settings propagate to MCTS core
+                if _exact_only:
+                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = '0'
+                else:
+                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = str(os.environ.get('SCOPONE_EVAL_MCTS_MAX_DEPTH', '0'))
+                os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES', ''))
+                os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_COVER_FRAC', '0'))
                 mc = dict(mcts)
                 mc['sims'] = int(sims_scaled)
                 mc['root_temp'] = float(root_temp_dyn)
+                # dets: separate prior vs exact in eval
+                _d_prior = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS_PRIOR', str(mc.get('dets', 1))))
+                _d_exact = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS_EXACT', str(mc.get('dets', 1))))
+                if _exact_only:
+                    _d_eff = int(_d_exact)
+                else:
+                    _d_eff = int(_d_exact if _near_end else _d_prior)
                 action = run_is_mcts(
                     env,
                     policy_fn=policy_fn,
@@ -401,13 +443,14 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
                     num_simulations=int(mc.get('sims', 128)),
                     c_puct=float(mc.get('c_puct', 1.0)),
                     belief=None,
-                    num_determinization=int(mc.get('dets', 1)),
+                    num_determinization=int(_d_eff),
                     root_temperature=float(mc.get('root_temp', 0.0)),
                     prior_smooth_eps=float(mc.get('prior_smooth_eps', 0.0)),
                     robust_child=True,
                     root_dirichlet_alpha=float(mc.get('root_dirichlet_alpha', 0.25)),
                     root_dirichlet_eps=float(mc.get('root_dirichlet_eps', 0.25)),
-                    belief_sampler=belief_sampler_neural
+                    belief_sampler=belief_sampler_neural,
+                    exact_only=_exact_only
                 )
                 return action
             # Greedy actor selection con belief neurale
@@ -605,10 +648,51 @@ def _eval_pair_chunk_worker(args):
                             log_prob += math.log(max(1e-12, float(ps[j])))
                     return {'assignments': det, 'logp': log_prob}
                 from algorithms.is_mcts import run_is_mcts
-                sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
+                # Exact-only handling: skip prior MCTS unless near end
+                def _remaining_moves_eval2(_env):
+                    _h = _env.game_state.get('hands', None)
+                    if isinstance(_h, (list, tuple)):
+                        return int(sum(len(x) for x in _h))
+                    if isinstance(_h, dict):
+                        return int(sum(len(x) for x in _h.values()))
+                    return 0
+                def _auto_thresh_eval2(_rem):
+                    if _rem <= 0:
+                        return 0
+                    _hh = int(round(_rem * 0.45))
+                    return max(6, min(16, _hh))
+                _exact_only = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
+                _rem = _remaining_moves_eval2(env)
+                _ovr = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES', '')).strip()
+                if _ovr:
+                    try:
+                        _thr = max(0, int(_ovr))
+                    except ValueError:
+                        _thr = _auto_thresh_eval2(_rem)
+                else:
+                    _thr = _auto_thresh_eval2(_rem)
+                _near_end = (_thr > 0) and (_rem <= _thr)
+                if _exact_only:
+                    sims_scaled = 0
+                    root_temp_dyn = 0.0
+                else:
+                    sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts))
+                # Ensure per-context depth/exact settings propagate to MCTS core
+                if _exact_only:
+                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = '0'
+                else:
+                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = str(os.environ.get('SCOPONE_EVAL_MCTS_MAX_DEPTH', '0'))
+                os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES', ''))
+                os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_COVER_FRAC', '0'))
                 mc = dict(mcts)
                 mc['sims'] = int(sims_scaled)
                 mc['root_temp'] = float(root_temp_dyn)
+                _d_prior = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS_PRIOR', str(mc.get('dets', 1))))
+                _d_exact = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS_EXACT', str(mc.get('dets', 1))))
+                if _exact_only:
+                    _d_eff = int(_d_exact)
+                else:
+                    _d_eff = int(_d_exact if _near_end else _d_prior)
                 action = run_is_mcts(
                     env,
                     policy_fn=policy_fn,
@@ -616,13 +700,14 @@ def _eval_pair_chunk_worker(args):
                     num_simulations=int(mc.get('sims', 128)),
                     c_puct=float(mc.get('c_puct', 1.0)),
                     belief=None,
-                    num_determinization=int(mc.get('dets', 1)),
+                    num_determinization=int(_d_eff),
                     root_temperature=float(mc.get('root_temp', 0.0)),
                     prior_smooth_eps=float(mc.get('prior_smooth_eps', 0.0)),
                     robust_child=True,
                     root_dirichlet_alpha=float(mc.get('root_dirichlet_alpha', 0.25)),
                     root_dirichlet_eps=float(mc.get('root_dirichlet_eps', 0.25)),
-                    belief_sampler=belief_sampler_neural
+                    belief_sampler=belief_sampler_neural,
+                    exact_only=_exact_only
                 )
                 return action
             obs = env._get_observation(cp)
@@ -797,10 +882,24 @@ def _eval_pair_chunk_worker_dist(args):
                         probs = torch.softmax(logits, dim=0).detach().cpu().numpy()
                     return probs
                 from algorithms.is_mcts import run_is_mcts
-                sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts_local))
+                _exact_only = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1', 'true', 'yes', 'on']
+                if _exact_only:
+                    sims_scaled = 0
+                    root_temp_dyn = 0.0
+                    dets_eff = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS_EXACT', str(mcts_local.get('dets', 1))))
+                else:
+                    sims_scaled, root_temp_dyn = _eval_resolve_mcts_params(env, dict(mcts_local))
+                    dets_eff = int(mcts_local.get('dets', 1))
                 mc = dict(mcts_local)
                 mc['sims'] = int(sims_scaled)
                 mc['root_temp'] = float(root_temp_dyn)
+                mc['dets'] = int(dets_eff)
+                if _exact_only:
+                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = '0'
+                else:
+                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = str(os.environ.get('SCOPONE_EVAL_MCTS_MAX_DEPTH', '0'))
+                os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES', ''))
+                os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_EVAL_MCTS_EXACT_COVER_FRAC', '0'))
                 action = run_is_mcts(
                     env,
                     policy_fn=policy_fn,
@@ -814,6 +913,7 @@ def _eval_pair_chunk_worker_dist(args):
                     robust_child=True,
                     root_dirichlet_alpha=float(mc.get('root_dirichlet_alpha', 0.25)),
                     root_dirichlet_eps=float(mc.get('root_dirichlet_eps', 0.25)),
+                    exact_only=_exact_only
                 )
                 return action
             obs = env._get_observation(cp)
