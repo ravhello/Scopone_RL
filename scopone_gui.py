@@ -8,11 +8,18 @@ import socket
 import pickle
 import time
 from collections import deque
+from typing import Optional
+
+import torch
+
 from layout import LayoutManager
 
 # Import game components
 from environment import ScoponeEnvMA
 from actions import encode_action_from_ids_tensor, decode_action_ids
+from models.action_conditioned import ActionConditionedActor
+from utils.compile import maybe_compile_module
+from utils.device import get_compute_device
 
 # Constants
 SCREEN_WIDTH = 1024
@@ -122,6 +129,129 @@ def get_local_ip():
         return local_ip
     except Exception as e:
         raise RuntimeError("Failed to obtain local IP address") from e
+
+
+class GuiPolicyAgent:
+    """Wrapper for the action-conditioned policy used by the GUI AI players."""
+
+    def __init__(self, team_id: int, obs_dim: int, action_dim: int = 80, device: Optional[str] = None):
+        self.team_id = int(team_id)
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        self.device = torch.device(device) if device is not None else get_compute_device()
+        self.epsilon = 0.0
+
+        actor = ActionConditionedActor(obs_dim=self.obs_dim, action_dim=self.action_dim)
+        actor_name = f"ActionConditionedActor[gui_team{self.team_id}]"
+        self.actor = maybe_compile_module(actor, name=actor_name).to(self.device)
+        self.actor.eval()
+
+    def load_checkpoint(self, path: Optional[str]) -> bool:
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            state = torch.load(path, map_location=self.device)
+        except Exception as exc:
+            print(f"Failed to load checkpoint '{path}': {exc}")
+            return False
+
+        state_dict = self._extract_actor_state(state)
+        if state_dict is None:
+            print(f"Checkpoint '{path}' does not contain actor weights; skipping")
+            return False
+        try:
+            missing, unexpected = self.actor.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"Checkpoint '{path}' missing keys: {missing}")
+            if unexpected:
+                print(f"Checkpoint '{path}' unexpected keys: {unexpected}")
+            self.actor.eval()
+            if hasattr(self.actor, 'invalidate_action_cache'):
+                try:
+                    self.actor.invalidate_action_cache()
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            print(f"Failed to apply checkpoint '{path}': {exc}")
+            return False
+
+    def _extract_actor_state(self, payload) -> Optional[dict]:
+        if isinstance(payload, dict):
+            if 'actor' in payload and isinstance(payload['actor'], dict):
+                return payload['actor']
+            if 'policy' in payload and isinstance(payload['policy'], dict):
+                pol = payload['policy']
+                if 'actor' in pol and isinstance(pol['actor'], dict):
+                    return pol['actor']
+            if all(isinstance(v, torch.Tensor) for v in payload.values()):
+                return payload
+            # Flatten keys starting with 'actor.'
+            actor_sub = {k.split('actor.', 1)[1]: v for k, v in payload.items()
+                         if isinstance(k, str) and k.startswith('actor.') and isinstance(v, torch.Tensor)}
+            if actor_sub:
+                return actor_sub
+        return None
+
+    def _seat_team_vector(self, player_index: int) -> torch.Tensor:
+        vec = torch.zeros(6, dtype=torch.float32)
+        if 0 <= player_index < 4:
+            vec[player_index] = 1.0
+        if player_index in (0, 2):
+            vec[4] = 1.0
+        elif player_index in (1, 3):
+            vec[5] = 1.0
+        return vec
+
+    def _prepare_legals(self, valid_actions):
+        if torch.is_tensor(valid_actions):
+            return valid_actions.detach(), valid_actions
+        if isinstance(valid_actions, (list, tuple)):
+            if not valid_actions:
+                empty = torch.zeros((0, self.action_dim), dtype=torch.float32)
+                return empty, valid_actions
+            first = valid_actions[0]
+            if torch.is_tensor(first):
+                stacked = torch.stack([va.detach() for va in valid_actions], dim=0)
+            else:
+                stacked = torch.as_tensor(valid_actions, dtype=torch.float32)
+            return stacked, valid_actions
+        raise TypeError("Unsupported valid_actions type for GuiPolicyAgent")
+
+    def _materialize_action(self, source, index: int) -> torch.Tensor:
+        if torch.is_tensor(source):
+            return source[index].detach().clone()
+        chosen = source[index]
+        if torch.is_tensor(chosen):
+            return chosen.detach().clone()
+        return torch.as_tensor(chosen, dtype=torch.float32)
+
+    def _select_action_index(self, obs, legals_tensor: torch.Tensor, env=None) -> int:
+        obs_t = obs if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)
+        obs_t = obs_t.to(self.device, dtype=torch.float32)
+        if obs_t.dim() == 1:
+            obs_t = obs_t.unsqueeze(0)
+        player_index = getattr(env, 'current_player', 0) if env is not None else 0
+        seat_vec = self._seat_team_vector(player_index).to(self.device, dtype=torch.float32).unsqueeze(0)
+        legals_t = legals_tensor.to(self.device, dtype=torch.float32)
+        with torch.no_grad():
+            scores = self.actor(obs_t, legals_t, seat_vec)
+            if scores.dim() == 0:
+                return 0
+            return int(torch.argmax(scores).item())
+
+    def pick_action(self, obs, valid_actions, env=None):
+        legals_tensor, source = self._prepare_legals(valid_actions)
+        num_actions = int(legals_tensor.shape[0])
+        if num_actions == 0:
+            raise ValueError("No legal actions available")
+        if num_actions == 1:
+            return self._materialize_action(source, 0)
+        if self.epsilon > 0.0 and random.random() < self.epsilon:
+            idx = random.randrange(num_actions)
+        else:
+            idx = self._select_action_index(obs, legals_tensor, env=env)
+        return self._materialize_action(source, idx)
 
 class LoadingAnimation:
     """Animazione di caricamento per quando si caricano i bot AI"""
@@ -3649,6 +3779,44 @@ class GameScreen(BaseScreen):
         # Defer overlay drawing until state sync/animations are handled (prevents overlay-before-sweep)
         self.defer_overlays_until_state_sync = False
 
+    def _resolve_obs_dim(self) -> int:
+        try:
+            if self.env is not None and getattr(self.env, 'observation_space', None) is not None:
+                return int(self.env.observation_space.shape[0])
+        except Exception:
+            pass
+        return 10823
+
+    def _resolve_checkpoint_path(self, team_id: int, fallback: Optional[str] = None) -> Optional[str]:
+        candidates = []
+        env_specific = os.environ.get(f'SCOPONE_GUI_CKPT_TEAM{team_id}')
+        if env_specific:
+            candidates.append(env_specific)
+        env_shared = os.environ.get('SCOPONE_GUI_CKPT')
+        if env_shared:
+            candidates.append(env_shared)
+        config = getattr(self.app, 'game_config', {})
+        if isinstance(config, dict):
+            team_map = config.get('team_checkpoints')
+            if isinstance(team_map, dict):
+                cand = team_map.get(team_id) or team_map.get(str(team_id))
+                if cand:
+                    candidates.append(cand)
+            for key in (f'team{team_id}_checkpoint', f'team_{team_id}_checkpoint'):
+                cand = config.get(key)
+                if cand:
+                    candidates.append(cand)
+        candidates.append(os.path.join('checkpoints', f'ppo_ac_team{team_id}.pth'))
+        candidates.append(os.path.join('checkpoints', 'ppo_ac.pth'))
+        if fallback:
+            candidates.append(fallback)
+        legacy = f'scopone_checkpoint_team{team_id}.pth'
+        candidates.append(legacy)
+        for cand in candidates:
+            if cand and os.path.exists(cand):
+                return cand
+        return None
+
     def _play_next_queued_client_move(self):
         """Play the next queued client move, ensuring strict serialization.
 
@@ -4004,22 +4172,23 @@ class GameScreen(BaseScreen):
         """Set up AI controllers based on game mode"""
         config = self.app.game_config
         mode = config.get("mode", "single_player")
-        
+        obs_dim = self._resolve_obs_dim()
+
         if mode == "single_player":
             # Crea un solo agente per squadra (come nell'addestramento)
             # Team 0: giocatori 0, 2
             # Team 1: giocatori 1, 3
-            
+
             # Crea l'agente per la squadra 0 (giocatori 0 e 2)
-            team0_agent = DQNAgent(team_id=0)
-            checkpoint_path_0 = "scopone_checkpoint_team0.pth"
-            if os.path.exists(checkpoint_path_0):
+            team0_agent = GuiPolicyAgent(team_id=0, obs_dim=obs_dim)
+            checkpoint_path_0 = self._resolve_checkpoint_path(0)
+            if checkpoint_path_0:
                 team0_agent.load_checkpoint(checkpoint_path_0)
-            
+
             # Crea l'agente per la squadra 1 (giocatori 1 e 3)
-            team1_agent = DQNAgent(team_id=1)
-            checkpoint_path_1 = "scopone_checkpoint_team1.pth"
-            if os.path.exists(checkpoint_path_1):
+            team1_agent = GuiPolicyAgent(team_id=1, obs_dim=obs_dim)
+            checkpoint_path_1 = self._resolve_checkpoint_path(1)
+            if checkpoint_path_1:
                 team1_agent.load_checkpoint(checkpoint_path_1)
             
             # Imposta epsilon in base alla difficoltà
@@ -4042,11 +4211,11 @@ class GameScreen(BaseScreen):
         elif mode == "team_vs_ai":
             # Players 0 and 2 are human team, 1 and 3 are AI team
             # Crea UN SOLO agente per la squadra AI (team 1)
-            ai_agent = DQNAgent(team_id=1)
-            
+            ai_agent = GuiPolicyAgent(team_id=1, obs_dim=obs_dim)
+
             # Carica checkpoint se disponibile
-            checkpoint_path = "scopone_checkpoint_team1.pth"
-            if os.path.exists(checkpoint_path):
+            checkpoint_path = self._resolve_checkpoint_path(1)
+            if checkpoint_path:
                 ai_agent.load_checkpoint(checkpoint_path)
             
             # Imposta epsilon in base alla difficoltà
@@ -4188,9 +4357,10 @@ class GameScreen(BaseScreen):
                     ai_seat = int(ai_seat)
                     if self.players[ai_seat].is_ai and ai_seat not in self.ai_controllers:
                         ai_team_id = 0 if ai_seat in [0, 2] else 1
-                        ai_agent = DQNAgent(team_id=ai_team_id)
-                        ck_path = f"scopone_checkpoint_team{ai_team_id}.pth"
-                        if os.path.exists(ck_path):
+                        obs_dim = self._resolve_obs_dim()
+                        ai_agent = GuiPolicyAgent(team_id=ai_team_id, obs_dim=obs_dim)
+                        ck_path = self._resolve_checkpoint_path(ai_team_id)
+                        if ck_path:
                             try:
                                 ai_agent.load_checkpoint(ck_path)
                             except Exception:
@@ -5701,12 +5871,13 @@ class GameScreen(BaseScreen):
         
         if not (ai_controller_exists and same_agent):
             print(f"Creazione controller AI unificato per la squadra 1")
-            ai_agent = DQNAgent(team_id=1)
-            
+            obs_dim = self._resolve_obs_dim()
+            ai_agent = GuiPolicyAgent(team_id=1, obs_dim=obs_dim)
+
             # Carica checkpoint se disponibile
-            checkpoint_path = f"scopone_checkpoint_team1.pth"
-            if os.path.exists(checkpoint_path):
-                print(f"Caricamento checkpoint per la squadra AI")
+            checkpoint_path = self._resolve_checkpoint_path(1)
+            if checkpoint_path:
+                print(f"Caricamento checkpoint per la squadra AI da {checkpoint_path}")
                 ai_agent.load_checkpoint(checkpoint_path)
             
             # Imposta epsilon in base alla difficoltà
@@ -5780,15 +5951,16 @@ class GameScreen(BaseScreen):
 
         # Controller AI: un agente per team 0? No, solo per i giocatori AI (2 e 3) con stesso livello
         # Creiamo un agente per ogni team AI in base alla difficoltà, ma sono indipendenti
+        obs_dim = self._resolve_obs_dim()
         difficulty = self.ai_difficulty
-        ai_agent_team0 = DQNAgent(team_id=0)
-        ai_agent_team1 = DQNAgent(team_id=1)
+        ai_agent_team0 = GuiPolicyAgent(team_id=0, obs_dim=obs_dim)
+        ai_agent_team1 = GuiPolicyAgent(team_id=1, obs_dim=obs_dim)
         # Caricamento checkpoint opzionale
-        ck0 = "scopone_checkpoint_team0.pth"
-        ck1 = "scopone_checkpoint_team1.pth"
-        if os.path.exists(ck0):
+        ck0 = self._resolve_checkpoint_path(0)
+        ck1 = self._resolve_checkpoint_path(1)
+        if ck0:
             ai_agent_team0.load_checkpoint(ck0)
-        if os.path.exists(ck1):
+        if ck1:
             ai_agent_team1.load_checkpoint(ck1)
         # Stessa epsilon in base al livello per entrambi
         if difficulty == 0:
