@@ -419,15 +419,23 @@ class ResourceManager:
             bg = pygame.image.load(os.path.join(folder, "background.jpg"))
             self.original_background = bg  # Store the original unscaled image
             self.background = pygame.transform.smoothscale(bg, (SCREEN_WIDTH, SCREEN_HEIGHT))
-        except Exception as e:
-            raise RuntimeError("Failed to load background image") from e
+        except:
+            # Create a default background if image not found
+            self.original_background = pygame.Surface((1024, 768))
+            self.original_background.fill(DARK_BLUE)
+            self.background = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            self.background.fill(DARK_BLUE)
         
         try:
             table = pygame.image.load(os.path.join(folder, "table_texture.jpg"))
             self.original_table_texture = table
             self.table_texture = pygame.transform.smoothscale(table, (750, 450))
-        except Exception as e:
-            raise RuntimeError("Failed to load table texture") from e
+        except:
+            # Create a default table texture if image not found
+            self.original_table_texture = pygame.Surface((750, 450))
+            self.original_table_texture.fill(TABLE_GREEN)
+            self.table_texture = pygame.Surface((750, 450))
+            self.table_texture.fill(TABLE_GREEN)
     
     def load_ui_elements(self, folder="assets"):
         """Load UI elements like icons and decorative graphics"""
@@ -437,8 +445,10 @@ class ResourceManager:
             try:
                 img = pygame.image.load(os.path.join(folder, f"{element}.png"))
                 self.ui_elements[element] = img
-            except Exception as e:
-                raise RuntimeError(f"Failed to load UI element: {element}") from e
+            except:
+                # Create placeholder UI elements
+                self.ui_elements[element] = pygame.Surface((32, 32))
+                self.ui_elements[element].fill(LIGHT_GRAY)
     
     def try_load_sounds(self, folder="assets"):
         """Try to load game sounds - gracefully fails if no audio device"""
@@ -459,8 +469,9 @@ class ResourceManager:
             for sound_name, filename in sound_files.items():
                 try:
                     self.sounds[sound_name] = pygame.mixer.Sound(os.path.join(folder, filename))
-                except Exception as e:
-                    raise RuntimeError(f"Failed to load sound: {sound_name}") from e
+                except:
+                    # Create silent sound if file not found
+                    self.sounds[sound_name] = None
         except Exception as e:
             print(f"Sound disabled: {e}")
             self.sound_enabled = False
