@@ -2543,8 +2543,14 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     # - POSIX with CUDA or background threads: prefer 'forkserver' (avoid forking after CUDA/threads)
     # - Otherwise: 'fork'
     override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
+    available_methods = set(mp.get_all_start_methods())
     if override in {'spawn', 'fork', 'forkserver'}:
-        start_method = override
+        if override in available_methods:
+            start_method = override
+        else:
+            fallback = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
+            print(f"[collector] mp start method '{override}' unavailable; falling back to '{fallback}'", flush=True)
+            start_method = fallback
     else:
         if platform.system().lower() == 'windows':
             start_method = 'spawn'
@@ -2554,6 +2560,11 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 start_method = 'spawn'
             else:
                 start_method = 'fork'
+        if start_method not in available_methods:
+            fallback = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
+            if start_method != fallback:
+                print(f"[collector] mp start method '{start_method}' not supported; using '{fallback}'", flush=True)
+            start_method = fallback
     ctx = mp.get_context(start_method)
     request_q = ctx.Queue(maxsize=num_envs * 4)
     # Make episode queue large enough to avoid backpressure when multiple workers finish close together

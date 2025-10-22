@@ -90,7 +90,8 @@ os.environ.setdefault('SCOPONE_START_OPP', 'top1')
 # ===== Section: Eval Process (Eval) =====
 # Evaluation process knobs
 os.environ.setdefault('SCOPONE_EVAL_DEBUG', '0')  # abilita log di debug in valutazione
-os.environ.setdefault('SCOPONE_EVAL_MP_START', 'forkserver')  # metodo start multiprocessing per eval
+_DEFAULT_MP_START = 'spawn' if os.name == 'nt' else 'forkserver'
+os.environ.setdefault('SCOPONE_EVAL_MP_START', _DEFAULT_MP_START)  # metodo start multiprocessing per eval
 os.environ.setdefault('SCOPONE_EVAL_POOL_TIMEOUT_S', '0')  # timeout attesa risultati pool eval (0=illimitato)
 os.environ.setdefault('SCOPONE_ELO_DIFF_SCALE', '6.0')  # fattore per mappare diff punti -> Elo
 
@@ -224,7 +225,7 @@ os.environ.setdefault('SCOPONE_TRAIN_MCTS_DETS_EXACT', '4')  # dets exact (train
 # ===== Section: Misc/Debug (Both) =====
 # Targeted FD-level stderr filter to drop absl/TF CUDA registration warnings from C++
 _SILENCE_ABSL = os.environ.get('SCOPONE_SILENCE_ABSL', '1') == '1'
-if _SILENCE_ABSL:
+if _SILENCE_ABSL and os.name != 'nt':
     _SUPPRESS_SUBSTRINGS = (
         "All log messages before absl::InitializeLog() is called are written to STDERR",
         "Unable to register cuDNN factory",
@@ -259,8 +260,8 @@ if _SILENCE_ABSL:
     _t.start()
 
 os.environ.setdefault('ENV_DEVICE', 'cpu')
-## Imposta metodo mp sicuro per CUDA: forkserver (override con SCOPONE_MP_START)
-os.environ.setdefault('SCOPONE_MP_START', 'forkserver')
+## Imposta metodo mp sicuro per CUDA: forkserver su POSIX, spawn su Windows (override con SCOPONE_MP_START)
+os.environ.setdefault('SCOPONE_MP_START', _DEFAULT_MP_START)
 
 import torch
 from utils.device import get_compute_device

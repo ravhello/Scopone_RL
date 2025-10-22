@@ -5,6 +5,7 @@ os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 import torch
+import inspect
 import math
 import random
 import time
@@ -29,6 +30,24 @@ from algorithms.is_mcts import run_is_mcts
 # Force evaluation on CPU across the project for consistency and to avoid GPU H2D overhead in unbatched eval
 device = torch.device('cpu')
 
+try:
+    _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = 'weights_only' in inspect.signature(torch.load).parameters
+except (TypeError, ValueError):
+    _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = False
+
+
+def _safe_torch_load(path: str, map_location) -> object:
+    """Load torch checkpoints with weights_only when available, falling back for older PyTorch."""
+    kwargs = {'map_location': map_location}
+    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
+        kwargs['weights_only'] = True
+    try:
+        return torch.load(path, **kwargs)
+    except TypeError:
+        if kwargs.pop('weights_only', None) is not None:
+            return torch.load(path, **kwargs)
+        raise
+
 # Debug helper for parallel eval
 _DEF_FALSE = ['0','false','no','off']
 _DEF_TRUE = ['1','true','yes','on']
@@ -51,9 +70,22 @@ def _get_mp_ctx():
     meth = (os.environ.get('SCOPONE_EVAL_MP_START')
             or os.environ.get('SCOPONE_MP_START')
             or '').strip().lower()
+    available_methods = set(mp.get_all_start_methods())
+
+    def _resolve_method(preferred: str) -> str:
+        if preferred in available_methods:
+            return preferred
+        fallback = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
+        _dbg(f"mp start method '{preferred}' unavailable; using '{fallback}' instead")
+        return fallback
+
     if meth in ('spawn', 'fork', 'forkserver'):
-        _dbg(f"using mp start method from env: {meth}")
-        return mp.get_context(meth)
+        resolved = _resolve_method(meth)
+        if resolved != meth:
+            _dbg(f"requested mp start method '{meth}' unavailable; using '{resolved}'")
+        else:
+            _dbg(f"using mp start method from env: {resolved}")
+        return mp.get_context(resolved)
     # Heuristics: prefer spawn on WSL2 or when CUDA is available; else forkserver
     try:
         is_wsl = ('WSL_INTEROP' in os.environ) or ('microsoft' in platform.release().lower())
@@ -64,10 +96,12 @@ def _get_mp_ctx():
     except Exception:
         has_cuda = False
     if is_wsl or has_cuda:
-        _dbg("using mp start method: spawn (WSL/CUDA heuristic)")
-        return mp.get_context('spawn')
-    _dbg("using mp start method: forkserver (default)")
-    return mp.get_context('forkserver')
+        resolved = _resolve_method('spawn')
+        _dbg(f"using mp start method: {resolved} (WSL/CUDA heuristic)")
+        return mp.get_context(resolved)
+    resolved = _resolve_method('forkserver')
+    _dbg(f"using mp start method: {resolved} (default)")
+    return mp.get_context(resolved)
 
 def _get_eval_pool_timeout_seconds():
     """
@@ -303,11 +337,11 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
     actor_a = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_A]').to(device)
     actor_b = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_B]').to(device)
     if ckpt_a and os.path.isfile(ckpt_a):
-        st_a = torch.load(ckpt_a, map_location=device)
+        st_a = _safe_torch_load(ckpt_a, map_location=device)
         if isinstance(st_a, dict) and 'actor' in st_a:
             actor_a.load_state_dict(st_a['actor'])
     if ckpt_b and os.path.isfile(ckpt_b):
-        st_b = torch.load(ckpt_b, map_location=device)
+        st_b = _safe_torch_load(ckpt_b, map_location=device)
         if isinstance(st_b, dict) and 'actor' in st_b:
             actor_b.load_state_dict(st_b['actor'])
     actor_a.eval(); actor_b.eval()
@@ -571,11 +605,11 @@ def _eval_pair_chunk_worker(args):
     actor_a = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_A]').to(device)
     actor_b = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_B]').to(device)
     if ckpt_a and os.path.isfile(ckpt_a):
-        st_a = torch.load(ckpt_a, map_location=device)
+        st_a = _safe_torch_load(ckpt_a, map_location=device)
         if isinstance(st_a, dict) and 'actor' in st_a:
             actor_a.load_state_dict(st_a['actor'])
     if ckpt_b and os.path.isfile(ckpt_b):
-        st_b = torch.load(ckpt_b, map_location=device)
+        st_b = _safe_torch_load(ckpt_b, map_location=device)
         if isinstance(st_b, dict) and 'actor' in st_b:
             actor_b.load_state_dict(st_b['actor'])
     actor_a.eval(); actor_b.eval()
@@ -848,11 +882,11 @@ def _eval_pair_chunk_worker_dist(args):
     actor_a = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_A]').to(device)
     actor_b = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_B]').to(device)
     if ckpt_a and os.path.isfile(ckpt_a):
-        st_a = torch.load(ckpt_a, map_location=device)
+        st_a = _safe_torch_load(ckpt_a, map_location=device)
         if isinstance(st_a, dict) and 'actor' in st_a:
             actor_a.load_state_dict(st_a['actor'])
     if ckpt_b and os.path.isfile(ckpt_b):
-        st_b = torch.load(ckpt_b, map_location=device)
+        st_b = _safe_torch_load(ckpt_b, map_location=device)
         if isinstance(st_b, dict) and 'actor' in st_b:
             actor_b.load_state_dict(st_b['actor'])
     actor_a.eval(); actor_b.eval()
