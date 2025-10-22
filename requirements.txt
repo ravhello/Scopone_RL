@@ -19,3 +19,7 @@ pytest>=7.0
 # Optional (used with fallback in observation.compute_rank_probabilities_by_player)
 scipy>=1.10
 tensorboard>=2.12
+
+# Extras
+pygame>=2.5
+# tmux (system package; install via OS package manager, not via pip)

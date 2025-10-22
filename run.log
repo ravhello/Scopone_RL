@@ -1,0 +1,28 @@
+Using device: cpu
+Training compute device: cpu
+Self-play: ON
+Training threads: num_threads=19 interop=2
+TensorBoard auto-started at http://localhost:6006/ (logdir=/home/rikyr/Scopone_RL/runs)
+Parallel envs: 32  (SCOPONE_PROFILE=0)
+Train from both team transitions: OFF
+Opponent frozen: OFF
+Warm start mode: 2
+League startup refresh: OFF
+Eval cfg: games=1000 mcts=OFF sims=4 dets=2 kh=39
+MCTS depth limit: unlimited
+MCTS exact-solve when <= 20 remaining moves
+[horizon] adjusted to LCM(mb=4096, per_ep=20)=20480: 16384 -> 20480
+[seed] Using randomly generated seed: 834462016
+[seed] Using seed=834462016
+[league] Startup refresh disabled (SCOPONE_LEAGUE_REFRESH=0)
+[resume] Loaded agent(A) from checkpoints/ppo_ac_selfplay_20251021_181526.pth
+[episodes] it=1 horizon=20480 num_envs=32 episodes_hint=1024 episodes_per_env=32 total_env_episodes=1024
+[collector] num_envs=32 episodes_total_hint=1024 episodes_per_env_list(min..max)=32..32 total_env_episodes=1024
+[episodes] it=2 horizon=20480 num_envs=32 episodes_hint=1024 episodes_per_env=32 total_env_episodes=1024
+[collector] num_envs=32 episodes_total_hint=1024 episodes_per_env_list(min..max)=32..32 total_env_episodes=1024
+[episodes] it=3 horizon=20480 num_envs=32 episodes_hint=1024 episodes_per_env=32 total_env_episodes=1024
+[collector] num_envs=32 episodes_total_hint=1024 episodes_per_env_list(min..max)=32..32 total_env_episodes=1024
+[episodes] it=4 horizon=20480 num_envs=32 episodes_hint=1024 episodes_per_env=32 total_env_episodes=1024
+[collector] num_envs=32 episodes_total_hint=1024 episodes_per_env_list(min..max)=32..32 total_env_episodes=1024
+[episodes] it=5 horizon=20480 num_envs=32 episodes_hint=1024 episodes_per_env=32 total_env_episodes=1024
+[collector] num_envs=32 episodes_total_hint=1024 episodes_per_env_list(min..max)=32..32 total_env_episodes=1024

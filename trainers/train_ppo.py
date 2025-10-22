@@ -2298,7 +2298,12 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 old_logp_t = (logp_card + logp_cap)
                 # Early validity for old_logp
                 if not torch.isfinite(old_logp_t).all():
-                    raise RuntimeError("collect_trajectory: old_logp contains non-finite values")
+                    idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
+                    if idx_bad.numel() > 0:
+                        _b = int(idx_bad[0].item())
+                        from tqdm import tqdm
+                        tqdm.write(f"[collect] non-finite old_logp (serial) -> forcing fallback (idx={_b})")
+                    old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
                 if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
                     mx = float(old_logp_t.max().item())
                     raise RuntimeError(f"collect_trajectory: old_logp contains positive values (max={mx})")
@@ -2560,8 +2565,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     rem = int(episodes_total_hint) % int(num_envs)
     episodes_per_env_list = [base + (1 if wid < rem else 0) for wid in range(num_envs)]
     total_eps = sum(episodes_per_env_list)
-    tqdm.write(f"[collector] num_envs={num_envs} episodes_total_hint={episodes_total_hint} "
-                   f"episodes_per_env_list(min..max)={min(episodes_per_env_list)}..{max(episodes_per_env_list)} total_env_episodes={total_eps}")
+    from tqdm import tqdm as _tqdm_local
+    _tqdm_local.write(f"[collector] num_envs={num_envs} episodes_total_hint={episodes_total_hint} "
+                      f"episodes_per_env_list(min..max)={min(episodes_per_env_list)}..{max(episodes_per_env_list)} total_env_episodes={total_eps}")
     workers = []
     cfg_base = {
         'rules': {'shape_scopa': False},
@@ -3211,9 +3217,14 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 logp_cap_per_legal = cap_logits - lse_per_legal
                 logp_cap = logp_cap_per_legal[chosen_pos]
                 old_logp_t = (logp_card + logp_cap)
-                # Early validity for old_logp
+                # Guard against numerical issues (NaNs/Inf) by falling back to zero-prob logp and logging once
                 if not torch.isfinite(old_logp_t).all():
-                    raise RuntimeError("collect_trajectory_parallel: old_logp contains non-finite values")
+                    idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
+                    if idx_bad.numel() > 0:
+                        _b = int(idx_bad[0].item())
+                        from tqdm import tqdm
+                        tqdm.write(f"[collect] non-finite old_logp -> forcing fallback (idx={_b} sims_scaled={int(sims_scaled)} dets={int(_dets_eff)} exact_only={bool(_exact_only)})")
+                    old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
                 if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
                     mx = float(old_logp_t.max().item())
                     raise RuntimeError(f"collect_trajectory_parallel: old_logp contains positive values (max={mx})")

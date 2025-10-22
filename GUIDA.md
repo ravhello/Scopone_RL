@@ -198,3 +198,10 @@ Analizza i profiling del mio codice e dimmi dove viene speso più tempo. Poi ott
 
 Attivazione server:
 gcloud compute config-ssh
+
+tmux new -s scopone 'source /home/rikyr/Scopone_RL/.venv/bin/activate && exec bash'
+python3 main.py | tee -a run.log
+Ctrl+B seguito da D
+tmux attach -t scopone
+Per verificare che il processo resti vivo dopo il distacco: ps -ef | grep main.py o tmux ls
+tmux kill-session -t scopone
