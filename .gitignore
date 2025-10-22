@@ -49,3 +49,4 @@ runs/profiler/**
 # Scalene reports
 *scalene*.html
 *scalene*.json
+run.log
