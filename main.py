@@ -123,7 +123,7 @@ os.environ.setdefault('SCOPONE_ALTERNATE_ITERS', '1')
 os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
 
 # Refresh League from disk at startup (scan checkpoints/). 1=ON, 0=OFF
-os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '0')
+os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '1')
 
 # Parallel eval workers: 1=serial, >1 parallel via multiprocessing
 os.environ.setdefault('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1))))  # numero processi worker per eval

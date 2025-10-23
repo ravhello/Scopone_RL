@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
 from utils.device import get_compute_device, get_amp_dtype
 from utils.compile import maybe_compile_module, maybe_compile_function
+from utils.torch_load import safe_torch_load
 import os as _os
 device = get_compute_device()
 autocast_device = device.type
@@ -1169,7 +1170,7 @@ class ActionConditionedPPO:
         }, path)
 
     def load(self, path: str, map_location=None):
-        ckpt = torch.load(path, map_location=map_location or device)
+        ckpt = safe_torch_load(path, map_location=map_location or device)
         # Support multiple checkpoint formats:
         # 1) Full PPO checkpoint: {'actor','critic','opt_actor','opt_critic',...}
         # 2) Actor-only checkpoint: {'actor', ...}

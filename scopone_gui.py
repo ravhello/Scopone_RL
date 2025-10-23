@@ -5249,7 +5249,7 @@ class GameScreen(BaseScreen):
             
             # Card selection in hand
             hand_card = self.get_card_at_position(pos, area="hand")
-            if hand_card:
+            if hand_card is not None:
                 if hand_card == self.selected_hand_card:
                     self.selected_hand_card = None
                 else:
@@ -5259,7 +5259,7 @@ class GameScreen(BaseScreen):
             
             # Card selection on table
             table_card = self.get_card_at_position(pos, area="table")
-            if table_card:
+            if table_card is not None:
                 if table_card in self.selected_table_cards:
                     self.selected_table_cards.remove(table_card)
                 else:
@@ -5621,51 +5621,63 @@ class GameScreen(BaseScreen):
                     hand = hands.get(cp, [])
                     if len(hand) == 1:
                         the_card = hand[0]
-                        valid_actions = self.env.get_valid_actions() or []
-                        # Filter actions for the only card in hand
-                        filtered = []
-                        for act in valid_actions:
+                        valid_actions_raw = self.env.get_valid_actions()
+                        if valid_actions_raw is None:
+                            valid_actions = []
+                        elif torch.is_tensor(valid_actions_raw):
+                            valid_actions = list(valid_actions_raw) if valid_actions_raw.numel() > 0 else []
+                        elif isinstance(valid_actions_raw, (list, tuple)):
+                            valid_actions = list(valid_actions_raw)
+                        else:
                             try:
-                                pc, cc = decode_action_ids(act)
-                                if pc == the_card:
-                                    filtered.append((act, pc, cc))
-                            except ValueError:
-                                continue
-                        # No valid action yet (e.g., state not fully synced): do nothing but continue update
-                        if not filtered:
+                                valid_actions = list(valid_actions_raw)
+                            except TypeError:
+                                valid_actions = [valid_actions_raw]
+                        if valid_actions:
+                            # Filter actions for the only card in hand
                             filtered = []
-                        capture_options = [t for t in filtered if t[2]]
-                        multiple_captures = len(capture_options) > 1
-                        current_is_human = not self.players[self.current_player_id].is_ai
-                        # Choose action we would auto-play with
-                        if capture_options:
-                            chosen = capture_options[0]
-                        else:
-                            no_cap = next((t for t in filtered if not t[2]), None)
-                            if no_cap is None:
-                                no_cap = filtered[0]
-                            chosen = no_cap
-                        action, card_played, cards_captured = chosen
-                        if is_online and not is_host:
-                            # Client: never auto-play; host will broadcast authoritative move and animation cues
-                            self.status_message = "Waiting for host..."
-                        else:
-                            # Local or Host: perform animations and schedule env step
-                            if (not multiple_captures) or (not current_is_human):
-                                # Guard: during serialized client animations, don't inject extra local autoplay
-                                if not getattr(self, 'queued_client_moves', None):
-                                    self.create_move_animations(card_played, cards_captured, source_player_id=cp)
-                                    self.app.resources.play_sound("card_play")
-                                    self.waiting_for_animation = True
-                                    self.pending_action = action
-                                    self.autoplay_sent_for_turn = True
-                                    self._last_player_for_autoplay = cp
-                                    # Schedule 1s pacing for next auto turn
-                                    self.autoplay_delay_until = time.time() + 1.0
+                            for act in valid_actions:
+                                try:
+                                    pc, cc = decode_action_ids(act)
+                                    if pc == the_card:
+                                        filtered.append((act, pc, cc))
+                                except ValueError:
+                                    continue
+                            if filtered:
+                                capture_options = [t for t in filtered if t[2]]
+                                multiple_captures = len(capture_options) > 1
+                                current_is_human = not self.players[self.current_player_id].is_ai
+                                # Choose action we would auto-play with
+                                if capture_options:
+                                    chosen = capture_options[0]
+                                else:
+                                    no_cap = next((t for t in filtered if not t[2]), None)
+                                    if no_cap is None:
+                                        no_cap = filtered[0]
+                                    chosen = no_cap
+                                action, card_played, cards_captured = chosen
+                                if is_online and not is_host:
+                                    # Client: never auto-play; host will broadcast authoritative move and animation cues
+                                    self.status_message = "Waiting for host..."
+                                else:
+                                    # Local or Host: perform animations and schedule env step
+                                    if (not multiple_captures) or (not current_is_human):
+                                        # Guard: during serialized client animations, don't inject extra local autoplay
+                                        if not getattr(self, 'queued_client_moves', None):
+                                            self.create_move_animations(card_played, cards_captured, source_player_id=cp)
+                                            self.app.resources.play_sound("card_play")
+                                            self.waiting_for_animation = True
+                                            self.pending_action = action
+                                            self.autoplay_sent_for_turn = True
+                                            self._last_player_for_autoplay = cp
+                                            # Schedule 1s pacing for next auto turn
+                                            self.autoplay_delay_until = time.time() + 1.0
             except Exception as e:
                 if str(e) == "autoplay_pacing_delay":
-                    raise RuntimeError("Autoplay pacing delay") from e
-                raise
+                    # Skip autoplay logic this frame while pacing delay is active
+                    pass
+                else:
+                    raise
 
             # Handle AI turns (solo il server lo fa in modalità online)
             self.handle_ai_turns()
@@ -7219,9 +7231,22 @@ class GameScreen(BaseScreen):
         # Get observation and valid actions
         obs = self.env._get_observation(self.current_player_id)
         valid_actions = self.env.get_valid_actions()
-        
-        if not valid_actions:
+
+        if valid_actions is None:
             return
+
+        # Normalize the container so emptiness checks do not trigger tensor truthiness errors
+        if torch.is_tensor(valid_actions):
+            if valid_actions.numel() == 0:
+                return
+        else:
+            if not isinstance(valid_actions, (list, tuple)):
+                try:
+                    valid_actions = list(valid_actions)
+                except TypeError:
+                    valid_actions = [valid_actions]
+            if len(valid_actions) == 0:
+                return
         
         # Choose action using the AI agent
         action = ai.pick_action(obs, valid_actions, self.env)
@@ -8688,10 +8713,21 @@ class GameScreen(BaseScreen):
                 
         gs = getattr(self.env, 'game_state', {}) if self.env else {}
         # Strict: captured squads must be present and well-formed
-        captured = gs.get("captured_squads")
-        if not isinstance(captured, (list, tuple)) or len(captured) != 2:
+        captured_raw = gs.get("captured_squads")
+        if isinstance(captured_raw, dict):
+            captured = [
+                list(captured_raw.get(0) or []),
+                list(captured_raw.get(1) or []),
+            ]
+        elif isinstance(captured_raw, (list, tuple)) and len(captured_raw) == 2:
+            captured = [
+                list(captured_raw[0] or []),
+                list(captured_raw[1] or []),
+            ]
+        else:
             from utils.fallback import notify_fallback
-            notify_fallback('gui.score_panel.invalid_captured_squads')
+            detail = f"type={type(captured_raw).__name__}"
+            notify_fallback('gui.score_panel.invalid_captured_squads', details=detail)
         width = self.app.window_width
         height = self.app.window_height
         

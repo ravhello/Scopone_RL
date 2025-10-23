@@ -5,7 +5,6 @@ os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
 os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
 os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 import torch
-import inspect
 import math
 import random
 import time
@@ -24,29 +23,12 @@ except Exception:
     TB_AVAILABLE = False
 from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
+from utils.torch_load import safe_torch_load
 from algorithms.is_mcts import run_is_mcts
 # BeliefState legacy opzionale (non usato nello scenario corrente)
 
 # Force evaluation on CPU across the project for consistency and to avoid GPU H2D overhead in unbatched eval
 device = torch.device('cpu')
-
-try:
-    _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = 'weights_only' in inspect.signature(torch.load).parameters
-except (TypeError, ValueError):
-    _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = False
-
-
-def _safe_torch_load(path: str, map_location) -> object:
-    """Load torch checkpoints with weights_only when available, falling back for older PyTorch."""
-    kwargs = {'map_location': map_location}
-    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
-        kwargs['weights_only'] = True
-    try:
-        return torch.load(path, **kwargs)
-    except TypeError:
-        if kwargs.pop('weights_only', None) is not None:
-            return torch.load(path, **kwargs)
-        raise
 
 # Debug helper for parallel eval
 _DEF_FALSE = ['0','false','no','off']
@@ -337,11 +319,11 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
     actor_a = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_A]').to(device)
     actor_b = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_B]').to(device)
     if ckpt_a and os.path.isfile(ckpt_a):
-        st_a = _safe_torch_load(ckpt_a, map_location=device)
+        st_a = safe_torch_load(ckpt_a, map_location=device)
         if isinstance(st_a, dict) and 'actor' in st_a:
             actor_a.load_state_dict(st_a['actor'])
     if ckpt_b and os.path.isfile(ckpt_b):
-        st_b = _safe_torch_load(ckpt_b, map_location=device)
+        st_b = safe_torch_load(ckpt_b, map_location=device)
         if isinstance(st_b, dict) and 'actor' in st_b:
             actor_b.load_state_dict(st_b['actor'])
     actor_a.eval(); actor_b.eval()
@@ -605,11 +587,11 @@ def _eval_pair_chunk_worker(args):
     actor_a = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_A]').to(device)
     actor_b = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_B]').to(device)
     if ckpt_a and os.path.isfile(ckpt_a):
-        st_a = _safe_torch_load(ckpt_a, map_location=device)
+        st_a = safe_torch_load(ckpt_a, map_location=device)
         if isinstance(st_a, dict) and 'actor' in st_a:
             actor_a.load_state_dict(st_a['actor'])
     if ckpt_b and os.path.isfile(ckpt_b):
-        st_b = _safe_torch_load(ckpt_b, map_location=device)
+        st_b = safe_torch_load(ckpt_b, map_location=device)
         if isinstance(st_b, dict) and 'actor' in st_b:
             actor_b.load_state_dict(st_b['actor'])
     actor_a.eval(); actor_b.eval()
@@ -882,11 +864,11 @@ def _eval_pair_chunk_worker_dist(args):
     actor_a = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_A]').to(device)
     actor_b = maybe_compile_module(ActionConditionedActor(obs_dim=obs_dim), name='ActionConditionedActor[eval_B]').to(device)
     if ckpt_a and os.path.isfile(ckpt_a):
-        st_a = _safe_torch_load(ckpt_a, map_location=device)
+        st_a = safe_torch_load(ckpt_a, map_location=device)
         if isinstance(st_a, dict) and 'actor' in st_a:
             actor_a.load_state_dict(st_a['actor'])
     if ckpt_b and os.path.isfile(ckpt_b):
-        st_b = _safe_torch_load(ckpt_b, map_location=device)
+        st_b = safe_torch_load(ckpt_b, map_location=device)
         if isinstance(st_b, dict) and 'actor' in st_b:
             actor_b.load_state_dict(st_b['actor'])
     actor_a.eval(); actor_b.eval()

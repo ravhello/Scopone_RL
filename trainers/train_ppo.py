@@ -23,6 +23,7 @@ from utils.device import get_compute_device
 from selfplay.league import League
 from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
+from utils.torch_load import safe_torch_load
 from utils.seed import set_global_seeds, resolve_seed, temporary_seed
 from evaluation.eval import evaluate_pair_actors
 
@@ -1428,7 +1429,7 @@ def _load_frozen_actor(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
     actor = ActionConditionedActor(obs_dim=obs_dim)
     actor = maybe_compile_module(actor, name='ActionConditionedActor[trainer_partner]')
     try:
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = safe_torch_load(ckpt_path, map_location=device)
         if isinstance(ckpt, dict) and 'actor' in ckpt:
             actor.load_state_dict(ckpt['actor'])
         # else: leave randomly init
@@ -3479,7 +3480,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         # Deep validation: try loading the checkpoint to detect truncated/invalid formats
                         try:
                             _sz = os.path.getsize(fpath)
-                            _ck = torch.load(fpath, map_location='cpu')
+                            _ck = safe_torch_load(fpath, map_location='cpu')
                             del _ck
                         except Exception as _load_e:
                             tqdm.write(
