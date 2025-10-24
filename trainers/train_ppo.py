@@ -25,7 +25,7 @@ from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
 from utils.torch_load import safe_torch_load
 from utils.seed import set_global_seeds, resolve_seed, temporary_seed
-from evaluation.eval import evaluate_pair_actors
+from evaluation.eval import evaluate_pair_actors, evaluate_pair_actors_parallel
 
 import torch.optim as optim
 
@@ -3448,6 +3448,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             pth_seen = 0
             skipped = 0
             added_paths = []
+            workers_env = int(os.environ.get('SCOPONE_EVAL_WORKERS', '1') or 1)
             for root in roots:
                 if not os.path.isdir(root):
                     tqdm.write(f"[league-refresh] root '{root}' missing; skipping root scan")
@@ -3495,34 +3496,88 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             tqdm.write(f"[league] Refresh scan: roots={len(roots)} scanned_files={scanned} pth_seen={pth_seen} added={added} skipped={skipped} total_now={len(_league.history)}")
             if added > 0:
                 tqdm.write(f"[league] Refreshed from disk: +{added} new checkpoints (total={len(_league.history)})")
-            # Evaluate newly added checkpoints to update Elo
-            if added > 0:
-                # Reference is the current top1 among the pre-existing history, if any
-                ref_candidates = [p for p in old_hist if os.path.isfile(p)]
-                if len(ref_candidates) >= 1:
-                    # pick highest Elo among old history
-                    ref = max(ref_candidates, key=lambda p: float(_league.elo.get(p, 1000.0)))
-                    for npth in added_paths:
-                        if npth == ref:
+            # Evaluate each new checkpoint against the existing league members
+            if added_paths and old_hist:
+                base_count = len(old_hist)
+                new_count = len(added_paths)
+                total_matches = new_count * base_count + (new_count * (new_count - 1)) // 2
+                tqdm.write(f"[league-refresh] evaluating {new_count} new checkpoint(s) vs {base_count} existing | total matches = {total_matches}")
+                seq_id = 0
+                for npth in added_paths:
+                    if not os.path.isfile(npth):
+                        continue
+                    base_n = os.path.basename(npth)
+                    # vs existing history (old checkpoints)
+                    for ref in old_hist:
+                        if not os.path.isfile(ref) or ref == npth:
                             continue
-                        diff, bd = evaluate_pair_actors(npth, ref, games=eval_games, k_history=k_history,
-                                                     mcts=_make_mcts_cfg_for_eval(),
-                                                     belief_particles=(belief_particles if mcts_in_eval else 0),
-                                                     belief_ess_frac=belief_ess_frac,
-                                                     tqdm_desc=f"League refresh: {os.path.basename(npth)} vs top",
-                                                     tqdm_position=2)
+                        if os.path.basename(ref).lower().startswith('bootstrap'):
+                            continue
+                        base_ref = os.path.basename(ref)
+                        seq_id += 1
+                        diff, _ = evaluate_pair_actors_parallel(
+                            npth,
+                            ref,
+                            games=eval_games,
+                            k_history=k_history,
+                            mcts=_make_mcts_cfg_for_eval(),
+                            belief_particles=(belief_particles if mcts_in_eval else 0),
+                            belief_ess_frac=belief_ess_frac,
+                            num_workers=max(1, workers_env),
+                            tqdm_desc=f"League refresh #{seq_id}: {base_n} vs {base_ref}",
+                            tqdm_disable=False,
+                        )
                         _league.update_elo_from_diff(npth, ref, diff)
-                elif len(added_paths) >= 2:
-                    # Evaluate sequentially among new paths to seed relative Elo
-                    anchor = added_paths[0]
-                    for npth in added_paths[1:]:
-                        diff, bd = evaluate_pair_actors(npth, anchor, games=eval_games, k_history=k_history,
-                                                     mcts=_make_mcts_cfg_for_eval(),
-                                                     belief_particles=(belief_particles if mcts_in_eval else 0),
-                                                     belief_ess_frac=belief_ess_frac,
-                                                     tqdm_desc=f"League refresh: {os.path.basename(npth)} vs anchor",
-                                                     tqdm_position=2)
-                        _league.update_elo_from_diff(npth, anchor, diff)
+                        _league._save()
+                # ensure each pair of new checkpoints has at least one match
+                if len(added_paths) > 1:
+                    from itertools import combinations
+                    for a, b in combinations(added_paths, 2):
+                        if not os.path.isfile(a) or not os.path.isfile(b):
+                            continue
+                        seq_id += 1
+                        base_a = os.path.basename(a)
+                        base_b = os.path.basename(b)
+                        diff, _ = evaluate_pair_actors_parallel(
+                            a,
+                            b,
+                            games=eval_games,
+                            k_history=k_history,
+                            mcts=_make_mcts_cfg_for_eval(),
+                            belief_particles=(belief_particles if mcts_in_eval else 0),
+                            belief_ess_frac=belief_ess_frac,
+                            num_workers=max(1, workers_env),
+                            tqdm_desc=f"League refresh #{seq_id}: {base_a} vs {base_b}",
+                            tqdm_disable=False,
+                        )
+                        _league.update_elo_from_diff(a, b, diff)
+                        _league._save()
+            elif len(added_paths) > 1:
+                # No old history yet: run full round robin among the new checkpoints
+                from itertools import combinations
+                total_matches = (len(added_paths) * (len(added_paths) - 1)) // 2
+                tqdm.write(f"[league-refresh] evaluating {len(added_paths)} new checkpoint(s) (no history) | total matches = {total_matches}")
+                seq_id = 0
+                for a, b in combinations(added_paths, 2):
+                    if not os.path.isfile(a) or not os.path.isfile(b):
+                        continue
+                    seq_id += 1
+                    base_a = os.path.basename(a)
+                    base_b = os.path.basename(b)
+                    diff, _ = evaluate_pair_actors_parallel(
+                        a,
+                        b,
+                        games=eval_games,
+                        k_history=k_history,
+                        mcts=_make_mcts_cfg_for_eval(),
+                        belief_particles=(belief_particles if mcts_in_eval else 0),
+                        belief_ess_frac=belief_ess_frac,
+                        num_workers=max(1, workers_env),
+                        tqdm_desc=f"League refresh seed #{seq_id}: {base_a} vs {base_b}",
+                        tqdm_disable=False,
+                    )
+                    _league.update_elo_from_diff(a, b, diff)
+                    _league._save()
 
         _LP = globals().get('LINE_PROFILE_DECORATOR', None)
         if _LP is not None:
@@ -4086,14 +4141,14 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 if avg_return_A > best_return:
                     best_return = avg_return_A
                     os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-                    agent.save(best_ckpt_path.replace('.pth', '_teamA.pth'))
+                    agent.save(best_ckpt_path)
             else:
                 avg_return_B = float(batch_B['ret'].mean().detach().cpu().item()) if len(batch_B['ret']) else 0.0
                 avg_return = avg_return_B
                 if avg_return_B > (globals().get('_best_return_B', -1e9)):
                     _best_return_B = avg_return_B
                     os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-                    agent_teamB.save(best_ckpt_path.replace('.pth', '_teamB.pth'))
+                    agent_teamB.save(best_ckpt_path)
         else:
             if len(batch['ret']):
                 avg_return = float(batch['ret'].mean().detach().cpu().item())
@@ -4143,25 +4198,9 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     writer.add_scalar('league/mini_eval_wr', wr, it)
                     writer.add_scalar('league/elo_current', league.elo.get(cur_tmp, 1000.0), it)
                     writer.add_scalar('league/elo_previous', league.elo.get(prev_ckpt, 1000.0), it)
-                # salva checkpoint best wr con soglia/CI (Wilson interval)
-                import math
-                n = max(1, eval_games)
-                p = wr
-                z = 1.96
-                denom = 1 + z*z/n
-                center = p + z*z/(2*n)
-                margin = z*math.sqrt((p*(1-p)/n) + (z*z/(4*n*n)))
-                lower = (center - margin) / denom
-                improved = wr > best_wr
-                meets_threshold = lower >= 0.5  # lower bound sopra il 50%
-                if improved or meets_threshold:
-                    best_wr = max(best_wr, wr)
-                    os.makedirs(os.path.dirname(best_wr_ckpt_path), exist_ok=True)
-                    agent.save(best_wr_ckpt_path)
+                # aggiorna soglia best win-rate ma senza salvare un checkpoint dedicato
                 if wr > best_wr:
                     best_wr = wr
-                    os.makedirs(os.path.dirname(best_wr_ckpt_path), exist_ok=True)
-                    agent.save(best_wr_ckpt_path)
 
         # Aggiorna output terminale ad ogni iterazione
         def _to_float(x):
@@ -4270,60 +4309,43 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             # Timestamped filenames, with suffixes by mode
             from datetime import datetime as _dt
             ts = _dt.now().strftime('%Y%m%d_%H%M%S')
-            if use_selfplay:
-                out_A = ckpt_path.replace('.pth', f'_selfplay_{ts}.pth')
-                agent.save(out_A)
-                # Register only non-bootstrap
-                league.register(out_A)
-                # Elo evaluation: current vs best historical reference (top Elo)
-                if len(league.history) >= 2:
-                    # pick highest-Elo historical different from current
-                    hist = [p for p in league.history if p != out_A]
-                    if hist:
-                        ref = max(hist, key=lambda p: float(league.elo.get(p, 1000.0)))
-                        diff, _ = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
-                                                    mcts=_make_mcts_cfg_for_eval(),
-                                                    belief_particles=(belief_particles if mcts_in_eval else 0),
-                                                    belief_ess_frac=belief_ess_frac,
-                                                    tqdm_desc=f"Eval: A vs ref",
-                                                    tqdm_position=2)
-                        league.update_elo_from_diff(out_A, ref, diff)
-            else:
-                out_A = ckpt_path.replace('.pth', f'_teamA_{ts}.pth')
-                agent.save(out_A)
-                league.register(out_A)
-                out_B = ckpt_path.replace('.pth', f'_teamB_{ts}.pth') if dual_team_nets else None
+            out_A = ckpt_path.replace('.pth', f'_selfplay_{ts}.pth') if use_selfplay else ckpt_path.replace('.pth', f'_teamA_{ts}.pth')
+            agent.save(out_A)
+            league.register(out_A)
+            out_B = None
+            if dual_team_nets and not use_selfplay:
+                out_B = ckpt_path.replace('.pth', f'_teamB_{ts}.pth')
+                agent_teamB.save(out_B)
+                league.register(out_B)
+            # Elo evaluation: ensure new checkpoints play required matches
+            targets = [ref for ref in league.history if ref not in [out_A] + ([out_B] if out_B else [])]
+            if targets:
+                ref = max(targets, key=lambda p: float(league.elo.get(p, 1000.0)))
+                diffA, _ = evaluate_pair_actors(
+                    out_A,
+                    ref,
+                    games=eval_games,
+                    k_history=k_history,
+                    mcts=_make_mcts_cfg_for_eval(),
+                    belief_particles=(belief_particles if mcts_in_eval else 0),
+                    belief_ess_frac=belief_ess_frac,
+                    tqdm_desc=f"Eval: A vs ref",
+                    tqdm_position=2,
+                )
+                league.update_elo_from_diff(out_A, ref, diffA)
                 if out_B:
-                    agent_teamB.save(out_B)
-                    league.register(out_B)
-                # Elo evaluation: A vs B (if both) and vs league top1
-                if out_B:
-                    diffAB, bdAB = evaluate_pair_actors(out_A, out_B, games=eval_games, k_history=k_history,
-                                                   mcts=_make_mcts_cfg_for_eval(),
-                                                   belief_particles=(belief_particles if mcts_in_eval else 0),
-                                                   belief_ess_frac=belief_ess_frac,
-                                                   tqdm_desc=f"Eval: A vs B",
-                                                   tqdm_position=2)
-                    league.update_elo_from_diff(out_A, out_B, diffAB)
-                # pick highest-Elo historical reference different from the new ones
-                hist = [p for p in league.history if p not in ([out_A] + ([out_B] if out_B else []))]
-                if hist:
-                    ref = max(hist, key=lambda p: float(league.elo.get(p, 1000.0)))
-                    diffA, bdA = evaluate_pair_actors(out_A, ref, games=eval_games, k_history=k_history,
-                                                  mcts=_make_mcts_cfg_for_eval(),
-                                                  belief_particles=(belief_particles if mcts_in_eval else 0),
-                                                  belief_ess_frac=belief_ess_frac,
-                                                  tqdm_desc=f"Eval: A vs ref",
-                                                  tqdm_position=2)
-                    league.update_elo_from_diff(out_A, ref, diffA)
-                    if out_B:
-                        diffB, bdB = evaluate_pair_actors(out_B, ref, games=eval_games, k_history=k_history,
-                                                      mcts=_make_mcts_cfg_for_eval(),
-                                                      belief_particles=(belief_particles if mcts_in_eval else 0),
-                                                      belief_ess_frac=belief_ess_frac,
-                                                      tqdm_desc=f"Eval: B vs ref",
-                                                      tqdm_position=2)
-                        league.update_elo_from_diff(out_B, ref, diffB)
+                    diffB, _ = evaluate_pair_actors(
+                        out_B,
+                        ref,
+                        games=eval_games,
+                        k_history=k_history,
+                        mcts=_make_mcts_cfg_for_eval(),
+                        belief_particles=(belief_particles if mcts_in_eval else 0),
+                        belief_ess_frac=belief_ess_frac,
+                        tqdm_desc=f"Eval: B vs ref",
+                        tqdm_position=2,
+                    )
+                    league.update_elo_from_diff(out_B, ref, diffB)
             # After saving a real checkpoint, delete any bootstrap files present
             _bootstrap_path = os.path.join('checkpoints', 'bootstrap_random.pth')
             if os.path.isfile(_bootstrap_path):

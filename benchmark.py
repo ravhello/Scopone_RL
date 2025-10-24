@@ -2,33 +2,27 @@
 """
 Checkpoint Benchmark Script for Scopone AI
 
-This script compares different Team 0 checkpoints of the Scopone AI model by having them
+This script compares different checkpoints of the Scopone AI model by having them
 play against each other to benchmark their performance.
 
 Usage:
-  python benchmark_team0.py --checkpoint_dir checkpoints/ --games 1000
-  python benchmark_team0.py --checkpoints checkpoints/model_team0_ep5000.pth checkpoints/model_team0_ep10000.pth
+  python benchmark.py --checkpoint_dir checkpoints/ --games 1000
+  python benchmark.py --checkpoints checkpoints/model_team0_ep5000.pth checkpoints/model_team0_ep10000.pth
 """
 
 import torch
 import os
 import math
-# Default compile-friendly settings for CLI run
-os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_MODE', 'max-autotune')
-os.environ.setdefault('SCOPONE_TORCH_COMPILE_BACKEND', 'inductor')
-os.environ.setdefault('SCOPONE_INDUCTOR_AUTOTUNE', '1')
 import argparse
 import time
 import re
 from tqdm import tqdm
-from collections import defaultdict
 import itertools
 import glob
 import pandas as pd
+from typing import Optional, List
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
-from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import PatternFill, Font
 import openpyxl
 
 # Import the required components from the existing code
@@ -36,15 +30,93 @@ from environment import ScoponeEnvMA
 from algorithms.is_mcts import run_is_mcts
 from models.action_conditioned import ActionConditionedActor, CentralValueNet
 from utils.compile import maybe_compile_module
-import torch
+from utils.torch_load import safe_torch_load
+from evaluation.eval import evaluate_pair_actors_parallel, evaluate_pair_actors
+from selfplay.league import League
+
+
+def _ensure_default_eval_env() -> None:
+    """Align evaluation defaults with main.py so benchmark uses identical settings."""
+    defaults = {
+        'SCOPONE_TORCH_COMPILE': '0',
+        'SCOPONE_TORCH_COMPILE_MODE': 'reduce-overhead',
+        'SCOPONE_TORCH_COMPILE_BACKEND': 'inductor',
+        'SCOPONE_INDUCTOR_AUTOTUNE': '1',
+        'SCOPONE_EVAL_GAMES': '1000',
+        'SCOPONE_EVAL_K_HISTORY': '39',
+        'SCOPONE_EVAL_USE_MCTS': '0',
+        'SCOPONE_EVAL_MCTS_C_PUCT': '1.0',
+        'SCOPONE_EVAL_MCTS_ROOT_TEMP': '0.0',
+        'SCOPONE_EVAL_MCTS_PRIOR_SMOOTH_EPS': '0.0',
+        'SCOPONE_EVAL_MCTS_DIRICHLET_ALPHA': '0.25',
+        'SCOPONE_EVAL_MCTS_DIRICHLET_EPS': '0.25',
+        'SCOPONE_EVAL_MCTS_SIMS': '4',
+        'SCOPONE_EVAL_MCTS_DETS_PRIOR': '2',
+        'SCOPONE_EVAL_BELIEF_PARTICLES': '0',
+        'SCOPONE_EVAL_BELIEF_ESS_FRAC': '0.5',
+        'SCOPONE_EVAL_MCTS_SCALING': '1',
+        'SCOPONE_EVAL_MCTS_PROGRESS_START': '0.25',
+        'SCOPONE_EVAL_MCTS_PROGRESS_FULL': '0.75',
+        'SCOPONE_EVAL_MCTS_MIN_SIMS': '0',
+        'SCOPONE_EVAL_MCTS_TRAIN_FACTOR': '1.0',
+        'SCOPONE_EVAL_POOL_TIMEOUT_S': '0',
+        'SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES': '12',
+        'SCOPONE_EVAL_MCTS_EXACT_ONLY': '1',
+        'SCOPONE_EVAL_MCTS_EXACT_COVER_FRAC': '70',
+        'SCOPONE_EVAL_MCTS_DETS_EXACT': '4',
+        'SCOPONE_EVAL_WORKERS': str(max(1, (os.cpu_count() or 1))),
+        'SCOPONE_ELO_DIFF_SCALE': '6.0',
+        'TQDM_DISABLE': '0',
+        'SCOPONE_WORKER_THREADS': '1',
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+    # Force evaluation to run on CPU for stability (match main.py defaults)
+    os.environ['SCOPONE_DEVICE'] = 'cpu'
+    os.environ['SCOPONE_TRAIN_DEVICE'] = 'cpu'
+    os.environ['ENV_DEVICE'] = 'cpu'
+    # Hide CUDA devices unless explicitly re-enabled by the user
+    if os.environ.get('CUDA_VISIBLE_DEVICES', None) not in ('', '-1'):
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+
+_ensure_default_eval_env()
+
+
+def _build_eval_mcts_cfg() -> Optional[dict]:
+    """Construct an evaluation MCTS config mirroring main.py defaults."""
+    use_mcts = str(os.environ.get('SCOPONE_EVAL_USE_MCTS', '1')).strip().lower() in ['1', 'true', 'yes', 'on']
+    if not use_mcts:
+        return None
+    try:
+        sims = int(os.environ.get('SCOPONE_EVAL_MCTS_SIMS', '4'))
+    except ValueError:
+        sims = 4
+    try:
+        dets = int(os.environ.get('SCOPONE_EVAL_MCTS_DETS_PRIOR', '2'))
+    except ValueError:
+        dets = 2
+    cfg = {
+        'sims': max(0, sims),
+        'dets': max(1, dets),
+        'c_puct': float(os.environ.get('SCOPONE_EVAL_MCTS_C_PUCT', '1.0')),
+        'root_temp': float(os.environ.get('SCOPONE_EVAL_MCTS_ROOT_TEMP', '0.0')),
+        'prior_smooth_eps': float(os.environ.get('SCOPONE_EVAL_MCTS_PRIOR_SMOOTH_EPS', '0.0')),
+        'root_dirichlet_alpha': float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_ALPHA', '0.25')),
+        'root_dirichlet_eps': float(os.environ.get('SCOPONE_EVAL_MCTS_DIRICHLET_EPS', '0.25')),
+        'robust_child': True,
+        'progress_start': float(os.environ.get('SCOPONE_EVAL_MCTS_PROGRESS_START', '0.25')),
+        'progress_full': float(os.environ.get('SCOPONE_EVAL_MCTS_PROGRESS_FULL', '0.75')),
+        'min_sims': int(os.environ.get('SCOPONE_EVAL_MCTS_MIN_SIMS', '0')),
+        'train_factor': float(os.environ.get('SCOPONE_EVAL_MCTS_TRAIN_FACTOR', '1.0')),
+    }
+    return cfg
  
 
 # Device selection with overrides
-device = torch.device(os.environ.get(
-    'SCOPONE_DEVICE',
-    ('cuda' if torch.cuda.is_available() and os.environ.get('TESTS_FORCE_CPU') != '1' else 'cpu')
-))
-print(f"Using device: {device}")
+# Force CPU device regardless of environment or CUDA availability
+device = torch.device('cpu')
+#print(f"Using device: {device}")
 
 # Regole di default per l'ambiente (modalità standard senza varianti)
 # Nota: la variante "asso_piglia_tutto" è disattivata e quindi ignorata in questo script di benchmark.
@@ -68,7 +140,7 @@ def load_actor_critic(ckpt_path: str):
     # Enable compiled versions when requested (works on CPU with inductor)
     actor = maybe_compile_module(actor, name='ActionConditionedActor[benchmark]')
     critic = maybe_compile_module(critic, name='CentralValueNet[benchmark]')
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = safe_torch_load(ckpt_path, map_location=device)
     # se si usa algorithms/ppo_ac save
     if 'actor' in ckpt and 'critic' in ckpt:
         actor.load_state_dict(ckpt['actor'])
@@ -108,7 +180,7 @@ def play_game(actor1, actor2, starting_player=0, use_mcts=False, sims=128, dets=
         # Get valid actions
         valid_actions = env.get_valid_actions()
         
-        if not valid_actions:
+        if len(valid_actions) == 0:
             print("\n[ERROR] No valid actions available!")
             break
         
@@ -234,23 +306,6 @@ def play_game(actor1, actor2, starting_player=0, use_mcts=False, sims=128, dets=
     winner = 0 if agent1_score > agent2_score else 1 if agent2_score > agent1_score else -1
     
     return winner, [agent1_score, agent2_score], len(env.game_state["history"])
-
-def load_actor_critic(ckpt_path: str):
-    actor = ActionConditionedActor()
-    critic = CentralValueNet()
-    # Enable compiled versions when requested (works on CPU with inductor)
-    actor = maybe_compile_module(actor, name='ActionConditionedActor[benchmark]')
-    critic = maybe_compile_module(critic, name='CentralValueNet[benchmark]')
-    ckpt = torch.load(ckpt_path, map_location=device)
-    # se si usa algorithms/ppo_ac save
-    if 'actor' in ckpt and 'critic' in ckpt:
-        actor.load_state_dict(ckpt['actor'])
-        critic.load_state_dict(ckpt['critic'])
-    else:
-        raise RuntimeError('No weights in checkpoint')
-    return actor, critic
-
-
 def main_cli():
     import argparse
     parser = argparse.ArgumentParser(description='Benchmark Scopone with optional IS-MCTS')
@@ -258,9 +313,9 @@ def main_cli():
     parser.add_argument('--sims', type=int, default=128, help='Number of MCTS simulations')
     parser.add_argument('--dets', type=int, default=16, help='Number of belief determinisations per search')
     parser.add_argument('--compact', action='store_true', help='Use compact observation')
-    parser.add_argument('--k-history', type=int, default=12, help='Recent moves for compact observation')
+    parser.add_argument('--k-history', type=int, default=39, help='Recent moves for compact observation')
     parser.add_argument('--ckpt', type=str, default='', help='Checkpoint path for actor/critic (optional)')
-    parser.add_argument('--games', type=int, default=10, help='Number of games to play')
+    parser.add_argument('--games', type=int, default=1000, help='Number of games to play')
     args = parser.parse_args()
     # Placeholder for agent loading and running a quick game
     actor, critic = load_actor_critic(args.ckpt) if args.ckpt else (maybe_compile_module(ActionConditionedActor(), name='ActionConditionedActor[benchmark]'),
@@ -271,7 +326,7 @@ def main_cli():
         while not done:
             obs = env._get_observation(env.current_player)
             legals = env.get_valid_actions()
-            if not legals:
+            if len(legals) == 0:
                 break
             if args.mcts:
                 def policy_fn(o, leg):
@@ -351,10 +406,10 @@ def main_cli():
             _, _, done, _ = env.step(action)
     print('Benchmark completed.')
 
-def find_checkpoints(checkpoint_dir, pattern="*team0*ep*.pth"):
+def find_checkpoints(checkpoint_dir, pattern="*.pth"):
     """Find Team 0 checkpoint files in the specified directory."""
     if os.path.isfile(checkpoint_dir):
-        return [checkpoint_dir]
+        return [os.path.normpath(checkpoint_dir)]
     
     checkpoint_pattern = os.path.join(checkpoint_dir, pattern)
     checkpoint_files = glob.glob(checkpoint_pattern)
@@ -365,6 +420,7 @@ def find_checkpoints(checkpoint_dir, pattern="*team0*ep*.pth"):
                              if '_ep' in x else float('inf'))
     except Exception as e:
         raise RuntimeError('Failed to sort checkpoint files by episode number') from e
+    checkpoint_files = [os.path.normpath(p) for p in checkpoint_files]
     
     return checkpoint_files
 
@@ -383,461 +439,381 @@ def extract_episode_number(checkpoint_path):
     # If still no number, return a very large number to place at the end
     return float('inf')
 
-def evaluate_checkpoints(checkpoint_paths, num_games=10000):
-    """Evaluate Team 0 checkpoints against each other in head-to-head matches."""
+
+def checkpoint_display_name(checkpoint_path: str) -> str:
+    """Return a readable name for a checkpoint based on its episode number."""
+    episode = extract_episode_number(checkpoint_path)
+    return f"ep{episode}" if episode != float('inf') else os.path.basename(checkpoint_path).replace(".pth", "")
+
+def canonicalize_league_paths(league: League) -> None:
+    """Normalize league history/Elo paths to the local OS format."""
+    new_history: List[str] = []
+    for path in getattr(league, 'history', []):
+        canon = os.path.normpath(path)
+        if canon not in new_history:
+            new_history.append(canon)
+    new_elo = {}
+    for path, value in getattr(league, 'elo', {}).items():
+        canon = os.path.normpath(path)
+        new_elo[canon] = value
+    if new_history != league.history or set(new_elo.keys()) != set(league.elo.keys()):
+        league.history = new_history
+        league.elo = new_elo
+        try:
+            league._save()
+        except Exception:
+            pass
+
+def evaluate_checkpoints(checkpoint_infos: List[dict],
+                         num_games: Optional[int] = None,
+                         league: Optional[League] = None,
+                         num_workers: Optional[int] = None,
+                         k_history: Optional[int] = None,
+                         show_progress: bool = True):
+    """Evaluate checkpoints head-to-head using the parallel eval pipeline."""
     results = {}
-    
-    # Load all models (actor/critic)
-    models = {}
-    for path in checkpoint_paths:
-        # Extract episode number for better naming
-        episode_num = extract_episode_number(path)
-        name = f"ep{episode_num}" if episode_num != float('inf') else os.path.basename(path).replace(".pth", "")
-        
-        print(f"Loading actor/critic from checkpoint: {path} as {name}")
-        models[name] = load_actor_critic(path)
-    
-    # Play games between all pairs of agents (each pair plays only once)
-    matchups = list(itertools.combinations(models.keys(), 2))
-    
-    for agent1_name, agent2_name in matchups:
-        print(f"\nEvaluating: {agent1_name} vs {agent2_name}")
-        actor1, critic1 = models[agent1_name]
-        actor2, critic2 = models[agent2_name]
-        
-        matchup_key = f"{agent1_name}_vs_{agent2_name}"
-        
-        results[matchup_key] = {
-            "games": num_games,
-            "agent1_wins": 0,
-            "agent2_wins": 0,
-            "draws": 0,
-            "agent1_score_total": 0,
-            "agent2_score_total": 0,
-            "agent1_score_distribution": defaultdict(int),
-            "agent2_score_distribution": defaultdict(int),
-            "first_starter_wins": 0,
-            "game_lengths": []
-        }
-        
-        # Progress bar
-        pbar = tqdm(total=num_games)
-        
-        # Play num_games games with rotation of starting player
-        for game_idx in range(num_games):
-            # Rotate starting player every game
-            starting_player = game_idx % 4
-            
-            # Play game
-            winner, scores, game_length = play_game(actor1, actor2, starting_player)
-            
-            # Record results
-            agent1_score, agent2_score = scores
-            
-            if winner == 0:  # Agent 1 won
-                results[matchup_key]["agent1_wins"] += 1
-                # Check if the starting team won
-                if starting_player in [0, 2]:  # Team 0 started
-                    results[matchup_key]["first_starter_wins"] += 1
-            elif winner == 1:  # Agent 2 won
-                results[matchup_key]["agent2_wins"] += 1
-                # Check if the starting team won
-                if starting_player in [1, 3]:  # Team 1 started
-                    results[matchup_key]["first_starter_wins"] += 1
+    matchups = list(itertools.combinations(checkpoint_infos, 2))
+    total_pairs = len(matchups)
+
+    env_default_games = int(os.environ.get('SCOPONE_EVAL_GAMES', '1000') or 1000)
+    games_to_play = int(num_games) if (num_games is not None and num_games > 0) else env_default_games
+    games_to_play = max(1, games_to_play)
+
+    env_workers_default = int(os.environ.get('SCOPONE_EVAL_WORKERS', str(max(1, (os.cpu_count() or 1))))) or 1
+    effective_workers = max(1, int(num_workers)) if num_workers is not None else max(1, env_workers_default)
+
+    env_k_history = int(os.environ.get('SCOPONE_EVAL_K_HISTORY', '39') or 39)
+    effective_k_history = int(k_history) if k_history is not None else env_k_history
+
+    mcts_cfg = _build_eval_mcts_cfg()
+    belief_particles = int(os.environ.get('SCOPONE_EVAL_BELIEF_PARTICLES', '0') or 0)
+    belief_ess = float(os.environ.get('SCOPONE_EVAL_BELIEF_ESS_FRAC', '0.5') or 0.5)
+
+    print(f"[benchmark] Using {effective_workers} worker(s) | games per matchup={games_to_play} | k_history={effective_k_history}")
+
+    prev_workers_env_global = os.environ.get('SCOPONE_EVAL_WORKERS')
+    os.environ['SCOPONE_EVAL_WORKERS'] = str(max(1, effective_workers))
+    try:
+        for pair_idx, (info_a, info_b) in enumerate(matchups, start=1):
+            name_a = info_a["name"]
+            name_b = info_b["name"]
+            path_a = info_a["file_path"]
+            path_b = info_b["file_path"]
+
+            print(f"\nEvaluating ({pair_idx}/{total_pairs}): {name_a} vs {name_b}")
+            tqdm_desc = f"{name_a} vs {name_b}"
+            use_parallel = effective_workers > 1 and games_to_play > 1
+
+            if use_parallel:
+                diff_eval, breakdown = evaluate_pair_actors_parallel(
+                    path_a,
+                    path_b,
+                    games=games_to_play,
+                    k_history=effective_k_history,
+                    mcts=mcts_cfg,
+                    belief_particles=belief_particles,
+                    belief_ess_frac=belief_ess,
+                    num_workers=effective_workers,
+                    tqdm_desc=tqdm_desc,
+                    tqdm_disable=not show_progress,
+                )
             else:
-                results[matchup_key]["draws"] += 1
-            
-            # Record scores
-            results[matchup_key]["agent1_score_total"] += agent1_score
-            results[matchup_key]["agent2_score_total"] += agent2_score
-            
-            # Update score distributions
-            results[matchup_key]["agent1_score_distribution"][agent1_score] += 1
-            results[matchup_key]["agent2_score_distribution"][agent2_score] += 1
-            
-            # Record game length
-            results[matchup_key]["game_lengths"].append(game_length)
-            
-            # Calculate win rates for progress bar
-            agent1_wins = results[matchup_key]["agent1_wins"]
-            agent2_wins = results[matchup_key]["agent2_wins"]
-            win_percentage1 = (agent1_wins / (game_idx + 1)) * 100
-            win_percentage2 = (agent2_wins / (game_idx + 1)) * 100
-            
-            pbar.update(1)
-            pbar.set_description(
-                f"{agent1_name}: {agent1_wins} ({win_percentage1:.1f}%), "
-                f"{agent2_name}: {agent2_wins} ({win_percentage2:.1f}%)"
-            )
-        
-        pbar.close()
-        
-        # Calculate average scores
-        results[matchup_key]["agent1_avg_score"] = results[matchup_key]["agent1_score_total"] / num_games
-        results[matchup_key]["agent2_avg_score"] = results[matchup_key]["agent2_score_total"] / num_games
-        
-        # Calculate detailed win percentages
-        agent1_total_wins = results[matchup_key]["agent1_wins"]
-        agent2_total_wins = results[matchup_key]["agent2_wins"]
-        total_decided_games = agent1_total_wins + agent2_total_wins
-        
-        # Calculate first-starter advantage
-        first_starter_wins = results[matchup_key]["first_starter_wins"] 
-        first_starter_advantage = first_starter_wins / total_decided_games if total_decided_games > 0 else 0.5
-        
-        agent1_win_pct = agent1_total_wins / num_games * 100
-        agent2_win_pct = agent2_total_wins / num_games * 100
-        draw_pct = results[matchup_key]["draws"] / num_games * 100
-        
-        # Print detailed summary
-        print(f"\nResults for {agent1_name} vs {agent2_name}:")
-        print(f"  {agent1_name} wins: {agent1_total_wins} ({agent1_win_pct:.1f}%)")
-        print(f"  {agent2_name} wins: {agent2_total_wins} ({agent2_win_pct:.1f}%)")
-        print(f"  Draws: {results[matchup_key]['draws']} ({draw_pct:.1f}%)")
-        print(f"  First-starter advantage: {first_starter_advantage:.2f} (1.0 = 100% advantage, 0.5 = no advantage)")
-        print(f"  Average score {agent1_name}: {results[matchup_key]['agent1_avg_score']:.2f}")
-        print(f"  Average score {agent2_name}: {results[matchup_key]['agent2_avg_score']:.2f}")
-        print(f"  Average game length: {sum(results[matchup_key]['game_lengths'])/len(results[matchup_key]['game_lengths']):.1f} moves")
-    
+                prev_local_workers = os.environ.get('SCOPONE_EVAL_WORKERS')
+                os.environ['SCOPONE_EVAL_WORKERS'] = '1'
+                try:
+                    diff_eval, breakdown = evaluate_pair_actors(
+                        path_a,
+                        path_b,
+                        games=games_to_play,
+                        k_history=effective_k_history,
+                        mcts=mcts_cfg,
+                        belief_particles=belief_particles,
+                        belief_ess_frac=belief_ess,
+                        tqdm_desc=tqdm_desc,
+                        tqdm_position=0,
+                        tqdm_disable=not show_progress,
+                    )
+                finally:
+                    if prev_local_workers is None:
+                        os.environ.pop('SCOPONE_EVAL_WORKERS', None)
+                    else:
+                        os.environ['SCOPONE_EVAL_WORKERS'] = prev_local_workers
+
+            meta = breakdown.get('meta') or {}
+            win_rate_a = max(0.0, min(1.0, float(meta.get('win_rate_agent1', meta.get('win_rate', 0.0)))))
+            win_rate_b = max(0.0, min(1.0, float(meta.get('win_rate_agent2', 1.0 - win_rate_a))))
+            draw_rate = max(0.0, min(1.0, float(meta.get('draw_rate', 1.0 - win_rate_a - win_rate_b))))
+            if 'actor_avg_score_agent1' in meta and 'actor_avg_score_agent2' in meta:
+                avg_score_a = float(meta.get('actor_avg_score_agent1', 0.0))
+                avg_score_b = float(meta.get('actor_avg_score_agent2', 0.0))
+            else:
+                team_a_stats = breakdown.get(0, {}) or {}
+                team_b_stats = breakdown.get(1, {}) or {}
+                avg_score_a = float(team_a_stats.get('total', 0.0))
+                avg_score_b = float(team_b_stats.get('total', 0.0))
+            diff_from_scores = avg_score_a - avg_score_b
+
+        matchup_key = f"{name_a}_vs_{name_b}"
+        results[matchup_key] = {
+            "games": games_to_play,
+            "win_rate_agent1": win_rate_a,
+            "win_rate_agent2": win_rate_b,
+            "draw_rate": draw_rate,
+            "diff_avg": float(diff_from_scores),
+            "agent1_avg_score": avg_score_a,
+            "agent2_avg_score": avg_score_b,
+            "breakdown": breakdown,
+            "agent1_path": info_a["league_key"],
+            "agent2_path": info_b["league_key"],
+            "agent1_name": name_a,
+            "agent2_name": name_b,
+        }
+
+        print(f"  Win rate {name_a}: {win_rate_a * 100:.1f}%")
+        print(f"  Win rate {name_b}: {win_rate_b * 100:.1f}%")
+        print(f"  Draw rate: {draw_rate * 100:.1f}%")
+        print(f"  Avg score {name_a}: {avg_score_a:.2f}")
+        print(f"  Avg score {name_b}: {avg_score_b:.2f}")
+        print(f"  Avg diff ({name_a} - {name_b}): {diff_from_scores:.2f}")
+
+        if league is not None:
+            league.update_elo_from_diff(info_a["league_key"], info_b["league_key"], diff_from_scores)
+            try:
+                league._save()
+            except Exception:
+                pass
+            elo_a = league.elo.get(info_a["league_key"], 1000.0)
+            elo_b = league.elo.get(info_b["league_key"], 1000.0)
+        print(f"  Updated league Elo: {name_a} -> {elo_a:.1f}, {name_b} -> {elo_b:.1f}")
+
+    finally:
+        if prev_workers_env_global is None:
+            os.environ.pop('SCOPONE_EVAL_WORKERS', None)
+        else:
+            os.environ['SCOPONE_EVAL_WORKERS'] = prev_workers_env_global
+
     return results
 
-def generate_excel_comparison(checkpoint_paths, results, output_file):
+
+
+
+def generate_excel_comparison(checkpoint_infos: List[dict], results, output_file):
     """
     Generate an Excel file with comparative results between models.
     Each metric has its own dedicated sheet.
     """
-    # Extract checkpoint names and episode numbers
     checkpoints_info = []
-    for path in checkpoint_paths:
-        episode = extract_episode_number(path)
-        name = f"ep{episode}" if episode != float('inf') else os.path.basename(path).replace(".pth", "")
-        checkpoints_info.append((name, episode, path))
-    
-    # Sort checkpoints by episode number
+    for info in checkpoint_infos:
+        file_path = info["file_path"]
+        episode = extract_episode_number(file_path)
+        name = info["name"]
+        checkpoints_info.append((name, episode, file_path))
+
     checkpoints_info.sort(key=lambda x: x[1])
-    
-    # Get model names
-    model_names = [info[0] for info in checkpoints_info]
-    
-    # Create DataFrames for different metrics
-    win_rate_data = pd.DataFrame(index=model_names, columns=model_names)
-    score_diff_data = pd.DataFrame(index=model_names, columns=model_names)
-    starter_advantage_data = pd.DataFrame(index=model_names, columns=model_names)
-    game_length_data = pd.DataFrame(index=model_names, columns=model_names)
-    draws_data = pd.DataFrame(index=model_names, columns=model_names)
-    
-    # Initialize DataFrames with dash in diagonal
-    for i, model1 in enumerate(model_names):
-        for j, model2 in enumerate(model_names):
-            if i == j:
-                win_rate_data.loc[model1, model2] = "—"
-                score_diff_data.loc[model1, model2] = "—"
-                starter_advantage_data.loc[model1, model2] = "—"
-                game_length_data.loc[model1, model2] = "—"
-                draws_data.loc[model1, model2] = "—"
-            else:
-                win_rate_data.loc[model1, model2] = "N/A"
-                score_diff_data.loc[model1, model2] = "N/A"
-                starter_advantage_data.loc[model1, model2] = "N/A"
-                game_length_data.loc[model1, model2] = "N/A"
-                draws_data.loc[model1, model2] = "N/A"
-    
-    # Fill in the metric matrices
-    for matchup_key, data in results.items():
-        agents = matchup_key.split("_vs_")
-        model1, model2 = agents
-        
-        # Win rates
-        model1_win_rate = data['agent1_wins'] / data['games'] * 100
-        model2_win_rate = data['agent2_wins'] / data['games'] * 100
-        win_rate_data.loc[model1, model2] = f"{model1_win_rate:.1f}%"
-        win_rate_data.loc[model2, model1] = f"{model2_win_rate:.1f}%"
-        
-        # Score differences
-        score_diff = data['agent1_avg_score'] - data['agent2_avg_score']
-        score_diff_data.loc[model1, model2] = f"{score_diff:.2f}"
-        score_diff_data.loc[model2, model1] = f"{-score_diff:.2f}"
-        
-        # First-starter advantage
-        total_decided_games = data['agent1_wins'] + data['agent2_wins']
-        if total_decided_games > 0:
-            first_starter_advantage = data['first_starter_wins'] / total_decided_games
-            starter_advantage_data.loc[model1, model2] = f"{first_starter_advantage:.2f}"
-            starter_advantage_data.loc[model2, model1] = f"{first_starter_advantage:.2f}"  # Same value for both directions
-        else:
-            starter_advantage_data.loc[model1, model2] = "N/A"
-            starter_advantage_data.loc[model2, model1] = "N/A"
-        
-        # Game length
-        avg_game_length = sum(data['game_lengths']) / len(data['game_lengths'])
-        game_length_data.loc[model1, model2] = f"{avg_game_length:.1f}"
-        game_length_data.loc[model2, model1] = f"{avg_game_length:.1f}"  # Same value for both directions
-        
-        # Draws percentage
-        draw_pct = data['draws'] / data['games'] * 100
-        draws_data.loc[model1, model2] = f"{draw_pct:.1f}%"
-        draws_data.loc[model2, model1] = f"{draw_pct:.1f}%"  # Same value for both directions
-    
-    # Create Excel workbook
+    model_names = [name for name, _, _ in checkpoints_info]
+
+    def _empty_matrix():
+        return pd.DataFrame(float('nan'), index=model_names, columns=model_names)
+
+    win_rate_matrix = _empty_matrix()
+    score_diff_matrix = _empty_matrix()
+    avg_score_matrix = _empty_matrix()
+    draw_rate_matrix = _empty_matrix()
+
+    for data in results.values():
+        name_a = data["agent1_name"]
+        name_b = data["agent2_name"]
+        win_rate_matrix.loc[name_a, name_b] = data["win_rate_agent1"] * 100.0
+        win_rate_matrix.loc[name_b, name_a] = data["win_rate_agent2"] * 100.0
+        score_diff_matrix.loc[name_a, name_b] = data["diff_avg"]
+        score_diff_matrix.loc[name_b, name_a] = -data["diff_avg"]
+        avg_score_matrix.loc[name_a, name_b] = data["agent1_avg_score"]
+        avg_score_matrix.loc[name_b, name_a] = data["agent2_avg_score"]
+        draw_rate_matrix.loc[name_a, name_b] = data["draw_rate"] * 100.0
+        draw_rate_matrix.loc[name_b, name_a] = data["draw_rate"] * 100.0
+
     wb = Workbook()
-    
-    # Create Summary sheet
     summary_sheet = wb.active
     summary_sheet.title = "Summary"
-    
-    # Add headers
-    summary_sheet['A1'] = "Team 0 Agent Comparison Summary"
+
+    summary_sheet['A1'] = "Checkpoint Benchmark Summary"
     summary_sheet['A1'].font = Font(bold=True, size=14)
-    summary_sheet.merge_cells('A1:F1')
-    
-    summary_sheet['A3'] = "Model"
-    summary_sheet['B3'] = "Episodes"
-    summary_sheet['C3'] = "Average Win Rate (%)"
-    summary_sheet['D3'] = "Average Score Diff"
-    summary_sheet['E3'] = "First-Starter Advantage"
-    summary_sheet['F3'] = "Path"
-    
-    # Bold the headers
-    for cell in summary_sheet['A3:F3'][0]:
+    summary_sheet.merge_cells('A1:E1')
+
+    headers = ["Model", "Episodes", "Average Win Rate (%)", "Average Score Diff", "Average Draw Rate (%)", "Path"]
+    for col_idx, header in enumerate(headers, start=1):
+        cell = summary_sheet.cell(row=3, column=col_idx, value=header)
         cell.font = Font(bold=True)
-    
-    # Fill summary data
-    for row_idx, (name, episode, path) in enumerate(checkpoints_info, start=4):
-        # Calculate average metrics against all other models
-        win_rates = []
-        score_diffs = []
-        starter_advantages = []
-        
-        for other_name in model_names:
-            if other_name != name:
-                # Win rates
-                win_rate_str = win_rate_data.loc[name, other_name]
-                if win_rate_str != "N/A" and win_rate_str != "—":
-                    win_rates.append(float(win_rate_str.strip('%')))
-                
-                # Score diffs
-                score_diff_str = score_diff_data.loc[name, other_name]
-                if score_diff_str != "N/A" and score_diff_str != "—":
-                    score_diffs.append(float(score_diff_str))
-                
-                # Starter advantage
-                starter_adv_str = starter_advantage_data.loc[name, other_name]
-                if starter_adv_str != "N/A" and starter_adv_str != "—":
-                    starter_advantages.append(float(starter_adv_str))
-        
-        avg_win_rate = sum(win_rates) / len(win_rates) if win_rates else float('nan')
-        avg_score_diff = sum(score_diffs) / len(score_diffs) if score_diffs else float('nan')
-        avg_starter_adv = sum(starter_advantages) / len(starter_advantages) if starter_advantages else float('nan')
-        
-        summary_sheet[f'A{row_idx}'] = name
-        summary_sheet[f'B{row_idx}'] = episode if episode != float('inf') else "Unknown"
-        summary_sheet[f'C{row_idx}'] = f"{avg_win_rate:.1f}%" if not pd.isna(avg_win_rate) else "N/A"
-        summary_sheet[f'D{row_idx}'] = f"{avg_score_diff:.2f}" if not pd.isna(avg_score_diff) else "N/A"
-        summary_sheet[f'E{row_idx}'] = f"{avg_starter_adv:.2f}" if not pd.isna(avg_starter_adv) else "N/A"
-        summary_sheet[f'F{row_idx}'] = path
-    
-    # Auto-adjust column widths for Summary sheet
-    for col in range(1, 7):  # Columns A-F
+
+    for row_idx, (name, episode, path_value) in enumerate(checkpoints_info, start=4):
+        wins_row = win_rate_matrix.loc[name].dropna()
+        diffs_row = score_diff_matrix.loc[name].dropna()
+        draws_row = draw_rate_matrix.loc[name].dropna()
+        avg_win_rate = wins_row.mean() if not wins_row.empty else float('nan')
+        avg_score_diff = diffs_row.mean() if not diffs_row.empty else float('nan')
+        avg_draw_rate = draws_row.mean() if not draws_row.empty else float('nan')
+
+        summary_sheet.cell(row=row_idx, column=1, value=name)
+        summary_sheet.cell(row=row_idx, column=2, value=episode if episode != float('inf') else "Unknown")
+        cell_win = summary_sheet.cell(row=row_idx, column=3,
+                                      value=None if pd.isna(avg_win_rate) else round(avg_win_rate, 1))
+        cell_diff = summary_sheet.cell(row=row_idx, column=4,
+                                       value=None if pd.isna(avg_score_diff) else round(avg_score_diff, 2))
+        cell_draw = summary_sheet.cell(row=row_idx, column=5,
+                                       value=None if pd.isna(avg_draw_rate) else round(avg_draw_rate, 1))
+        summary_sheet.cell(row=row_idx, column=6, value=path_value)
+        if cell_win.value is not None:
+            cell_win.number_format = "0.0"
+        if cell_diff.value is not None:
+            cell_diff.number_format = "0.00"
+        if cell_draw.value is not None:
+            cell_draw.number_format = "0.0"
+
+    for col in range(1, len(headers) + 1):
         column_letter = openpyxl.utils.get_column_letter(col)
         max_length = 0
         for row in range(1, summary_sheet.max_row + 1):
-            cell = summary_sheet.cell(row=row, column=col)
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = max_length + 2
-        summary_sheet.column_dimensions[column_letter].width = adjusted_width
-    
-    # Create all metric-specific sheets
-    metrics_to_create = [
-        ("Win Rates", win_rate_data, "Win Rates (Row vs Column)", 
-         "Higher percentage means the row model wins more often against the column model"),
-        ("Score Differences", score_diff_data, "Score Differences (Row minus Column)",
-         "Positive values mean the row model scores higher than the column model"),
-        ("First-Starter Advantage", starter_advantage_data, "First-Starter Advantage",
-         "Values close to 0.5 indicate no advantage, higher values indicate advantage (1.0 = 100% advantage)"),
-        ("Game Length", game_length_data, "Average Game Length (moves)",
-         "Average number of moves per game for each matchup"),
-        ("Draws", draws_data, "Draw Percentage", 
-         "Percentage of games that ended in a draw")
+            value = summary_sheet.cell(row=row, column=col).value
+            if value is not None:
+                max_length = max(max_length, len(str(value)))
+        summary_sheet.column_dimensions[column_letter].width = max_length + 2
+
+    metrics = [
+        ("Win Rates", win_rate_matrix, "Win Rates (Row vs Column)",
+         "Percentage of games won by the row model against the column model", "{:.1f}%", True),
+        ("Draw Rates", draw_rate_matrix, "Draw Rates (Row vs Column)",
+         "Percentage of games ending in a draw for each matchup", "{:.1f}%", False),
+        ("Score Differences", score_diff_matrix, "Score Differences (Row minus Column)",
+         "Positive values mean the row model scores higher than the column model", "{:.2f}", True),
+        ("Average Scores", avg_score_matrix, "Average Total Score (Row perspective)",
+         "Average total score achieved by the row model in each matchup", "{:.2f}", False),
     ]
-    
-    for sheet_name, data_frame, title, description in metrics_to_create:
+
+    for sheet_name, matrix, title, description, fmt, apply_gradient in metrics:
         sheet = wb.create_sheet(title=sheet_name)
-        
-        # Add title and description
         sheet['A1'] = title
         sheet['A1'].font = Font(bold=True, size=14)
-        sheet.merge_cells(f'A1:{chr(65 + len(model_names) + 1)}1')
-        
+        last_col_letter = openpyxl.utils.get_column_letter(len(model_names) + 1)
+        sheet.merge_cells(f'A1:{last_col_letter}1')
         sheet['A2'] = description
-        sheet.merge_cells(f'A2:{chr(65 + len(model_names) + 1)}2')
-        
-        # Add data from DataFrame
-        for r_idx, row in enumerate(dataframe_to_rows(data_frame, index=True, header=True), start=4):
-            for c_idx, value in enumerate(row, start=1):
-                sheet.cell(row=r_idx, column=c_idx, value=value)
-                
-                # Apply conditional formatting based on sheet type
-                cell = sheet.cell(row=r_idx, column=c_idx)
-                
-                if sheet_name == "Win Rates" and isinstance(value, str) and '%' in value and value != "—":
-                    # Apply color gradient to win rates (green for high, red for low)
-                    win_rate = float(value.strip('%'))
-                    if win_rate >= 50:
-                        intensity = min(255, int(155 + (win_rate - 50) * 2))
-                        green_hex = format(intensity, '02x')
-                        red_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                end_color=f"{red_hex}{green_hex}55", 
-                                                fill_type="solid")
-                    else:
-                        intensity = min(255, int(155 + (50 - win_rate) * 2))
-                        red_hex = format(intensity, '02x')
-                        green_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                end_color=f"{red_hex}{green_hex}55", 
-                                                fill_type="solid")
-                
-                elif sheet_name == "Score Differences" and isinstance(value, str) and value not in ["N/A", "—"]:
-                # Apply color gradient to score differences
-                    score_diff = float(value)
-                    if score_diff > 0:
-                        intensity = min(255, int(155 + min(score_diff * 25, 100)))
-                        green_hex = format(intensity, '02x')
-                        red_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                end_color=f"{red_hex}{green_hex}55", 
-                                                fill_type="solid")
-                    elif score_diff < 0:
-                        intensity = min(255, int(155 + min(abs(score_diff) * 25, 100)))
-                        red_hex = format(intensity, '02x')
-                        green_hex = format(255 - intensity // 3, '02x')
-                        cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55", 
-                                                end_color=f"{red_hex}{green_hex}55", 
-                                                fill_type="solid")
-                
-                elif sheet_name == "First-Starter Advantage" and isinstance(value, str) and value not in ["N/A", "—"]:
-                    # Apply color gradient to starter advantage (neutral at 0.5)
-                    advantage = float(value)
-                    # Distance from 0.5 (neutral)
-                    distance = abs(advantage - 0.5)
-                    intensity = min(255, int(155 + min(distance * 200, 100)))
-                    blue_hex = format(intensity, '02x')
-                    cell.fill = PatternFill(start_color=f"55{blue_hex}{blue_hex}", 
-                                            end_color=f"55{blue_hex}{blue_hex}", 
-                                            fill_type="solid")
-        
-        # Apply formatting to header row and column
-        for row in sheet.iter_rows(min_row=4, max_row=4, min_col=2):
-            for cell in row:
-                cell.font = Font(bold=True)
-        
-        for col in sheet.iter_cols(min_col=1, max_col=1, min_row=5):
-            for cell in col:
-                cell.font = Font(bold=True)
-        
-        # Auto-adjust column widths
-        max_col = len(model_names) + 1
-        for col in range(1, max_col + 1):
+        sheet.merge_cells(f'A2:{last_col_letter}2')
+
+        sheet.cell(row=3, column=1, value="Model").font = Font(bold=True)
+        for col_idx, model in enumerate(model_names, start=2):
+            sheet.cell(row=3, column=col_idx, value=model).font = Font(bold=True)
+
+        for row_idx, row_model in enumerate(model_names, start=4):
+            sheet.cell(row=row_idx, column=1, value=row_model).font = Font(bold=True)
+            for col_idx, col_model in enumerate(model_names, start=2):
+                numeric_val = matrix.loc[row_model, col_model]
+                display = "-" if pd.isna(numeric_val) else fmt.format(numeric_val)
+                cell = sheet.cell(row=row_idx, column=col_idx, value=display)
+                if apply_gradient and not pd.isna(numeric_val):
+                    value_f = float(numeric_val)
+                    if sheet_name == "Win Rates":
+                        midpoint = 50.0
+                        if value_f >= midpoint:
+                            intensity = min(255, int(155 + (value_f - midpoint) * 2))
+                            green_hex = format(intensity, '02x')
+                            red_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55",
+                                                    end_color=f"{red_hex}{green_hex}55",
+                                                    fill_type="solid")
+                        else:
+                            intensity = min(255, int(155 + (midpoint - value_f) * 2))
+                            red_hex = format(intensity, '02x')
+                            green_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55",
+                                                    end_color=f"{red_hex}{green_hex}55",
+                                                    fill_type="solid")
+                    elif sheet_name == "Score Differences":
+                        if value_f > 0:
+                            intensity = min(255, int(155 + min(value_f * 25, 100)))
+                            green_hex = format(intensity, '02x')
+                            red_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55",
+                                                    end_color=f"{red_hex}{green_hex}55",
+                                                    fill_type="solid")
+                        elif value_f < 0:
+                            intensity = min(255, int(155 + min(abs(value_f) * 25, 100)))
+                            red_hex = format(intensity, '02x')
+                            green_hex = format(255 - intensity // 3, '02x')
+                            cell.fill = PatternFill(start_color=f"{red_hex}{green_hex}55",
+                                                    end_color=f"{red_hex}{green_hex}55",
+                                                    fill_type="solid")
+
+        max_cols = len(model_names) + 1
+        for col in range(1, max_cols + 1):
             column_letter = openpyxl.utils.get_column_letter(col)
             max_length = 0
             for row in range(1, sheet.max_row + 1):
-                cell = sheet.cell(row=row, column=col)
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            adjusted_width = max_length + 2
-            sheet.column_dimensions[column_letter].width = adjusted_width
-    
-    # Create a Detailed Results sheet
+                value = sheet.cell(row=row, column=col).value
+                if value is not None:
+                    max_length = max(max_length, len(str(value)))
+            sheet.column_dimensions[column_letter].width = max_length + 2
+
     detailed_sheet = wb.create_sheet(title="Detailed Results")
-    
-    # Add headers
     detailed_sheet['A1'] = "Detailed Matchup Results"
     detailed_sheet['A1'].font = Font(bold=True, size=14)
-    detailed_sheet.merge_cells('A1:J1')
-    
-    row_idx = 3
-    detailed_sheet[f'A{row_idx}'] = "Model A"
-    detailed_sheet[f'B{row_idx}'] = "Model B"
-    detailed_sheet[f'C{row_idx}'] = "A Wins"
-    detailed_sheet[f'D{row_idx}'] = "B Wins"
-    detailed_sheet[f'E{row_idx}'] = "Draws"
-    detailed_sheet[f'F{row_idx}'] = "A Win %"
-    detailed_sheet[f'G{row_idx}'] = "B Win %"
-    detailed_sheet[f'H{row_idx}'] = "A Avg Score"
-    detailed_sheet[f'I{row_idx}'] = "B Avg Score"
-    detailed_sheet[f'J{row_idx}'] = "First-Starter Advantage"
-    
-    # Bold the headers
-    for cell in detailed_sheet[f'A{row_idx}:J{row_idx}'][0]:
-        cell.font = Font(bold=True)
-    
-    # Add detailed results
+    detailed_sheet.merge_cells('A1:H1')
+
+    detailed_headers = [
+        "Model A", "Model B", "Games", "Win Rate A (%)",
+        "Win Rate B (%)", "Draw Rate (%)", "Avg Score A", "Avg Score B", "Avg Diff (A-B)"
+    ]
+    for col_idx, header in enumerate(detailed_headers, start=1):
+        detailed_sheet.cell(row=3, column=col_idx, value=header).font = Font(bold=True)
+
     row_idx = 4
-    for matchup, data in results.items():
-        agents = matchup.split("_vs_")
-        agent1_name, agent2_name = agents
-        
-        # Calculate metrics
-        total_games = data['games']
-        agent1_wins = data['agent1_wins']
-        agent2_wins = data['agent2_wins']
-        draws = data['draws']
-        
-        agent1_win_pct = (agent1_wins / total_games) * 100
-        agent2_win_pct = (agent2_wins / total_games) * 100
-        
-        total_decided_games = agent1_wins + agent2_wins
-        if total_decided_games > 0:
-            first_starter_advantage = data['first_starter_wins'] / total_decided_games
-        else:
-            first_starter_advantage = 0.5  # Default to no advantage
-        
-        # Add data to sheet
-        detailed_sheet[f'A{row_idx}'] = agent1_name
-        detailed_sheet[f'B{row_idx}'] = agent2_name
-        detailed_sheet[f'C{row_idx}'] = agent1_wins
-        detailed_sheet[f'D{row_idx}'] = agent2_wins
-        detailed_sheet[f'E{row_idx}'] = draws
-        detailed_sheet[f'F{row_idx}'] = f"{agent1_win_pct:.1f}%"
-        detailed_sheet[f'G{row_idx}'] = f"{agent2_win_pct:.1f}%"
-        detailed_sheet[f'H{row_idx}'] = data['agent1_avg_score']
-        detailed_sheet[f'I{row_idx}'] = data['agent2_avg_score']
-        detailed_sheet[f'J{row_idx}'] = f"{first_starter_advantage:.2f}"
-        
+    for data in results.values():
+        detailed_sheet.cell(row=row_idx, column=1, value=data['agent1_name'])
+        detailed_sheet.cell(row=row_idx, column=2, value=data['agent2_name'])
+        detailed_sheet.cell(row=row_idx, column=3, value=data['games'])
+        cell_wra = detailed_sheet.cell(row=row_idx, column=4, value=data['win_rate_agent1'] * 100.0)
+        cell_wra.number_format = "0.0"
+        cell_wrb = detailed_sheet.cell(row=row_idx, column=5, value=data['win_rate_agent2'] * 100.0)
+        cell_wrb.number_format = "0.0"
+        cell_draw = detailed_sheet.cell(row=row_idx, column=6, value=data['draw_rate'] * 100.0)
+        cell_draw.number_format = "0.0"
+        cell_sca = detailed_sheet.cell(row=row_idx, column=7, value=data['agent1_avg_score'])
+        cell_sca.number_format = "0.00"
+        cell_scb = detailed_sheet.cell(row=row_idx, column=8, value=data['agent2_avg_score'])
+        cell_scb.number_format = "0.00"
+        cell_diff = detailed_sheet.cell(row=row_idx, column=9, value=data['diff_avg'])
+        cell_diff.number_format = "0.00"
         row_idx += 1
-    
-    # Auto-adjust column widths for Detailed Results
-    for col in range(1, 11):  # Columns A-J
+
+    for col in range(1, len(detailed_headers) + 1):
         column_letter = openpyxl.utils.get_column_letter(col)
         max_length = 0
         for row in range(1, detailed_sheet.max_row + 1):
-            cell = detailed_sheet.cell(row=row, column=col)
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = max_length + 2
-        detailed_sheet.column_dimensions[column_letter].width = adjusted_width
-    
-    # Save the workbook
+            value = detailed_sheet.cell(row=row, column=col).value
+            if value is not None:
+                max_length = max(max_length, len(str(value)))
+        detailed_sheet.column_dimensions[column_letter].width = max_length + 2
+
     wb.save(output_file)
     print(f"\nEnhanced Excel comparison report saved to {output_file}")
-    
+
     return output_file
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Team 0 Scopone AI checkpoints")
-    parser.add_argument("--checkpoints", nargs="+", help="Paths to Team 0 checkpoint files or directories")
-    parser.add_argument("--checkpoint_dir", help="Directory containing Team 0 checkpoints")
-    parser.add_argument("--checkpoint_pattern", default="*team0*ep*.pth", help="Pattern to match Team 0 checkpoint files")
-    parser.add_argument("--games", type=int, default=10000, help="Number of games to play for each matchup")
+    parser = argparse.ArgumentParser(description="Benchmark Scopone checkpoints head-to-head and update league Elo")
+    parser.add_argument("--checkpoints", nargs="+", help="Paths to checkpoint files or directories")
+    parser.add_argument("--checkpoint_dir", help="Directory containing checkpoints")
+    parser.add_argument("--checkpoint_pattern", default="*.pth", help="Pattern to match checkpoint files inside directories")
+    parser.add_argument("--games", type=int, default=1000, help="Number of games to play for each matchup")
     parser.add_argument("--output", help="Output file path (default: auto-generated)")
     parser.add_argument("--excel", help="Excel output file path (default: auto-generated)")
     parser.add_argument("--limit", type=int, help="Limit the number of checkpoints to evaluate")
+    parser.add_argument("--workers", type=int, help="Number of parallel evaluation workers")
+    parser.add_argument("--k-history", type=int, help="Observation history length for evaluation")
+    parser.add_argument("--no-progress", action='store_true', help="Disable per-match evaluation progress bars")
+    parser.add_argument("--show-progress", action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    
-    # Get checkpoint paths
-    checkpoint_paths = []
-    
+
+    checkpoint_paths: List[str] = []
+
     if args.checkpoints:
         for cp in args.checkpoints:
             if os.path.isfile(cp):
@@ -846,40 +822,101 @@ def main():
                 checkpoint_paths.extend(find_checkpoints(cp, args.checkpoint_pattern))
             else:
                 print(f"Warning: Checkpoint not found: {cp}")
-    
+
     if args.checkpoint_dir:
         checkpoint_paths.extend(find_checkpoints(args.checkpoint_dir, args.checkpoint_pattern))
-    
-    # Remove duplicates
-    checkpoint_paths = list(set(checkpoint_paths))
-    
-    # Ensure we only have Team 0 checkpoints
-    team0_checkpoints = []
+
+    default_dir = os.path.join('checkpoints')
+    if os.path.isdir(default_dir):
+        checkpoint_paths.extend(find_checkpoints(default_dir, args.checkpoint_pattern))
+
+    normalized_paths: List[str] = []
+    seen_paths = set()
     for cp in checkpoint_paths:
-        if "team0" in os.path.basename(cp):
-            team0_checkpoints.append(cp)
+        norm_cp = os.path.normpath(cp)
+        if norm_cp not in seen_paths:
+            seen_paths.add(norm_cp)
+            normalized_paths.append(norm_cp)
+    checkpoint_paths = normalized_paths
+
+    existing_files: List[str] = []
+    for cp in checkpoint_paths:
+        if os.path.isfile(cp):
+            existing_files.append(cp)
         else:
-            print(f"Skipping non-Team 0 checkpoint: {cp}")
-    
-    checkpoint_paths = team0_checkpoints
-    
-    # Limit number of checkpoints if requested
+            print(f"Warning: Skipping missing checkpoint: {cp}")
+    checkpoint_paths = existing_files
+
     if args.limit and len(checkpoint_paths) > args.limit:
-        # Try to pick evenly spaced checkpoints
-        step = len(checkpoint_paths) // args.limit
-        limited_paths = [checkpoint_paths[i] for i in range(0, len(checkpoint_paths), step)][:args.limit]
-        checkpoint_paths = limited_paths
-    
+        step = max(1, len(checkpoint_paths) // args.limit)
+        checkpoint_paths = [checkpoint_paths[i] for i in range(0, len(checkpoint_paths), step)][:args.limit]
+
     if not checkpoint_paths:
-        print("Error: No Team 0 checkpoint files found. Please provide valid checkpoint paths.")
+        print("Error: No checkpoint files found. Please provide valid checkpoint paths.")
         return
-    
-    # Report found checkpoints
-    print(f"Found {len(checkpoint_paths)} Team 0 checkpoint files:")
-    for i, cp in enumerate(checkpoint_paths):
-        print(f"{i+1}. {cp}")
-    
-    # Configure GPU if available
+
+    league = League()
+    canonicalize_league_paths(league)
+
+    raw_infos: List[dict] = []
+    for cp in checkpoint_paths:
+        league_key = os.path.normpath(cp)
+        if league_key not in getattr(league, 'history', []):
+            league.register(league_key)
+        raw_infos.append({
+            "file_path": cp,
+            "league_key": league_key,
+            "base_name": checkpoint_display_name(cp),
+        })
+
+    name_counts = {}
+    checkpoint_infos: List[dict] = []
+    for info in raw_infos:
+        base = info["base_name"]
+        count = name_counts.get(base, 0)
+        display_name = base if count == 0 else f"{base}_{count + 1}"
+        name_counts[base] = count + 1
+        checkpoint_infos.append({
+            "name": display_name,
+            "file_path": info["file_path"],
+            "league_key": info["league_key"],
+            "base_name": base,
+        })
+
+    print(f"Found {len(checkpoint_infos)} checkpoint files:")
+    for idx, info in enumerate(checkpoint_infos, start=1):
+        print(f"{idx}. {info['file_path']} [{info['name']}]")
+
+    workers_env = os.environ.get('SCOPONE_EVAL_WORKERS')
+    if args.workers is not None:
+        num_workers = max(1, args.workers)
+    elif workers_env:
+        try:
+            num_workers = max(1, int(workers_env))
+        except ValueError:
+            num_workers = 1
+    else:
+        cpu_count = os.cpu_count() or 1
+        num_workers = max(1, cpu_count // 2)
+    num_workers = max(1, num_workers)
+
+    k_history_env = os.environ.get('SCOPONE_EVAL_K_HISTORY') or os.environ.get('SCOPONE_EVAL_KH')
+    if args.k_history is not None:
+        k_history = max(1, args.k_history)
+    elif k_history_env:
+        try:
+            k_history = max(1, int(k_history_env))
+        except ValueError:
+            k_history = 39
+    else:
+        k_history = 39
+
+    progress_enabled = True
+    if getattr(args, 'no_progress', False):
+        progress_enabled = False
+    elif getattr(args, 'show_progress', False):
+        progress_enabled = True
+
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
@@ -887,53 +924,68 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.cuda.empty_cache()
-    
-    # Save results to file
+
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    output_file = args.output if args.output else f"team0_comparison_{timestamp}.txt"
-    excel_file = args.excel if args.excel else f"team0_comparison_{timestamp}.xlsx"
-    
+    output_file = args.output if args.output else f"benchmark_comparison_{timestamp}.txt"
+    excel_file = args.excel if args.excel else f"benchmark_comparison_{timestamp}.xlsx"
+    excel_generated = False
+
     with open(output_file, "w") as f:
-        f.write(f"Scopone AI Team 0 Checkpoint Comparison Results ({time.strftime('%Y-%m-%d %H:%M:%S')})\n")
-        f.write(f"Number of games per evaluation: {args.games}\n\n")
-        f.write(f"Checkpoints evaluated ({len(checkpoint_paths)}):\n")
-        for i, cp in enumerate(checkpoint_paths):
-            episode = extract_episode_number(cp)
-            episode_str = f" (Episode {episode})" if episode != float('inf') else ""
-            f.write(f"{i+1}. {cp}{episode_str}\n")
+        f.write(f"Scopone AI Checkpoint Benchmark Results ({time.strftime('%Y-%m-%d %H:%M:%S')})\n")
+        f.write(f"Games per matchup: {args.games}\n")
+        f.write(f"Eval k_history: {k_history}\n")
+        f.write(f"Parallel workers: {num_workers}\n\n")
+        f.write(f"Checkpoints evaluated ({len(checkpoint_infos)}):\n")
+        for idx, info in enumerate(checkpoint_infos, start=1):
+            f.write(f"{idx}. {info['file_path']} [{info['name']}]\n")
         f.write("\n")
-        
-        # Only do comparison - no self-play needed since all agents are Team 0
-        if len(checkpoint_paths) > 1:
+
+        comparison_results = {}
+        if len(checkpoint_infos) > 1:
             f.write("=== COMPARISON RESULTS ===\n\n")
-            comparison_results = evaluate_checkpoints(checkpoint_paths, args.games)
-            
-            for matchup, data in comparison_results.items():
-                agents = matchup.split("_vs_")
-                
-                # Calculate first-mover advantage
-                first_starter_advantage = 0
-                total_decided_games = data['agent1_wins'] + data['agent2_wins']
-                if total_decided_games > 0:
-                    first_starter_advantage = data['first_starter_wins'] / total_decided_games
-                
-                f.write(f"{agents[0]} vs {agents[1]}:\n")
-                f.write(f"  {agents[0]} wins: {data['agent1_wins']} ({data['agent1_wins']/args.games*100:.1f}%)\n")
-                f.write(f"  {agents[1]} wins: {data['agent2_wins']} ({data['agent2_wins']/args.games*100:.1f}%)\n")
-                f.write(f"  First-starter advantage: {first_starter_advantage:.2f} (1.0 = 100% advantage, 0.5 = no advantage)\n")
-                f.write(f"  Draws: {data['draws']} ({data['draws']/args.games*100:.1f}%)\n")
-                f.write(f"  Average score {agents[0]}: {data['agent1_avg_score']:.2f}\n")
-                f.write(f"  Average score {agents[1]}: {data['agent2_avg_score']:.2f}\n")
-                f.write(f"  Average game length: {sum(data['game_lengths'])/len(data['game_lengths']):.1f} moves\n")
-                f.write(f"  Score distributions:\n")
-                f.write(f"    {agents[0]}: {dict(data['agent1_score_distribution'])}\n")
-                f.write(f"    {agents[1]}: {dict(data['agent2_score_distribution'])}\n\n")
-            
-            # Generate Excel report with comparative matrix
-            generate_excel_comparison(checkpoint_paths, comparison_results, excel_file)
-    
+            comparison_results = evaluate_checkpoints(
+                checkpoint_infos,
+                args.games,
+                league=league,
+                num_workers=num_workers,
+                k_history=k_history,
+                show_progress=progress_enabled,
+            )
+
+            for data in comparison_results.values():
+                name_a = data['agent1_name']
+                name_b = data['agent2_name']
+                win_rate_a_pct = data['win_rate_agent1'] * 100.0
+                win_rate_b_pct = data['win_rate_agent2'] * 100.0
+                diff_avg = data['diff_avg']
+                elo_a = league.elo.get(data['agent1_path'], 1000.0)
+                elo_b = league.elo.get(data['agent2_path'], 1000.0)
+
+                draw_pct = data['draw_rate'] * 100.0
+
+                f.write(f"{name_a} vs {name_b}:\n")
+                f.write(f"  Win rate {name_a}: {win_rate_a_pct:.1f}%\n")
+                f.write(f"  Win rate {name_b}: {win_rate_b_pct:.1f}%\n")
+                f.write(f"  Draw rate: {draw_pct:.1f}%\n")
+                f.write(f"  Avg score {name_a}: {data['agent1_avg_score']:.2f}\n")
+                f.write(f"  Avg score {name_b}: {data['agent2_avg_score']:.2f}\n")
+                f.write(f"  Avg diff ({name_a} - {name_b}): {diff_avg:.2f}\n")
+                f.write(f"  Updated league Elo: {name_a} -> {elo_a:.1f}, {name_b} -> {elo_b:.1f}\n\n")
+
+            generate_excel_comparison(checkpoint_infos, comparison_results, excel_file)
+            excel_generated = True
+
+        f.write("=== LEAGUE ELO SNAPSHOT ===\n")
+        for info in checkpoint_infos:
+            elo_value = league.elo.get(info["league_key"], 1000.0)
+            f.write(f"{info['name']}: {elo_value:.1f} ({info['file_path']})\n")
+
     print(f"\nResults saved to {output_file}")
-    print(f"Excel comparison report saved to {excel_file}")
+    if excel_generated:
+        print(f"Excel comparison report saved to {excel_file}")
+    elif len(checkpoint_infos) > 1:
+        print("Excel comparison report was not generated.")
+
 
 if __name__ == "__main__":
     main()

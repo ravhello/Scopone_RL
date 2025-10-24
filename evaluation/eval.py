@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 # Default compile-friendly settings (work on CPU and CUDA)
 os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
@@ -180,7 +182,9 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int =
     agent_fn_*: callable(env) -> action (usa env.get_valid_actions())
     """
     # Evaluation runs strictly on CPU (independent from training device)
-    wins = 0
+    wins_agent0 = 0
+    wins_agent1 = 0
+    draws = 0
     actor_tot_sum = {0: 0.0, 1: 0.0}
     breakdown_sum = {0: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0},
                      1: {'carte': 0.0, 'denari': 0.0, 'settebello': 0.0, 'primiera': 0.0, 'scope': 0.0, 'total': 0.0}}
@@ -242,12 +246,20 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int =
                 actor_tot_sum[0] += _t0
                 actor_tot_sum[1] += _t1
                 if _t0 > _t1:
-                    wins += 1
+                    wins_agent0 += 1
+                elif _t1 > _t0:
+                    wins_agent1 += 1
+                else:
+                    draws += 1
             else:
                 actor_tot_sum[0] += _t1
                 actor_tot_sum[1] += _t0
                 if _t1 > _t0:
-                    wins += 1
+                    wins_agent0 += 1
+                elif _t0 > _t1:
+                    wins_agent1 += 1
+                else:
+                    draws += 1
         elif 'team_rewards' in info:
             tr = info['team_rewards']
             _r0 = _to_float_scalar(tr[0])
@@ -256,19 +268,46 @@ def play_match(agent_fn_team0, agent_fn_team1, games: int = 50, k_history: int =
                 actor_tot_sum[0] += _r0
                 actor_tot_sum[1] += _r1
                 if _r0 > _r1:
-                    wins += 1
+                    wins_agent0 += 1
+                elif _r1 > _r0:
+                    wins_agent1 += 1
+                else:
+                    draws += 1
             else:
                 actor_tot_sum[0] += _r1
                 actor_tot_sum[1] += _r0
                 if _r1 > _r0:
-                    wins += 1
+                    wins_agent0 += 1
+                elif _r0 > _r1:
+                    wins_agent1 += 1
+                else:
+                    draws += 1
     # medie
     for t in [0, 1]:
         for k in breakdown_sum[t].keys():
             breakdown_sum[t][k] /= games
-    wr = wins / games if games > 0 else 0.0
-    breakdown_sum['meta'] = {'win_rate': float(wr)}
-    diff_avg = (actor_tot_sum[0] - actor_tot_sum[1]) / float(games) if games > 0 else 0.0
+    games_f = float(games) if games > 0 else 1.0
+    win_rate_agent0 = wins_agent0 / games_f
+    win_rate_agent1 = wins_agent1 / games_f
+    draw_rate = max(0.0, 1.0 - win_rate_agent0 - win_rate_agent1)
+    breakdown_sum['meta'] = {
+        'win_rate': float(win_rate_agent0),
+        'win_rate_agent1': float(win_rate_agent0),
+        'win_rate_agent2': float(win_rate_agent1),
+        'draw_rate': float(draw_rate),
+        'counts': {
+            'wins_agent1': int(wins_agent0),
+            'wins_agent2': int(wins_agent1),
+            'draws': int(draws),
+        },
+        'actor_total_sum': {
+            'agent1': float(actor_tot_sum[0]),
+            'agent2': float(actor_tot_sum[1]),
+        },
+        'actor_avg_score_agent1': float(actor_tot_sum[0] / games_f),
+        'actor_avg_score_agent2': float(actor_tot_sum[1] / games_f),
+    }
+    diff_avg = (actor_tot_sum[0] - actor_tot_sum[1]) / games_f
     return float(diff_avg), breakdown_sum
 
 
@@ -752,11 +791,17 @@ def _eval_pair_chunk_worker(args):
     for t in [0, 1]:
         for k in bd[t].keys():
             bd_sum[t][k] = float(bd[t][k]) * float(games)
-    wr = float((bd.get('meta') or {}).get('win_rate', 0.0))
-    wins_int = int(round(wr * games))
+    meta = bd.get('meta') or {}
+    counts = meta.get('counts') or {}
+    wins_agent1 = int(counts.get('wins_agent1', round(float(meta.get('win_rate', 0.0)) * games)))
+    wins_agent2 = int(counts.get('wins_agent2', round(float(meta.get('win_rate_agent2', 0.0)) * games)))
+    draws = int(counts.get('draws', max(0, int(games) - wins_agent1 - wins_agent2)))
+    actor_totals = meta.get('actor_total_sum') or {}
+    actor_total_agent1 = float(actor_totals.get('agent1', float(meta.get('actor_avg_score_agent1', 0.0)) * games))
+    actor_total_agent2 = float(actor_totals.get('agent2', float(meta.get('actor_avg_score_agent2', 0.0)) * games))
     diff_sum = float(diff) * float(games)
-    _dbg(f"worker[{wid}] done: wins={wins_int}/{int(games)} diff_sum={diff_sum:.2f}")
-    return diff_sum, bd_sum, wins_int, int(games)
+    _dbg(f"worker[{wid}] done: winsA={wins_agent1}, winsB={wins_agent2}, draws={draws}, diff_sum={diff_sum:.2f}")
+    return diff_sum, bd_sum, wins_agent1, wins_agent2, draws, actor_total_agent1, actor_total_agent2, int(games)
 
 
 def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
@@ -827,13 +872,22 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
         pbar.close()
     _dbg(f"aggregating {len(results)} results")
     total_games = 0
-    total_wins = 0
+    total_wins_agent1 = 0
+    total_wins_agent2 = 0
+    total_draws = 0
     total_diff_sum = 0.0
+    total_actor_sum_agent1 = 0.0
+    total_actor_sum_agent2 = 0.0
     agg = {0: {}, 1: {}}
-    for diff_sum_i, bd_sum_i, wins_i, games_i in results:
-        total_games += int(games_i)
-        total_wins += int(wins_i)
+    for diff_sum_i, bd_sum_i, wins_a_i, wins_b_i, draws_i, actor_sum_a_i, actor_sum_b_i, games_i in results:
+        games_int = int(games_i)
+        total_games += games_int
+        total_wins_agent1 += int(wins_a_i)
+        total_wins_agent2 += int(wins_b_i)
+        total_draws += int(draws_i)
         total_diff_sum += float(diff_sum_i)
+        total_actor_sum_agent1 += float(actor_sum_a_i)
+        total_actor_sum_agent2 += float(actor_sum_b_i)
         for t in [0, 1]:
             for k, v in bd_sum_i[t].items():
                 agg[t][k] = agg[t].get(k, 0.0) + float(v)
@@ -844,8 +898,22 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
     for t in [0, 1]:
         for k, v in agg[t].items():
             bd_avg[t][k] = (float(v) / float(total_games))
-    wr = float(total_wins) / float(total_games)
-    bd_avg['meta'] = {'win_rate': float(wr)}
+    win_rate_agent1 = float(total_wins_agent1) / float(total_games)
+    win_rate_agent2 = float(total_wins_agent2) / float(total_games)
+    draw_rate = float(total_draws) / float(total_games)
+    bd_avg['meta'] = {
+        'win_rate': float(win_rate_agent1),
+        'win_rate_agent1': float(win_rate_agent1),
+        'win_rate_agent2': float(win_rate_agent2),
+        'draw_rate': float(draw_rate),
+        'counts': {
+            'wins_agent1': int(total_wins_agent1),
+            'wins_agent2': int(total_wins_agent2),
+            'draws': int(total_draws),
+        },
+        'actor_avg_score_agent1': float(total_actor_sum_agent1 / float(total_games)),
+        'actor_avg_score_agent2': float(total_actor_sum_agent2 / float(total_games)),
+    }
     diff_avg = float(total_diff_sum) / float(total_games)
     return float(diff_avg), bd_avg
 

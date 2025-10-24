@@ -25,7 +25,7 @@ class League:
             self.elo[ckpt_path] = init_elo
             self._save()
 
-    def update_elo(self, ckpt_a: str, ckpt_b: str, result_a: float, k: float = 16.0):
+    def update_elo(self, ckpt_a: str, ckpt_b: str, result_a: float, k: float = 128.0):
         # result_a: 1 win, 0.5 draw, 0 loss
         ra = self.elo.get(ckpt_a, 1000.0)
         rb = self.elo.get(ckpt_b, 1000.0)
@@ -35,7 +35,7 @@ class League:
         self.elo[ckpt_b] = rb + k * ((1.0 - result_a) - eb)
         self._save()
 
-    def update_elo_from_diff(self, ckpt_a: str, ckpt_b: str, avg_point_diff_a: float, k: float = 16.0, tau: float = None):
+    def update_elo_from_diff(self, ckpt_a: str, ckpt_b: str, avg_point_diff_a: float, k: float = 128.0, tau: float = None):
         """
         Aggiorna l'Elo usando la differenza media di punti (reward) con mappatura LINEARE a score [0,1].
         score = clamp(0.5 + diff / (2*scale), 0, 1)

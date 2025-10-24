@@ -7,6 +7,7 @@ import threading
 import socket
 import pickle
 import time
+import json
 from collections import deque
 from typing import Optional
 
@@ -20,6 +21,7 @@ from actions import encode_action_from_ids_tensor, decode_action_ids
 from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
 from utils.device import get_compute_device
+from utils.torch_load import safe_torch_load
 
 # Constants
 SCREEN_WIDTH = 1024
@@ -150,7 +152,7 @@ class GuiPolicyAgent:
         if not path or not os.path.isfile(path):
             return False
         try:
-            state = torch.load(path, map_location=self.device)
+            state = safe_torch_load(path, map_location=self.device)
         except Exception as exc:
             print(f"Failed to load checkpoint '{path}': {exc}")
             return False
@@ -3786,6 +3788,56 @@ class GameScreen(BaseScreen):
         except Exception:
             pass
         return 10823
+    
+    def _league_best_checkpoint(self) -> Optional[str]:
+        """Return the top-Elo checkpoint recorded by the training league, if available."""
+        league_path = os.path.join('checkpoints', 'league', 'league.json')
+        try:
+            with open(league_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        history = data.get('history')
+        if not isinstance(history, list) or not history:
+            return None
+
+        elo_map = data.get('elo') if isinstance(data.get('elo'), dict) else {}
+
+        def _elo_value(path: str) -> float:
+            try:
+                return float(elo_map.get(path, 1000.0))
+            except Exception:
+                return 1000.0
+
+        ranked_paths = sorted(
+            (p for p in history if isinstance(p, str)),
+            key=_elo_value,
+            reverse=True,
+        )
+        for raw_path in ranked_paths:
+            norm = os.path.normpath(raw_path)
+            candidates = [norm]
+            if not os.path.isabs(norm):
+                if not norm.startswith('checkpoints'):
+                    candidates.append(os.path.join('checkpoints', norm))
+                basename = os.path.basename(norm)
+                if basename:
+                    candidates.append(os.path.join('checkpoints', 'league', basename))
+            seen = set()
+            for cand in candidates:
+                cand_norm = os.path.normpath(cand)
+                if cand_norm in seen:
+                    continue
+                seen.add(cand_norm)
+                if os.path.exists(cand_norm):
+                    return cand_norm
+        return None
 
     def _resolve_checkpoint_path(self, team_id: int, fallback: Optional[str] = None) -> Optional[str]:
         candidates = []
@@ -3795,6 +3847,9 @@ class GameScreen(BaseScreen):
         env_shared = os.environ.get('SCOPONE_GUI_CKPT')
         if env_shared:
             candidates.append(env_shared)
+        league_best = self._league_best_checkpoint()
+        if league_best:
+            candidates.append(league_best)
         config = getattr(self.app, 'game_config', {})
         if isinstance(config, dict):
             team_map = config.get('team_checkpoints')
@@ -3814,6 +3869,10 @@ class GameScreen(BaseScreen):
         candidates.append(legacy)
         for cand in candidates:
             if cand and os.path.exists(cand):
+                try:
+                    print(f"[checkpoint] team {team_id} -> {os.path.normpath(cand)}")
+                except Exception:
+                    pass
                 return cand
         return None
 

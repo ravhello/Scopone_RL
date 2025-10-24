@@ -158,7 +158,7 @@ _eval_max_games_per_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK
 # ===== Section: MCTS — Global (Train/Eval specific) =====
 
 # ===== Section: MCTS (Eval) =====
-_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','0').lower() in ['1','true','yes','on']
+_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','1').lower() in ['1','true','yes','on']
 
 # ----- Prior-only -----
 _eval_c_puct = float(os.environ.get('SCOPONE_EVAL_MCTS_C_PUCT','1.0'))  # c_puct per MCTS in eval
@@ -183,7 +183,7 @@ os.environ.setdefault('SCOPONE_EVAL_MCTS_TRAIN_FACTOR', '1.0')  # moltiplicatore
 # Non è per-giocatore e non è il numero di mosse già fatte.
 # Se N è impostato, l'exact parte quando le mosse rimanenti <= N; '' = soglia automatica (20).
 
-os.environ.setdefault('SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES', '20')
+os.environ.setdefault('SCOPONE_EVAL_MCTS_EXACT_MAX_MOVES', '12')
 os.environ.setdefault('SCOPONE_EVAL_MCTS_EXACT_ONLY', '1')
 os.environ.setdefault('SCOPONE_EVAL_MCTS_EXACT_COVER_FRAC', '70')  # frazione richiesta (0 disattiva)
 os.environ.setdefault('SCOPONE_EVAL_MCTS_DETS_EXACT', '4')  # dets exact (eval)
@@ -191,7 +191,7 @@ os.environ.setdefault('SCOPONE_EVAL_MCTS_DETS_EXACT', '4')  # dets exact (eval)
 
 # ===== Section: MCTS (Train) =====
 os.environ.setdefault('SCOPONE_MCTS_BOTH_SIDES', '1')  # applica MCTS su entrambi i lati (non solo main) durante training
-_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','0') in ['1','true','yes','on']  # abilita MCTS nella raccolta (prior o exact)
+_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']  # abilita MCTS nella raccolta (prior o exact)
 _mcts_warmup_iters = int(os.environ.get('SCOPONE_MCTS_WARMUP_ITERS', '0'))  # iterazioni con MCTS disattivato in train
 os.environ.setdefault('SCOPONE_RAISE_ON_INVALID_SIMS', '1')  # solleva eccezione se sims MCTS scalate sono invalide
 
@@ -215,7 +215,7 @@ os.environ.setdefault('SCOPONE_MCTS_SCALING', '1')  # abilita scaling per-mano d
 os.environ.setdefault('SCOPONE_TRAIN_MCTS_MAX_DEPTH', '0')
 
 # ----- Exact-only -----
-os.environ.setdefault('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', '20') # soglia automatica se vuoto (20)
+os.environ.setdefault('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', '12') # soglia automatica se vuoto (20)
 os.environ.setdefault('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '1')
 os.environ.setdefault('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '80')  # frazione richiesta (0 disattiva)
 os.environ.setdefault('SCOPONE_TRAIN_MCTS_DETS_EXACT', '4')  # dets exact (train)
