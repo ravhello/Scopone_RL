@@ -148,17 +148,19 @@ num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environmen
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 
 # EVAL
-_eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '10'))  # esegui eval ogni N iterazioni
+_eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '100'))  # esegui eval ogni N iterazioni
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))  # ampiezza cronologia osservazioni (k_history)
 _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))  # numero partite per valutazione
 os.environ.setdefault('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4')  # partite per task/worker (granularità progress)
 _eval_max_games_per_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4'))  # letta per logging
 
 
-# ===== Section: MCTS — Global (Train/Eval specific) =====
+# ===== Section: MCTS - Global (Train/Eval specific) =====
+os.environ.setdefault('SCOPONE_MCTS_MOVE_TIMEOUT_S', '120')  # timeout (s) per mossa IS-MCTS; 'off' disabilita
+os.environ.setdefault('SCOPONE_LEAGUE_EVAL_TOP_K', '3')  # top-K reti della lega per eval
 
 # ===== Section: MCTS (Eval) =====
-_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','1').lower() in ['1','true','yes','on']
+_eval_use_mcts = os.environ.get('SCOPONE_EVAL_USE_MCTS','0').lower() in ['1','true','yes','on']
 
 # ----- Prior-only -----
 _eval_c_puct = float(os.environ.get('SCOPONE_EVAL_MCTS_C_PUCT','1.0'))  # c_puct per MCTS in eval
@@ -191,7 +193,7 @@ os.environ.setdefault('SCOPONE_EVAL_MCTS_DETS_EXACT', '4')  # dets exact (eval)
 
 # ===== Section: MCTS (Train) =====
 os.environ.setdefault('SCOPONE_MCTS_BOTH_SIDES', '1')  # applica MCTS su entrambi i lati (non solo main) durante training
-_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','1') in ['1','true','yes','on']  # abilita MCTS nella raccolta (prior o exact)
+_mcts_train = os.environ.get('SCOPONE_MCTS_TRAIN','0') in ['1','true','yes','on']  # abilita MCTS nella raccolta (prior o exact)
 _mcts_warmup_iters = int(os.environ.get('SCOPONE_MCTS_WARMUP_ITERS', '0'))  # iterazioni con MCTS disattivato in train
 os.environ.setdefault('SCOPONE_RAISE_ON_INVALID_SIMS', '1')  # solleva eccezione se sims MCTS scalate sono invalide
 
@@ -340,6 +342,12 @@ if __name__ == "__main__":
         tqdm.write("MCTS exact-solve threshold: auto")
     else:
         tqdm.write(f"MCTS exact-solve when <= {_mcts_exact_override} remaining moves")
+
+    _mcts_timeout_raw = str(os.environ.get('SCOPONE_MCTS_MOVE_TIMEOUT_S', '')).strip()
+    if not _mcts_timeout_raw or _mcts_timeout_raw.lower() in ('off', 'none', 'no', 'false', '0'):
+        tqdm.write("MCTS move timeout: disabled")
+    else:
+        tqdm.write(f"MCTS move timeout: {_mcts_timeout_raw} s")
 
 
     train_ppo(num_iterations=iters, horizon=horizon, k_history=_eval_kh,

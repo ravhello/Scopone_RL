@@ -1,13 +1,69 @@
 import math
+import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import os
 import torch
 
 from environment import ScoponeEnvMA
 from rewards import compute_final_score_breakdown
 from utils.device import get_compute_device
 from utils.fallback import notify_fallback
+
+_DEFAULT_MCTS_MOVE_TIMEOUT_S = 120.0
+
+
+class MCTSTimeoutError(RuntimeError):
+    def __init__(self, timeout_s: float, elapsed_s: float):
+        super().__init__(f"IS-MCTS move exceeded timeout of {timeout_s:.2f}s (elapsed {elapsed_s:.2f}s)")
+        self.timeout_s = float(timeout_s)
+        self.elapsed_s = float(elapsed_s)
+
+
+class _MctsMoveTimer:
+    __slots__ = ('timeout_s', '_start', '_deadline')
+
+    def __init__(self, timeout_s: Optional[float]):
+        self._start = time.perf_counter()
+        if timeout_s is None or timeout_s <= 0:
+            self.timeout_s = None
+            self._deadline = None
+        else:
+            self.timeout_s = float(timeout_s)
+            self._deadline = self._start + self.timeout_s
+
+    def check(self) -> None:
+        if self._deadline is None:
+            return
+        now = time.perf_counter()
+        if now >= self._deadline:
+            elapsed = now - self._start
+            raise MCTSTimeoutError(self.timeout_s, elapsed)
+
+    def elapsed(self) -> float:
+        return time.perf_counter() - self._start
+
+    def remaining(self) -> Optional[float]:
+        if self._deadline is None:
+            return None
+        return max(0.0, self._deadline - time.perf_counter())
+
+
+def _resolve_move_timeout_s() -> Optional[float]:
+    raw = os.environ.get('SCOPONE_MCTS_MOVE_TIMEOUT_S', '') or ''
+    raw = raw.strip()
+    if not raw:
+        return _DEFAULT_MCTS_MOVE_TIMEOUT_S
+    lowered = raw.lower()
+    if lowered in ('off', 'none', 'no', 'false', '0'):
+        return None
+    try:
+        val = float(raw)
+        if val <= 0:
+            return None
+        return float(val)
+    except ValueError:
+        return _DEFAULT_MCTS_MOVE_TIMEOUT_S
 
 
 class ISMCTSNode:
@@ -295,6 +351,12 @@ def run_is_mcts(env: ScoponeEnvMA,
     else:
         depth_limit = 0
 
+    move_timeout_s = _resolve_move_timeout_s()
+    move_timer = _MctsMoveTimer(move_timeout_s) if move_timeout_s is not None else None
+    timer_check = move_timer.check if move_timer is not None else None
+    if timer_check:
+        timer_check()
+
     root_env = env.clone()
     obs = root_env._get_observation(root_env.current_player)
     legals = root_env.get_valid_actions()
@@ -369,6 +431,23 @@ def run_is_mcts(env: ScoponeEnvMA,
         if priors_len != len(legals_seq):
             raise RuntimeError(f"IS-MCTS: priors length {priors_len} != num legals {len(legals_seq)}")
     ak_order = [action_key(a) for a in legals_seq]
+
+    def _select_greedy_from_priors():
+        if not legals_seq:
+            raise RuntimeError("IS-MCTS: greedy fallback requested with no legal actions")
+        if isinstance(priors, _np.ndarray):
+            best_idx = int(_np.argmax(priors))
+        else:
+            priors_tensor = priors if torch.is_tensor(priors) else torch.as_tensor(priors, dtype=torch.float32)
+            best_idx = int(torch.argmax(priors_tensor).item())
+        best_idx = max(0, min(best_idx, len(legals_seq) - 1))
+        best_action = legals_seq[best_idx]
+        if return_stats:
+            probs_np = _np.zeros(len(legals_seq), dtype=_np.float32)
+            probs_np[best_idx] = 1.0
+            return best_action, probs_np
+        return best_action
+
     for a, p in zip(legals_seq, prior_list):
         ak = action_key(a)
         key = (pk_root, ak)
@@ -438,190 +517,242 @@ def run_is_mcts(env: ScoponeEnvMA,
                         p_vec = p_vec / s
                 else:
                     p_vec = probs_np
-                return best_action, p_vec
+            return best_action, p_vec
             return best_action
     if exact_only and not should_try_exact:
-        # Fallback to greedy selection from prior
-        if isinstance(priors, _np.ndarray):
-            best_idx = int(_np.argmax(priors))
-        else:
-            best_idx = int(torch.argmax(priors).item())
-        best_idx = max(0, min(best_idx, len(legals_seq) - 1))
-        best_action = legals_seq[best_idx]
-        if return_stats:
-            probs_np = _np.zeros(len(legals_seq), dtype=_np.float32)
-            probs_np[best_idx] = 1.0
-            return best_action, probs_np
-        return best_action
+        return _select_greedy_from_priors()
 
-    if int(num_simulations) <= 0:
-        best = max(root.children, key=(lambda n: n.P))
-        if return_stats:
-            import numpy as _np
-            probs_np = _np.zeros(len(ak_order), dtype=_np.float32)
-            if ak_order:
-                target_idx = ak_order.index(action_key(best.action))
-                probs_np[target_idx] = 1.0
-            return best.action, probs_np
-        return best.action
+    try:
+        if int(num_simulations) <= 0:
+            best = max(root.children, key=(lambda n: n.P))
+            if return_stats:
+                import numpy as _np
+                probs_np = _np.zeros(len(ak_order), dtype=_np.float32)
+                if ak_order:
+                    target_idx = ak_order.index(action_key(best.action))
+                    probs_np[target_idx] = 1.0
+                return best.action, probs_np
+            return best.action
 
-    entropy_factor = max(0.0, 1.0 - entropy)
-    progress_factor = 0.0
-    if remaining_moves_root > 0:
-        progress_factor = max(0.0, 1.0 - min(1.0, remaining_moves_root / 40.0))
-    scale = 1.0 + 0.75 * entropy_factor + 0.25 * progress_factor
-    if remaining_moves_root <= 12:
-        scale += 0.15
-    scale = min(scale, 2.0)
-    sim_budget = max(1, int(round(int(num_simulations) * scale)))
-    det_counts = _allocate_simulation_counts(sim_budget, [det['weight'] for det in det_outputs])
+        entropy_factor = max(0.0, 1.0 - entropy)
+        progress_factor = 0.0
+        if remaining_moves_root > 0:
+            progress_factor = max(0.0, 1.0 - min(1.0, remaining_moves_root / 40.0))
+        scale = 1.0 + 0.75 * entropy_factor + 0.25 * progress_factor
+        if remaining_moves_root <= 12:
+            scale += 0.15
+        scale = min(scale, 2.0)
+        sim_budget = max(1, int(round(int(num_simulations) * scale)))
+        det_counts = _allocate_simulation_counts(sim_budget, [det['weight'] for det in det_outputs])
 
-    def simulate_with_det(det_assignment: Optional[Dict[int, Iterable[int]]], det_weight: float) -> None:
-        nonlocal node_cache
-        sim_env = root_env.clone()
-        _apply_determinization(sim_env, det_assignment)
-        node = root
-        path = [node]
-        reached_depth_cap = False
-        while True:
-            if depth_limit > 0 and (len(path) - 1) >= depth_limit:
-                reached_depth_cap = True
-                break
-            if not node.children:
-                break
-            legals_cur = sim_env.get_valid_actions()
-            if torch.is_tensor(legals_cur):
-                legals_list = list(legals_cur.unbind(0))
-            else:
-                legals_list = list(legals_cur)
-            legal_keys = set(action_key(a) for a in legals_list)
-            legal_children = [ch for ch in node.children if action_key(ch.action) in legal_keys or ch.action is None]
-            if not legal_children:
-                break
-            node = max(legal_children, key=lambda n: n.ucb_score(c_puct))
-            path.append(node)
-            if node.action is not None:
-                _, _, done_flag, _ = sim_env.step(_ensure_tensor_action(node.action))
-                if done_flag:
+        def simulate_with_det(det_assignment: Optional[Dict[int, Iterable[int]]], det_weight: float) -> None:
+            nonlocal node_cache
+            if timer_check:
+                timer_check()
+            sim_env = root_env.clone()
+            _apply_determinization(sim_env, det_assignment)
+            node = root
+            path = [node]
+            reached_depth_cap = False
+            while True:
+                if timer_check:
+                    timer_check()
+                if depth_limit > 0 and (len(path) - 1) >= depth_limit:
+                    reached_depth_cap = True
                     break
-        if (not sim_env.done) and (not reached_depth_cap):
-            obs_s = sim_env._get_observation(sim_env.current_player)
-            legals_s = sim_env.get_valid_actions()
-            if torch.is_tensor(legals_s):
-                legals_seq = list(legals_s.unbind(0))
-            else:
-                legals_seq = list(legals_s)
-            if legals_seq:
-                try:
-                    priors_s = policy_fn(obs_s, legals_s)
-                except Exception as e:
-                    raise RuntimeError("IS-MCTS: policy_fn failed during expansion priors") from e
-                if isinstance(priors_s, _np.ndarray):
-                    if prior_smooth_eps > 0 and len(priors_s) > 1:
-                        priors_s = (1 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / len(priors_s))
-                    visits_here = max(1, node.N)
-                    k_allow = min(len(legals_seq), int(3.0 * (visits_here ** 0.5)) + 1)
-                    top_idx = _np.argsort(-priors_s)[:k_allow]
-                    legals_sel = [legals_seq[i] for i in top_idx]
-                    priors_sel = priors_s[top_idx]
+                if not node.children:
+                    break
+                legals_cur = sim_env.get_valid_actions()
+                if torch.is_tensor(legals_cur):
+                    legals_list = list(legals_cur.unbind(0))
                 else:
-                    if not torch.is_tensor(priors_s):
-                        pri_dev2 = get_compute_device()
-                        priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=pri_dev2)
-                    if prior_smooth_eps > 0 and priors_s.numel() > 1:
-                        priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
-                    visits_here = max(1, node.N)
-                    k_allow = min(int(priors_s.numel()), int(3.0 * (visits_here ** 0.5)) + 1)
-                    top_idx = torch.argsort(priors_s, descending=True)[:k_allow]
-                    legals_sel = [legals_seq[int(i)] for i in top_idx.tolist()]
-                    priors_sel = priors_s[top_idx].detach().cpu().numpy()
-                cur = sim_env.current_player
-                table_ids = tuple(sorted(sim_env.game_state.get('table', [])))
-                cs = sim_env.game_state.get('captured_squads', [[], []])
-                if isinstance(cs, dict):
-                    cs0 = tuple(sorted(cs.get(0, [])))
-                    cs1 = tuple(sorted(cs.get(1, [])))
+                    legals_list = list(legals_cur)
+                legal_keys = set(action_key(a) for a in legals_list)
+                legal_children = [ch for ch in node.children if action_key(ch.action) in legal_keys or ch.action is None]
+                if not legal_children:
+                    break
+                node = max(legal_children, key=lambda n: n.ucb_score(c_puct))
+                path.append(node)
+                if node.action is not None:
+                    _, _, done_flag, _ = sim_env.step(_ensure_tensor_action(node.action))
+                    if done_flag:
+                        break
+            if (not sim_env.done) and (not reached_depth_cap):
+                obs_s = sim_env._get_observation(sim_env.current_player)
+                legals_s = sim_env.get_valid_actions()
+                if torch.is_tensor(legals_s):
+                    legals_seq = list(legals_s.unbind(0))
                 else:
-                    cs0 = tuple(sorted(cs[0]))
-                    cs1 = tuple(sorted(cs[1]))
-                pk = (cur, table_ids, cs0, cs1)
-                for a, p in zip(legals_sel, (priors_sel.tolist() if hasattr(priors_sel, 'tolist') else priors_sel)):
-                    ak = action_key(a)
-                    key = (pk, ak)
-                    if key in node_cache:
-                        ch = node_cache[key]
-                        ch.P = float(p)
-                        if ch not in node.children:
-                            node.children.append(ch)
+                    legals_seq = list(legals_s)
+                if legals_seq:
+                    if timer_check:
+                        timer_check()
+                    try:
+                        priors_s = policy_fn(obs_s, legals_s)
+                    except Exception as e:
+                        raise RuntimeError("IS-MCTS: policy_fn failed during expansion priors") from e
+                    if isinstance(priors_s, _np.ndarray):
+                        if prior_smooth_eps > 0 and len(priors_s) > 1:
+                            priors_s = (1 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / len(priors_s))
+                        visits_here = max(1, node.N)
+                        k_allow = min(len(legals_seq), int(3.0 * (visits_here ** 0.5)) + 1)
+                        top_idx = _np.argsort(-priors_s)[:k_allow]
+                        legals_sel = [legals_seq[i] for i in top_idx]
+                        priors_sel = priors_s[top_idx]
                     else:
-                        ch = ISMCTSNode(parent=node, action=a)
-                        ch.P = float(p)
-                        node.children.append(ch)
-                        node_cache[key] = ch
-        if sim_env.done:
-            v = _final_score_diff(sim_env)
-        else:
-            obs_v = sim_env._get_observation(sim_env.current_player)
-            v = float(value_fn(obs_v, sim_env))
-        weight = max(det_weight, 1e-6)
-        for n in reversed(path):
-            n.N += 1
-            n.W += weight * v
-            n.weight += weight
-            if n.weight > 0:
-                n.Q = n.W / n.weight
+                        if not torch.is_tensor(priors_s):
+                            pri_dev2 = get_compute_device()
+                            priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=pri_dev2)
+                        if prior_smooth_eps > 0 and priors_s.numel() > 1:
+                            priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
+                        visits_here = max(1, node.N)
+                        k_allow = min(int(priors_s.numel()), int(3.0 * (visits_here ** 0.5)) + 1)
+                        top_idx = torch.argsort(priors_s, descending=True)[:k_allow]
+                        legals_sel = [legals_seq[int(i)] for i in top_idx.tolist()]
+                        priors_sel = priors_s[top_idx].detach().cpu().numpy()
+                    cur = sim_env.current_player
+                    table_ids = tuple(sorted(sim_env.game_state.get('table', [])))
+                    cs = sim_env.game_state.get('captured_squads', [[], []])
+                    if isinstance(cs, dict):
+                        cs0 = tuple(sorted(cs.get(0, [])))
+                        cs1 = tuple(sorted(cs.get(1, [])))
+                    else:
+                        cs0 = tuple(sorted(cs[0]))
+                        cs1 = tuple(sorted(cs[1]))
+                    pk = (cur, table_ids, cs0, cs1)
+                    for a, p in zip(legals_sel, (priors_sel.tolist() if hasattr(priors_sel, 'tolist') else priors_sel)):
+                        ak = action_key(a)
+                        key = (pk, ak)
+                        if key in node_cache:
+                            ch = node_cache[key]
+                            ch.P = float(p)
+                            if ch not in node.children:
+                                node.children.append(ch)
+                        else:
+                            ch = ISMCTSNode(parent=node, action=a)
+                            ch.P = float(p)
+                            node.children.append(ch)
+                            node_cache[key] = ch
+            if sim_env.done:
+                v = _final_score_diff(sim_env)
             else:
-                n.Q = n.W / max(1, n.N)
+                if timer_check:
+                    timer_check()
+                obs_v = sim_env._get_observation(sim_env.current_player)
+                v = float(value_fn(obs_v, sim_env))
+            weight = max(det_weight, 1e-6)
+            for n in reversed(path):
+                n.N += 1
+                n.W += weight * v
+                n.weight += weight
+                if n.weight > 0:
+                    n.Q = n.W / n.weight
+                else:
+                    n.Q = n.W / max(1, n.N)
 
-    for det, count in zip(det_outputs, det_counts):
-        for _ in range(count):
-            simulate_with_det(det.get('assignment'), float(det.get('weight', 1.0)))
+        for det, count in zip(det_outputs, det_counts):
+            for _ in range(count):
+                if timer_check:
+                    timer_check()
+                simulate_with_det(det.get('assignment'), float(det.get('weight', 1.0)))
 
-    device = get_compute_device()
-    if root_temperature and root_temperature > 1e-6:
-        visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
-        logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))
-        probs_t = logits / torch.clamp_min(logits.sum(), 1e-9)
-        probs_t = probs_t.nan_to_num(0.0)
-        probs_t = torch.clamp(probs_t, min=0.0)
-        s = probs_t.sum()
-        if not torch.isfinite(s) or s <= 0:
-            raise RuntimeError("IS-MCTS: invalid root selection probabilities (NaN/Inf or zero-sum)")
-        probs_t = probs_t / s
-        idx = int(torch.multinomial(probs_t, num_samples=1).item())
-        if return_stats:
-            import numpy as _np
-            ch_keys = [action_key(ch.action) for ch in root.children]
-            probs_np = probs_t.detach().cpu().numpy()
-            agg = {}
-            for k, p in zip(ch_keys, probs_np):
-                agg[k] = float(agg.get(k, 0.0) + float(p))
-            if ak_order:
-                p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
-                s = float(p_vec.sum())
-                if s > 0:
-                    p_vec = p_vec / s
-            else:
-                p_vec = probs_np
-            return root.children[idx].action, p_vec
-        return root.children[idx].action
-    else:
-        best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
-        if return_stats:
+        device = get_compute_device()
+        if timer_check:
+            timer_check()
+        if root_temperature and root_temperature > 1e-6:
             visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
-            probs_t = visits_t / torch.clamp_min(visits_t.sum(), 1e-9)
-            import numpy as _np
-            ch_keys = [action_key(ch.action) for ch in root.children]
-            probs_np = probs_t.detach().cpu().numpy()
-            agg = {}
-            for k, p in zip(ch_keys, probs_np):
-                agg[k] = float(agg.get(k, 0.0) + float(p))
-            if ak_order:
-                p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
-                s = float(p_vec.sum())
-                if s > 0:
-                    p_vec = p_vec / s
-            else:
-                p_vec = probs_np
-            return best.action, p_vec
-        return best.action
+            logits = torch.pow(visits_t + 1e-9, 1.0 / float(root_temperature))
+            probs_t = logits / torch.clamp_min(logits.sum(), 1e-9)
+            probs_t = probs_t.nan_to_num(0.0)
+            probs_t = torch.clamp(probs_t, min=0.0)
+            s = probs_t.sum()
+            if not torch.isfinite(s) or s <= 0:
+                raise RuntimeError("IS-MCTS: invalid root selection probabilities (NaN/Inf or zero-sum)")
+            probs_t = probs_t / s
+            idx = int(torch.multinomial(probs_t, num_samples=1).item())
+            if return_stats:
+                import numpy as _np
+                ch_keys = [action_key(ch.action) for ch in root.children]
+                probs_np = probs_t.detach().cpu().numpy()
+                agg = {}
+                for k, p in zip(ch_keys, probs_np):
+                    agg[k] = float(agg.get(k, 0.0) + float(p))
+                if ak_order:
+                    p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
+                    s = float(p_vec.sum())
+                    if s > 0:
+                        p_vec = p_vec / s
+                else:
+                    p_vec = probs_np
+                return root.children[idx].action, p_vec
+            return root.children[idx].action
+        else:
+            best = max(root.children, key=(lambda n: n.N) if robust_child else (lambda n: n.Q))
+            if return_stats:
+                visits_t = torch.tensor([ch.N for ch in root.children], dtype=torch.float32, device=device)
+                probs_t = visits_t / torch.clamp_min(visits_t.sum(), 1e-9)
+                import numpy as _np
+                ch_keys = [action_key(ch.action) for ch in root.children]
+                probs_np = probs_t.detach().cpu().numpy()
+                agg = {}
+                for k, p in zip(ch_keys, probs_np):
+                    agg[k] = float(agg.get(k, 0.0) + float(p))
+                if ak_order:
+                    p_vec = _np.asarray([agg.get(k, 0.0) for k in ak_order], dtype=_np.float32)
+                    s = float(p_vec.sum())
+                    if s > 0:
+                        p_vec = p_vec / s
+                else:
+                    p_vec = probs_np
+                return best.action, p_vec
+            return best.action
+    except MCTSTimeoutError as exc:
+        elapsed = exc.elapsed_s
+        limit = exc.timeout_s
+        timer_elapsed = move_timer.elapsed() if move_timer is not None else None
+        print(f"[WARN][is_mcts] move timed out after {elapsed:.2f}s (limit {limit:.2f}s); falling back to greedy policy.", flush=True)
+        ctx_parts = [
+            f"player={root_env.current_player}",
+            f"sims_requested={num_simulations}",
+            f"dets={num_determinization}",
+            f"exact_only={exact_only}",
+            f"remaining_moves={remaining_moves_root}",
+            f"belief_sampler={'yes' if callable(belief_sampler) else 'no'}",
+            f"belief_arg={'yes' if belief is not None else 'no'}",
+        ]
+        if timer_elapsed is not None:
+            ctx_parts.append(f"timer_elapsed={timer_elapsed:.2f}s")
+        try:
+            total_visits = sum(ch.N for ch in root.children)
+            ctx_parts.append(f"completed_sims={total_visits}")
+        except Exception:
+            pass
+        print(f"[WARN][is_mcts] context: " + ", ".join(ctx_parts), flush=True)
+        try:
+            priors_repr = priors.tolist() if hasattr(priors, 'tolist') else list(priors)
+            print(f"[WARN][is_mcts] priors={priors_repr}", flush=True)
+        except Exception as pri_exc:
+            print(f"[WARN][is_mcts] failed to serialize priors: {pri_exc}", flush=True)
+        print(f"[WARN][is_mcts] legal_keys={ak_order}", flush=True)
+        try:
+            child_stats = []
+            for ch in root.children:
+                child_stats.append({
+                    'key': action_key(ch.action) if ch.action is not None else None,
+                    'N': ch.N,
+                    'Q': ch.Q,
+                    'P': ch.P,
+                    'W': ch.W,
+                    'weight': ch.weight,
+                })
+            print(f"[WARN][is_mcts] root_children_stats={child_stats}", flush=True)
+        except Exception as child_exc:
+            print(f"[WARN][is_mcts] failed to serialize root children: {child_exc}", flush=True)
+        try:
+            from pprint import pformat
+            state_str = pformat(root_env.game_state, width=120)
+            print("[WARN][is_mcts] game_state snapshot:", flush=True)
+            print(state_str, flush=True)
+        except Exception as state_exc:
+            print(f"[WARN][is_mcts] failed to format game_state: {state_exc}", flush=True)
+        return _select_greedy_from_priors()

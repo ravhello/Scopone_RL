@@ -64,6 +64,7 @@ def _ensure_default_eval_env() -> None:
         'SCOPONE_EVAL_MCTS_EXACT_ONLY': '1',
         'SCOPONE_EVAL_MCTS_EXACT_COVER_FRAC': '70',
         'SCOPONE_EVAL_MCTS_DETS_EXACT': '4',
+        'SCOPONE_MCTS_MOVE_TIMEOUT_S': '120',
         'SCOPONE_EVAL_WORKERS': str(max(1, (os.cpu_count() or 1))),
         'SCOPONE_ELO_DIFF_SCALE': '6.0',
         'TQDM_DISABLE': '0',
@@ -886,6 +887,12 @@ def main():
     print(f"Found {len(checkpoint_infos)} checkpoint files:")
     for idx, info in enumerate(checkpoint_infos, start=1):
         print(f"{idx}. {info['file_path']} [{info['name']}]")
+
+    timeout_raw = str(os.environ.get('SCOPONE_MCTS_MOVE_TIMEOUT_S', '')).strip()
+    if not timeout_raw or timeout_raw.lower() in ('off', 'none', 'no', 'false', '0'):
+        print("[benchmark] MCTS move timeout: disabled")
+    else:
+        print(f"[benchmark] MCTS move timeout: {timeout_raw} s")
 
     workers_env = os.environ.get('SCOPONE_EVAL_WORKERS')
     if args.workers is not None:

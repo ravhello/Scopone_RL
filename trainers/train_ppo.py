@@ -3306,7 +3306,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
 
 
 def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 10, ckpt_path: str = 'checkpoints/ppo_ac.pth', k_history: int = 39, seed: int = 0,
-              entropy_schedule_type: str = 'linear', eval_every: int = 0, eval_games: int = 10, belief_particles: int = 512, belief_ess_frac: float = 0.5,
+              entropy_schedule_type: str = 'linear', eval_every: int = 100, eval_games: int = 1000, belief_particles: int = 512, belief_ess_frac: float = 0.5,
               mcts_in_eval: bool = True, mcts_train: bool = True, mcts_sims: int = 128, mcts_sims_eval: Optional[int] = None, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
               mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25,
               num_envs: int = 32,
@@ -3415,10 +3415,11 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                             'by_seat/kl_02, by_seat/kl_13: KL media per gruppo di posti.',
                             'by_seat/entropy_02, by_seat/entropy_13: Entropia media per gruppo di posti.',
                             'by_seat/clip_frac_02, by_seat/clip_frac_13: Frazione di clipping per gruppo.',
-                            'league/mini_eval_wr: Win-rate nella mini-valutazione vs checkpoint precedente.',
-                            'league/elo_current / league/elo_previous: Elo nel league per corrente/precedente.',
+                            'league/mini_eval_wr: Win-rate medio nella mini-valutazione vs checkpoint con Elo più alto nella lega.',
+                            'league/elo_current / league/elo_previous: Elo nel league per corrente / top avversario affrontato.',
                         ]), 0)
     league = League(base_dir='checkpoints/league')
+    league_eval_top = max(1, int(os.environ.get('SCOPONE_LEAGUE_EVAL_TOP', '3')))
     # Helper to build MCTS config for eval consistently from trainer flags
     def _make_mcts_cfg_for_eval():
         if not mcts_in_eval:
@@ -3679,6 +3680,30 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     best_ckpt_path = ckpt_path.replace('.pth', '_best.pth')
     best_wr = -1e9
     best_wr_ckpt_path = ckpt_path.replace('.pth', '_bestwr.pth')
+
+    def _save_official_checkpoint(tag: str) -> Tuple[str, Optional[str]]:
+        from datetime import datetime as _dt  # local import to avoid global churn
+        ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+        suffix_a = '_selfplay' if use_selfplay else '_teamA'
+        out_A = ckpt_path.replace('.pth', f'{suffix_a}_{ts}.pth')
+        base_dir = os.path.dirname(out_A)
+        if base_dir:
+            os.makedirs(base_dir, exist_ok=True)
+        agent.save(out_A)
+        league.register(out_A)
+        out_B = None
+        if dual_team_nets and not use_selfplay:
+            out_B = ckpt_path.replace('.pth', f'_teamB_{ts}.pth')
+            agent_teamB.save(out_B)
+            league.register(out_B)
+        tqdm.write(f"[checkpoint-{tag}] Saved {out_A}" + (f" and {out_B}" if out_B else ""))
+        return out_A, out_B
+
+    def _cleanup_bootstrap():
+        _bootstrap_path = os.path.join('checkpoints', 'bootstrap_random.pth')
+        if os.path.isfile(_bootstrap_path):
+            os.remove(_bootstrap_path)
+            tqdm.write("[bootstrap] Removed bootstrap_random.pth after saving official checkpoint")
 
     # Two-line UI: top line shows metrics, second line is the progress bar
     _TQDM_DISABLE = (os.environ.get('TQDM_DISABLE','0') in ['1','true','yes','on'])
@@ -4159,49 +4184,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
                 agent.save(best_ckpt_path)
 
-        # mini-eval periodica e Elo update
-        if eval_every and (it + 1) % eval_every == 0 and len(league.history) >= 1:
-            cur_tmp = ckpt_path.replace('.pth', f'_tmp_it{it+1}.pth')
-            agent.save(cur_tmp)
-            league.register(cur_tmp)
-            if dual_team_nets and (not opp_frozen_env):
-                cur_tmp_B = ckpt_path.replace('.pth', f'_tmpB_it{it+1}.pth')
-                agent_teamB.save(cur_tmp_B)
-                league.register(cur_tmp_B)
-            prev_ckpt = league.history[-2] if len(league.history) >= 2 else None
-            if prev_ckpt is not None:
-                mcts_cfg = None
-                if mcts_in_eval:
-                    mcts_cfg = {
-                        'sims': int(mcts_sims_eval if mcts_sims_eval is not None else mcts_sims),
-                        'dets': mcts_dets,
-                        'c_puct': mcts_c_puct,
-                        'root_temp': mcts_root_temp,
-                        'prior_smooth_eps': mcts_prior_smooth_eps,
-                        'root_dirichlet_alpha': mcts_dirichlet_alpha,
-                        'root_dirichlet_eps': mcts_dirichlet_eps,
-                        'robust_child': True,
-                    }
-                # Ensure deterministic MCTS during evaluation/post-game analysis
-                mcts_eval_seed = int(os.environ.get('MCTS_EVAL_SEED', resolve_seed(0)))
-                with temporary_seed(mcts_eval_seed):
-                    diff, bd = evaluate_pair_actors(cur_tmp, prev_ckpt, games=eval_games, k_history=k_history,
-                                                 mcts=_make_mcts_cfg_for_eval(),
-                                                 belief_particles=(belief_particles if mcts_in_eval else 0),
-                                                 belief_ess_frac=belief_ess_frac,
-                                                 tqdm_desc=f"Mini-eval: it{it+1}",
-                                                 tqdm_position=2)
-                league.update_elo_from_diff(cur_tmp, prev_ckpt, diff)
-                if writer is not None:
-                    wr = float((bd.get('meta') or {}).get('win_rate', 0.0))
-                    writer.add_scalar('league/mini_eval_diff', diff, it)
-                    writer.add_scalar('league/mini_eval_wr', wr, it)
-                    writer.add_scalar('league/elo_current', league.elo.get(cur_tmp, 1000.0), it)
-                    writer.add_scalar('league/elo_previous', league.elo.get(prev_ckpt, 1000.0), it)
-                # aggiorna soglia best win-rate ma senza salvare un checkpoint dedicato
-                if wr > best_wr:
-                    best_wr = wr
-
         # Aggiorna output terminale ad ogni iterazione
         def _to_float(x):
             return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
@@ -4302,55 +4284,83 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             numbers = stacked.detach().cpu().tolist()  # unica sincronizzazione CPU
             for key, num in zip(keys, numbers):
                 writer.add_scalar(key, float(num), it)
-        # Save periodically every 'save_every' iters. Additionally, save on the last
-        # iteration to avoid runs with zero checkpoints.
-        if ((it + 1) % save_every == 0) or ((it + 1) == num_iterations):
-            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            # Timestamped filenames, with suffixes by mode
-            from datetime import datetime as _dt
-            ts = _dt.now().strftime('%Y%m%d_%H%M%S')
-            out_A = ckpt_path.replace('.pth', f'_selfplay_{ts}.pth') if use_selfplay else ckpt_path.replace('.pth', f'_teamA_{ts}.pth')
-            agent.save(out_A)
-            league.register(out_A)
-            out_B = None
-            if dual_team_nets and not use_selfplay:
-                out_B = ckpt_path.replace('.pth', f'_teamB_{ts}.pth')
-                agent_teamB.save(out_B)
-                league.register(out_B)
-            # Elo evaluation: ensure new checkpoints play required matches
-            targets = [ref for ref in league.history if ref not in [out_A] + ([out_B] if out_B else [])]
-            if targets:
-                ref = max(targets, key=lambda p: float(league.elo.get(p, 1000.0)))
-                diffA, _ = evaluate_pair_actors(
-                    out_A,
-                    ref,
-                    games=eval_games,
-                    k_history=k_history,
-                    mcts=_make_mcts_cfg_for_eval(),
-                    belief_particles=(belief_particles if mcts_in_eval else 0),
-                    belief_ess_frac=belief_ess_frac,
-                    tqdm_desc=f"Eval: A vs ref",
-                    tqdm_position=2,
-                )
-                league.update_elo_from_diff(out_A, ref, diffA)
+
+        # Gestione dei checkpoint ufficiali e delle valutazioni di lega
+        do_eval = bool(eval_every and (it + 1) % eval_every == 0)
+        do_save = ((it + 1) % save_every == 0) or ((it + 1) == num_iterations)
+        if do_eval:
+            do_save = False  # l'eval include già un salvataggio ufficiale
+            out_A, out_B = _save_official_checkpoint('eval')
+            new_ckpts = [out_A] + ([out_B] if out_B else [])
+            opponents = [ref for ref in league.history if ref not in new_ckpts]
+            opponents_info = [
+                (ref, float(league.elo.get(ref, 1000.0)))
+                for ref in opponents
+            ]
+            opponents_info.sort(key=lambda t: t[1], reverse=True)
+            eval_targets = opponents_info[:league_eval_top]
+            diff_values: List[float] = []
+            wr_values: List[float] = []
+            if eval_targets:
+                tqdm.write(f"[league-eval] {out_A} vs top {len(eval_targets)} checkpoint(s)")
+                mcts_eval_seed = int(os.environ.get('MCTS_EVAL_SEED', resolve_seed(0)))
+                for idx, (ref_ckpt, ref_elo) in enumerate(eval_targets, start=1):
+                    seed_offset = mcts_eval_seed + idx - 1
+                    with temporary_seed(seed_offset):
+                        diffA, bdA = evaluate_pair_actors(
+                            out_A,
+                            ref_ckpt,
+                            games=eval_games,
+                            k_history=k_history,
+                            mcts=_make_mcts_cfg_for_eval(),
+                            belief_particles=(belief_particles if mcts_in_eval else 0),
+                            belief_ess_frac=belief_ess_frac,
+                            tqdm_desc=f"Eval A vs ref#{idx}",
+                            tqdm_position=2,
+                        )
+                    league.update_elo_from_diff(out_A, ref_ckpt, diffA)
+                    wrA = float((bdA.get('meta') or {}).get('win_rate', 0.0))
+                    diff_values.append(diffA)
+                    wr_values.append(wrA)
+                    if writer is not None:
+                        writer.add_scalar(f'league/mini_eval_diff_A_{idx}', diffA, it)
+                        writer.add_scalar(f'league/mini_eval_wr_A_{idx}', wrA, it)
+                    if out_B:
+                        with temporary_seed(seed_offset):
+                            diffB, bdB = evaluate_pair_actors(
+                                out_B,
+                                ref_ckpt,
+                                games=eval_games,
+                                k_history=k_history,
+                                mcts=_make_mcts_cfg_for_eval(),
+                                belief_particles=(belief_particles if mcts_in_eval else 0),
+                                belief_ess_frac=belief_ess_frac,
+                                tqdm_desc=f"Eval B vs ref#{idx}",
+                                tqdm_position=2,
+                            )
+                        league.update_elo_from_diff(out_B, ref_ckpt, diffB)
+                        if writer is not None:
+                            writer.add_scalar(f'league/mini_eval_diff_B_{idx}', diffB, it)
+                            writer.add_scalar(f'league/mini_eval_wr_B_{idx}', float((bdB.get('meta') or {}).get('win_rate', 0.0)), it)
+            else:
+                tqdm.write("[league-eval] Skipping evaluation: no opponents available in league history")
+            avg_wr = float(sum(wr_values) / len(wr_values)) if wr_values else None
+            if avg_wr is not None and avg_wr > best_wr:
+                best_wr = avg_wr
+            if writer is not None:
+                if diff_values:
+                    writer.add_scalar('league/mini_eval_diff', float(sum(diff_values) / len(diff_values)), it)
+                if avg_wr is not None:
+                    writer.add_scalar('league/mini_eval_wr', avg_wr, it)
+                if eval_targets:
+                    writer.add_scalar('league/elo_previous', eval_targets[0][1], it)
+                writer.add_scalar('league/elo_current', league.elo.get(out_A, 1000.0), it)
                 if out_B:
-                    diffB, _ = evaluate_pair_actors(
-                        out_B,
-                        ref,
-                        games=eval_games,
-                        k_history=k_history,
-                        mcts=_make_mcts_cfg_for_eval(),
-                        belief_particles=(belief_particles if mcts_in_eval else 0),
-                        belief_ess_frac=belief_ess_frac,
-                        tqdm_desc=f"Eval: B vs ref",
-                        tqdm_position=2,
-                    )
-                    league.update_elo_from_diff(out_B, ref, diffB)
-            # After saving a real checkpoint, delete any bootstrap files present
-            _bootstrap_path = os.path.join('checkpoints', 'bootstrap_random.pth')
-            if os.path.isfile(_bootstrap_path):
-                os.remove(_bootstrap_path)
-                tqdm.write("[bootstrap] Removed bootstrap_random.pth after saving real checkpoint")
+                    writer.add_scalar('league/elo_current_B', league.elo.get(out_B, 1000.0), it)
+            _cleanup_bootstrap()
+        elif do_save:
+            _save_official_checkpoint('save')
+            _cleanup_bootstrap()
         # Optional profiler or external hook per-iteration
         if on_iter_end is not None:
             on_iter_end(it)
@@ -4365,13 +4375,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train PPO Action-Conditioned for Scopone')
     parser.add_argument('--iters', type=int, default=2000, help='Number of PPO iterations')
     parser.add_argument('--horizon', type=int, default=256, help='Rollout horizon (steps) per iteration (minimo 40); con solo reward finale raccoglie ~horizon//40 episodi')
-    parser.add_argument('--save-every', type=int, default=200, help='Save checkpoint every N iterations')
+    parser.add_argument('--save-every', type=int, default=10, help='Save checkpoint every N iterations')
     parser.add_argument('--ckpt', type=str, default='checkpoints/ppo_ac.pth', help='Checkpoint path')
     parser.add_argument('--compact', action='store_true', help='Use compact observation (recommended)')
     parser.add_argument('--k-history', type=int, default=39, help='Number of recent moves in compact history')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--entropy-schedule', type=str, default='linear', choices=['linear','cosine'], help='Entropy schedule type')
-    parser.add_argument('--eval-every', type=int, default=0, help='Run mini-eval every N iters (0=off)')
+    parser.add_argument('--eval-every', type=int, default=100, help='Run evaluation (with official save) every N iters (0=off)')
     parser.add_argument('--eval-games', type=int, default=10, help='Games per mini-eval')
     parser.add_argument('--belief-particles', type=int, default=512, help='Belief particles for trainer')
     parser.add_argument('--belief-ess-frac', type=float, default=0.5, help='Belief ESS fraction for trainer')

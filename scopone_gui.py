@@ -9,7 +9,7 @@ import pickle
 import time
 import json
 from collections import deque
-from typing import Optional
+from typing import Optional, Any, Dict, List
 
 import torch
 
@@ -131,6 +131,196 @@ def get_local_ip():
         return local_ip
     except Exception as e:
         raise RuntimeError("Failed to obtain local IP address") from e
+
+
+def _normalize_checkpoint_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        return os.path.normpath(path)
+    except Exception:
+        return path
+
+
+def league_best_checkpoint() -> Optional[str]:
+    """Return the checkpoint with the highest Elo from the league metadata, if available."""
+    league_path = os.path.join('checkpoints', 'league', 'league.json')
+    if not os.path.exists(league_path):
+        return None
+    try:
+        with open(league_path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    history = data.get('history')
+    if not isinstance(history, list) or not history:
+        return None
+
+    elo_map = data.get('elo') if isinstance(data.get('elo'), dict) else {}
+
+    def _elo_value(path: str) -> float:
+        try:
+            return float(elo_map.get(path, 1000.0))
+        except Exception:
+            return 1000.0
+
+    ranked_paths = sorted(
+        (p for p in history if isinstance(p, str)),
+        key=_elo_value,
+        reverse=True,
+    )
+    for raw_path in ranked_paths:
+        norm = _normalize_checkpoint_path(raw_path)
+        if not norm:
+            continue
+        candidates = [norm]
+        if not os.path.isabs(norm):
+            if not norm.startswith('checkpoints'):
+                candidates.append(os.path.join('checkpoints', norm))
+            basename = os.path.basename(norm)
+            if basename:
+                candidates.append(os.path.join('checkpoints', 'league', basename))
+        seen = set()
+        for cand in candidates:
+            cand_norm = _normalize_checkpoint_path(cand)
+            if not cand_norm or cand_norm in seen:
+                continue
+            seen.add(cand_norm)
+            if os.path.exists(cand_norm):
+                return cand_norm
+    return None
+
+
+def resolve_checkpoint_path(app: Any, team_id: int, fallback: Optional[str] = None,
+                            ignore_override: bool = False, quiet: bool = False) -> Optional[str]:
+    """
+    Resolve the checkpoint path for a given team using the same precedence everywhere.
+
+    The resolution order matches the legacy GUI behaviour, with the addition of an optional
+    manual override stored on the app/game_config.
+    """
+    config: Dict[str, Any] = {}
+    if app is not None and hasattr(app, 'game_config'):
+        cfg = getattr(app, 'game_config')
+        if isinstance(cfg, dict):
+            config = cfg
+
+    if not ignore_override:
+        override_source: Any = None
+        if 'checkpoint_override' in config:
+            override_source = config.get('checkpoint_override')
+        elif app is not None and hasattr(app, 'checkpoint_override'):
+            override_source = getattr(app, 'checkpoint_override')
+
+        override_path: Optional[str] = None
+        if isinstance(override_source, dict):
+            override_path = override_source.get(team_id) or override_source.get(str(team_id))
+        elif isinstance(override_source, str):
+            override_path = override_source
+
+        override_norm = _normalize_checkpoint_path(override_path)
+        if override_norm and os.path.exists(override_norm):
+            if not quiet:
+                try:
+                    print(f"[checkpoint] team {team_id} -> {override_norm}")
+                except Exception:
+                    pass
+            return override_norm
+
+    candidates: List[str] = []
+    env_specific = os.environ.get(f'SCOPONE_GUI_CKPT_TEAM{team_id}')
+    if env_specific:
+        candidates.append(env_specific)
+    env_shared = os.environ.get('SCOPONE_GUI_CKPT')
+    if env_shared:
+        candidates.append(env_shared)
+    league_best = league_best_checkpoint()
+    if league_best:
+        candidates.append(league_best)
+
+    if isinstance(config, dict):
+        team_map = config.get('team_checkpoints')
+        if isinstance(team_map, dict):
+            cand = team_map.get(team_id) or team_map.get(str(team_id))
+            if cand:
+                candidates.append(cand)
+        for key in (f'team{team_id}_checkpoint', f'team_{team_id}_checkpoint'):
+            cand = config.get(key)
+            if cand:
+                candidates.append(cand)
+
+    candidates.append(os.path.join('checkpoints', f'ppo_ac_team{team_id}.pth'))
+    candidates.append(os.path.join('checkpoints', 'ppo_ac.pth'))
+    if fallback:
+        candidates.append(fallback)
+    legacy = f'scopone_checkpoint_team{team_id}.pth'
+    candidates.append(legacy)
+
+    seen = set()
+    for cand in candidates:
+        cand_norm = _normalize_checkpoint_path(cand)
+        if not cand_norm or cand_norm in seen:
+            continue
+        seen.add(cand_norm)
+        if os.path.exists(cand_norm):
+            if not quiet:
+                try:
+                    print(f"[checkpoint] team {team_id} -> {cand_norm}")
+                except Exception:
+                    pass
+            return cand_norm
+    return None
+
+
+def discover_checkpoint_files(max_results: Optional[int] = None) -> List[str]:
+    """Return a list of available checkpoint files sorted by modification time (newest first)."""
+    search_roots = ['checkpoints']
+    candidates: List[str] = []
+    seen = set()
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for name in filenames:
+                if not name.lower().endswith('.pth'):
+                    continue
+                full_path = _normalize_checkpoint_path(os.path.join(dirpath, name))
+                if not full_path or full_path in seen:
+                    continue
+                try:
+                    if os.path.getsize(full_path) <= 0:
+                        continue
+                except OSError:
+                    continue
+                seen.add(full_path)
+                candidates.append(full_path)
+
+    def _mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    candidates.sort(key=_mtime, reverse=True)
+    if max_results is not None:
+        candidates = candidates[:max_results]
+    return candidates
+
+
+def checkpoint_display_label(path: str) -> str:
+    """Return a compact label for a checkpoint path."""
+    try:
+        rel = os.path.relpath(path, os.getcwd())
+    except Exception:
+        rel = os.path.basename(path)
+    else:
+        if rel.startswith('..'):
+            rel = os.path.basename(path)
+    return rel.replace('\\', '/')
 
 
 class GuiPolicyAgent:
@@ -2103,6 +2293,12 @@ class GameModeScreen(BaseScreen):
         # Status message
         self.status_message = ""
         
+        # Checkpoint selection state
+        self.checkpoint_options: List[Dict[str, Any]] = []
+        self.selected_checkpoint_index = 0
+        self.checkpoint_rect = pygame.Rect(0, 0, 0, 0)
+        self._last_checkpoint_scan = 0.0
+        
         self.host_screen_active = False
         self.online_mode_buttons = []
         self.selected_online_mode = 0  # 0: 4 Players, 1: 2v2 with AI
@@ -2231,11 +2427,22 @@ class GameModeScreen(BaseScreen):
                 font_size=int(height * 0.025)),
         ]
         
+        # Checkpoint selector positioned between difficulty buttons and IP input
+        checkpoint_width = int(width * 0.3)
+        checkpoint_height = int(height * 0.05)
+        checkpoint_y = button_start_y + 5 * (button_height + button_spacing)
+        self.checkpoint_rect = pygame.Rect(
+            center_x - checkpoint_width // 2,
+            checkpoint_y,
+            checkpoint_width,
+            checkpoint_height
+        )
+
         # IP input for joining online games
         self.ip_input_rect = pygame.Rect(
             center_x - int(width * 0.225),
-            button_start_y + 5 * (button_height + button_spacing),  # Change from 6 to 5
-            int(width * 0.3),  # Already set to correct width
+            self.checkpoint_rect.bottom + int(height * 0.02),
+            int(width * 0.3),
             int(height * 0.05)
         )
 
@@ -2265,7 +2472,8 @@ class GameModeScreen(BaseScreen):
         for button in self.difficulty_buttons:
             ui_elements.append((button.rect, 2))
         
-        # Aggiungi la casella di input IP (priorità 3)
+        # Aggiungi il selettore checkpoint e la casella di input IP (priorità 3)
+        ui_elements.append((self.checkpoint_rect, 3))
         ui_elements.append((self.ip_input_rect, 3))
         
         # Usa il LayoutManager per riposizionare gli elementi evitando sovrapposizioni
@@ -2306,7 +2514,105 @@ class GameModeScreen(BaseScreen):
                 rect.x = new_rects[rect_index].x
                 rect.y = new_rects[rect_index].y
                 rect_index += 1
+        
+        # Assicurati che il selettore checkpoint abbia la stessa larghezza della casella IP
+        self.checkpoint_rect.width = self.ip_input_rect.width
+        self.checkpoint_rect.height = checkpoint_height
+
+        self.refresh_checkpoint_options()
     
+    def refresh_checkpoint_options(self):
+        """Aggiorna l'elenco dei checkpoint e mantiene coerente la selezione."""
+        now = time.time()
+        should_rescan = (not self.checkpoint_options) or ((now - self._last_checkpoint_scan) > 5.0)
+        available: List[str] = []
+        if should_rescan:
+            self._last_checkpoint_scan = now
+            available = discover_checkpoint_files(30)
+        else:
+            # Riutilizza le opzioni gi� note (saltando la voce Auto)
+            available = [opt.get("value") for opt in self.checkpoint_options[1:]]
+
+        config = getattr(self.app, 'game_config', {})
+        override_value = None
+        if isinstance(config, dict) and config.get('checkpoint_override'):
+            override_value = config.get('checkpoint_override')
+        elif hasattr(self.app, 'checkpoint_override'):
+            override_value = getattr(self.app, 'checkpoint_override')
+        override_norm = _normalize_checkpoint_path(override_value)
+        override_exists = bool(override_norm and os.path.exists(override_norm))
+
+        auto_t0 = resolve_checkpoint_path(self.app, 0, ignore_override=True, quiet=True)
+        auto_t1 = resolve_checkpoint_path(self.app, 1, ignore_override=True, quiet=True)
+        parts = []
+        if auto_t0:
+            parts.append(f"T0: {checkpoint_display_label(auto_t0)}")
+        if auto_t1:
+            parts.append(f"T1: {checkpoint_display_label(auto_t1)}")
+        auto_label = f"Auto ({' | '.join(parts)})" if parts else "Auto (nessun checkpoint disponibile)"
+
+        options: List[Dict[str, Any]] = [{"label": auto_label, "value": None}]
+        source_paths = available
+        for path in source_paths:
+            if not path:
+                continue
+            options.append({"label": checkpoint_display_label(path), "value": path})
+
+        selected_index = 0
+        if override_norm and override_exists:
+            for idx, opt in enumerate(options):
+                opt_val = _normalize_checkpoint_path(opt.get('value'))
+                if opt_val and opt_val == override_norm:
+                    selected_index = idx
+                    break
+            else:
+                label = checkpoint_display_label(override_norm)
+                options.append({"label": f"{label} (custom)", "value": override_norm})
+                selected_index = len(options) - 1
+
+        self.checkpoint_options = options
+        if override_exists:
+            self.selected_checkpoint_index = selected_index
+        else:
+            self.selected_checkpoint_index = 0
+        self._apply_checkpoint_selection_to_config()
+
+    def _get_selected_checkpoint_value(self) -> Optional[str]:
+        if not self.checkpoint_options:
+            return None
+        try:
+            raw_value = self.checkpoint_options[self.selected_checkpoint_index].get('value')
+        except (IndexError, AttributeError):
+            raw_value = None
+        return _normalize_checkpoint_path(raw_value)
+
+    def _current_checkpoint_label(self) -> str:
+        if not self.checkpoint_options:
+            return "Auto (nessun checkpoint disponibile)"
+        idx = max(0, min(self.selected_checkpoint_index, len(self.checkpoint_options) - 1))
+        label = self.checkpoint_options[idx].get('label')
+        return label if isinstance(label, str) else str(label)
+
+    def _apply_checkpoint_selection_to_config(self):
+        selected = self._get_selected_checkpoint_value()
+        if selected and not os.path.exists(selected):
+            selected = None
+            self.selected_checkpoint_index = 0
+        setattr(self.app, 'checkpoint_override', selected)
+        if not hasattr(self.app, 'game_config') or not isinstance(self.app.game_config, dict):
+            self.app.game_config = {}
+        if selected:
+            self.app.game_config['checkpoint_override'] = selected
+        else:
+            self.app.game_config.pop('checkpoint_override', None)
+
+    def _cycle_checkpoint_selection(self, direction: int = 1):
+        if not self.checkpoint_options:
+            return
+        total = len(self.checkpoint_options)
+        self.selected_checkpoint_index = (self.selected_checkpoint_index + direction) % total
+        self._apply_checkpoint_selection_to_config()
+
     def handle_events(self, events):
         for event in events:
             if event.type == pygame.QUIT:
@@ -2351,6 +2657,15 @@ class GameModeScreen(BaseScreen):
                     return
                 
                 # Resto del codice per la schermata principale (invariato)
+                # Gestisci il selettore checkpoint
+                if self.checkpoint_rect.collidepoint(pos):
+                    if event.button == 1:
+                        self._cycle_checkpoint_selection(1)
+                    elif event.button == 3:
+                        self._cycle_checkpoint_selection(-1)
+                    self.ip_input_active = False
+                    return
+                
                 # Check if IP input box clicked
                 if self.ip_input_rect.collidepoint(pos):
                     self.ip_input_active = True
@@ -2427,6 +2742,7 @@ class GameModeScreen(BaseScreen):
                 "ai_players": 3,
                 "difficulty": self.selected_difficulty
             }
+            self._apply_checkpoint_selection_to_config()
             self.done = True
             self.next_screen = "options"
             return
@@ -2445,6 +2761,7 @@ class GameModeScreen(BaseScreen):
                 "ai_players": 2,
                 "difficulty": self.selected_difficulty
             }
+            self._apply_checkpoint_selection_to_config()
             self.done = True
             self.next_screen = "options"
             return
@@ -2459,6 +2776,7 @@ class GameModeScreen(BaseScreen):
                 "human_players": 4,
                 "ai_players": 0
             }
+            self._apply_checkpoint_selection_to_config()
         elif button_index == 3:
             # Host Online Game -> apri SUBITO il sottomenu online
             self.app.game_config = {
@@ -2466,6 +2784,7 @@ class GameModeScreen(BaseScreen):
                 "is_host": True,
                 "player_id": 0
             }
+            self._apply_checkpoint_selection_to_config()
             self.host_screen_active = True
             self.setup_online_choice_buttons()
             return
@@ -2545,6 +2864,7 @@ class GameModeScreen(BaseScreen):
                     "online_type": "all_human",
                     "rules": preserved_rules,
                 }
+                self._apply_checkpoint_selection_to_config()
                 # Initialize basic lobby state for host
                 try:
                     lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}})
@@ -2570,6 +2890,7 @@ class GameModeScreen(BaseScreen):
                     "difficulty": self.selected_difficulty,
                     "rules": preserved_rules,
                 }
+                self._apply_checkpoint_selection_to_config()
                 print(f"DEBUG HOST GAME: Setting game_config with is_host=True, online_type=team_vs_ai")
                 
                 # Force game_config to be correctly set
@@ -2599,6 +2920,7 @@ class GameModeScreen(BaseScreen):
                     "difficulty": self.selected_difficulty,
                     "rules": preserved_rules,
                 }
+                self._apply_checkpoint_selection_to_config()
                 print("DEBUG HOST GAME: Setting online_type=humans_plus_ai")
                 self.waiting_for_other_player = True
                 if hasattr(self.app, 'network') and self.app.network:
@@ -2617,6 +2939,7 @@ class GameModeScreen(BaseScreen):
                     "difficulty": self.selected_difficulty,
                     "rules": preserved_rules,
                 }
+                self._apply_checkpoint_selection_to_config()
                 # Inizializza lobby con AI pronta su seat libero (placeholder; sarà determinato dopo i join)
                 try:
                     lobby = self.app.network.game_state.setdefault('lobby_state', {'players': {}, 'seats': {}, 'ai_ready': True})
@@ -2784,6 +3107,34 @@ class GameModeScreen(BaseScreen):
                 pygame.draw.rect(surface, GOLD, button.rect.inflate(6, 6), 3, border_radius=8)
             button.draw(surface)
         
+        # Draw checkpoint selector
+        checkpoint_label = self.info_font.render("AI Checkpoint:", True, WHITE)
+        label_rect = checkpoint_label.get_rect(
+            right=self.checkpoint_rect.left - width * 0.01,
+            centery=self.checkpoint_rect.centery
+        )
+        surface.blit(checkpoint_label, label_rect)
+
+        hover = self.checkpoint_rect.collidepoint(pygame.mouse.get_pos())
+        base_color = LIGHT_BLUE if hover else DARK_BLUE
+        pygame.draw.rect(surface, base_color, self.checkpoint_rect, border_radius=5)
+        pygame.draw.rect(surface, WHITE, self.checkpoint_rect, 2, border_radius=5)
+
+        checkpoint_text = self._current_checkpoint_label()
+        max_text_width = self.checkpoint_rect.width - 16
+        text_color = WHITE
+        font = self.small_font
+        if hasattr(font, "size"):
+            text_width, _ = font.size(checkpoint_text)
+            if text_width > max_text_width:
+                ellipsis = "…"
+                truncated = checkpoint_text
+                while truncated and font.size(truncated + ellipsis)[0] > max_text_width:
+                    truncated = truncated[:-1]
+                checkpoint_text = (truncated + ellipsis) if truncated else ellipsis
+        checkpoint_surf = font.render(checkpoint_text, True, text_color)
+        surface.blit(checkpoint_surf, checkpoint_surf.get_rect(center=self.checkpoint_rect.center))
+        
         # Draw IP input box with appropriate colors
         ip_color = LIGHT_BLUE if self.ip_input_active else DARK_BLUE
         pygame.draw.rect(surface, ip_color, self.ip_input_rect, border_radius=5)
@@ -2923,6 +3274,7 @@ class GameModeScreen(BaseScreen):
             try:
                 if self.app.game_config.get('room_closed_by_host') or self.app.game_config.get('kicked_by_host'):
                     self.app.game_config = {}
+                    self._apply_checkpoint_selection_to_config()
                     self.done = True
                     self.next_screen = "mode"
                     return
@@ -2944,6 +3296,7 @@ class GameModeScreen(BaseScreen):
                     # Client: lobby for lobby-type rooms; in AI modes auto-enter game when state is available; otherwise wait for start signal
                     if gs.get('room_closed_by_host'):
                         self.app.game_config = {}
+                        self._apply_checkpoint_selection_to_config()
                         self.done = True
                         self.next_screen = "mode"
                     elif (ot in ['all_human', 'three_humans_one_ai']) and has_lobby:
@@ -2982,6 +3335,7 @@ class GameModeScreen(BaseScreen):
                     "is_host": is_host,
                     "player_id": self.app.network.player_id
                 }
+                self._apply_checkpoint_selection_to_config()
                 # Preserve known fields from previous selection
                 for key in ['online_type', 'difficulty', 'rules']:
                     if key in existing_config:
@@ -3790,91 +4144,10 @@ class GameScreen(BaseScreen):
         return 10823
     
     def _league_best_checkpoint(self) -> Optional[str]:
-        """Return the top-Elo checkpoint recorded by the training league, if available."""
-        league_path = os.path.join('checkpoints', 'league', 'league.json')
-        try:
-            with open(league_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            return None
-
-        if not isinstance(data, dict):
-            return None
-
-        history = data.get('history')
-        if not isinstance(history, list) or not history:
-            return None
-
-        elo_map = data.get('elo') if isinstance(data.get('elo'), dict) else {}
-
-        def _elo_value(path: str) -> float:
-            try:
-                return float(elo_map.get(path, 1000.0))
-            except Exception:
-                return 1000.0
-
-        ranked_paths = sorted(
-            (p for p in history if isinstance(p, str)),
-            key=_elo_value,
-            reverse=True,
-        )
-        for raw_path in ranked_paths:
-            norm = os.path.normpath(raw_path)
-            candidates = [norm]
-            if not os.path.isabs(norm):
-                if not norm.startswith('checkpoints'):
-                    candidates.append(os.path.join('checkpoints', norm))
-                basename = os.path.basename(norm)
-                if basename:
-                    candidates.append(os.path.join('checkpoints', 'league', basename))
-            seen = set()
-            for cand in candidates:
-                cand_norm = os.path.normpath(cand)
-                if cand_norm in seen:
-                    continue
-                seen.add(cand_norm)
-                if os.path.exists(cand_norm):
-                    return cand_norm
-        return None
+        return league_best_checkpoint()
 
     def _resolve_checkpoint_path(self, team_id: int, fallback: Optional[str] = None) -> Optional[str]:
-        candidates = []
-        env_specific = os.environ.get(f'SCOPONE_GUI_CKPT_TEAM{team_id}')
-        if env_specific:
-            candidates.append(env_specific)
-        env_shared = os.environ.get('SCOPONE_GUI_CKPT')
-        if env_shared:
-            candidates.append(env_shared)
-        league_best = self._league_best_checkpoint()
-        if league_best:
-            candidates.append(league_best)
-        config = getattr(self.app, 'game_config', {})
-        if isinstance(config, dict):
-            team_map = config.get('team_checkpoints')
-            if isinstance(team_map, dict):
-                cand = team_map.get(team_id) or team_map.get(str(team_id))
-                if cand:
-                    candidates.append(cand)
-            for key in (f'team{team_id}_checkpoint', f'team_{team_id}_checkpoint'):
-                cand = config.get(key)
-                if cand:
-                    candidates.append(cand)
-        candidates.append(os.path.join('checkpoints', f'ppo_ac_team{team_id}.pth'))
-        candidates.append(os.path.join('checkpoints', 'ppo_ac.pth'))
-        if fallback:
-            candidates.append(fallback)
-        legacy = f'scopone_checkpoint_team{team_id}.pth'
-        candidates.append(legacy)
-        for cand in candidates:
-            if cand and os.path.exists(cand):
-                try:
-                    print(f"[checkpoint] team {team_id} -> {os.path.normpath(cand)}")
-                except Exception:
-                    pass
-                return cand
-        return None
+        return resolve_checkpoint_path(self.app, team_id, fallback=fallback)
 
     def _play_next_queued_client_move(self):
         """Play the next queued client move, ensuring strict serialization.
@@ -10439,6 +10712,7 @@ class ScoponeApp:
         
         # Game configuration
         self.game_config = {}
+        self.checkpoint_override: Optional[str] = None
         
         # Network manager (for online play)
         self.network = None
