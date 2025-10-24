@@ -1029,9 +1029,7 @@ def test_policy_prefers_optimal_ace_king_sequence_with_checkpoint():
     ckpt_path = os.getenv("BEST_ACTOR_CKPT")
     if not ckpt_path:
         candidates = [
-            os.path.join('checkpoints', 'ppo_ac_best.pth'),      # priorità: best generale
-            os.path.join('checkpoints', 'ppo_ac_bestwr.pth'),    # poi best per win-rate
-            os.path.join('checkpoints', 'ppo_ac.pth'),           # poi ultimo checkpoint standard
+            os.path.join('checkpoints', 'ppo_ac.pth'),           # ultimo checkpoint standard
         ]
         ckpt_path = next((p for p in candidates if os.path.isfile(p)), None)
         # heuristic: cerca l'ultimo .pth in checkpoints/

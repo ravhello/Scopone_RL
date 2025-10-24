@@ -7347,7 +7347,7 @@ class GameScreen(BaseScreen):
             self.status_message = "Non è il tuo turno"
             return False
                 
-        if not self.selected_hand_card:
+        if self.selected_hand_card is None:
             self.status_message = "Select a card from your hand first"
             return False
         
@@ -7357,7 +7357,7 @@ class GameScreen(BaseScreen):
             ap_enabled = bool(rules.get("asso_piglia_tutto", False))
             ap_posabile = bool(rules.get("asso_piglia_tutto_posabile", False))
             ap_only_empty = bool(rules.get("asso_piglia_tutto_posabile_only_empty", False))
-            if ap_enabled and self.selected_hand_card and rank_of(self.selected_hand_card) == 1:
+            if ap_enabled and self.selected_hand_card is not None and rank_of(self.selected_hand_card) == 1:
                 table_cards = []
                 if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                     table_cards = list(self.env.game_state.get("table", []))
@@ -7390,7 +7390,7 @@ class GameScreen(BaseScreen):
             # Regola speciale: se esistono carte di pari rank sul tavolo, permetti solo la cattura di UNA di esse
             # (non una combinazione). Quindi, se selected_table_cards contiene più carte dello stesso rank, invalida.
             try:
-                if self.selected_hand_card and rank_of(self.selected_hand_card) == rank_of(card):
+                if self.selected_hand_card is not None and rank_of(self.selected_hand_card) == rank_of(card):
                     table_same_rank = [c for c in (self.env.game_state.get("table", []) if self.env else []) if rank_of(c) == rank_of(card)]
                 else:
                     table_same_rank = []
@@ -7412,7 +7412,13 @@ class GameScreen(BaseScreen):
                 table_cards = []
                 if self.env and isinstance(getattr(self.env, 'game_state', None), dict):
                     table_cards = list(self.env.game_state.get("table", []))
-                if ap_enabled and not ap_posabile and self.selected_hand_card and rank_of(self.selected_hand_card) == 1 and len(table_cards) == 0:
+                if (
+                    ap_enabled
+                    and not ap_posabile
+                    and self.selected_hand_card is not None
+                    and rank_of(self.selected_hand_card) == 1
+                    and len(table_cards) == 0
+                ):
                     import torch
                     def _to_id(x):
                         return x if isinstance(x, int) else (x[0]-1)*4 + { 'denari':0, 'coppe':1, 'spade':2, 'bastoni':3 }[x[1]]

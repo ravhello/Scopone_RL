@@ -3678,7 +3678,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
 
     best_return = -1e9
     best_ckpt_path = ckpt_path.replace('.pth', '_best.pth')
-    best_wr = -1e9
     best_wr_ckpt_path = ckpt_path.replace('.pth', '_bestwr.pth')
 
     def _save_official_checkpoint(tag: str) -> Tuple[str, Optional[str]]:
@@ -3818,11 +3817,14 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
                 horizon = new_h
             episodes_hint = max(1, horizon // per_ep_util)
-            # Debug: mostra hint e distribuzione per-env
-            eps_per_env_dbg = max(1, (episodes_hint + int(num_envs) - 1) // int(num_envs))
-            total_eps_dbg = eps_per_env_dbg * int(num_envs)
-            tqdm.write(f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
-                        f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}")
+            if _PPO_DEBUG:
+                # Debug: mostra hint e distribuzione per-env
+                eps_per_env_dbg = max(1, (episodes_hint + int(num_envs) - 1) // int(num_envs))
+                total_eps_dbg = eps_per_env_dbg * int(num_envs)
+                tqdm.write(
+                    f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
+                    f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}"
+                )
             # Abilita/disabilita MCTS in parallelo in base al flag di training
             parallel_use_mcts = bool(mcts_train and mcts_train_factor > 0.0)
             if dual_team_nets and (not opp_frozen_env):
@@ -4152,28 +4154,17 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             avg_return = avg_return_A
             if avg_return_A > best_return:
                 best_return = avg_return_A
-                os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-                agent.save(best_ckpt_path.replace('.pth', '_teamA.pth'))
-            # Save best for team B separately
-            if avg_return_B > (globals().get('_best_return_B', -1e9)):
-                _best_return_B = avg_return_B
-                os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-                agent_teamB.save(best_ckpt_path.replace('.pth', '_teamB.pth'))
         elif dual_team_nets and opp_frozen_env:
             if train_A_now:
                 avg_return_A = float(batch_A['ret'].mean().detach().cpu().item()) if len(batch_A['ret']) else 0.0
                 avg_return = avg_return_A
                 if avg_return_A > best_return:
                     best_return = avg_return_A
-                    os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-                    agent.save(best_ckpt_path)
             else:
                 avg_return_B = float(batch_B['ret'].mean().detach().cpu().item()) if len(batch_B['ret']) else 0.0
                 avg_return = avg_return_B
-                if avg_return_B > (globals().get('_best_return_B', -1e9)):
-                    _best_return_B = avg_return_B
-                    os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-                    agent_teamB.save(best_ckpt_path)
+                if avg_return_B > best_return:
+                    best_return = avg_return_B
         else:
             if len(batch['ret']):
                 avg_return = float(batch['ret'].mean().detach().cpu().item())
@@ -4181,8 +4172,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 avg_return = 0.0
             if avg_return > best_return:
                 best_return = avg_return
-                os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
-                agent.save(best_ckpt_path)
 
         # Aggiorna output terminale ad ogni iterazione
         def _to_float(x):
@@ -4345,8 +4334,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             else:
                 tqdm.write("[league-eval] Skipping evaluation: no opponents available in league history")
             avg_wr = float(sum(wr_values) / len(wr_values)) if wr_values else None
-            if avg_wr is not None and avg_wr > best_wr:
-                best_wr = avg_wr
             if writer is not None:
                 if diff_values:
                     writer.add_scalar('league/mini_eval_diff', float(sum(diff_values) / len(diff_values)), it)

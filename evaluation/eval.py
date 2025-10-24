@@ -596,7 +596,7 @@ def evaluate_pair_actors(ckpt_a: str, ckpt_b: str, games: int = 10,
 
 
 def _eval_pair_chunk_worker(args):
-    """Worker: esegue un sottoinsieme di partite e ritorna (wins_int, breakdown_sum_dict)."""
+    """Worker: esegue un sottoinsieme di partite e ritorna (diff_sum, breakdown_sum, winsA, winsB, draws, actor_sumA, actor_sumB, games)."""
     # Args can be (wid, ckpt_a, ckpt_b, games, ...) or without wid
     if len(args) == 8:
         wid, ckpt_a, ckpt_b, games, k_history, mcts, belief_particles, belief_ess_frac = args
@@ -846,13 +846,33 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
                             continue
                         raise
                     try:
-                        diff_sum_i, bd_sum_i, wins_i, games_i = item
+                        (
+                            diff_sum_i,
+                            bd_sum_i,
+                            wins_a_i,
+                            wins_b_i,
+                            draws_i,
+                            actor_sum_a_i,
+                            actor_sum_b_i,
+                            games_i,
+                        ) = item
                     except Exception as e:
                         _dbg(f"received malformed result {item!r}: {e}")
                         break
                     if pbar is not None:
                         pbar.update(int(games_i))
-                    results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
+                    results.append(
+                        (
+                            diff_sum_i,
+                            bd_sum_i,
+                            wins_a_i,
+                            wins_b_i,
+                            draws_i,
+                            actor_sum_a_i,
+                            actor_sum_b_i,
+                            games_i,
+                        )
+                    )
                     break
         except mp.TimeoutError as te:
             _dbg("pool timeout while waiting for results; terminating pool …")
@@ -879,7 +899,16 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
     total_actor_sum_agent1 = 0.0
     total_actor_sum_agent2 = 0.0
     agg = {0: {}, 1: {}}
-    for diff_sum_i, bd_sum_i, wins_a_i, wins_b_i, draws_i, actor_sum_a_i, actor_sum_b_i, games_i in results:
+    for (
+        diff_sum_i,
+        bd_sum_i,
+        wins_a_i,
+        wins_b_i,
+        draws_i,
+        actor_sum_a_i,
+        actor_sum_b_i,
+        games_i,
+    ) in results:
         games_int = int(games_i)
         total_games += games_int
         total_wins_agent1 += int(wins_a_i)
