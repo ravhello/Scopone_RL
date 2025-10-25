@@ -3309,7 +3309,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
 
 
 def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 10, ckpt_path: str = 'checkpoints/ppo_ac.pth', k_history: int = 39, seed: int = 0,
-              entropy_schedule_type: str = 'linear', eval_every: int = 100, eval_games: int = 1000, belief_particles: int = 512, belief_ess_frac: float = 0.5,
+              entropy_schedule_type: str = 'linear', eval_every: int = 100, eval_games: int = 10000, belief_particles: int = 512, belief_ess_frac: float = 0.5,
               mcts_in_eval: bool = True, mcts_train: bool = True, mcts_sims: int = 128, mcts_sims_eval: Optional[int] = None, mcts_dets: int = 4, mcts_c_puct: float = 1.0, mcts_root_temp: float = 0.0,
               mcts_prior_smooth_eps: float = 0.0, mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.25,
               num_envs: int = 32,
@@ -3529,6 +3529,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                             belief_ess_frac=belief_ess_frac,
                             num_workers=max(1, workers_env),
                             tqdm_desc=f"League refresh #{seq_id}: {base_n} vs {base_ref}",
+                            tqdm_position=2,
                             tqdm_disable=False,
                         )
                         _league.update_elo_from_diff(npth, ref, diff)
@@ -3552,6 +3553,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                             belief_ess_frac=belief_ess_frac,
                             num_workers=max(1, workers_env),
                             tqdm_desc=f"League refresh #{seq_id}: {base_a} vs {base_b}",
+                            tqdm_position=2,
                             tqdm_disable=False,
                         )
                         _league.update_elo_from_diff(a, b, diff)
@@ -3578,6 +3580,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         belief_ess_frac=belief_ess_frac,
                         num_workers=max(1, workers_env),
                         tqdm_desc=f"League refresh seed #{seq_id}: {base_a} vs {base_b}",
+                        tqdm_position=2,
                         tqdm_disable=False,
                     )
                     _league.update_elo_from_diff(a, b, diff)

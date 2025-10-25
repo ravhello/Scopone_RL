@@ -6,7 +6,7 @@ This script compares different checkpoints of the Scopone AI model by having the
 play against each other to benchmark their performance.
 
 Usage:
-  python benchmark.py --checkpoint_dir checkpoints/ --games 1000
+  python benchmark.py --checkpoint_dir checkpoints/ --games 10000
   python benchmark.py --checkpoints checkpoints/model_team0_ep5000.pth checkpoints/model_team0_ep10000.pth
 """
 
@@ -42,7 +42,7 @@ def _ensure_default_eval_env() -> None:
         'SCOPONE_TORCH_COMPILE_MODE': 'reduce-overhead',
         'SCOPONE_TORCH_COMPILE_BACKEND': 'inductor',
         'SCOPONE_INDUCTOR_AUTOTUNE': '1',
-        'SCOPONE_EVAL_GAMES': '1000',
+        'SCOPONE_EVAL_GAMES': '10000',
         'SCOPONE_EVAL_K_HISTORY': '39',
         'SCOPONE_EVAL_USE_MCTS': '0',
         'SCOPONE_EVAL_MCTS_C_PUCT': '1.0',
@@ -316,7 +316,7 @@ def main_cli():
     parser.add_argument('--compact', action='store_true', help='Use compact observation')
     parser.add_argument('--k-history', type=int, default=39, help='Recent moves for compact observation')
     parser.add_argument('--ckpt', type=str, default='', help='Checkpoint path for actor/critic (optional)')
-    parser.add_argument('--games', type=int, default=1000, help='Number of games to play')
+    parser.add_argument('--games', type=int, default=10000, help='Number of games to play')
     args = parser.parse_args()
     # Placeholder for agent loading and running a quick game
     actor, critic = load_actor_critic(args.ckpt) if args.ckpt else (maybe_compile_module(ActionConditionedActor(), name='ActionConditionedActor[benchmark]'),
@@ -560,7 +560,7 @@ def evaluate_checkpoints(checkpoint_infos: List[dict],
     matchups = list(itertools.combinations(checkpoint_infos, 2))
     total_pairs = len(matchups)
 
-    env_default_games = int(os.environ.get('SCOPONE_EVAL_GAMES', '1000') or 1000)
+    env_default_games = int(os.environ.get('SCOPONE_EVAL_GAMES', '10000') or 10000)
     games_to_play = int(num_games) if (num_games is not None and num_games > 0) else env_default_games
     games_to_play = max(1, games_to_play)
 
@@ -887,7 +887,7 @@ def main():
     parser.add_argument("--checkpoints", nargs="+", help="Paths to checkpoint files or directories")
     parser.add_argument("--checkpoint_dir", help="Directory containing checkpoints")
     parser.add_argument("--checkpoint_pattern", default="*.pth", help="Pattern to match checkpoint files inside directories")
-    parser.add_argument("--games", type=int, default=1000, help="Number of games to play for each matchup")
+    parser.add_argument("--games", type=int, default=10000, help="Number of games to play for each matchup")
     parser.add_argument("--output", help="Output file path (default: auto-generated)")
     parser.add_argument("--excel", help="Excel output file path (default: auto-generated)")
     parser.add_argument("--limit", type=int, help="Limit the number of checkpoints to evaluate")

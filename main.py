@@ -146,7 +146,7 @@ ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 # EVAL
 _eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '35'))  # esegui eval ogni N iterazioni
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))  # ampiezza cronologia osservazioni (k_history)
-_eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))  # numero partite per valutazione
+_eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','10000'))  # numero partite per valutazione
 os.environ.setdefault('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4')  # partite per task/worker (granularità progress)
 _eval_max_games_per_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4'))  # letta per logging
 
