@@ -2577,9 +2577,12 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     rem = int(episodes_total_hint) % int(num_envs)
     episodes_per_env_list = [base + (1 if wid < rem else 0) for wid in range(num_envs)]
     total_eps = sum(episodes_per_env_list)
-    from tqdm import tqdm as _tqdm_local
-    _tqdm_local.write(f"[collector] num_envs={num_envs} episodes_total_hint={episodes_total_hint} "
-                      f"episodes_per_env_list(min..max)={min(episodes_per_env_list)}..{max(episodes_per_env_list)} total_env_episodes={total_eps}")
+    if _PPO_DEBUG:
+        from tqdm import tqdm as _tqdm_local
+        _tqdm_local.write(
+            f"[collector] num_envs={num_envs} episodes_total_hint={episodes_total_hint} "
+            f"episodes_per_env_list(min..max)={min(episodes_per_env_list)}..{max(episodes_per_env_list)} total_env_episodes={total_eps}"
+        )
     workers = []
     cfg_base = {
         'rules': {'shape_scopa': False},
