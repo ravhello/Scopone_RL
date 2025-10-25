@@ -123,7 +123,8 @@ def compute_final_reward_from_breakdown(breakdown):
     """
     device = torch.device(os.environ.get('REW_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')))
     diff = torch.tensor(breakdown[0]["total"] - breakdown[1]["total"], dtype=torch.float32, device=device)
-    # Mantieni reward final-only senza moltiplicatore artificiale
-    pos = int(diff.item())
+    scale = float(os.environ.get('SCOPONE_REWARD_SCALE', '1.0'))
+    scaled = diff * scale
+    pos = float(scaled.item())
     neg = -pos
     return {0: pos, 1: neg}

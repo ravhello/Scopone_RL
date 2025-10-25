@@ -20,7 +20,7 @@ from tqdm import tqdm
 import itertools
 import glob
 import pandas as pd
-from typing import Optional, List
+from typing import Optional, List, Dict
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 import openpyxl
@@ -446,24 +446,108 @@ def checkpoint_display_name(checkpoint_path: str) -> str:
     episode = extract_episode_number(checkpoint_path)
     return f"ep{episode}" if episode != float('inf') else os.path.basename(checkpoint_path).replace(".pth", "")
 
+def _league_storage_key(path: str) -> str:
+    """Return the canonical storage key for a checkpoint path."""
+    abs_path = os.path.abspath(path)
+    try:
+        rel_path = os.path.relpath(abs_path, os.getcwd())
+    except ValueError:
+        rel_path = None
+    else:
+        # Prefer relative paths that stay within the workspace root.
+        if rel_path and not rel_path.startswith('..'):
+            return os.path.normpath(rel_path)
+    return os.path.normpath(abs_path)
+
+
 def canonicalize_league_paths(league: League) -> None:
-    """Normalize league history/Elo paths to the local OS format."""
+    """Coalesce duplicated entries in the league by physical path."""
+    history = list(getattr(league, 'history', []) or [])
+    elo_map: Dict[str, float] = dict(getattr(league, 'elo', {}) or {})
+
+    # Map real paths to the representation we keep in league.json
+    canon_lookup: Dict[str, str] = {}
     new_history: List[str] = []
-    for path in getattr(league, 'history', []):
-        canon = os.path.normpath(path)
-        if canon not in new_history:
-            new_history.append(canon)
-    new_elo = {}
-    for path, value in getattr(league, 'elo', {}).items():
-        canon = os.path.normpath(path)
-        new_elo[canon] = value
-    if new_history != league.history or set(new_elo.keys()) != set(league.elo.keys()):
+
+    for raw_path in history:
+        try:
+            abs_key = os.path.normcase(os.path.abspath(raw_path))
+        except Exception:
+            continue
+        if abs_key not in canon_lookup:
+            stored = _league_storage_key(raw_path)
+            canon_lookup[abs_key] = stored
+            new_history.append(stored)
+
+    new_elo: Dict[str, float] = {}
+    for raw_path, value in elo_map.items():
+        try:
+            abs_key = os.path.normcase(os.path.abspath(raw_path))
+        except Exception:
+            continue
+        stored = canon_lookup.get(abs_key)
+        if stored is None:
+            stored = _league_storage_key(raw_path)
+            canon_lookup[abs_key] = stored
+            if stored not in new_history:
+                new_history.append(stored)
+        val = float(value)
+        prev = new_elo.get(stored)
+        # Prefer non-default Elo values when merging duplicates
+        if prev is None or (abs(val - 1000.0) > 1e-6 and abs(prev - 1000.0) < 1e-6):
+            new_elo[stored] = val
+
+    changed = (history != new_history) or (set(elo_map.keys()) != set(new_elo.keys()))
+    if not changed:
+        # Even if the keys match, the values might have changed after merging duplicates.
+        for key, val in new_elo.items():
+            if not math.isclose(float(elo_map.get(key, float('nan'))), float(val), rel_tol=0.0, abs_tol=1e-6):
+                changed = True
+                break
+
+    if changed:
         league.history = new_history
         league.elo = new_elo
         try:
             league._save()
         except Exception:
             pass
+
+
+def resolve_league_key(league: League, ckpt_path: str) -> Optional[str]:
+    """Return the existing league key matching ckpt_path, if any."""
+    try:
+        target = os.path.normcase(os.path.abspath(ckpt_path))
+    except Exception:
+        target = None
+
+    history = list(getattr(league, 'history', []) or [])
+    elo_keys = list(getattr(league, 'elo', {}).keys())
+
+    # Direct match on normalized absolute path
+    if target is not None:
+        for path in history:
+            try:
+                if os.path.normcase(os.path.abspath(path)) == target:
+                    return path
+            except Exception:
+                continue
+        for path in elo_keys:
+            try:
+                if os.path.normcase(os.path.abspath(path)) == target:
+                    return path
+            except Exception:
+                continue
+
+    # Fallback: unique basename match among known entries
+    base = os.path.normcase(os.path.basename(ckpt_path))
+    fallback = [p for p in history if os.path.normcase(os.path.basename(p)) == base]
+    if len(fallback) == 1:
+        return fallback[0]
+    fallback_elo = [p for p in elo_keys if os.path.normcase(os.path.basename(p)) == base]
+    if len(fallback_elo) == 1:
+        return fallback_elo[0]
+    return None
 
 def evaluate_checkpoints(checkpoint_infos: List[dict],
                          num_games: Optional[int] = None,
@@ -861,9 +945,19 @@ def main():
 
     raw_infos: List[dict] = []
     for cp in checkpoint_paths:
-        league_key = os.path.normpath(cp)
-        if league_key not in getattr(league, 'history', []):
-            league.register(league_key)
+        existing_key = resolve_league_key(league, cp)
+        if existing_key is not None:
+            league_key = existing_key
+            if league_key not in getattr(league, 'history', []):
+                getattr(league, 'history').append(league_key)
+                try:
+                    league._save()
+                except Exception:
+                    pass
+        else:
+            league_key = _league_storage_key(cp)
+            if league_key not in getattr(league, 'history', []):
+                league.register(league_key)
         raw_infos.append({
             "file_path": cp,
             "league_key": league_key,

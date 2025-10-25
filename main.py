@@ -103,24 +103,24 @@ os.environ.setdefault('SCOPONE_PER_ENV_TQDM', '0')  # barre per-env (se 1)
 
 # ===== Section: Self-Play & Opponent (Train) =====
 # SELFPLAY: 1=single net (self-play), 0=dual nets (Team A/B)
-_selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
+_selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '0')).strip().lower()
 _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
 
 # SCOPONE_OPP_FROZEN: 1=freeze the opponent, 0=co-train with the opponent
-_opp_frozen = os.environ.get('SCOPONE_OPP_FROZEN','0') in ['1','true','yes','on']
+_opp_frozen = os.environ.get('SCOPONE_OPP_FROZEN','1') in ['1','true','yes','on']
 
 # SCOPONE_TRAIN_FROM_BOTH_TEAMS: effective ONLY when SELFPLAY=1 and OPP_FROZEN=0.
 # Uses transitions from both teams for the single net; otherwise ignored (on-policy).
-_tfb = os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS','0') in ['1','true','yes','on']
+_tfb = os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS','1') in ['1','true','yes','on']
 
 # Warm-start policy controlled by SCOPONE_WARM_START: '0' start-from-scratch, '1' force top1 clone, '2' use top2 if available
 os.environ.setdefault('SCOPONE_WARM_START', '2')
 
 # SCOPONE_ALTERNATE_ITERS: in dual-nets+frozen, train A for N iters then swap to B (and vice versa)
-os.environ.setdefault('SCOPONE_ALTERNATE_ITERS', '1')
+os.environ.setdefault('SCOPONE_ALTERNATE_ITERS', '35')
 
 # SCOPONE_FROZEN_UPDATE_EVERY: in selfplay+frozen, refresh the shadow (frozen) opponent every N iters
-os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '1')
+os.environ.setdefault('SCOPONE_FROZEN_UPDATE_EVERY', '35')
 
 # Refresh League from disk at startup (scan checkpoints/). 1=ON, 0=OFF
 os.environ.setdefault('SCOPONE_LEAGUE_REFRESH', '1')
@@ -140,15 +140,17 @@ os.environ.setdefault('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')  # percorso chec
 seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
-iters = int(os.environ.get('SCOPONE_ITERS', '500'))  # numero iterazioni di training
-horizon = int(os.environ.get('SCOPONE_HORIZON', '16384'))  # horizon di raccolta per iterazione
+iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
+horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
 num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
+os.environ.setdefault('BELIEF_AUX_COEF', '0.1')  # coefficiente loss ausiliaria belief (default 0.0)
+os.environ.setdefault('SCOPONE_REWARD_SCALE', '0.1')  # scala ricompense finali (1.0 = nessuna variazione)
 
 # Read checkpoint path from env for training
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 
 # EVAL
-_eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '100'))  # esegui eval ogni N iterazioni
+_eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '35'))  # esegui eval ogni N iterazioni
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))  # ampiezza cronologia osservazioni (k_history)
 _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','1000'))  # numero partite per valutazione
 os.environ.setdefault('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4')  # partite per task/worker (granularità progress)

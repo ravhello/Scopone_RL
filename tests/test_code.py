@@ -446,7 +446,7 @@ def test_full_match_random(env_fixture):
         # Basta controllare la coerenza:
         diff = r0 - r1
         # Se diff>0 => r1 deve essere <0. Se diff=0 => r0=r1=0, etc.
-        # In base alla formula diff = breakdown0 - breakdown1, rewardTeam0= diff*10, rewardTeam1= -diff*10
+        # In base alla formula diff = breakdown0 - breakdown1, rewardTeam0= diff, rewardTeam1= -diff
         # => r0 + r1 deve essere 0 in ogni caso
         assert abs(r0 + r1) < 1e-9, "Le ricompense di due team devono essere opposte"
 
