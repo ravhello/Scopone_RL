@@ -940,7 +940,7 @@ class ActionConditionedPPO:
                     total_sq = total_sq + p.grad.data.norm(2).pow(2)
             return total_sq.sqrt()
 
-        check_every = 8  # reduce CPU syncs for early-stop
+        check_every = 1  # sample ogni minibatch: più controlli -> KL aderente al target
         # Stage intero batch su device una sola volta (CPU-friendly: evita .to no-op)
         batch_cuda = {}
         for k, v in batch.items():
