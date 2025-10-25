@@ -1,18 +1,12 @@
 import os
 import threading
-import torch as _torch
 
 # ===== Section: Device & Threads (Both) =====
-_train_dev = os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')
-if (_train_dev.startswith('cuda') and _torch.cuda.is_available()):
-    _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', '2'))
-    _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', '1'))
-else:
-    _cores = int(max(1, (os.cpu_count() or 1)))
-    _target = max(1, int(_cores * 0.60))
-    _n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', str(_target)))
-    _n_interop_default = max(1, _n_threads // 8)
-    _n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', str(_n_interop_default)))
+_cores = int(max(1, (os.cpu_count() or 1)))
+_target = max(1, int(_cores * 0.60))
+_n_threads = int(os.environ.get('SCOPONE_TRAIN_THREADS', str(_target)))
+_n_interop_default = max(1, _n_threads // 8)
+_n_interop = int(os.environ.get('SCOPONE_TRAIN_INTEROP_THREADS', str(_n_interop_default)))
 
 # ===== Section: Logging/Runtime (Both) =====
 # Silence TensorFlow/absl noise before any heavy imports
@@ -103,7 +97,7 @@ os.environ.setdefault('SCOPONE_PER_ENV_TQDM', '0')  # barre per-env (se 1)
 
 # ===== Section: Self-Play & Opponent (Train) =====
 # SELFPLAY: 1=single net (self-play), 0=dual nets (Team A/B)
-_selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '0')).strip().lower()
+_selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
 _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
 
 # SCOPONE_OPP_FROZEN: 1=freeze the opponent, 0=co-train with the opponent

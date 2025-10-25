@@ -3238,7 +3238,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     if idx_bad.numel() > 0:
                         _b = int(idx_bad[0].item())
                         from tqdm import tqdm
-                        tqdm.write(f"[collect] non-finite old_logp -> forcing fallback (idx={_b} sims_scaled={int(sims_scaled)} dets={int(_dets_eff)} exact_only={bool(_exact_only)})")
+                        tqdm.write(f"[collect] non-finite old_logp (parallel) -> forcing fallback (idx={_b})")
                     old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
                 if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
                     mx = float(old_logp_t.max().item())
