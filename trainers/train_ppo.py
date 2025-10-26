@@ -1053,41 +1053,68 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
             if _PAR_TIMING:
                 _BATCHSEL_PROF['t_mask'] += (time.time() - _t0)
-            _t0 = time.time() if _PAR_TIMING else 0.0
-            a_emb_mb = a_emb_all[abs_idx]
-            legal_scores = (a_emb_mb * state_proj[sample_idx]).sum(dim=1)
-            if _PAR_TIMING:
-                _BATCHSEL_PROF['t_score'] += (time.time() - _t0)
-            _t0 = time.time() if _PAR_TIMING else 0.0
-            padded = torch.full((B, max_cnt), -1e9, device=device, dtype=legal_scores.dtype)
-            padded[mask] = legal_scores
-            logits = padded
-            probs = torch.softmax(logits, dim=1)
-            # Keep only legal positions; set others to zero
-            probs = torch.where(mask, probs, torch.zeros_like(probs))
-            # Select only rows with at least one legal action for sampling
+            # Two-stage selection: card → capture
+            # Card logits (B,40)
+            card_logits_all = torch.matmul(state_proj, agent.actor.card_emb_play.t())
+            # Allowed mask per sample
+            played_ids_all = torch.argmax(leg_t[:, :40], dim=1).to(device)
+            played_ids_mb = played_ids_all[abs_idx]
+            allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
+            allowed_mask[sample_idx, played_ids_mb] = True
+            masked_logits = torch.where(allowed_mask, card_logits_all, torch.full_like(card_logits_all, float('-inf')))
+            probs_cards = torch.softmax(masked_logits, dim=1)
+            # Sample card per sample for valid rows
             valid_rows = (cnts_t > 0)
-            sel = torch.zeros((B,), dtype=torch.long, device=device)
+            chosen_card = torch.zeros((B,), dtype=torch.long, device=device)
             if bool(valid_rows.any()):
-                pv = probs[valid_rows]
-                mv = mask[valid_rows]
-                # Sanitize probabilities: remove NaN/Inf and negatives; strictly validate
-                pv = pv.nan_to_num(0.0)
-                pv = torch.clamp(pv, min=0.0)
-                rs = pv.sum(dim=1, keepdim=True)
-                bad_rows = (~torch.isfinite(rs)) | (rs <= 0)
-                if bool(bad_rows.any()):
-                    raise RuntimeError("_batched_select_indices: invalid probability rows (NaN/Inf or zero-sum)")
-                # Sample for exploration
-                sub = torch.multinomial(pv, num_samples=1).squeeze(1)
-                # Write back selections to full batch
-                sel[valid_rows] = sub
-            # rows with no legal actions keep sel=0
+                pv_cards = probs_cards[valid_rows]
+                # numerical guards
+                pv_cards = pv_cards.nan_to_num(0.0)
+                pv_cards = torch.clamp(pv_cards, min=0.0)
+                rs = pv_cards.sum(dim=1, keepdim=True)
+                if bool(((rs <= 0) | (~torch.isfinite(rs))).any()):
+                    raise RuntimeError("_batched_select_indices: invalid card probability rows (NaN/Inf or zero-sum)")
+                pv_cards = pv_cards / rs
+                chosen_sub = torch.multinomial(pv_cards, num_samples=1).squeeze(1)
+                chosen_card[valid_rows] = chosen_sub
+            # For each sample, sample capture within chosen card group
+            sel = torch.zeros((B,), dtype=torch.long, device=device)
+            # Precompute per-legal action embeddings on device
+            a_emb_all_dev = agent.actor.action_enc(leg_t.to(device=device))
+            for i in range(B):
+                c = int(cnts_t[i].item())
+                if c <= 0:
+                    sel[i] = 0
+                    continue
+                start = int(offs[i])
+                end = start + c
+                # Slice legals for this sample
+                played_slice = played_ids_all[start:end]
+                # Ensure chosen_card index is valid
+                cc = int(chosen_card[i].item())
+                # Legal positions with chosen card
+                mask_slice = (played_slice == cc)
+                if not bool(mask_slice.any().item()):
+                    # Fallback STRICT: raise
+                    if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                        raise RuntimeError(f"_batched_select_indices: no legal captures for chosen card (sample={i}, card={cc}, cnt={c})")
+                    sel[i] = 0
+                    continue
+                idxs = torch.nonzero(mask_slice, as_tuple=False).flatten()
+                # Compute capture logits for this sample subset
+                emb_slice = a_emb_all_dev[start:end][idxs]
+                cap_logits = (emb_slice * state_proj[i]).sum(dim=1)
+                probs_cap = torch.softmax(cap_logits, dim=0).nan_to_num(0.0)
+                if bool((probs_cap.sum() <= 0) or (~torch.isfinite(probs_cap.sum()))):
+                    if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                        raise RuntimeError(f"_batched_select_indices: invalid capture probabilities (sample={i})")
+                    sel[i] = int(idxs[0].item())
+                    continue
+                j = int(torch.multinomial(probs_cap, num_samples=1).item())
+                sel[i] = int(idxs[j].item())
             sel_cpu = sel.detach().to('cpu')
             for i in range(B):
                 out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
-            if _PAR_TIMING:
-                _BATCHSEL_PROF['t_softmax_sample'] += (time.time() - _t0)
         else:
             out_idx = [(int(reqs[i]['wid']), 0) for i in range(B)]
     if _PAR_TIMING:
@@ -1587,6 +1614,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
 
         # Selezione azione: se train_both_teams è True, tutti i seat sono "main"
         is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
+        # Solo i seat "main" devono contribuire alle transizioni quando train_both_teams è False
+        store_sample = bool(train_both_teams or is_main)
         bsum_tensor = _BELIEF_ZERO
         use_mcts_cur = False
         sims_scaled = 0
@@ -1594,6 +1623,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         root_temp_dyn = float(mcts_root_temp)
         _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
         if is_main or _both_sides:
+            # Exact-only mode flag (training): read once per decision to avoid unbound access when MCTS is disabled
+            _exact_only2 = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
             # MCTS sempre attivo (stile AlphaZero): poche simulazioni sempre, scala con il progresso della mano
             progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
             if use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
@@ -1619,7 +1650,6 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
                 root_temp_dyn = float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0) else float(max(0.0, 1.0 - alpha))
             # Exact-only mode: optionally disable prior MCTS unless near end
-                _exact_only2 = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
             def _remaining_moves_train_b(_env):
                 _h = _env.game_state.get('hands', None)
                 if isinstance(_h, (list, tuple)):
@@ -1944,8 +1974,9 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 s = float(mcts_probs.sum().item())
                 if s > 0:
                     mcts_probs = mcts_probs / s
-                mcts_policy_flat.extend((mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs)))
-                mcts_weight_list.append(1.0)
+                if store_sample:
+                    mcts_policy_flat.extend((mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs)))
+                    mcts_weight_list.append(1.0)
                 if _PAR_TIMING:
                     t_mcts += (time.time() - _t0_mcts)
             else:
@@ -1966,40 +1997,73 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 if _PAR_TIMING:
                     t_step += (time.time() - _t0_step)
                 routing_log.append((cp, 'main'))
-                # Per mantenere l'allineamento per-sample della distillazione, aggiungi zeri
-                mcts_policy_flat.extend([0.0] * len(legal))
-                mcts_weight_list.append(0.0)
+                # Per mantenere l'allineamento per-sample della distillazione, aggiungi zeri solo se stai salvando il sample
+                if store_sample:
+                    mcts_policy_flat.extend([0.0] * len(legal))
+                    mcts_weight_list.append(0.0)
 
-            obs_list.append(obs)
-            next_obs_list.append(next_obs)
-            act_list.append(chosen_act)
-            rew_list.append(rew)
-            done_list.append(done)
-            seat_team_list.append(seat_vec)
-            belief_sum_list.append(bsum_tensor)
-            legals_offset.append(len(legals_list))
-            legals_count.append(len(legal))
-            chosen_index_t_list.append(idx_t)
-            legals_list.extend(legal)
-            # costruisci target mani reali altrui (3x40) vettoriale sfruttando bitset CPU
-            if belief_aux_coef <= 0.0:
-                others_hands_targets.append(_OTHERS_HANDS_ZERO)
+            if store_sample:
+                obs_list.append(obs)
+                next_obs_list.append(next_obs)
+                act_list.append(chosen_act)
+                rew_list.append(rew)
+                done_list.append(done)
+                seat_team_list.append(seat_vec)
+                belief_sum_list.append(bsum_tensor)
+                legals_offset.append(len(legals_list))
+                legals_count.append(len(legal))
+                chosen_index_t_list.append(idx_t)
+                # STRICT: ensure chosen index points to the same action under action-encoding hashing (played | capture_bits<<6)
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    def _encode_action_64_cpu(vec80: torch.Tensor) -> torch.Tensor:
+                        played_id = torch.argmax(vec80[:40]).to(torch.int64)
+                        cap_mask = (vec80[40:] > 0.5).to(torch.int64)
+                        idxs = torch.arange(40, dtype=torch.int64)
+                        bits = (cap_mask << idxs).sum()
+                        return (played_id | (bits << 6)).to(torch.int64)
+                    code_chosen = _encode_action_64_cpu(chosen_act if torch.is_tensor(chosen_act) else torch.as_tensor(chosen_act, dtype=torch.float32))
+                    leg_codes = []
+                    for a in legal:
+                        v = a if torch.is_tensor(a) else torch.as_tensor(a, dtype=torch.float32)
+                        leg_codes.append(_encode_action_64_cpu(v))
+                    leg_codes_t = torch.stack(leg_codes, dim=0)
+                    if int(leg_codes_t.size(0)) > 0:
+                        ok = bool((leg_codes_t[idx_t] == code_chosen).item())
+                        if not ok:
+                            raise RuntimeError(f"collect_trajectory: chosen_index hash mismatch (idx_t={int(idx_t.item())})")
+                legals_list.extend(legal)
             else:
-                others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-                # usa mirror bitset CPU se disponibile per evitare loop Python
-                if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
-                    ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
-                    target = _OTHERS_HANDS_ZERO.clone()
-                    for i, pid in enumerate(others):
-                        bits_t = env._hands_bits_t[pid]
-                        bits = int(bits_t.item()) if torch.is_tensor(bits_t) else int(bits_t)
-                        mask = (((torch.tensor(bits, dtype=torch.int64) >> ids) & 1).to(torch.float32))
-                        target[i] = mask
-                    others_hands_targets.append(target)
-                else:
-                    from utils.fallback import notify_fallback
-                    notify_fallback('trainer.others_hands_targets.slow_game_state_path')
+                # Se l'episodio termina su un seat non-main, marca l'ultimo sample main come terminale e aggiorna la sua next_obs
+                if done and len(done_list) > 0:
+                    done_list[-1] = True
+                    try:
+                        final_obs = _to_cpu_float32(next_obs)
+                    except Exception:
+                        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                            raise
+                        final_obs = torch.zeros_like(next_obs_list[-1]) if len(next_obs_list) > 0 else _to_cpu_float32(next_obs)
+                    if len(next_obs_list) > 0:
+                        next_obs_list[-1] = final_obs
+            # costruisci target mani reali altrui (3x40) vettoriale sfruttando bitset CPU
+            if store_sample:
+                if belief_aux_coef <= 0.0:
                     others_hands_targets.append(_OTHERS_HANDS_ZERO)
+                else:
+                    others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                    # usa mirror bitset CPU se disponibile per evitare loop Python
+                    if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
+                        ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
+                        target = _OTHERS_HANDS_ZERO.clone()
+                        for i, pid in enumerate(others):
+                            bits_t = env._hands_bits_t[pid]
+                            bits = int(bits_t.item()) if torch.is_tensor(bits_t) else int(bits_t)
+                            mask = (((torch.tensor(bits, dtype=torch.int64) >> ids) & 1).to(torch.float32))
+                            target[i] = mask
+                        others_hands_targets.append(target)
+                    else:
+                        from utils.fallback import notify_fallback
+                        notify_fallback('trainer.others_hands_targets.slow_game_state_path')
+                        others_hands_targets.append(_OTHERS_HANDS_ZERO)
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
             is_partner_seat = (cp in [0, 2] and (main_seats == [1, 3])) or (cp in [1, 3] and (main_seats == [0, 2]))
@@ -2274,9 +2338,23 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 neg_inf = torch.full_like(card_logits_all, float('-inf'))
                 masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
                 max_allowed = torch.amax(masked_logits, dim=1)
-                exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
+                # Numerically stable exp shift: use masked_logits instead of full logits
+                exp_shift_allowed = torch.exp(masked_logits - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
                 sum_allowed = exp_shift_allowed.sum(dim=1)
                 lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))
+                # STRICT: invariants for card stage – each present row must have at least one allowed card and finite normalizer
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    rows_present = mask.any(dim=1)
+                    allow_any = allowed_mask.any(dim=1)
+                    if bool(((rows_present & (~allow_any)).any()).item()):
+                        bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory_parallel: allowed_mask empty for rows {bad_rows}")
+                    if not torch.isfinite(card_logits_all).all():
+                        bad = card_logits_all[~torch.isfinite(card_logits_all)]
+                        raise RuntimeError(f"collect_trajectory_parallel: card_logits_all non-finite (count={int(bad.numel())})")
+                    if not torch.isfinite(lse_allowed[rows_present]).all():
+                        bad_idx = torch.nonzero(~torch.isfinite(lse_allowed) & rows_present, as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory_parallel: lse_allowed non-finite for rows {bad_idx}")
                 if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
                     rows_present = mask.any(dim=1)
                     allow_any = allowed_mask.any(dim=1)
@@ -3275,7 +3353,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 neg_inf = torch.full_like(card_logits_all, float('-inf'))
                 masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
                 max_allowed = torch.amax(masked_logits, dim=1)
-                exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
+                # Numerically stable exp shift: use masked_logits instead of full logits
+                exp_shift_allowed = torch.exp(masked_logits - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
                 sum_allowed = exp_shift_allowed.sum(dim=1)
                 lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))
                 # Map chosen indices to absolute and card ids
@@ -3291,7 +3370,48 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     raise RuntimeError(f"collect_trajectory_parallel: chosen_pos mapping failed for rows {bad_rows}")
                 played_ids_all = torch.argmax(leg_t[:, :40], dim=1)
                 chosen_card_ids = played_ids_all[chosen_abs]
+                # STRICT: chosen card must be in the allowed set for its sample
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1' and chosen_pos.numel() > 0:
+                    sample_idx_for_chosen = sample_idx[chosen_pos]
+                    valid_chosen = allowed_mask[sample_idx_for_chosen, chosen_card_ids]
+                    if bool((~valid_chosen).any().item() if valid_chosen.numel() > 0 else False):
+                        r = int(torch.nonzero(~valid_chosen, as_tuple=False).flatten()[0].item())
+                        raise RuntimeError(f"collect_trajectory_parallel: chosen card not allowed (row={r}, chosen_card={int(chosen_card_ids[r].item())})")
                 logp_card = card_logits_all[torch.arange(B, device=device), chosen_card_ids] - lse_allowed[torch.arange(B, device=device)]
+                # STRICT: diagnose extremely small logp_card (card stage) with detailed context
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    too_small = (logp_card < -80.0)
+                    if bool(too_small.any().item() if logp_card.numel() > 0 else False):
+                        r = int(torch.nonzero(too_small, as_tuple=False).flatten()[0].item())
+                        s = r  # sample index (row)
+                        allowed_row = allowed_mask[s]
+                        allowed_count = int(allowed_row.sum().item())
+                        logits_row = card_logits_all[s]
+                        chosen_c = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
+                        chosen_logit = float(logits_row[chosen_c].item()) if 0 <= chosen_c < 40 else None
+                        max_allowed = float((logits_row[allowed_row]).max().item()) if allowed_count > 0 else None
+                        # rank of chosen among allowed
+                        if allowed_count > 0 and 0 <= chosen_c < 40 and bool(allowed_row[chosen_c].item()):
+                            allowed_logits_sorted, idxs = torch.sort(logits_row[allowed_row], descending=True)
+                            chosen_val = logits_row[chosen_c]
+                            rank = int((allowed_logits_sorted >= chosen_val - 1e-9).nonzero(as_tuple=False).flatten()[-1].item()) + 1
+                        else:
+                            rank = -1
+                        # Show top-k allowed ids and their logits for context
+                        topk = min(5, allowed_count)
+                        if allowed_count > 0:
+                            top_vals, top_pos = torch.topk(logits_row[allowed_row], k=topk)
+                            # Map positions back to card ids
+                            allowed_ids = torch.nonzero(allowed_row, as_tuple=False).flatten()
+                            top_ids = allowed_ids[top_pos]
+                            top_pairs = [(int(top_ids[i].item()), float(top_vals[i].item())) for i in range(topk)]
+                        else:
+                            top_pairs = []
+                        raise RuntimeError(
+                            f"collect_trajectory_parallel: logp_card extremely small at row={r}; "
+                            f"allowed_count={allowed_count}, chosen_card={chosen_c}, chosen_logit={chosen_logit}, max_allowed={max_allowed}, rank_in_allowed={rank}, "
+                            f"top_allowed={top_pairs}"
+                        )
                 # Capture log-softmax within card groups
                 a_emb_mb = agent.actor.action_enc(legals_mb)               # (M_mb,64)
                 cap_logits = (a_emb_mb * state_proj[sample_idx]).sum(dim=1)
@@ -3303,6 +3423,14 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 exp_shifted = torch.exp(cap_logits - gmax_per_legal)
                 group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
                 group_sum.index_add_(0, group_ids, exp_shifted)
+                # STRICT: denominator for chosen group must be finite and > 0
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1' and chosen_pos.numel() > 0:
+                    gid_chosen = group_ids[chosen_pos]
+                    denom_chosen = group_sum[gid_chosen]
+                    bad = (~torch.isfinite(denom_chosen)) | (denom_chosen <= 0)
+                    if bool(bad.any().item() if denom_chosen.numel() > 0 else False):
+                        bad_rows = torch.nonzero(bad, as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory_parallel: capture group denominator invalid for chosen rows {bad_rows}")
                 lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
                 logp_cap_per_legal = cap_logits - lse_per_legal
                 logp_cap = logp_cap_per_legal[chosen_pos]
@@ -3310,6 +3438,17 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 # STRICT: fail fast with diagnostics; non-STRICT: sanitize
                 _strict = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
                 if _strict:
+                    # Cross-check two-stage logp with reference implementation
+                    try:
+                        lp_ref = agent.actor.compute_two_stage_logp(card_logits_all, legals_mb, sample_idx, state_proj, a_emb_mb)
+                        ref_sel = lp_ref[chosen_pos]
+                        if ref_sel.numel() == old_logp_t.numel():
+                            delta = torch.abs(ref_sel - old_logp_t)
+                            if bool((delta > 1e-4).any().item() if delta.numel() > 0 else False):
+                                r = int(torch.nonzero(delta > 1e-4, as_tuple=False).flatten()[0].item())
+                                raise RuntimeError(f"collect_trajectory_parallel: old_logp mismatch vs ref at row {r} (delta={float(delta[r].item())})")
+                    except Exception as _e:
+                        raise RuntimeError(f"collect_trajectory_parallel: compute_two_stage_logp failed ({type(_e).__name__}: {_e})") from _e
                     if not torch.isfinite(old_logp_t).all():
                         idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
                         r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
@@ -3617,7 +3756,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                             belief_ess_frac=belief_ess_frac,
                             num_workers=max(1, workers_env),
                             tqdm_desc=f"League refresh #{seq_id}: {base_n} vs {base_ref}",
-                            tqdm_position=2,
+                            tqdm_position=0,
                             tqdm_disable=False,
                         )
                         _league.update_elo_from_diff(npth, ref, diff)
@@ -3641,7 +3780,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                             belief_ess_frac=belief_ess_frac,
                             num_workers=max(1, workers_env),
                             tqdm_desc=f"League refresh #{seq_id}: {base_a} vs {base_b}",
-                            tqdm_position=2,
+                            tqdm_position=0,
                             tqdm_disable=False,
                         )
                         _league.update_elo_from_diff(a, b, diff)
@@ -3668,7 +3807,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         belief_ess_frac=belief_ess_frac,
                         num_workers=max(1, workers_env),
                         tqdm_desc=f"League refresh seed #{seq_id}: {base_a} vs {base_b}",
-                        tqdm_position=2,
+                        tqdm_position=0,
                         tqdm_disable=False,
                     )
                     _league.update_elo_from_diff(a, b, diff)

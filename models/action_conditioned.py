@@ -913,14 +913,70 @@ class ActionConditionedActor(torch.nn.Module):
 
         # Card log-prob restricted to allowed set per sample
         B = int(card_logits_all.size(0))
+        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+            if (sample_idx_per_legal.min() < 0) or (sample_idx_per_legal.max() >= B):
+                raise RuntimeError(f"compute_two_stage_logp: sample_idx_per_legal out of range (min={int(sample_idx_per_legal.min().item())}, max={int(sample_idx_per_legal.max().item())}, B={B})")
         allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device_local)
         allowed_mask[sample_idx_per_legal, played_ids_mb] = True
+        # STRICT: rows that appear must have at least one allowed card
+        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+            rows_present = torch.zeros((B,), dtype=torch.bool, device=device_local)
+            rows_present[sample_idx_per_legal] = True
+            allow_any = allowed_mask.any(dim=1)
+            if bool(((rows_present & (~allow_any)).any()).item()):
+                bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
+                raise RuntimeError(f"compute_two_stage_logp: allowed_mask empty for rows {bad_rows}")
+            # Also ensure logits are finite at allowed positions
+            bad_allowed = (~torch.isfinite(card_logits_all)) & allowed_mask
+            rows_bad = bad_allowed.any(dim=1) & rows_present
+            if bool(rows_bad.any().item() if rows_bad.numel() > 0 else False):
+                bad_rows = torch.nonzero(rows_bad, as_tuple=False).flatten().tolist()
+                # collect indices of bad allowed positions for the first bad row
+                r = bad_rows[0]
+                ids = torch.nonzero(bad_allowed[r], as_tuple=False).flatten()
+                raise RuntimeError(f"compute_two_stage_logp: non-finite card_logits at allowed positions for rows {bad_rows}; first_row_bad_ids={[int(i.item()) for i in ids]} ")
         masked_logits = torch.where(allowed_mask, card_logits_all, torch.full_like(card_logits_all, float('-inf')))
         max_allowed = torch.amax(masked_logits, dim=1)
+        # Numerically stable exp: operate on masked logits so disallowed are -inf → exp=0
         # Avoid in-place ops on tensors needed for gradient; keep computation out-of-place
-        exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
-        sum_allowed = exp_shift_allowed.sum(dim=1)
+        exp_shift_allowed = torch.exp(masked_logits - max_allowed.unsqueeze(1))
+        sum_allowed = (exp_shift_allowed * allowed_mask.to(card_logits_all.dtype)).sum(dim=1)
+        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+            rows_present = torch.zeros((B,), dtype=torch.bool, device=device_local)
+            rows_present[sample_idx_per_legal] = True
+            bad_sum = (~torch.isfinite(sum_allowed)) | (sum_allowed <= 0)
+            bad_rows = (bad_sum & rows_present)
+            if bool(bad_rows.any().item() if bad_rows.numel() > 0 else False):
+                r = int(torch.nonzero(bad_rows, as_tuple=False).flatten()[0].item())
+                allow_ids = torch.nonzero(allowed_mask[r], as_tuple=False).flatten()
+                v = card_logits_all[r, allow_ids] if allow_ids.numel() > 0 else torch.empty(0, device=device_local)
+                ma = float(max_allowed[r].item()) if torch.isfinite(max_allowed[r]) else None
+                ssum = float(sum_allowed[r].item()) if torch.isfinite(sum_allowed[r]) else None
+                # Detailed per-row numerics
+                diff = (card_logits_all[r] - max_allowed[r])
+                diff_allowed = diff[allow_ids] if allow_ids.numel() > 0 else torch.empty(0, device=device_local)
+                exp_allowed = torch.exp(diff_allowed) if diff_allowed.numel() > 0 else torch.empty(0, device=device_local)
+                def _to_list(t):
+                    return [float(x.item()) for x in t] if t.numel() > 0 else []
+                raise RuntimeError(
+                    f"compute_two_stage_logp: sum_allowed invalid at row={r}; allow_ids={[int(i.item()) for i in allow_ids]}, "
+                    f"logits_allowed={_to_list(v)}, max_allowed={ma}, sum_allowed={ssum}, "
+                    f"diff_allowed={_to_list(diff_allowed)}, exp_diff_allowed={_to_list(exp_allowed)}"
+                )
         lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))  # (B)
+        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+            # For rows that actually appear in sample_idx_per_legal, we must have at least one allowed card
+            rows_present = torch.zeros((B,), dtype=torch.bool, device=device_local)
+            rows_present[sample_idx_per_legal] = True
+            allow_any = allowed_mask.any(dim=1)
+            if bool(((rows_present & (~allow_any)).any()).item()):
+                bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
+                raise RuntimeError(f"compute_two_stage_logp: allowed_mask empty for rows {bad_rows}")
+            if not torch.isfinite(card_logits_all[rows_present]).all():
+                raise RuntimeError("compute_two_stage_logp: card_logits_all non-finite on present rows")
+            if not torch.isfinite(lse_allowed[rows_present]).all():
+                bad_rows = torch.nonzero(~torch.isfinite(lse_allowed) & rows_present, as_tuple=False).flatten().tolist()
+                raise RuntimeError(f"compute_two_stage_logp: lse_allowed non-finite for rows {bad_rows}")
         logp_cards_allowed_per_legal = (card_logits_all[sample_idx_per_legal, played_ids_mb] - lse_allowed[sample_idx_per_legal])  # (M)
 
         # Capture logits per legal using action embeddings
@@ -936,12 +992,45 @@ class ActionConditionedActor(torch.nn.Module):
         exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
         group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device_local)
         group_sum.index_add_(0, group_ids, exp_shifted)
+        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+            denom = group_sum[group_ids]
+            bad = (~torch.isfinite(denom)) | (denom <= 0)
+            if bool(bad.any().item() if denom.numel() > 0 else False):
+                r = int(torch.nonzero(bad, as_tuple=False).flatten()[0].item()) if denom.numel() > 0 else -1
+                s = int(sample_idx_per_legal[r].item()) if r >= 0 else -1
+                chosen = int(played_ids_mb[r].item()) if r >= 0 else -1
+                # capture stats for that sample/card
+                cap_grp = cap_logits[(sample_idx_per_legal == s) & (played_ids_mb == chosen)]
+                def _st(t):
+                    return {'min': float(t.min().item()) if t.numel() > 0 else None,
+                            'max': float(t.max().item()) if t.numel() > 0 else None,
+                            'mean': float(t.mean().item()) if t.numel() > 0 else None,
+                            'numel': int(t.numel())}
+                raise RuntimeError(f"compute_two_stage_logp: capture group denominator invalid at row={r}, sample={s}, card={chosen}, cap_logits_stats={_st(cap_grp)}")
         lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
         logp_cap_per_legal = cap_logits - lse_per_legal
 
         logp_total_per_legal = (logp_cards_allowed_per_legal + logp_cap_per_legal)
         if not torch.isfinite(logp_total_per_legal).all():
-            raise RuntimeError("compute_two_stage_logp: logp_total_per_legal non-finite")
+            # Provide diagnostics for the first bad row
+            idx_bad = torch.nonzero(~torch.isfinite(logp_total_per_legal), as_tuple=False).flatten()
+            r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else -1
+            s = int(sample_idx_per_legal[r].item()) if r >= 0 else -1
+            chosen = int(played_ids_mb[r].item()) if r >= 0 else -1
+            # Per-sample debug
+            allow_count = int(allowed_mask[s].sum().item()) if s >= 0 else -1
+            max_allowed_s = float(max_allowed[s].item()) if s >= 0 else None
+            masked_row = masked_logits[s] if s >= 0 else None
+            def _stats_row(t):
+                return {'min': float(t.min().item()) if t is not None and t.numel() > 0 else None,
+                        'max': float(t.max().item()) if t is not None and t.numel() > 0 else None,
+                        'mean': float(t.mean().item()) if t is not None and t.numel() > 0 else None,
+                        'numel': int(t.numel()) if t is not None else 0}
+            raise RuntimeError(
+                f"compute_two_stage_logp: logp_total_per_legal non-finite at row={r}, sample={s}, card={chosen}; "
+                f"allow_count={allow_count}, max_allowed={max_allowed_s}, masked_logits_stats={_stats_row(masked_row)}, "
+                f"card_logits_stats={_stats_row(card_logits_all[s]) if s>=0 else None}, cap_logits_stats={_stats_row(cap_logits[(sample_idx_per_legal==s)]) if s>=0 else None}"
+            )
         return logp_total_per_legal
 
 

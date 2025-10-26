@@ -819,21 +819,44 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
     rem = games % num_workers
     chunks = [base + (1 if i < rem else 0) for i in range(num_workers)]
     chunks = [c for c in chunks if c > 0]
-    args_list = [(i, ckpt_a, ckpt_b, chunks[i], k_history, mcts, belief_particles, belief_ess_frac) for i in range(len(chunks))]
+    # Optionally split each worker chunk into smaller tasks for smoother progress updates
+    max_chunk = int(os.environ.get('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '0'))
+    args_list = []
+    if max_chunk <= 0:
+        args_list = [(i, ckpt_a, ckpt_b, chunks[i], k_history, mcts, belief_particles, belief_ess_frac) for i in range(len(chunks))]
+    else:
+        for i, games_i in enumerate(chunks):
+            remaining = games_i
+            while remaining > 0:
+                take = remaining if max_chunk <= 0 else min(remaining, max_chunk)
+                args_list.append((i, ckpt_a, ckpt_b, int(take), k_history, mcts, belief_particles, belief_ess_frac))
+                remaining -= take
     _dbg(f"parallel setup: workers={num_workers} chunks={chunks} args={len(args_list)}")
     # Progress bar aggregata
     total_games = sum(chunks)
+    # Emit an initial textual progress line immediately so the user sees something even if bars are hidden
+    try:
+        tqdm.write(f"[eval-progress] start: 0/{int(total_games)} (0%) :: {(tqdm_desc or 'Eval')}")
+    except Exception:
+        pass
     pbar = None
     if not tqdm_disable:
         pbar = tqdm(total=total_games, desc=(tqdm_desc or 'Eval'), position=int(tqdm_position or 0), dynamic_ncols=True, leave=True)
+        try:
+            pbar.refresh()
+        except Exception:
+            pass
     # Esegui i worker in modo che possiamo aggiornare il pbar al completamento
     ctx = _get_mp_ctx()
     results = []
     _dbg("creating pool and dispatching tasks …")
-    with ctx.Pool(processes=len(args_list)) as pool:
+    pool_size = max(1, min(num_workers, len(args_list)))
+    with ctx.Pool(processes=pool_size) as pool:
         try:
             async_res = pool.imap_unordered(_eval_pair_chunk_worker, args_list)
             timeout_s = _get_eval_pool_timeout_seconds()
+            completed_games = 0
+            last_print_pct = -1
             for idx in range(len(args_list)):
                 _dbg(f"waiting result {idx+1}/{len(args_list)} …")
                 while True:
@@ -861,6 +884,16 @@ def evaluate_pair_actors_parallel(ckpt_a: str, ckpt_b: str, games: int = 10,
                         break
                     if pbar is not None:
                         pbar.update(int(games_i))
+                    try:
+                        completed_games += int(games_i)
+                        if total_games > 0:
+                            pct = int(100 * completed_games / total_games)
+                            # Print at 5% increments to avoid spam
+                            if pct >= 0 and (pct == 100 or pct // 5 > last_print_pct // 5):
+                                last_print_pct = pct
+                                tqdm.write(f"[eval-progress] {completed_games}/{int(total_games)} ({pct}%) :: {(tqdm_desc or 'Eval')}")
+                    except Exception:
+                        pass
                     results.append(
                         (
                             diff_sum_i,
@@ -1095,9 +1128,17 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
     _dbg(f"parallel-dist setup: workers={num_workers} chunks={chunks} tasks={len(args_list)} dets={[m.get('dets',1) for m in mcts_eff]} max_chunk={max_chunk if max_chunk is not None else 'inf'}")
     # Progress bar aggregata
     total_games = sum(chunks)
+    try:
+        tqdm.write(f"[eval-progress] start: 0/{int(total_games)} (0%) :: {(tqdm_desc or 'Eval')}")
+    except Exception:
+        pass
     pbar = None
     if not tqdm_disable:
         pbar = tqdm(total=total_games, desc=(tqdm_desc or 'Eval'), position=int(tqdm_position or 0), dynamic_ncols=True, leave=True)
+        try:
+            pbar.refresh()
+        except Exception:
+            pass
     ctx = _get_mp_ctx()
     results = []
     pool_size = max(1, min(num_workers, len(args_list)))
@@ -1105,6 +1146,8 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
         try:
             async_res = pool.imap_unordered(_eval_pair_chunk_worker_dist, args_list)
             timeout_s = _get_eval_pool_timeout_seconds()
+            completed_games = 0
+            last_print_pct = -1
             for idx in range(len(args_list)):
                 _dbg(f"waiting dist result {idx+1}/{len(args_list)} …")
                 while True:
@@ -1122,6 +1165,15 @@ def evaluate_pair_actors_parallel_dist(ckpt_a: str, ckpt_b: str, games: int = 10
                         break
                     if pbar is not None:
                         pbar.update(int(games_i))
+                    try:
+                        completed_games += int(games_i)
+                        if total_games > 0:
+                            pct = int(100 * completed_games / total_games)
+                            if pct >= 0 and (pct == 100 or pct // 5 > last_print_pct // 5):
+                                last_print_pct = pct
+                                tqdm.write(f"[eval-progress] {completed_games}/{int(total_games)} ({pct}%) :: {(tqdm_desc or 'Eval')}")
+                    except Exception:
+                        pass
                     results.append((diff_sum_i, bd_sum_i, wins_i, games_i))
                     break
         except mp.TimeoutError as te:
