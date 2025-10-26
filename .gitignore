@@ -15,6 +15,7 @@ profiling_report.txt
 .vscode/settings.json
 .gitignore
 profile_trace.json
+tuning_results.json
 
 # TensorFlow / TensorBoard logs
 logs/
