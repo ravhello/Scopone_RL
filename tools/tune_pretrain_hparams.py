@@ -42,8 +42,6 @@ class TrialConfig:
     target_kl: float
     scheduler_mode: str
     scheduler_scale: float
-    gamma: float
-    lam: float
 
 
 @dataclass
@@ -109,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--horizon",
         type=int,
-        default=int(os.environ.get("SCOPONE_HORIZON", "16384")),
+        default=int(os.environ.get("SCOPONE_HORIZON", "32768")),
         help="Rollout horizon per iteration.",
     )
     parser.add_argument(
@@ -195,8 +193,6 @@ def sample_config(rng: random.Random) -> TrialConfig:
         target_kl=rng.choice([0.01, 0.015, 0.02]),
         scheduler_mode=rng.choice(["cosine", "cosine_half", "constant"]),
         scheduler_scale=rng.choice([1.0, 0.75, 0.5]),
-        gamma=rng.choice([0.99, 1.0]),
-        lam=rng.choice([0.9, 0.95, 0.99]),
     )
 
 
@@ -238,15 +234,6 @@ def run_single_trial(
     recorder: MetricsRecorder,
 ) -> TrialResult:
     start = time.time()
-    ckpt_dir = args.ckpt_dir / f"trial_{index:03d}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / "actor_critic.pth"
-    if ckpt_path.exists():
-        ckpt_path.unlink()
-    if args.resume_from:
-        if not args.resume_from.exists():
-            raise FileNotFoundError(f"--resume-from checkpoint not found: {args.resume_from}")
-        shutil.copy2(args.resume_from, ckpt_path)
 
     recorder.reset()
 
@@ -254,8 +241,9 @@ def run_single_trial(
         "BELIEF_AUX_COEF": config.belief_aux_coef,
         "SCOPONE_ENTROPY_SCHED": config.entropy_schedule,
         "SCOPONE_DISABLE_TB": "0" if args.enable_tb else "1",
-        "SCOPONE_SAVE_EVERY": max(args.iters + 1, 10_000),
-        "SCOPONE_EVAL_EVERY": 0,
+        # Disable side effects during tuning (no saves/evals/refresh)
+        "SCOPONE_DISABLE_SAVE": "1",
+        "SCOPONE_DISABLE_EVAL": "1",
         "SCOPONE_LEAGUE_REFRESH": 0,
     }
 
@@ -297,13 +285,13 @@ def run_single_trial(
         return info
 
     def tuned_collect(*args, **kwargs):
-        kwargs.setdefault("gamma", config.gamma)
-        kwargs.setdefault("lam", config.lam)
+        kwargs.setdefault("gamma", 1.0)
+        kwargs.setdefault("lam", 1.0)
         return orig_collect(*args, **kwargs)
 
     def tuned_collect_parallel(*args, **kwargs):
-        kwargs.setdefault("gamma", config.gamma)
-        kwargs.setdefault("lam", config.lam)
+        kwargs.setdefault("gamma", 1.0)
+        kwargs.setdefault("lam", 1.0)
         return orig_collect_parallel(*args, **kwargs)
 
     class PatchedCosine:
@@ -342,7 +330,6 @@ def run_single_trial(
                 num_iterations=args.iters,
                 horizon=args.horizon,
                 save_every=max(args.iters + 1, 10_000),
-                ckpt_path=str(ckpt_path),
                 k_history=int(os.environ.get("SCOPONE_EVAL_K_HISTORY", "39")),
                 seed=args.seed,
                 entropy_schedule_type=config.entropy_schedule,
@@ -369,8 +356,8 @@ def run_single_trial(
         trainer.collect_trajectory_parallel = orig_collect_parallel  # type: ignore[assignment]
         trainer.optim.lr_scheduler.CosineAnnealingLR = orig_cosine  # type: ignore[assignment]
 
-        if not args.keep_checkpoints and ckpt_dir.exists():
-            shutil.rmtree(ckpt_dir, ignore_errors=True)
+        # No per-trial checkpoint directory management: delegate warm-start and
+        # checkpoint handling entirely to the main/trainer defaults.
 
     best_avg = recorder.best("avg_return")
     final_avg = recorder.last("avg_return")

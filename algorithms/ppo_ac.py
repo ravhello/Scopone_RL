@@ -400,6 +400,8 @@ class ActionConditionedPPO:
             raise RuntimeError(f"Capture logits (group) contain non-finite values (count={int(bad.numel())})")
         # softmax nel gruppo
         probs_cap_grp = torch.softmax(cap_logits_grp, dim=0)
+        if STRICT_CHECKS and (not torch.isfinite(probs_cap_grp).all()):
+            raise RuntimeError("select_action: non-finite capture group probabilities before sanitize")
         probs_cap_grp = probs_cap_grp.nan_to_num(0.0)
         s_g = probs_cap_grp.sum()
         if STRICT_CHECKS and ((not torch.isfinite(s_g)) or (s_g <= 0)):
@@ -486,6 +488,8 @@ class ActionConditionedPPO:
             bad = cap_logits_grp[~torch.isfinite(cap_logits_grp)]
             raise RuntimeError(f"Capture logits (group) contain non-finite values (count={int(bad.numel())})")
         probs_cap_grp = torch.softmax(cap_logits_grp, dim=0)
+        if STRICT_CHECKS and (not torch.isfinite(probs_cap_grp).all()):
+            raise RuntimeError("select_action: non-finite capture group probabilities before sanitize")
         probs_cap_grp = probs_cap_grp.nan_to_num(0.0)
         s_g = probs_cap_grp.sum()
         if STRICT_CHECKS and ((not torch.isfinite(s_g)) or (s_g <= 0)):
@@ -601,6 +605,8 @@ class ActionConditionedPPO:
         valid_mask = cnts > 0
         if not bool(valid_mask.all()):
             if not bool(valid_mask.any()):
+                if STRICT_CHECKS:
+                    raise RuntimeError("compute_loss: batch has no samples with legal actions (cnts>0)")
                 zero = torch.tensor(0.0, device=device)
                 return zero, {'loss_pi': 0.0, 'loss_v': 0.0, 'entropy': 0.0, 'approx_kl': 0.0, 'clip_frac': 0.0}
             obs = obs[valid_mask]

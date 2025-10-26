@@ -1208,7 +1208,13 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                     if c > 0:
                         padded[j, :c] = logp_total_per_legal[start:start+c]
                         start += c
-                priors_padded = torch.softmax(padded, dim=1).nan_to_num(0.0)
+                # STRICT: fail if softmax yields non-finite; otherwise sanitize NaNs to 0
+                _strict = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
+                priors_soft = torch.softmax(padded, dim=1)
+                if _strict and (not torch.isfinite(priors_soft).all()):
+                    bad_rows = torch.nonzero(~torch.isfinite(priors_soft).any(dim=1), as_tuple=False).flatten().tolist()
+                    raise RuntimeError(f"_batched_service: non-finite priors rows={bad_rows}")
+                priors_padded = priors_soft.nan_to_num(0.0)
                 priors_padded = torch.clamp(priors_padded, min=0.0)
                 row_sums = priors_padded.sum(dim=1, keepdim=True)
                 if bool(((row_sums <= 0) | (~torch.isfinite(row_sums))).any()):
@@ -1463,7 +1469,7 @@ def _load_frozen_actor(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
 
 
 def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: int = 128,
-                       gamma: float = 1.0, lam: float = 0.95,
+                       gamma: float = 1.0, lam: float = 1.0,
                        partner_actor: ActionConditionedActor = None,
                        opponent_actor: ActionConditionedActor = None,
                        main_seats: List[int] = None,
@@ -2060,6 +2066,9 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 try:
                     final_obs = _to_cpu_float32(next_obs)
                 except Exception:
+                    # STRICT: surface the error source instead of zero-filling
+                    if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                        raise
                     final_obs = torch.zeros_like(next_obs_list[-1]) if len(next_obs_list) > 0 else _to_cpu_float32(next_obs)
                 if len(next_obs_list) > 0:
                     next_obs_list[-1] = final_obs
@@ -2268,6 +2277,31 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
                 sum_allowed = exp_shift_allowed.sum(dim=1)
                 lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    rows_present = mask.any(dim=1)
+                    allow_any = allowed_mask.any(dim=1)
+                    if bool(((rows_present & (~allow_any)).any()).item()):
+                        bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory_parallel: allowed_mask empty for rows {bad_rows}")
+                    if not torch.isfinite(card_logits_all).all():
+                        bad = card_logits_all[~torch.isfinite(card_logits_all)]
+                        raise RuntimeError(f"collect_trajectory_parallel: card_logits_all non-finite (count={int(bad.numel())})")
+                    if not torch.isfinite(lse_allowed[rows_present]).all():
+                        bad_idx = torch.nonzero(~torch.isfinite(lse_allowed) & rows_present, as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory_parallel: lse_allowed non-finite for rows {bad_idx}")
+                # STRICT: invariants for card stage – each present row must have at least one allowed card and finite normalizer
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    rows_present = mask.any(dim=1)
+                    allow_any = allowed_mask.any(dim=1)
+                    if bool(((rows_present & (~allow_any)).any()).item()):
+                        bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory: allowed_mask empty for rows {bad_rows}")
+                    if not torch.isfinite(card_logits_all).all():
+                        bad = card_logits_all[~torch.isfinite(card_logits_all)]
+                        raise RuntimeError(f"collect_trajectory: card_logits_all non-finite (count={int(bad.numel())})")
+                    if not torch.isfinite(lse_allowed[rows_present]).all():
+                        bad_idx = torch.nonzero(~torch.isfinite(lse_allowed) & rows_present, as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory: lse_allowed non-finite for rows {bad_idx}")
                 chosen_clamped = torch.minimum(chosen_index_t, (legals_count_t - 1).clamp_min(0))
                 chosen_abs = (legals_offset_t + chosen_clamped)
                 total_legals = legals_t.size(0)
@@ -2281,6 +2315,16 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 played_ids_all = torch.argmax(legals_t[:, :40], dim=1)
                 chosen_card_ids = played_ids_all[chosen_abs]
                 logp_card = card_logits_all[torch.arange(B, device=device), chosen_card_ids] - lse_allowed[torch.arange(B, device=device)]
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    too_neg = (logp_card < -80.0)
+                    if bool(too_neg.any().item() if logp_card.numel() > 0 else False):
+                        r = int(torch.nonzero(too_neg, as_tuple=False).flatten()[0].item())
+                        raise RuntimeError(f"collect_trajectory_parallel: logp_card too negative at row {r} (val={float(logp_card[r].item())}, chosen_card={int(chosen_card_ids[r].item())})")
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    too_neg = (logp_card < -80.0)
+                    if bool(too_neg.any().item() if logp_card.numel() > 0 else False):
+                        r = int(torch.nonzero(too_neg, as_tuple=False).flatten()[0].item())
+                        raise RuntimeError(f"collect_trajectory: logp_card too negative at row {r} (val={float(logp_card[r].item())}, chosen_card={int(chosen_card_ids[r].item())})")
                 # capture
                 a_emb_mb = agent.actor.action_enc(legals_mb)
                 cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
@@ -2293,44 +2337,75 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 exp_shifted = torch.exp(cap_logits - gmax_per_legal)
                 group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
                 group_sum.index_add_(0, group_ids, exp_shifted)
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    gid_chosen = (torch.arange(B, device=device, dtype=torch.long) * 40 + chosen_card_ids)
+                    denom_chosen = group_sum[gid_chosen]
+                    rows_present = mask.any(dim=1)
+                    bad = (~torch.isfinite(denom_chosen)) | (denom_chosen <= 0)
+                    bad = bad & rows_present
+                    if bool(bad.any().item() if denom_chosen.numel() > 0 else False):
+                        bad_rows = torch.nonzero(bad, as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory_parallel: capture group denominator invalid for rows {bad_rows}")
+                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                    gid_chosen = (torch.arange(B, device=device, dtype=torch.long) * 40 + chosen_card_ids)
+                    denom_chosen = group_sum[gid_chosen]
+                    rows_present = mask.any(dim=1)
+                    bad = (~torch.isfinite(denom_chosen)) | (denom_chosen <= 0)
+                    bad = bad & rows_present
+                    if bool(bad.any().item() if denom_chosen.numel() > 0 else False):
+                        bad_rows = torch.nonzero(bad, as_tuple=False).flatten().tolist()
+                        raise RuntimeError(f"collect_trajectory: capture group denominator invalid for rows {bad_rows}")
                 lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
                 logp_cap_per_legal = cap_logits - lse_per_legal
                 logp_cap = logp_cap_per_legal[chosen_pos]
                 old_logp_t = (logp_card + logp_cap)
-                # Early validity for old_logp
-                if not torch.isfinite(old_logp_t).all():
-                    idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
-                    if idx_bad.numel() > 0:
-                        _b = int(idx_bad[0].item())
+                # STRICT: fail fast with diagnostics; non-STRICT: sanitize
+                _strict = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
+                if _strict:
+                    if not torch.isfinite(old_logp_t).all():
+                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
+                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
+                        raise RuntimeError(f"collect_trajectory: old_logp non-finite at row {r}; logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}")
+                    if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
+                        r = int(torch.nonzero(old_logp_t > 1e-6, as_tuple=False).flatten()[0].item())
+                        raise RuntimeError(f"collect_trajectory: old_logp positive at row {r} (val={float(old_logp_t[r].item())})")
+                    if bool((old_logp_t < -100.0).any().item() if old_logp_t.numel() > 0 else False):
+                        idx_bad = torch.nonzero(old_logp_t < -100.0, as_tuple=False).flatten()
+                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
+                        # diagnostics for the first bad row
+                        chosen_card = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
+                        cnt_r = int(legals_count_t[r].item()) if legals_count_t.numel() > r else -1
+                        grp_mask = (sample_idx_per_legal == r) & (played_ids_mb == chosen_card)
+                        cap_logits_grp = cap_logits[grp_mask]
+                        def _stats(t):
+                            return {
+                                'min': float(t.min().item()) if t.numel() > 0 else None,
+                                'max': float(t.max().item()) if t.numel() > 0 else None,
+                                'mean': float(t.mean().item()) if t.numel() > 0 else None,
+                                'numel': int(t.numel())
+                            }
+                        raise RuntimeError(
+                            f"collect_trajectory: old_logp extremely small (min={float(old_logp_t.min().item())}); "
+                            f"row={r}, chosen_card={chosen_card}, legals_count={cnt_r}, "
+                            f"logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}, "
+                            f"card_logits_all_stats={_stats(card_logits_all[r])}, cap_logits_grp_stats={_stats(cap_logits_grp)}"
+                        )
+                else:
+                    # Sanitize old_logp to avoid rare numerical issues spilling into PPO ratio
+                    if not torch.isfinite(old_logp_t).all():
+                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
+                        if idx_bad.numel() > 0:
+                            _b = int(idx_bad[0].item())
+                            from tqdm import tqdm
+                            tqdm.write(f"[collect] non-finite old_logp (serial) -> sanitizing (idx={_b})")
+                        old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
+                    # Clamp tiny positive drift to 0 and floor extreme negatives to prevent exp overflow
+                    old_logp_t = torch.where(old_logp_t > 0, torch.zeros_like(old_logp_t), old_logp_t)
+                    if bool((old_logp_t < -80.0).any().item() if old_logp_t.numel() > 0 else False):
                         from tqdm import tqdm
-                        tqdm.write(f"[collect] non-finite old_logp (serial) -> forcing fallback (idx={_b})")
-                    old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
-                if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
-                    mx = float(old_logp_t.max().item())
-                    raise RuntimeError(f"collect_trajectory: old_logp contains positive values (max={mx})")
-                if bool((old_logp_t < -100.0).any().item() if old_logp_t.numel() > 0 else False):
-                    idx_bad = torch.nonzero(old_logp_t < -100.0, as_tuple=False).flatten()
-                    r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
-                    # diagnostics for the first bad row
-                    chosen_card = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
-                    cnt_r = int(legals_count_t[r].item()) if legals_count_t.numel() > r else -1
-                    # group size for (r, chosen_card)
-                    grp_mask = (sample_idx_per_legal == r) & (played_ids_mb == chosen_card)
-                    grp_size = int(grp_mask.sum().item())
-                    cap_logits_grp = cap_logits[grp_mask]
-                    def _stats(t):
-                        return {
-                            'min': float(t.min().item()) if t.numel() > 0 else None,
-                            'max': float(t.max().item()) if t.numel() > 0 else None,
-                            'mean': float(t.mean().item()) if t.numel() > 0 else None,
-                            'numel': int(t.numel())
-                        }
-                    raise RuntimeError(
-                        f"collect_trajectory: old_logp extremely small (min={float(old_logp_t.min().item())}); "
-                        f"row={r}, chosen_card={chosen_card}, legals_count={cnt_r}, group_size={grp_size}, "
-                        f"logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}, "
-                        f"card_logits_all_stats={_stats(card_logits_all[r])}, cap_logits_grp_stats={_stats(cap_logits_grp)}"
-                    )
+                        n_clamped = int((old_logp_t < -80.0).sum().item())
+                        tqdm.write(f"[collect] old_logp clamped to -80.0 for {n_clamped} rows (serial)")
+                        old_logp_t = torch.clamp(old_logp_t, min=-80.0)
             else:
                 old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
     else:
@@ -2450,7 +2525,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
 
 
 def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: int = 128,
-                       gamma: float = 1.0, lam: float = 0.95,
+                       gamma: float = 1.0, lam: float = 1.0,
                        partner_actor: ActionConditionedActor = None,
                        opponent_actor: ActionConditionedActor = None,
                        main_seats: List[int] = None,
@@ -2502,7 +2577,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                                 episodes_total_hint: int = 8,
                                 k_history: int = 39,
                                 gamma: float = 1.0,
-                                lam: float = 0.95,
+                                lam: float = 1.0,
                                 use_mcts: bool = True,
                                 train_both_teams: bool = True,
                                 main_seats: List[int] = None,
@@ -3232,37 +3307,52 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 logp_cap_per_legal = cap_logits - lse_per_legal
                 logp_cap = logp_cap_per_legal[chosen_pos]
                 old_logp_t = (logp_card + logp_cap)
-                # Guard against numerical issues (NaNs/Inf) by falling back to zero-prob logp and logging once
-                if not torch.isfinite(old_logp_t).all():
-                    idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
-                    if idx_bad.numel() > 0:
-                        _b = int(idx_bad[0].item())
+                # STRICT: fail fast with diagnostics; non-STRICT: sanitize
+                _strict = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
+                if _strict:
+                    if not torch.isfinite(old_logp_t).all():
+                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
+                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
+                        raise RuntimeError(f"collect_trajectory_parallel: old_logp non-finite at row {r}; logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}")
+                    if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
+                        r = int(torch.nonzero(old_logp_t > 1e-6, as_tuple=False).flatten()[0].item())
+                        raise RuntimeError(f"collect_trajectory_parallel: old_logp positive at row {r} (val={float(old_logp_t[r].item())})")
+                    if bool((old_logp_t < -100.0).any().item() if old_logp_t.numel() > 0 else False):
+                        idx_bad = torch.nonzero(old_logp_t < -100.0, as_tuple=False).flatten()
+                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
+                        chosen_card = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
+                        cnt_r = int(cnts[r].item()) if cnts.numel() > r else -1
+                        grp_mask = (sample_idx == r) & (played_ids_mb == chosen_card)
+                        cap_logits_grp = cap_logits[grp_mask]
+                        def _stats(t):
+                            return {
+                                'min': float(t.min().item()) if t.numel() > 0 else None,
+                                'max': float(t.max().item()) if t.numel() > 0 else None,
+                                'mean': float(t.mean().item()) if t.numel() > 0 else None,
+                                'numel': int(t.numel())
+                            }
+                        raise RuntimeError(
+                            f"collect_trajectory_parallel: old_logp extremely small (min={float(old_logp_t.min().item())}); "
+                            f"row={r}, chosen_card={chosen_card}, legals_count={cnt_r}, "
+                            f"logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}, "
+                            f"card_logits_all_stats={_stats(card_logits_all[r])}, cap_logits_grp_stats={_stats(cap_logits_grp)}"
+                        )
+                else:
+                    # Sanitize old_logp to avoid rare numerical issues spilling into PPO ratio
+                    if not torch.isfinite(old_logp_t).all():
+                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
+                        if idx_bad.numel() > 0:
+                            _b = int(idx_bad[0].item())
+                            from tqdm import tqdm
+                            tqdm.write(f"[collect] non-finite old_logp (parallel) -> sanitizing (idx={_b})")
+                        old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
+                    # Clamp tiny positive drift to 0 and floor extreme negatives to prevent exp overflow
+                    old_logp_t = torch.where(old_logp_t > 0, torch.zeros_like(old_logp_t), old_logp_t)
+                    if bool((old_logp_t < -80.0).any().item() if old_logp_t.numel() > 0 else False):
                         from tqdm import tqdm
-                        tqdm.write(f"[collect] non-finite old_logp (parallel) -> forcing fallback (idx={_b})")
-                    old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
-                if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
-                    mx = float(old_logp_t.max().item())
-                    raise RuntimeError(f"collect_trajectory_parallel: old_logp contains positive values (max={mx})")
-                if bool((old_logp_t < -100.0).any().item() if old_logp_t.numel() > 0 else False):
-                    idx_bad = torch.nonzero(old_logp_t < -100.0, as_tuple=False).flatten()
-                    r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
-                    chosen_card = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
-                    cnt_r = int(cnts[r].item()) if cnts.numel() > r else -1
-                    grp_mask = (sample_idx == r) & (played_ids_mb == chosen_card)
-                    cap_logits_grp = cap_logits[grp_mask]
-                    def _stats(t):
-                        return {
-                            'min': float(t.min().item()) if t.numel() > 0 else None,
-                            'max': float(t.max().item()) if t.numel() > 0 else None,
-                            'mean': float(t.mean().item()) if t.numel() > 0 else None,
-                            'numel': int(t.numel())
-                        }
-                    raise RuntimeError(
-                        f"collect_trajectory_parallel: old_logp extremely small (min={float(old_logp_t.min().item())}); "
-                        f"row={r}, chosen_card={chosen_card}, legals_count={cnt_r}, "
-                        f"logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}, "
-                        f"card_logits_all_stats={_stats(card_logits_all[r])}, cap_logits_grp_stats={_stats(cap_logits_grp)}"
-                    )
+                        n_clamped = int((old_logp_t < -80.0).sum().item())
+                        tqdm.write(f"[collect] old_logp clamped to -80.0 for {n_clamped} rows (parallel)")
+                        old_logp_t = torch.clamp(old_logp_t, min=-80.0)
             else:
                 old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
     else:
@@ -3351,8 +3441,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     # Models live on CPU for collection; moved to train device inside agent.update.
 
     # Discover existing checkpoints to possibly resume later (actual load happens after league init)
-    best_ckpt_path = ckpt_path.replace('.pth', '_best.pth') if isinstance(ckpt_path, str) else 'checkpoints/ppo_ac_best.pth'
-    best_wr_ckpt_path = ckpt_path.replace('.pth', '_bestwr.pth') if isinstance(ckpt_path, str) else 'checkpoints/ppo_ac_bestwr.pth'
     resume_ckpt = None
     def _is_bootstrap_path(p: str) -> bool:
         try:
@@ -3360,7 +3448,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         except Exception:
             return False
 
-    for _p in [ckpt_path, best_ckpt_path, best_wr_ckpt_path]:
+    for _p in [ckpt_path]:
         if _p and (not _is_bootstrap_path(_p)) and os.path.isfile(_p) and os.path.getsize(_p) > 0:
             resume_ckpt = _p
             break
@@ -3683,8 +3771,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     odd_main_seats = [1, 3]
 
     best_return = -1e9
-    best_ckpt_path = ckpt_path.replace('.pth', '_best.pth')
-    best_wr_ckpt_path = ckpt_path.replace('.pth', '_bestwr.pth')
 
     def _save_official_checkpoint(tag: str) -> Tuple[str, Optional[str]]:
         from datetime import datetime as _dt  # local import to avoid global churn
@@ -3841,7 +3927,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                        episodes_total_hint=episodes_hint,
                                                        k_history=k_history,
                                                        gamma=1.0,
-                                                       lam=0.95,
+                                                       lam=1.0,
                                                        use_mcts=parallel_use_mcts,
                                                        train_both_teams=False,
                                                        main_seats=main_seats,
@@ -3863,7 +3949,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                        episodes_total_hint=episodes_hint,
                                                        k_history=k_history,
                                                        gamma=1.0,
-                                                       lam=0.95,
+                                                       lam=1.0,
                                                        use_mcts=parallel_use_mcts,
                                                        train_both_teams=False,
                                                        main_seats=main_seats_B,
@@ -3889,7 +3975,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                            episodes_total_hint=episodes_hint,
                                                            k_history=k_history,
                                                            gamma=1.0,
-                                                           lam=0.95,
+                                                           lam=1.0,
                                                            use_mcts=parallel_use_mcts,
                                                            train_both_teams=False,
                                                            main_seats=main_seats,
@@ -3912,7 +3998,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                            episodes_total_hint=episodes_hint,
                                                            k_history=k_history,
                                                            gamma=1.0,
-                                                           lam=0.95,
+                                                           lam=1.0,
                                                            use_mcts=parallel_use_mcts,
                                                            train_both_teams=False,
                                                            main_seats=main_seats_B,
@@ -3947,7 +4033,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                     episodes_total_hint=episodes_hint,
                                                     k_history=k_history,
                                                     gamma=1.0,
-                                                    lam=0.95,
+                                                    lam=1.0,
                                                     use_mcts=parallel_use_mcts,
                                                     train_both_teams=train_both_teams,
                                                     main_seats=main_seats,
@@ -3983,7 +4069,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  mcts_min_sims=0,
                                                  train_both_teams=False,
                                                  gamma=1.0,
-                                                 lam=0.95,
+                                                 lam=1.0,
                                                  seed=int(seed))
                 # Team B as main vs live team A (swap seats)
                 main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
@@ -3999,7 +4085,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  mcts_min_sims=0,
                                                  train_both_teams=False,
                                                  gamma=1.0,
-                                                 lam=0.95,
+                                                 lam=1.0,
                                                  seed=int(seed + 1))
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
@@ -4019,7 +4105,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  mcts_min_sims=0,
                                                  train_both_teams=False,
                                                  gamma=1.0,
-                                                 lam=0.95,
+                                                 lam=1.0,
                                                  seed=int(seed))
                 else:
                     # Team B learns vs frozen Team A
@@ -4035,7 +4121,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  mcts_min_sims=0,
                                                  train_both_teams=False,
                                                  gamma=1.0,
-                                                 lam=0.95,
+                                                 lam=1.0,
                                                  seed=int(seed + 1))
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
@@ -4053,7 +4139,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                            mcts_min_sims=0,
                                            train_both_teams=train_both_teams,
                                            gamma=1.0,
-                                           lam=0.95,
+                                           lam=1.0,
                                            seed=int(seed))
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
@@ -4229,11 +4315,17 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         writer.add_scalar(f'train/A_{k}', _to_float(v), it)
                     writer.add_scalar('train/A_episode_time_s', dt, it)
                     writer.add_scalar('train/A_avg_return', avg_return, it)
+                    # Ensure B tags exist even when B is not updated this iteration
+                    writer.add_scalar('train/B_episode_time_s', 0.0, it)
+                    writer.add_scalar('train/B_avg_return', 0.0, it)
                 else:
                     for k, v in info_B.items():
                         writer.add_scalar(f'train/B_{k}', _to_float(v), it)
                     writer.add_scalar('train/B_episode_time_s', dt, it)
                     writer.add_scalar('train/B_avg_return', avg_return, it)
+                    # Ensure A tags still present in this iteration
+                    writer.add_scalar('train/A_episode_time_s', 0.0, it)
+                    writer.add_scalar('train/A_avg_return', 0.0, it)
             else:
                 for k, v in info.items():
                     writer.add_scalar(f'train/{k}', _to_float(v), it)
@@ -4281,8 +4373,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 writer.add_scalar(key, float(num), it)
 
         # Gestione dei checkpoint ufficiali e delle valutazioni di lega
-        do_eval = bool(eval_every and (it + 1) % eval_every == 0)
-        do_save = ((it + 1) % save_every == 0) or ((it + 1) == num_iterations)
+        _disable_eval = (str(os.environ.get('SCOPONE_DISABLE_EVAL', '0')).strip().lower() in ['1','true','yes','on'])
+        _disable_save = (str(os.environ.get('SCOPONE_DISABLE_SAVE', '0')).strip().lower() in ['1','true','yes','on'])
+        do_eval = (not _disable_eval) and bool(eval_every and (it + 1) % eval_every == 0)
+        do_save = (not _disable_save) and (((it + 1) % save_every == 0) or ((it + 1) == num_iterations))
         if do_eval:
             do_save = False  # l'eval include già un salvataggio ufficiale
             out_A, out_B = _save_official_checkpoint('eval')

@@ -84,7 +84,7 @@ class StateEncoderCompact(nn.Module):
         # Final guard after move to device
         with torch.no_grad():
             if (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1') and (not torch.isfinite(self.card_emb).all()):
-                self.card_emb.copy_(torch.zeros_like(self.card_emb))
+                raise RuntimeError("ActionConditionedActor: non-finite card_emb on initialization")
         # Pre-create positional ids for up to 40 steps to avoid per-forward arange
         self.register_buffer('_hist_pos_ids', torch.arange(40, dtype=torch.long, device=device))
 
@@ -800,6 +800,9 @@ class ActionConditionedActor(torch.nn.Module):
             state_feat = state_feat.to(dtype=bn_dtype)
         visible_mask = self._visible_mask_from_obs(x_obs)
         belief_logits = self.belief_net(state_feat)
+        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1' and (not torch.isfinite(belief_logits).all()):
+            bad = belief_logits[~torch.isfinite(belief_logits)]
+            raise RuntimeError(f"BeliefNet produced non-finite logits (count={int(bad.numel())})")
         belief_logits = torch.nan_to_num(belief_logits, nan=0.0, posinf=1e6, neginf=-1e6).clamp(-30.0, 30.0)
         if not torch.isfinite(belief_logits).all():
             bad = belief_logits[~torch.isfinite(belief_logits)]
