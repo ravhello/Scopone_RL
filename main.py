@@ -57,14 +57,13 @@ os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
 
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
-os.environ.setdefault('SCOPONE_STRICT_CHECKS', '1')
-os.environ.setdefault('SCOPONE_PROFILE', '0')
+os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
+os.environ.setdefault('SCOPONE_PROFILE', '1')
 
 # ===== Section: Diagnostics/Profiling (Both) =====
 # Additional trainer/eval tunables exposed via environment (defaults; override as needed)
 os.environ.setdefault('SCOPONE_PAR_DEBUG', '0')  # abilita log di debug per raccolta parallela/eval
 os.environ.setdefault('SCOPONE_PPO_DEBUG', '0')  # abilita log di debug per PPO
-os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')  # thread CPU per processo worker (eval)
 os.environ.setdefault('SCOPONE_TORCH_PROF', '0')  # abilita PyTorch profiler (main/workers)
 os.environ.setdefault('SCOPONE_TORCH_TB_DIR', '')  # directory TensorBoard per tracce profiler
 os.environ.setdefault('SCOPONE_RPC_TIMEOUT_S', '30')  # timeout RPC dei collector paralleli (s)
@@ -73,13 +72,11 @@ os.environ.setdefault('SCOPONE_TORCH_PROF_DIR', 'profiles')  # cartella output p
 os.environ.setdefault('SCOPONE_RAISE_ON_CKPT_FAIL', '0')  # solleva se fallisce il load del checkpoint
 os.environ.setdefault('ENABLE_BELIEF_SUMMARY', '0')  # stampa riassunti belief (diagnostica)
 os.environ.setdefault('DET_NOISE', '0.0')  # rumore per determinizzazioni MCTS (IS-MCTS)
-os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')  # minima dimensione batch prima di flush del collector
-os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')  # latenza massima (ms) prima del flush del collector
 os.environ.setdefault('SCOPONE_COLLECTOR_STALL_S', '30')  # watchdog: tempo di stallo consentito (s)
 
 # ===== Section: Topology & League (Both) =====
 # Gameplay/training topology flags
-os.environ.setdefault('SCOPONE_START_OPP', 'top1')
+os.environ.setdefault('SCOPONE_START_OPP', 'top1') # top1, top2, random
 
 # ===== Section: Eval Process (Eval) =====
 # Evaluation process knobs
@@ -136,9 +133,43 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
 iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
-num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '24'))  # numero di environment paralleli
 os.environ.setdefault('BELIEF_AUX_COEF', '0.1')  # coefficiente loss ausiliaria belief (default 0.0)
 os.environ.setdefault('SCOPONE_REWARD_SCALE', '0.1')  # scala ricompense finali (1.0 = nessuna variazione)
+
+# ----- Sequenziale vs Parallelo: default mirati per variabili d'ambiente -----
+# Nota: con num_envs <= 1 il trainer usa il percorso seriale; con num_envs > 1 usa il collector parallelo.
+try:
+    import platform as _platform
+    _is_windows = (_platform.system().lower() == 'windows')
+except Exception:
+    _is_windows = False
+
+if num_envs <= 1:
+    # Single-env (seriale): niente batching/attese nel collector; sfrutta tutti i thread della CPU.
+    # Forza latenza zero e batch minimo 1 (solo se qualcuno non li ha già impostati diversamente nel processo).
+    os.environ['SCOPONE_COLLECT_MAX_LATENCY_MS'] = '0'
+    os.environ['SCOPONE_COLLECT_MIN_BATCH'] = '1'
+    # Limita i thread dei processi worker (es. eval) a 1 per evitare oversubscription.
+    os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
+    # Ottimizza BLAS/Torch per processo unico (i worker paralleli non vengono creati).
+    if 'OMP_NUM_THREADS' not in os.environ:
+        try:
+            os.environ['OMP_NUM_THREADS'] = str(max(1, (os.cpu_count() or 1)))
+        except Exception:
+            os.environ['OMP_NUM_THREADS'] = '8'
+    if 'MKL_NUM_THREADS' not in os.environ:
+        os.environ['MKL_NUM_THREADS'] = os.environ.get('OMP_NUM_THREADS', '8')
+else:
+    # Multi-env (parallelo): lascia la strategia di batching dinamica del collector.
+    # Mantieni min_batch auto (0) e piccola latenza per favorire batch grandi senza alta latenza.
+    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')
+    os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')
+    # Un thread per worker per evitare oversubscription; usato dai processi figli.
+    os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
+    # Su Windows, esplicita 'spawn' per sicurezza (altrove il trainer risolve automaticamente).
+    if _is_windows:
+        os.environ.setdefault('SCOPONE_MP_START', 'spawn')
 
 # Read checkpoint path from env for training
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
@@ -259,7 +290,9 @@ if _SILENCE_ABSL and os.name != 'nt':
 
 os.environ.setdefault('ENV_DEVICE', 'cpu')
 ## Imposta metodo mp sicuro per CUDA: forkserver su POSIX, spawn su Windows (override con SCOPONE_MP_START)
-os.environ.setdefault('SCOPONE_MP_START', _DEFAULT_MP_START)
+# Nota: per il collector parallelo impostiamo già SCOPONE_MP_START nel blocco single/multi-env;
+# qui manteniamo solo un default globale compatibile per altri usi (es. script esterni)
+os.environ.setdefault('SCOPONE_MP_START', os.environ.get('SCOPONE_MP_START', _DEFAULT_MP_START))
 
 import torch
 from utils.device import get_compute_device
@@ -292,13 +325,28 @@ def _maybe_launch_tensorboard():
 if __name__ == "__main__":
     device = get_compute_device()
     tqdm.write(f"Using device: {device}")
-    tqdm.write(f"Training compute device: {os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')}")
+    _train_dev_raw = str(os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')).strip().lower()
+    tqdm.write(f"Training compute device: {_train_dev_raw}")
     tqdm.write(f"Self-play: {'ON' if _selfplay else 'OFF (League)'}")
-    # Configure CPU threads for training in the main process only (workers handled in trainers/train_ppo.py)
-    # On GPU training, keep minimal CPU threads to reduce host contention
-    torch.set_num_threads(_n_threads)
-    torch.set_num_interop_threads(_n_interop)
-    tqdm.write(f"Training threads: num_threads={_n_threads} interop={_n_interop}")
+    # Configura i thread CPU del processo principale in modo adattivo:
+    # - Se multi-env e training su GPU: pochi thread CPU (riduce la contesa con i worker)
+    # - Se multi-env e training su CPU: usa tutti i core
+    # - Se single-env: usa i valori calcolati in testa (_n_threads/_n_interop)
+    _cores = max(1, (os.cpu_count() or 1))
+    if int(num_envs) > 1:
+        _train_is_cuda = ('cuda' in _train_dev_raw)
+        if _train_is_cuda:
+            _thr = max(1, min(4, _cores // 4))
+            _interop = 1
+        else:
+            _thr = _cores
+            _interop = max(1, _cores // 8)
+    else:
+        _thr = _n_threads
+        _interop = _n_interop
+    torch.set_num_threads(_thr)
+    torch.set_num_interop_threads(_interop)
+    tqdm.write(f"Training threads: num_threads={_thr} interop={_interop}")
     _maybe_launch_tensorboard()
 
     tqdm.write(f"Parallel envs: {num_envs}  (SCOPONE_PROFILE={os.environ.get('SCOPONE_PROFILE','0')})")
