@@ -97,7 +97,7 @@ os.environ.setdefault('SCOPONE_PER_ENV_TQDM', '0')  # barre per-env (se 1)
 
 # ===== Section: Self-Play & Opponent (Train) =====
 # SELFPLAY: 1=single net (self-play), 0=dual nets (Team A/B)
-_selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '1')).strip().lower()
+_selfplay_env = str(os.environ.get('SCOPONE_SELFPLAY', '0')).strip().lower()
 _selfplay = (_selfplay_env in ['1', 'true', 'yes', 'on'])
 
 # SCOPONE_OPP_FROZEN: 1=freeze the opponent, 0=co-train with the opponent
