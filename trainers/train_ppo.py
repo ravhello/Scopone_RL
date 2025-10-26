@@ -2474,13 +2474,13 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                         idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
                         if idx_bad.numel() > 0:
                             _b = int(idx_bad[0].item())
-                            from tqdm import tqdm
+                            from tqdm import tqdm as _tqdm_serial
                             tqdm.write(f"[collect] non-finite old_logp (serial) -> sanitizing (idx={_b})")
                         old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
                     # Clamp tiny positive drift to 0 and floor extreme negatives to prevent exp overflow
                     old_logp_t = torch.where(old_logp_t > 0, torch.zeros_like(old_logp_t), old_logp_t)
                     if bool((old_logp_t < -80.0).any().item() if old_logp_t.numel() > 0 else False):
-                        from tqdm import tqdm
+                        from tqdm import tqdm as _tqdm_serial2
                         n_clamped = int((old_logp_t < -80.0).sum().item())
                         tqdm.write(f"[collect] old_logp clamped to -80.0 for {n_clamped} rows (serial)")
                         old_logp_t = torch.clamp(old_logp_t, min=-80.0)
@@ -3482,13 +3482,13 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                         idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
                         if idx_bad.numel() > 0:
                             _b = int(idx_bad[0].item())
-                            from tqdm import tqdm
+                            from tqdm import tqdm as _tqdm_par
                             tqdm.write(f"[collect] non-finite old_logp (parallel) -> sanitizing (idx={_b})")
                         old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
                     # Clamp tiny positive drift to 0 and floor extreme negatives to prevent exp overflow
                     old_logp_t = torch.where(old_logp_t > 0, torch.zeros_like(old_logp_t), old_logp_t)
                     if bool((old_logp_t < -80.0).any().item() if old_logp_t.numel() > 0 else False):
-                        from tqdm import tqdm
+                        from tqdm import tqdm as _tqdm_par2
                         n_clamped = int((old_logp_t < -80.0).sum().item())
                         tqdm.write(f"[collect] old_logp clamped to -80.0 for {n_clamped} rows (parallel)")
                         old_logp_t = torch.clamp(old_logp_t, min=-80.0)
