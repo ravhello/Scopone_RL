@@ -3599,9 +3599,20 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
 
     warmup_iters = 0 if mcts_warmup_iters is None else max(0, int(mcts_warmup_iters))
 
-    # Cosine annealing LR schedulers
-    actor_sched = optim.lr_scheduler.CosineAnnealingLR(agent.opt_actor, T_max=max(1, num_iterations))
-    critic_sched = optim.lr_scheduler.CosineAnnealingLR(agent.opt_critic, T_max=max(1, num_iterations))
+    # LR scheduler configuration (mode: constant|cosine|cosine_half, with optional scale)
+    _sched_mode = str(os.environ.get('SCOPONE_LR_SCHED_MODE', 'constant')).strip().lower()
+    try:
+        _sched_scale = float(os.environ.get('SCOPONE_LR_SCHED_SCALE', '0.75'))
+    except Exception:
+        _sched_scale = 1.0
+    actor_sched = None
+    critic_sched = None
+    if _sched_mode in ('cosine', 'cosine_half'):
+        _t_max = max(1, int(max(1, num_iterations) * max(0.0, _sched_scale)))
+        if _sched_mode == 'cosine_half':
+            _t_max = max(1, _t_max // 2)
+        actor_sched = optim.lr_scheduler.CosineAnnealingLR(agent.opt_actor, T_max=_t_max)
+        critic_sched = optim.lr_scheduler.CosineAnnealingLR(agent.opt_critic, T_max=_t_max)
     agent.add_lr_schedulers(actor_sched, critic_sched)
 
     # entropy schedules

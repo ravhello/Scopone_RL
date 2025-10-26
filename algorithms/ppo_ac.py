@@ -25,12 +25,12 @@ class ActionConditionedPPO:
     def __init__(self,
                  obs_dim: int = 10823,
                  action_dim: int = 80,
-                 lr: float = 3e-4,
-                 clip_ratio: float = 0.2,
-                 value_coef: float = 0.5,
-                 entropy_coef: float = 0.01,
-                 value_clip: float = 0.2,
-                 target_kl: float = 0.02,
+                 lr: float = 0.0001989908416605655,
+                 clip_ratio: float = 0.15,
+                 value_coef: float = 1.0,
+                 entropy_coef: float = 0.0069646788699474806,
+                 value_clip: float = 0.1,
+                 target_kl: float = 0.015,
                  k_history: int = None):
         shared_enc = StateEncoderCompact(k_history=k_history)
         self.actor = ActionConditionedActor(obs_dim, action_dim, state_encoder=shared_enc)

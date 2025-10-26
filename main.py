@@ -137,7 +137,7 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
 num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
-os.environ.setdefault('BELIEF_AUX_COEF', '0.1')  # coefficiente loss ausiliaria belief (default 0.0)
+os.environ.setdefault('BELIEF_AUX_COEF', '0.05')  # coefficiente loss ausiliaria belief (default 0.0)
 os.environ.setdefault('SCOPONE_REWARD_SCALE', '0.1')  # scala ricompense finali (1.0 = nessuna variazione)
 
 # Read checkpoint path from env for training
@@ -194,7 +194,7 @@ _mcts_warmup_iters = int(os.environ.get('SCOPONE_MCTS_WARMUP_ITERS', '0'))  # it
 os.environ.setdefault('SCOPONE_RAISE_ON_INVALID_SIMS', '1')  # solleva eccezione se sims MCTS scalate sono invalide
 
 # ----- Prior-only -----
-_entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED','linear')  # schedulazione entropia (es. linear, cos)
+_entropy_sched = os.environ.get('SCOPONE_ENTROPY_SCHED','cosine')  # schedulazione entropia (es. linear, cosine)
 _belief_particles = int(os.environ.get('SCOPONE_BELIEF_PARTICLES','512'))  # particelle belief per training
 _belief_ess = float(os.environ.get('SCOPONE_BELIEF_ESS_FRAC','0.5'))  # soglia ESS per resampling belief (train)
 _mcts_c_puct = float(os.environ.get('SCOPONE_MCTS_C_PUCT','1.0'))  # c_puct per MCTS in training
@@ -218,6 +218,11 @@ os.environ.setdefault('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '1')
 os.environ.setdefault('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '80')  # frazione richiesta (0 disattiva)
 os.environ.setdefault('SCOPONE_TRAIN_MCTS_DETS_EXACT', '4')  # dets exact (train)
 
+
+# ===== Section: LR Scheduler Defaults =====
+# Controls the learning-rate scheduler behaviour in trainer: constant|cosine|cosine_half with optional scale.
+os.environ.setdefault('SCOPONE_LR_SCHED_MODE', 'constant')  # best tuned default
+os.environ.setdefault('SCOPONE_LR_SCHED_SCALE', '0.75')     # scale T_max of cosine schedulers
 
 
 # ===== Section: Misc/Debug (Both) =====
