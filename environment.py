@@ -45,6 +45,42 @@ def _ids_to_bitset(ids):
         bits |= (1 << cid)
     return bits
 
+def _remove_id_from_card_list(card_list, cid: int) -> None:
+    """Remove one card matching cid from a list that may contain ints or (rank, suit) tuples.
+    Does nothing if not found (raises ValueError to preserve semantics).
+    """
+    # Fast path: exact int present
+    try:
+        card_list.remove(cid)
+        return
+    except ValueError:
+        pass
+    # Fallback: search tuples
+    idx = -1
+    for i, c in enumerate(card_list):
+        if isinstance(c, tuple):
+            if _card_to_id(c) == int(cid):
+                idx = i
+                break
+        elif isinstance(c, int) and int(c) == int(cid):
+            idx = i
+            break
+    if idx >= 0:
+        del card_list[idx]
+        return
+    # Preserve original behavior: raise if not found
+    raise ValueError(f"Card id {int(cid)} not found in list")
+
+def _list_contains_id(card_list, cid: int) -> bool:
+    for c in card_list:
+        if isinstance(c, int):
+            if int(c) == int(cid):
+                return True
+        else:
+            if _card_to_id(c) == int(cid):
+                return True
+    return False
+
 class ScoponeEnvMA(gym.Env):
     def __init__(self, rules=None, k_history: int = 39):
         super().__init__()
@@ -472,10 +508,11 @@ class ScoponeEnvMA(gym.Env):
         if self._use_bitset:
             if ((self._hands_bits[current_player] >> int(pid)) & 1) == 0:
                 raise ValueError(f"La carta {pid} non è nella mano del giocatore {current_player}.")
-        elif pid not in hand:
-            raise ValueError(f"La carta {pid} non è nella mano del giocatore {current_player}.")
+        elif not _list_contains_id(hand, int(pid)):
+            raise ValueError(f"La carta {int(pid)} non è nella mano del giocatore {current_player}.")
 
-        table_ids_list = self._table_ids if self._use_id_cache else [_card_to_id(c) for c in table]
+        # Usa sempre rappresentazione ID coerente del tavolo; non dipendere dal tipo interno di table
+        table_ids_list = (list(self._table_ids) if self._use_id_cache else [_card_to_id(c) for c in table])
 
         if self._profiling:
             _t_validate_start = time.time()
@@ -536,7 +573,7 @@ class ScoponeEnvMA(gym.Env):
         capture_type = "no_capture"
         
         # Rimuovi la carta giocata dalla mano (ID)
-        hand.remove(pid)
+        _remove_id_from_card_list(hand, int(pid))
         # Aggiorna cache ID/bitset
         if self._use_id_cache:
             self._hands_ids[current_player].remove(pid)
@@ -563,11 +600,16 @@ class ScoponeEnvMA(gym.Env):
         elif cap_ids:
             # Cattura carte
             for cid in cap_ids:
-                table.remove(cid)
+                _remove_id_from_card_list(table, int(cid))
                 if self._use_id_cache:
-                    self._table_ids.remove(cid)
+                    try:
+                        self._table_ids.remove(int(cid))
+                    except ValueError:
+                        # Se la cache si è desincronizzata, riallinea da sorgente e riprova una volta
+                        self._rebuild_id_caches()
+                        self._table_ids.remove(int(cid))
                     if self._use_bitset:
-                        self._table_bits &= ~(1 << cid)
+                        self._table_bits &= ~(1 << int(cid))
                         self._table_bits_t = self._table_bits_t & (~(self._one_i64 << int(cid)))
             
             # Aggiungi le carte catturate e la carta giocata alla squadra
@@ -592,11 +634,12 @@ class ScoponeEnvMA(gym.Env):
                 capture_type = "capture"
         else:
             # Nessuna cattura: la carta va sul tavolo
-            table.append(pid)
+            # Appendi coerentemente come ID
+            table.append(int(pid))
             if self._use_id_cache:
-                self._table_ids.append(pid)
+                self._table_ids.append(int(pid))
                 if self._use_bitset:
-                    self._table_bits |= (1 << pid)
+                    self._table_bits |= (1 << int(pid))
                     self._table_bits_t = self._table_bits_t | (self._one_i64 << int(pid))
         
         # Calcola reward shaping opzionale
