@@ -320,6 +320,24 @@ _GETREQS_PROF = {
     'bs_hist': {},
 }
 
+# service sub-profiler (policy/value/belief scoring on master)
+_SERVICE_PROF = {
+    'policy': {
+        'calls': 0,          # number of policy batches (Bp > 0)
+        't': 0.0,            # total time spent in policy scoring
+        'Bp_sum': 0,         # sum of policy requests per batch
+        'legals_sum': 0,     # total number of legals scored across all batches
+    },
+    'value': {
+        'calls': 0,
+        't': 0.0,
+    },
+    'belief': {
+        'calls': 0,
+        't': 0.0,
+    },
+}
+
 # One-time run flags
 _HORIZON_ADJUST_LOGGED = False
 
@@ -348,7 +366,8 @@ def _env_worker(worker_id: int,
                 cfg: Dict,
                 request_q: mp.Queue,
                 action_q: mp.Queue,
-                episode_q: mp.Queue):
+                episode_q: mp.Queue,
+                control_q: Optional[mp.Queue] = None):
     _WDBG = (os.environ.get('SCOPONE_PAR_DEBUG', '0') in ['1','true','yes','on'])
     def _wdbg(msg: str) -> None:
         if _WDBG:
@@ -407,60 +426,92 @@ def _env_worker(worker_id: int,
     t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
     t0_glob = time.time()
     _wdbg(f"start (episodes_per_env={int(episodes_per_env)})")
-    for ep in range(episodes_per_env):
-        t0 = time.time(); env.reset(); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
-        _wdbg(f"ep {ep} reset")
-        obs_list, next_obs_list = [], []
-        act_list = []
-        rew_list, done_list = [], []
-        seat_team_list = []
-        belief_sum_list = []
-        legals_list, legals_offset, legals_count = [], [], []
-        chosen_index_list = []
-        mcts_policy_list = []
-        mcts_weight_list = []
-        others_hands_list = []
+    # In persistent mode (control_q provided) we can receive new budgets and loop forever
+    _persistent = (control_q is not None)
+    while True:
+        # Resolve budget for this round (and apply any dynamic control updates)
+        budget = int(episodes_per_env)
+        if _persistent:
+            # Wait until a positive budget is provided
+            while budget <= 0:
+                try:
+                    cmd = control_q.get()  # type: ignore[union-attr]
+                except Exception:
+                    cmd = None
+                if isinstance(cmd, dict) and cmd.get('cmd') == 'set_budget':
+                    try:
+                        budget = int(cmd.get('episodes', 0))
+                    except Exception:
+                        budget = 0
+                elif isinstance(cmd, dict) and cmd.get('cmd') == 'set_main_seats':
+                    try:
+                        ms = cmd.get('value', None)
+                        if isinstance(ms, (list, tuple)):
+                            main_seats = [int(x) for x in ms]
+                    except Exception:
+                        pass
+                elif isinstance(cmd, dict) and cmd.get('cmd') == 'stop':
+                    # Exit worker gracefully
+                    if _worker_prof is not None:
+                        _worker_prof.stop()
+                    return
+                else:
+                    continue
+        # Produce 'budget' episodes this round
+        for ep in range(max(0, int(budget))):
+            t0 = time.time(); env.reset(); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
+            _wdbg(f"ep {ep} reset")
+            obs_list, next_obs_list = [], []
+            act_list = []
+            rew_list, done_list = [], []
+            seat_team_list = []
+            belief_sum_list = []
+            legals_list, legals_offset, legals_count = [], [], []
+            chosen_index_list = []
+            mcts_policy_list = []
+            mcts_weight_list = []
+            others_hands_list = []
 
-        done = False
-        info = {}
-        step_idx = 0
-        while not done:
-            t0 = time.time();
-            with _record_function('env._get_observation'):
-                obs = env._get_observation(env.current_player)
-            t_get_obs += (time.time() - t0) if _PAR_TIMING else 0.0
-            if step_idx < 3:
-                _wdbg(f"ep {ep} step {step_idx}: got obs (cp={env.current_player})")
-            t0 = time.time();
-            with _record_function('env.get_valid_actions'):
-                legal = env.get_valid_actions()
-            t_get_legals += (time.time() - t0) if _PAR_TIMING else 0.0
-            if step_idx < 3:
-                _wdbg(f"ep {ep} step {step_idx}: legals={int(len(legal))}")
-            if torch.is_tensor(legal) and (legal.size(0) == 0):
-                raise RuntimeError(f"collect_trajectory_parallel: worker {worker_id} got 0 legal actions (player={env.current_player})")
-            # Avoid ambiguous truth-value on tensors; treat empty action sets explicitly
-            is_empty = (int(legal.numel()) == 0)
-            if is_empty:
-                raise RuntimeError(f"worker {worker_id}: no legal actions at episode start (player={env.current_player})")
-            cp = env.current_player
-            seat_vec = _seat_vec_for(cp)
-            seat_cpu = seat_vec
-            obs_cpu = _to_cpu_float32(obs)
-            if torch.is_tensor(legal):
-                legal_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
-                legal_cpu_entries = list(legal_cpu_tensor.unbind(0))
-            else:
-                legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
-                legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
-            legal_count = len(legal_cpu_entries)
-            is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
-            store_sample = bool(train_both_teams or is_main)
-            policy_entries: List[float] = []
-            policy_weight = 0.0
-            bsum_tensor = _BELIEF_ZERO
-            # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
-            _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
+            done = False
+            info = {}
+            step_idx = 0
+            while not done:
+                t0 = time.time();
+                with _record_function('env._get_observation'):
+                    obs = env._get_observation(env.current_player)
+                t_get_obs += (time.time() - t0) if _PAR_TIMING else 0.0
+                if step_idx < 3:
+                    _wdbg(f"ep {ep} step {step_idx}: got obs (cp={env.current_player})")
+                t0 = time.time();
+                with _record_function('env.get_valid_actions'):
+                    legal = env.get_valid_actions()
+                t_get_legals += (time.time() - t0) if _PAR_TIMING else 0.0
+                if step_idx < 3:
+                    _wdbg(f"ep {ep} step {step_idx}: legals={int(len(legal))}")
+                if torch.is_tensor(legal) and (legal.size(0) == 0):
+                    raise RuntimeError(f"collect_trajectory_parallel: worker {worker_id} got 0 legal actions (player={env.current_player})")
+                # Avoid ambiguous truth-value on tensors; treat empty action sets explicitly
+                is_empty = (int(legal.numel()) == 0)
+                if is_empty:
+                    raise RuntimeError(f"worker {worker_id}: no legal actions at episode start (player={env.current_player})")
+                cp = env.current_player
+                seat_vec = _seat_vec_for(cp)
+                seat_cpu = seat_vec
+                obs_cpu = _to_cpu_float32(obs)
+                if torch.is_tensor(legal):
+                    legal_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
+                    legal_cpu_entries = list(legal_cpu_tensor.unbind(0))
+                else:
+                    legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
+                    legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
+                legal_count = len(legal_cpu_entries)
+                is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
+                store_sample = bool(train_both_teams or is_main)
+                policy_entries: List[float] = []
+                policy_weight = 0.0
+                bsum_tensor = _BELIEF_ZERO
+                # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
+                _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
             if (is_main or _both_sides) and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
                 # Build helper RPCs to master for batched scoring
                 if send_legals:
@@ -950,36 +1001,26 @@ def _env_worker(worker_id: int,
             _wdbg(f"ep {ep} payload put ok")
         except Exception as e:
             raise RuntimeError(f"worker {worker_id}: episode_q.put failed") from e
-        # Do not advance worker profiler schedule per-episode to avoid Kineto stack issues
-    # Stop and export worker torch profiler if active
-    if _worker_prof is not None:
-        _worker_prof.stop()
-        from datetime import datetime as _dt  # local import to avoid changing global imports
-        _dir = os.environ.get('SCOPONE_TORCH_PROF_DIR', os.path.abspath(os.path.join(_PROJECT_ROOT, 'profiles')))
-        _run = os.environ.get('SCOPONE_TORCH_PROF_RUN', _dt.now().strftime('%Y%m%d_%H%M%S'))
-        os.makedirs(_dir, exist_ok=True)
-        _out = os.path.abspath(os.path.join(_dir, f"tp_worker_{int(worker_id)}_{os.getpid()}_{_run}.json"))
-        _worker_prof.export_chrome_trace(_out)
-        # Also write into the combined TensorBoard trace directory, if configured
-        if '_tb_write_fn' in locals() and _tb_write_fn is not None:
-            _tb_write_fn(_worker_prof)
-
-    # Signal completion to master
-    _wdbg("sending done marker")
-    episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
-    if _PAR_TIMING:
-        total = time.time() - t0_glob
-        episode_q.put({'wid': worker_id, 'type': 'timing',
-                       't_env_reset': t_env_reset,
-                       't_get_obs': t_get_obs,
-                       't_get_legals': t_get_legals,
-                       't_mcts': t_mcts,
-                       't_rpc': t_rpc,
-                       't_step': t_step,
-                       't_pack': t_pack,
-                       't_total': total})
-
-
+        # End-of-round signalling (like per-iteration)
+        _wdbg("round done -> sending done marker")
+        episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
+        if _PAR_TIMING:
+            total = time.time() - t0_glob
+            episode_q.put({'wid': worker_id, 'type': 'timing',
+                           't_env_reset': t_env_reset,
+                           't_get_obs': t_get_obs,
+                           't_get_legals': t_get_legals,
+                           't_mcts': t_mcts,
+                           't_rpc': t_rpc,
+                           't_step': t_step,
+                           't_pack': t_pack,
+                           't_total': total})
+        # In non-persistent mode produce once and exit; otherwise reset timers and wait for new budget
+        if not _persistent:
+            break
+        t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
+        t0_glob = time.time()
+        episodes_per_env = 0
 def _batched_select_indices(agent: ActionConditionedPPO,
                             reqs: List[Dict]) -> List[Tuple[int, int]]:
     # Returns list of (wid, idx) per req
@@ -1175,6 +1216,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                     results[i] = {'priors': []}
 
     if len(policy_positions) > 0:
+        _t_policy0 = time.time() if _PAR_TIMING else 0.0
         with torch.no_grad():
             # Concatenate legals
             legals_flat = torch.cat(policy_legals_rows, dim=0)
@@ -1258,11 +1300,20 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
             else:
                 for pos_j in policy_positions:
                     results[pos_j] = {'priors': []}
+        if _PAR_TIMING:
+            try:
+                _SERVICE_PROF['policy']['calls'] += 1
+                _SERVICE_PROF['policy']['t'] += (time.time() - _t_policy0)
+                _SERVICE_PROF['policy']['Bp_sum'] += int(Bp)
+                _SERVICE_PROF['policy']['legals_sum'] += int(legals_flat.size(0))
+            except Exception:
+                pass
 
     # 2) Process score_value and score_belief (can remain per-request)
     for i, r in enumerate(reqs):
         rtype = r.get('type')
         if rtype == 'score_value':
+            _t_val0 = time.time() if _PAR_TIMING else 0.0
             with torch.no_grad():
                 o_one = o_t[i:i+1]
                 s_one = s_t[i:i+1]
@@ -1283,7 +1334,14 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                 oh = probs_flat.view(1, 3, 40)
                 val = agent.critic(o_one, s_one, oh).squeeze(0)
             results[i] = {'value': float(val.detach().cpu().item())}
+            if _PAR_TIMING:
+                try:
+                    _SERVICE_PROF['value']['calls'] += 1
+                    _SERVICE_PROF['value']['t'] += (time.time() - _t_val0)
+                except Exception:
+                    pass
         elif rtype == 'score_belief':
+            _t_bel0 = time.time() if _PAR_TIMING else 0.0
             with torch.no_grad():
                 _state = agent.actor.state_enc(o_t[i:i+1], s_t[i:i+1])
                 bn_dtype = agent.actor.belief_net.fc_in.weight.dtype
@@ -1299,8 +1357,159 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                 visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
                 probs_flat = agent.actor.belief_net.probs(logits, visible_mask).squeeze(0).detach().cpu().tolist()
             results[i] = {'belief_probs': probs_flat}
+            if _PAR_TIMING:
+                try:
+                    _SERVICE_PROF['belief']['calls'] += 1
+                    _SERVICE_PROF['belief']['t'] += (time.time() - _t_bel0)
+                except Exception:
+                    pass
 
     return results
+
+class ParallelCollector:
+    """
+    Collector persistente: spawna i worker una volta e li riusa per round successivi.
+    Consente di inviare un budget per round (episodi totali) e drenare i risultati
+    mentre serve le richieste dei worker (step/score/belief) dal master.
+    """
+    def __init__(self, num_envs: int, cfg_base: Dict, show_progress_env: bool, tqdm_base_pos: int):
+        available_methods = set(mp.get_all_start_methods())
+        override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
+        if override in {'spawn', 'fork', 'forkserver'} and override in available_methods:
+            start_method = override
+        else:
+            if platform.system().lower() == 'windows':
+                start_method = 'spawn'
+            else:
+                start_method = 'fork' if 'fork' in available_methods else ('spawn' if 'spawn' in available_methods else next(iter(available_methods)))
+            if start_method not in available_methods:
+                start_method = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
+        self.ctx = mp.get_context(start_method)
+        self.num_envs = int(num_envs)
+        self.request_q = self.ctx.Queue(maxsize=self.num_envs * 4)
+        self.episode_q = self.ctx.Queue(maxsize=max(self.num_envs * 4, 64))
+        self.action_queues = [self.ctx.Queue(maxsize=2) for _ in range(self.num_envs)]
+        self.control_queues = [self.ctx.Queue(maxsize=8) for _ in range(self.num_envs)]
+        self.workers: List[mp.Process] = []
+        for wid in range(self.num_envs):
+            cfg = dict(cfg_base)
+            cfg['episodes_per_env'] = 0
+            p = self.ctx.Process(target=_env_worker, args=(wid, cfg, self.request_q, self.action_queues[wid], self.episode_q, self.control_queues[wid]), daemon=True)
+            p.start()
+            self.workers.append(p)
+        _TQDM_DISABLE = (os.environ.get('TQDM_DISABLE','0') in ['1','true','yes','on'])
+        _PER_ENV_TQDM = (str(os.environ.get('SCOPONE_PER_ENV_TQDM', '1')).strip().lower() in ['1','true','yes','on'])
+        self._show_pb = bool(show_progress_env) and _PER_ENV_TQDM and (not _TQDM_DISABLE) and (not _PAR_DEBUG)
+        self.env_pbars = []
+        if self._show_pb:
+            for wid in range(self.num_envs):
+                self.env_pbars.append(tqdm(total=0, desc=f"env {wid}", position=(tqdm_base_pos + wid), leave=False, dynamic_ncols=True, disable=_TQDM_DISABLE))
+        else:
+            self.env_pbars = [None] * self.num_envs
+
+    def dispatch_budget(self, total_episodes: int, main_seats: Optional[List[int]] = None) -> List[int]:
+        base = int(total_episodes) // self.num_envs
+        rem = int(total_episodes) % self.num_envs
+        per_env = [base + (1 if i < rem else 0) for i in range(self.num_envs)]
+        for wid in range(self.num_envs):
+            try:
+                self.control_queues[wid].put({'cmd': 'set_budget', 'episodes': int(per_env[wid])}, block=False)
+                if main_seats is not None:
+                    self.control_queues[wid].put({'cmd': 'set_main_seats', 'value': list(main_seats)}, block=False)
+                if self.env_pbars[wid] is not None:
+                    self.env_pbars[wid].reset(total=int(per_env[wid]))
+            except Exception:
+                pass
+        return per_env
+
+    def drain_once(self, agent: ActionConditionedPPO, expected_total: int, frozen_actor: Optional[ActionConditionedActor], frozen_non_main: bool) -> List[Dict]:
+        episodes_payloads: List[Dict[str, Any]] = []
+        episodes_received = 0
+        min_batch = int(os.environ.get('SCOPONE_COLLECT_MIN_BATCH', '0'))
+        if min_batch <= 0:
+            min_batch = max(32, 2 * int(self.num_envs))
+        batch_target = max(min_batch, 64)
+        max_latency_s = max(0.0, float(os.environ.get('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')) / 1000.0)
+        last_activity = time.time()
+        while episodes_received < int(expected_total):
+            # Drain episodes
+            while True:
+                try:
+                    ep = self.episode_q.get_nowait()
+                    if isinstance(ep, dict) and ep.get('type') == 'done':
+                        wid = int(ep.get('wid', -1))
+                        if 0 <= wid < len(self.env_pbars) and self.env_pbars[wid] is not None:
+                            self.env_pbars[wid].close(); self.env_pbars[wid] = None
+                        continue
+                    elif isinstance(ep, dict) and ep.get('type') == 'timing':
+                        continue
+                    else:
+                        episodes_payloads.append(ep)
+                        episodes_received += 1
+                        wid = int(ep.get('wid', -1))
+                        if 0 <= wid < len(self.env_pbars) and self.env_pbars[wid] is not None:
+                            self.env_pbars[wid].update(1)
+                        last_activity = time.time()
+                except queue.Empty:
+                    break
+            # Gather micro-batch of requests
+            reqs: List[Dict] = []
+            try:
+                r0 = self.request_q.get(timeout=max_latency_s)
+                reqs.append(r0)
+            except queue.Empty:
+                pass
+            while len(reqs) < batch_target:
+                try:
+                    reqs.append(self.request_q.get_nowait())
+                except queue.Empty:
+                    break
+            if len(reqs) > 0:
+                step_reqs = [r for r in reqs if r.get('type') == 'step']
+                shadow_reqs = [r for r in reqs if r.get('type') == 'step_shadow']
+                other_reqs = [r for r in reqs if r.get('type') not in ('step', 'step_shadow')]
+                if len(step_reqs) > 0:
+                    sel = _batched_select_indices(agent, step_reqs)
+                    for wid, idx in sel:
+                        self.action_queues[wid].put({'idx': int(idx)}, block=False)
+                if len(shadow_reqs) > 0:
+                    if frozen_actor is None:
+                        sel = _batched_select_indices(agent, shadow_reqs)
+                    else:
+                        sel = _batched_select_indices_with_actor(frozen_actor, shadow_reqs)
+                    for wid, idx in sel:
+                        self.action_queues[wid].put({'idx': int(idx)}, block=False)
+                if len(other_reqs) > 0:
+                    outs = _batched_service(agent, other_reqs)
+                    for r, out in zip(other_reqs, outs):
+                        wid = int(r.get('wid', 0))
+                        self.action_queues[wid].put(out, block=False)
+                last_activity = time.time()
+            # Watchdog
+            if (time.time() - last_activity) > float(os.environ.get('SCOPONE_COLLECTOR_STALL_S', '30')):
+                break
+        return episodes_payloads
+
+    def stop(self) -> None:
+        for q in self.control_queues:
+            try:
+                q.put({'cmd': 'stop'}, block=False)
+            except Exception:
+                pass
+        for p in self.workers:
+            try:
+                p.join(timeout=0.2)
+            except Exception:
+                pass
+        for p in self.workers:
+            if p.is_alive():
+                p.terminate(); p.join(timeout=0.2)
+        self.request_q.close(); self.request_q.join_thread()
+        self.episode_q.close(); self.episode_q.join_thread()
+        for q in self.action_queues:
+            q.close(); q.join_thread()
+        for q in self.control_queues:
+            q.close(); q.join_thread()
 
 def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List[Dict]) -> List[Tuple[int, int]]:
     """Like _batched_select_indices but using a provided frozen actor (no critic)."""
@@ -1370,6 +1579,190 @@ def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List
         _BATCHSEL_PROF['t_total'] += (time.time() - _t_total0)
         _BATCHSEL_PROF['count'] += 1
     return out_idx
+
+
+def _postprocess_episodes_to_batch(episodes_payloads: List[Dict],
+                                   actor_for_old_logp: ActionConditionedActor,
+                                   agent: ActionConditionedPPO,
+                                   train_both_teams: bool,
+                                   gamma: float,
+                                   lam: float) -> Dict:
+    # Build batch CPU tensors from payloads (adapted from collect_trajectory_parallel)
+    obs_cpu = []
+    act_cpu = []
+    next_obs_cpu = []
+    rew_list = []
+    done_list = []
+    seat_cpu = []
+    belief_cpu = []
+    legals_cpu = []
+    leg_off = []
+    leg_cnt = []
+    chosen_idx = []
+    for ep in episodes_payloads:
+        obs_cpu.extend([torch.as_tensor(x, dtype=torch.float32) for x in ep['obs']])
+        next_obs_cpu.extend([torch.as_tensor(x, dtype=torch.float32) for x in ep['next_obs']])
+        act_cpu.extend([torch.as_tensor(x, dtype=torch.float32) for x in ep['act']])
+        seat_ep = [torch.as_tensor(x, dtype=torch.float32) for x in ep['seat']]
+        seat_cpu.extend(seat_ep)
+        belief_cpu.extend([torch.as_tensor(x, dtype=torch.float32) for x in ep['belief_summary']])
+        legals_cpu.extend([torch.as_tensor(x, dtype=torch.float32) for x in ep['legals']])
+        base = len(legals_cpu) - len(ep['legals'])
+        leg_off.extend([base + int(o) for o in ep['leg_off']])
+        leg_cnt.extend([int(c) for c in ep['leg_cnt']])
+        chosen_idx.extend([int(i) for i in ep['chosen_idx']])
+        # rewards flat per-seat da team_rewards episodio
+        tr = ep.get('team_rewards', [0.0, 0.0])
+        t0 = float(tr[0]); t1 = float(tr[1])
+        for st in seat_ep:
+            team0_flag = bool(float(st[4]) > 0.5)
+            if not team0_flag:
+                seat_idx = int(torch.argmax(st[:4]).item())
+                team0_flag = (seat_idx in [0, 2])
+            rew_list.append(t0 if team0_flag else t1)
+        done_list.extend([bool(d) for d in ep['done']])
+
+    _obs_dim = int(episodes_payloads[0]['obs'][0].__len__()) if episodes_payloads and episodes_payloads[0]['obs'] else 1
+    obs_cpu_t = torch.stack(obs_cpu, dim=0) if len(obs_cpu) > 0 else torch.zeros((0, _obs_dim), dtype=torch.float32)
+    next_obs_cpu_t = torch.stack(next_obs_cpu, dim=0) if len(next_obs_cpu) > 0 else torch.zeros_like(obs_cpu_t)
+    act_cpu_t = torch.stack(act_cpu, dim=0) if len(act_cpu) > 0 else torch.zeros((0, 80), dtype=torch.float32)
+    seat_cpu_t = torch.stack(seat_cpu, dim=0) if len(seat_cpu) > 0 else torch.zeros((0, 6), dtype=torch.float32)
+    belief_cpu_t = torch.stack(belief_cpu, dim=0) if len(belief_cpu) > 0 else torch.zeros((0, 120), dtype=torch.float32)
+    legals_cpu_t = torch.stack(legals_cpu, dim=0) if len(legals_cpu) > 0 else torch.zeros((0, 80), dtype=torch.float32)
+    leg_off_t = torch.as_tensor(leg_off, dtype=torch.long)
+    leg_cnt_t = torch.as_tensor(leg_cnt, dtype=torch.long)
+    chosen_idx_t = torch.as_tensor(chosen_idx, dtype=torch.long)
+
+    # Distill/belief aux (optional fields)
+    mcts_policy_flat = []
+    mcts_weight = []
+    others_hands = []
+    for ep in episodes_payloads:
+        total_legals_ep = sum(ep['leg_cnt']) if isinstance(ep['leg_cnt'], list) else int(torch.as_tensor(ep['leg_cnt']).sum().item())
+        mcts_policy_ep = ep.get('mcts_policy', [])
+        mcts_weight_ep = ep.get('mcts_weight', [0.0]*len(ep.get('obs', [])))
+        if len(mcts_policy_ep) == 0:
+            mcts_policy_ep = [0.0] * total_legals_ep
+        if len(mcts_weight_ep) == 0:
+            mcts_weight_ep = [0.0] * len(ep.get('obs', []))
+        mcts_policy_flat.extend(mcts_policy_ep)
+        mcts_weight.extend(mcts_weight_ep)
+        if 'others_hands' in ep:
+            for oh in ep['others_hands']:
+                others_hands.append(torch.as_tensor(oh, dtype=torch.float32))
+    mcts_policy_t = torch.as_tensor(mcts_policy_flat, dtype=torch.float32) if len(mcts_policy_flat)>0 else torch.zeros((0,), dtype=torch.float32)
+    mcts_weight_t = torch.as_tensor(mcts_weight, dtype=torch.float32) if len(mcts_weight)>0 else torch.zeros((0,), dtype=torch.float32)
+    others_hands_t = torch.stack(others_hands, dim=0) if len(others_hands)>0 else torch.zeros((0,3,40), dtype=torch.float32)
+
+    # Values/GAE on device using current critic
+    rew_t = torch.as_tensor(rew_list, dtype=torch.float32, device=device) if len(rew_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
+    done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if len(done_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
+    if len(rew_list) > 0:
+        with torch.no_grad():
+            o_all = (obs_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=False) if device.type == 'cuda' else obs_cpu_t.to(device=device, dtype=torch.float32))
+            s_all = (seat_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=False) if device.type == 'cuda' else seat_cpu_t.to(device=device, dtype=torch.float32))
+            oh_all = (others_hands_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=False) if device.type == 'cuda' and others_hands_t.numel() > 0 and others_hands_t.size(0) == o_all.size(0) else (others_hands_t.to(device=device, dtype=torch.float32) if (others_hands_t.numel() > 0 and others_hands_t.size(0) == o_all.size(0)) else None))
+            val_t = agent.critic(o_all, s_all, oh_all)
+            n_all = (next_obs_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=False) if device.type == 'cuda' else next_obs_cpu_t.to(device=device, dtype=torch.float32))
+            oh_next = None
+            if oh_all is not None:
+                oh_next = torch.zeros_like(oh_all)
+                if oh_all.size(0) > 1:
+                    oh_next[:-1] = oh_all[1:]
+            nval_t = agent.critic(n_all, s_all, oh_next)
+            nval_t = torch.where(done_mask.bool(), torch.zeros_like(nval_t), nval_t)
+    else:
+        val_t = torch.zeros((0,), dtype=torch.float32, device=device)
+        nval_t = torch.zeros((0,), dtype=torch.float32, device=device)
+    adv_vec = torch.zeros_like(rew_t)
+    gae = torch.tensor(0.0, dtype=torch.float32, device=device)
+    T = int(rew_t.numel())
+    for t in reversed(range(T)):
+        delta = rew_t[t] + nval_t[t] * gamma - val_t[t]
+        gae = delta + gamma * lam * (1.0 - done_mask[t]) * gae
+        adv_vec[t] = gae
+    ret_vec = adv_vec + val_t
+
+    # old_logp using frozen actor snapshot
+    if obs_cpu_t.size(0) > 0:
+        with torch.no_grad():
+            def to_pinned(x):
+                x_cpu = (x.detach().to('cpu') if torch.is_tensor(x) else torch.as_tensor(x))
+                return x_cpu.pin_memory() if device.type == 'cuda' else x_cpu
+            nb = (device.type == 'cuda')
+            obs_t = to_pinned(obs_cpu_t).to(device=device, dtype=torch.float32, non_blocking=nb)
+            seat_t = to_pinned(seat_cpu_t).to(device=device, non_blocking=nb)
+            leg_t = to_pinned(legals_cpu_t).to(device=device, non_blocking=nb)
+            offs = (leg_off_t.pin_memory().to(device=device, non_blocking=nb) if device.type == 'cuda' else leg_off_t.to(device=device))
+            cnts = (leg_cnt_t.pin_memory().to(device=device, non_blocking=nb) if device.type == 'cuda' else leg_cnt_t.to(device=device))
+            B = obs_t.size(0)
+            max_cnt = int(cnts.max().item()) if B > 0 else 0
+            if max_cnt > 0:
+                state_proj = actor_for_old_logp.compute_state_proj(obs_t, seat_t)  # (B,64)
+                card_logits_all = torch.matmul(state_proj, actor_for_old_logp.card_emb_play.t())  # (B,40)
+                pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+                rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
+                mask = rel_pos_2d < cnts.unsqueeze(1)
+                abs_idx = (offs.unsqueeze(1) + rel_pos_2d)[mask]
+                sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+                legals_mb = leg_t[abs_idx].contiguous()
+                played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)
+                allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
+                allowed_mask[sample_idx, played_ids_mb] = True
+                neg_inf = torch.full_like(card_logits_all, float('-inf'))
+                masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
+                max_allowed = torch.amax(masked_logits, dim=1)
+                exp_shift_allowed = torch.exp(card_logits_all - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
+                sum_allowed = exp_shift_allowed.sum(dim=1)
+                lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))
+                chosen_clamped = torch.minimum(chosen_idx_t.pin_memory().to(device=device), (cnts - 1).clamp_min(0)) if device.type == 'cuda' else torch.minimum(chosen_idx_t.to(device=device), (cnts - 1).clamp_min(0))
+                chosen_abs = (offs + chosen_clamped)
+                total_legals = leg_t.size(0)
+                pos_map = torch.full((total_legals,), -1, dtype=torch.long, device=device)
+                pos_map[abs_idx] = torch.arange(abs_idx.numel(), device=device, dtype=torch.long)
+                chosen_pos = pos_map[chosen_abs]
+                played_ids_all = torch.argmax(leg_t[:, :40], dim=1)
+                chosen_card_ids = played_ids_all[chosen_abs]
+                logp_card = card_logits_all[torch.arange(B, device=device), chosen_card_ids] - lse_allowed[torch.arange(B, device=device)]
+                a_emb_mb = actor_for_old_logp.action_enc(legals_mb)
+                cap_logits = (a_emb_mb * state_proj[sample_idx]).sum(dim=1)
+                group_ids = sample_idx * 40 + played_ids_mb
+                num_groups = B * 40
+                group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
+                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
+                gmax_per_legal = group_max[group_ids]
+                exp_shifted = torch.exp(cap_logits - gmax_per_legal)
+                group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
+                group_sum.index_add_(0, group_ids, exp_shifted)
+                lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
+                logp_cap_per_legal = cap_logits - lse_per_legal
+                logp_cap = logp_cap_per_legal[chosen_pos]
+                old_logp_t = (logp_card + logp_cap)
+            else:
+                old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
+    else:
+        old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
+
+    batch = {
+        'obs': obs_cpu_t,
+        'act': act_cpu_t,
+        'old_logp': old_logp_t.detach(),
+        'ret': ret_vec.detach(),
+        'adv': adv_vec.detach(),
+        'rew': rew_t,
+        'done': torch.as_tensor(done_list, dtype=torch.bool, device=device) if len(done_list)>0 else torch.zeros((0,), dtype=torch.bool, device=device),
+        'seat_team': seat_cpu_t,
+        'belief_summary': belief_cpu_t,
+        'legals': legals_cpu_t,
+        'legals_offset': leg_off_t,
+        'legals_count': leg_cnt_t,
+        'chosen_index': chosen_idx_t,
+        'mcts_policy': mcts_policy_t,
+        'mcts_weight': mcts_weight_t,
+        'others_hands': others_hands_t,
+        'routing_log': [('parallel', 'main-pipelined')],
+    }
+    return batch
 def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> Dict[str, torch.Tensor]:
     """Calcola approx_kl, entropia e clip_frac per gruppi seat 0/2 vs 1/3.
 
@@ -2013,7 +2406,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 legals_offset.append(len(legals_list))
                 legals_count.append(len(legal))
                 chosen_index_t_list.append(idx_t)
-                # STRICT: ensure chosen index points to the same action under action-encoding hashing (played | capture_bits<<6)
+                # STRICT: ensure chosen index points to the same action under action-encoding hashing (played_id | capture_bits<<6)
                 if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
                     def _encode_action_64_cpu(vec80: torch.Tensor) -> torch.Tensor:
                         played_id = torch.argmax(vec80[:40]).to(torch.int64)
@@ -2725,6 +3118,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     _episodes_hint = max(1, int(episodes_total_hint))
     episode_q = ctx.Queue(maxsize=max(num_envs * 4, _episodes_hint * 2))
     action_queues = [ctx.Queue(maxsize=2) for _ in range(num_envs)]
+    control_queues = [ctx.Queue(maxsize=8) for _ in range(num_envs)]
     # Distribute episodes exactly across workers without overshoot
     base = int(episodes_total_hint) // int(num_envs)
     rem = int(episodes_total_hint) % int(num_envs)
@@ -2761,7 +3155,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     for wid in range(num_envs):
         cfg = dict(cfg_base)
         cfg['episodes_per_env'] = int(episodes_per_env_list[wid])
-        p = ctx.Process(target=_env_worker, args=(wid, cfg, request_q, action_queues[wid], episode_q), daemon=True)
+        p = ctx.Process(target=_env_worker, args=(wid, cfg, request_q, action_queues[wid], episode_q, control_queues[wid]), daemon=True)
         p.start()
         workers.append(p)
 
@@ -2804,6 +3198,20 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     _last_activity_ts = time.time()
     _expected_total = sum(episodes_per_env_list)
     _done_flags = [False] * num_envs
+    # Reset service profiler counters for this collection pass
+    if _PAR_TIMING:
+        try:
+            _SERVICE_PROF['policy'].update({'calls': 0, 't': 0.0, 'Bp_sum': 0, 'legals_sum': 0})
+            _SERVICE_PROF['value'].update({'calls': 0, 't': 0.0})
+            _SERVICE_PROF['belief'].update({'calls': 0, 't': 0.0})
+        except Exception:
+            pass
+    # On first round, set per-worker budgets; on next rounds we can re-use the same workers
+    for wid in range(num_envs):
+        try:
+            control_queues[wid].put({'cmd': 'set_budget', 'episodes': int(episodes_per_env_list[wid])}, block=False)
+        except Exception:
+            pass
     while episodes_received < _expected_total:
         # 1) Drain any completed episodes first to free episode_q
         drained_any = False
@@ -3047,12 +3455,23 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     episode_q.close(); episode_q.join_thread()
     for q in action_queues:
         q.close(); q.join_thread()
+    for q in control_queues:
+        q.close(); q.join_thread()
     if _PAR_TIMING:
         t_teardown = (time.time() - _t_td0)
 
     # If no episodes were produced, raise with context (no fallback)
     if len(episodes_payloads) == 0:
         raise RuntimeError(f"collector: No episodes produced (num_envs={num_envs}, episodes_total_hint={episodes_total_hint}, use_mcts={use_mcts}, mcts_sims={mcts_sims}, mcts_dets={mcts_dets})")
+
+    # Emit per-worker produced episodes and done flags stats (helps detect stragglers)
+    if _PAR_TIMING:
+        try:
+            prod_str = ' '.join([f"w{idx}:{cnt}" for idx, cnt in enumerate(produced_count)])
+            done_str = ' '.join([('1' if d else '0') for d in _done_flags])
+            tqdm.write(f"[par-workers] produced_per_worker=({prod_str}) done_flags=({done_str})")
+        except Exception:
+            pass
 
     # End-of-collection invariant: each episode must contribute exactly E transitions
     # E = 40 if training both teams, else 20 (main seats only)
@@ -3109,6 +3528,13 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             def _agg(key):
                 arr = _np.asarray([x.get(key, 0.0) for x in timing_from_workers], dtype=_np.float64)
                 return float(arr.sum()), float(arr.mean()), float(arr.max())
+            # Per-worker totals (min/avg/max) to spot stragglers
+            try:
+                per = _np.asarray([float(x.get('t_total', 0.0)) for x in timing_from_workers], dtype=_np.float64)
+                _min, _avg, _max = float(per.min(initial=0.0)), float(per.mean() if per.size>0 else 0.0), float(per.max(initial=0.0))
+                tqdm.write(f"[par-workers-total] min={_min:.3f}s avg={_avg:.3f}s max={_max:.3f}s")
+            except Exception:
+                pass
             s_env, m_env, M_env = _agg('t_env_reset')
             s_obs, m_obs, M_obs = _agg('t_get_obs')
             s_leg, m_leg, M_leg = _agg('t_get_legals')
@@ -3117,9 +3543,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             s_step, m_step, M_step = _agg('t_step')
             s_pack, m_pack, M_pack = _agg('t_pack')
             s_tot, m_tot, M_tot = _agg('t_total')
-            tqdm.write(f"[par-timing] workers={num_envs} workers_total={s_tot:.3f}s (avg={m_tot:.3f}, max={M_tot:.3f})\n"
+            tqdm.write(f"[par-timing] workers={num_envs} workers_total={s_tot:.3f} (avg={m_tot:.3f}, max={M_tot:.3f})\n"
                         f"  env.reset={s_env:.3f} get_obs={s_obs:.3f} get_legals={s_leg:.3f} rpc_wait={s_rpc:.3f} mcts={s_mcts:.3f} env.step={s_step:.3f} pack={s_pack:.3f}")
-        tqdm.write(f"[par-timing-master] total={master_total:.3f}s drain={t_drain:.3f} get_reqs={t_get_reqs:.3f} batch_select={t_batch_select:.3f} batch_service={t_batch_service:.3f} dispatch={t_dispatch:.3f}")
+        tqdm.write(f"[par-timing-master] total={master_total:.3f} drain={t_drain:.3f} get_reqs={t_get_reqs:.3f} batch_select={t_batch_select:.3f} batch_service={t_batch_service:.3f} dispatch={t_dispatch:.3f}")
         # Detailed get_reqs breakdown
         avg_batch = (getreqs_total_reqs / max(getreqs_batches, 1))
         tqdm.write(f"[par-getreqs] batches={getreqs_batches} total_reqs={getreqs_total_reqs} nowait_ok={cnt_nowait_ok} nowait_empty={cnt_nowait_empty} block_ok={cnt_block_ok} block_to={cnt_block_timeout} t_nowait={t_get_nowait:.3f} t_block={t_get_block:.3f} avg_batch={avg_batch:.2f}")
@@ -3167,6 +3593,19 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     f"gates={_sp['t_belief_gates']:.3f}s merge={_sp['t_merge']:.3f}s proj={_sp['t_proj']:.3f}s"
                 )
             reset_actor_stateproj()
+        # Service micro-breakdown (per-collection pass)
+        if _PAR_TIMING and isinstance(_SERVICE_PROF, dict):
+            try:
+                p = _SERVICE_PROF.get('policy', {})
+                v = _SERVICE_PROF.get('value', {})
+                b = _SERVICE_PROF.get('belief', {})
+                tqdm.write(
+                    f"[par-service] policy: calls={int(p.get('calls',0))} t={float(p.get('t',0.0)):.3f}s Bp_sum={int(p.get('Bp_sum',0))} legals_sum={int(p.get('legals_sum',0))} | "
+                    f"value: calls={int(v.get('calls',0))} t={float(v.get('t',0.0)):.3f}s | "
+                    f"belief: calls={int(b.get('calls',0))} t={float(b.get('t',0.0)):.3f}s"
+                )
+            except Exception:
+                pass
         tqdm.write(f"[par-collect-post] build={t_build:.3f} values_gae={t_values_gae:.3f} old_logp={t_oldlogp:.3f} teardown={t_teardown:.3f}")
 
     # Build batch CPU tensors from payloads
@@ -4070,136 +4509,208 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             # Abilita/disabilita MCTS in parallelo in base al flag di training
             parallel_use_mcts = bool(mcts_train and mcts_train_factor > 0.0)
             if dual_team_nets and (not opp_frozen_env):
-                # Collect for team A vs live team B
+                # Persistent collectors for Team A and Team B (main seats complementari)
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
-                batch_A = collect_trajectory_parallel(agent,
-                                                       num_envs=int(num_envs),
-                                                       episodes_total_hint=episodes_hint,
-                                                       k_history=k_history,
-                                                       gamma=1.0,
-                                                       lam=1.0,
-                                                       use_mcts=parallel_use_mcts,
-                                                       train_both_teams=False,
-                                                       main_seats=main_seats,
-                                                       mcts_sims=mcts_sims,
-                                                       mcts_dets=mcts_dets,
-                                                       mcts_c_puct=mcts_c_puct,
-                                                       mcts_root_temp=mcts_root_temp,
-                                                       mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                       mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                       mcts_train_factor=mcts_train_factor,
-                                                       seed=int(seed),
-                                                       show_progress_env=True,
-                                                       tqdm_base_pos=3)
-                # Collect for team B vs live team A (swap seats)
-                main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
-                batch_B = collect_trajectory_parallel(agent_teamB,
-                                                       num_envs=int(num_envs),
-                                                       episodes_total_hint=episodes_hint,
-                                                       k_history=k_history,
-                                                       gamma=1.0,
-                                                       lam=1.0,
-                                                       use_mcts=parallel_use_mcts,
-                                                       train_both_teams=False,
-                                                       main_seats=main_seats_B,
-                                                       mcts_sims=mcts_sims,
-                                                       mcts_dets=mcts_dets,
-                                                       mcts_c_puct=mcts_c_puct,
-                                                       mcts_root_temp=mcts_root_temp,
-                                                       mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                       mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                       mcts_train_factor=mcts_train_factor,
-                                                       seed=int(seed + 1),
-                                                       show_progress_env=True,
-                                                       tqdm_base_pos=4)
+                if not hasattr(train_ppo, '_collector_A'):
+                    cfg_base_A = {
+                        'rules': {'shape_scopa': False},
+                        'k_history': int(k_history),
+                        'send_legals': True,
+                        'use_mcts': bool(parallel_use_mcts),
+                        'train_both_teams': False,
+                        'main_seats': main_seats,
+                        'frozen_non_main': False,
+                        'mcts_sims': int(mcts_sims),
+                        'mcts_dets': int(mcts_dets),
+                        'mcts_c_puct': float(mcts_c_puct),
+                        'mcts_root_temp': float(mcts_root_temp),
+                        'mcts_prior_smooth_eps': float(mcts_prior_smooth_eps),
+                        'mcts_dirichlet_alpha': float(mcts_dirichlet_alpha),
+                        'mcts_dirichlet_eps': float(mcts_dirichlet_eps),
+                        'mcts_progress_start': 0.25,
+                        'mcts_progress_full': 0.75,
+                        'mcts_min_sims': 0,
+                        'mcts_train_factor': float(mcts_train_factor),
+                        'seed': int(seed),
+                    }
+                    train_ppo._collector_A = ParallelCollector(num_envs=int(num_envs), cfg_base=cfg_base_A, show_progress_env=True, tqdm_base_pos=3)
+                if not hasattr(train_ppo, '_collector_B'):
+                    cfg_base_B = dict(cfg_base_A)
+                    cfg_base_B['main_seats'] = (odd_main_seats if (main_seats == even_main_seats) else even_main_seats)
+                    cfg_base_B['seed'] = int(seed + 1)
+                    train_ppo._collector_B = ParallelCollector(num_envs=int(num_envs), cfg_base=cfg_base_B, show_progress_env=True, tqdm_base_pos=4)
+                collector_A: ParallelCollector = train_ppo._collector_A
+                collector_B: ParallelCollector = train_ppo._collector_B
+                # Pipeline opzionale
+                pipeline_on = True
+                import threading as _th
+                # Prefill se necessario
+                if pipeline_on and (not hasattr(train_ppo, '_pipe_prev_A') or not hasattr(train_ppo, '_pipe_prev_B')):
+                    collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
+                    eps_A0 = collector_A.drain_once(agent=agent, expected_total=episodes_hint, frozen_actor=None, frozen_non_main=False)
+                    msB0 = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
+                    collector_B.dispatch_budget(episodes_hint, main_seats=msB0)
+                    eps_B0 = collector_B.drain_once(agent=agent_teamB, expected_total=episodes_hint, frozen_actor=None, frozen_non_main=False)
+                    train_ppo._pipe_prev_A = eps_A0
+                    train_ppo._pipe_prev_B = eps_B0
+                # Se pipelined, avvia subito la produzione del prossimo round durante l'update
+                if pipeline_on:
+                    # Dispatch round k+1 in background
+                    msB_next = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
+                    collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
+                    container_A = {}
+                    def _drain_A():
+                        container_A['eps'] = collector_A.drain_once(agent=agent, expected_total=episodes_hint, frozen_actor=None, frozen_non_main=False)
+                    tA = _th.Thread(target=_drain_A, daemon=True); tA.start()
+                    collector_B.dispatch_budget(episodes_hint, main_seats=msB_next)
+                    container_B = {}
+                    def _drain_B():
+                        container_B['eps'] = collector_B.drain_once(agent=agent_teamB, expected_total=episodes_hint, frozen_actor=None, frozen_non_main=False)
+                    tB = _th.Thread(target=_drain_B, daemon=True); tB.start()
+                    # Usa i payload del round precedente per costruire i batch da aggiornare ora
+                    eps_A = getattr(train_ppo, '_pipe_prev_A')
+                    eps_B = getattr(train_ppo, '_pipe_prev_B')
+                    batch_A = _postprocess_episodes_to_batch(eps_A, actor_for_old_logp=agent.actor, agent=agent, train_both_teams=False, gamma=1.0, lam=1.0)
+                    batch_B = _postprocess_episodes_to_batch(eps_B, actor_for_old_logp=agent_teamB.actor, agent=agent_teamB, train_both_teams=False, gamma=1.0, lam=1.0)
+                    # Al termine dell'update, attendi i nuovi payload e sostituisci i prev
+                    tA.join(); tB.join()
+                    train_ppo._pipe_prev_A = container_A.get('eps', [])
+                    train_ppo._pipe_prev_B = container_B.get('eps', [])
+                else:
+                    # Synchronous round (no pipeline)
+                    collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
+                    eps_A = collector_A.drain_once(agent=agent, expected_total=episodes_hint, frozen_actor=None, frozen_non_main=False)
+                    main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
+                    collector_B.dispatch_budget(episodes_hint, main_seats=main_seats_B)
+                    eps_B = collector_B.drain_once(agent=agent_teamB, expected_total=episodes_hint, frozen_actor=None, frozen_non_main=False)
+                    batch_A = _postprocess_episodes_to_batch(eps_A, actor_for_old_logp=agent.actor, agent=agent, train_both_teams=False, gamma=1.0, lam=1.0)
+                    batch_B = _postprocess_episodes_to_batch(eps_B, actor_for_old_logp=agent_teamB.actor, agent=agent_teamB, train_both_teams=False, gamma=1.0, lam=1.0)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             elif dual_team_nets and opp_frozen_env:
-                # Alternate training: one team learns while the other team acts frozen (no update)
+                # Alternate training: one team learns while the other team acts frozen (no update on the frozen team)
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
+                # Persistent collectors
+                if not hasattr(train_ppo, '_collector_A'):
+                    cfg_base_A = {
+                        'rules': {'shape_scopa': False},
+                        'k_history': int(k_history),
+                        'send_legals': True,
+                        'use_mcts': bool(parallel_use_mcts),
+                        'train_both_teams': False,
+                        'main_seats': main_seats,
+                        'frozen_non_main': True,
+                        'mcts_sims': int(mcts_sims),
+                        'mcts_dets': int(mcts_dets),
+                        'mcts_c_puct': float(mcts_c_puct),
+                        'mcts_root_temp': float(mcts_root_temp),
+                        'mcts_prior_smooth_eps': float(mcts_prior_smooth_eps),
+                        'mcts_dirichlet_alpha': float(mcts_dirichlet_alpha),
+                        'mcts_dirichlet_eps': float(mcts_dirichlet_eps),
+                        'mcts_progress_start': 0.25,
+                        'mcts_progress_full': 0.75,
+                        'mcts_min_sims': 0,
+                        'mcts_train_factor': float(mcts_train_factor),
+                        'seed': int(seed),
+                    }
+                    train_ppo._collector_A = ParallelCollector(num_envs=int(num_envs), cfg_base=cfg_base_A, show_progress_env=True, tqdm_base_pos=3)
+                if not hasattr(train_ppo, '_collector_B'):
+                    cfg_base_B = dict(cfg_base_A)
+                    cfg_base_B['main_seats'] = main_seats_B
+                    cfg_base_B['seed'] = int(seed + 1)
+                    train_ppo._collector_B = ParallelCollector(num_envs=int(num_envs), cfg_base=cfg_base_B, show_progress_env=True, tqdm_base_pos=4)
+                collector_A: ParallelCollector = train_ppo._collector_A
+                collector_B: ParallelCollector = train_ppo._collector_B
+                import threading as _th
                 if train_A_now:
-                    batch_A = collect_trajectory_parallel(agent,
-                                                           num_envs=int(num_envs),
-                                                           episodes_total_hint=episodes_hint,
-                                                           k_history=k_history,
-                                                           gamma=1.0,
-                                                           lam=1.0,
-                                                           use_mcts=parallel_use_mcts,
-                                                           train_both_teams=False,
-                                                           main_seats=main_seats,
-                                                           mcts_sims=mcts_sims,
-                                                           mcts_dets=mcts_dets,
-                                                           mcts_c_puct=mcts_c_puct,
-                                                           mcts_root_temp=mcts_root_temp,
-                                                           mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                           mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                           mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                           mcts_train_factor=mcts_train_factor,
-                                                           seed=int(seed),
-                                                           show_progress_env=True,
-                                                           tqdm_base_pos=3,
-                                                           frozen_actor=agent_teamB.actor,
-                                                           frozen_non_main=True)
+                    # Prefill pipeline if needed
+                    if not hasattr(train_ppo, '_pipe_prev_froz_A'):
+                        collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
+                        eps0 = collector_A.drain_once(agent=agent, expected_total=episodes_hint, frozen_actor=agent_teamB.actor, frozen_non_main=True)
+                        train_ppo._pipe_prev_froz_A = eps0
+                    # Dispatch next while aggiornamento di batch precedente
+                    collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
+                    cont = {}
+                    def _drainA():
+                        cont['eps'] = collector_A.drain_once(agent=agent, expected_total=episodes_hint, frozen_actor=agent_teamB.actor, frozen_non_main=True)
+                    t = _th.Thread(target=_drainA, daemon=True); t.start()
+                    eps_prev = getattr(train_ppo, '_pipe_prev_froz_A')
+                    batch_A = _postprocess_episodes_to_batch(eps_prev, actor_for_old_logp=agent.actor, agent=agent, train_both_teams=False, gamma=1.0, lam=1.0)
+                    t.join()
+                    train_ppo._pipe_prev_froz_A = cont.get('eps', [])
                 else:
-                    batch_B = collect_trajectory_parallel(agent_teamB,
-                                                           num_envs=int(num_envs),
-                                                           episodes_total_hint=episodes_hint,
-                                                           k_history=k_history,
-                                                           gamma=1.0,
-                                                           lam=1.0,
-                                                           use_mcts=parallel_use_mcts,
-                                                           train_both_teams=False,
-                                                           main_seats=main_seats_B,
-                                                           mcts_sims=mcts_sims,
-                                                           mcts_dets=mcts_dets,
-                                                           mcts_c_puct=mcts_c_puct,
-                                                           mcts_root_temp=mcts_root_temp,
-                                                           mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                           mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                           mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                           mcts_train_factor=mcts_train_factor,
-                                                           seed=int(seed + 1),
-                                                           show_progress_env=True,
-                                                           tqdm_base_pos=4,
-                                                           frozen_actor=agent.actor,
-                                                           frozen_non_main=True)
+                    if not hasattr(train_ppo, '_pipe_prev_froz_B'):
+                        collector_B.dispatch_budget(episodes_hint, main_seats=main_seats_B)
+                        eps0 = collector_B.drain_once(agent=agent_teamB, expected_total=episodes_hint, frozen_actor=agent.actor, frozen_non_main=True)
+                        train_ppo._pipe_prev_froz_B = eps0
+                    collector_B.dispatch_budget(episodes_hint, main_seats=main_seats_B)
+                    contB = {}
+                    def _drainB():
+                        contB['eps'] = collector_B.drain_once(agent=agent_teamB, expected_total=episodes_hint, frozen_actor=agent.actor, frozen_non_main=True)
+                    tB = _th.Thread(target=_drainB, daemon=True); tB.start()
+                    eps_prev_B = getattr(train_ppo, '_pipe_prev_froz_B')
+                    batch_B = _postprocess_episodes_to_batch(eps_prev_B, actor_for_old_logp=agent_teamB.actor, agent=agent_teamB, train_both_teams=False, gamma=1.0, lam=1.0)
+                    tB.join()
+                    train_ppo._pipe_prev_froz_B = contB.get('eps', [])
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             else:
+                # Persistent collector pipeline (CPU-only master), enabled when using parallel collection
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
-                # Refresh shadow actor on schedule in selfplay+frozen
-                # SCOPONE_FROZEN_UPDATE_EVERY: in selfplay+frozen, how often to refresh the
-                #   "shadow" opponent from the current live net. The shadow remains fixed
-                #   between refreshes to create a stationary opponent for the non-main seats.
+                # Build collector once and reuse across iterations to avoid spawn/teardown
+                if not hasattr(train_ppo, '_collector'):
+                    cfg_base = {
+                        'rules': {'shape_scopa': False},
+                        'k_history': int(k_history),
+                        'send_legals': True,
+                        'use_mcts': bool(parallel_use_mcts),
+                        'train_both_teams': bool(train_both_teams),
+                        'main_seats': main_seats if main_seats is not None else [0,2],
+                        'frozen_non_main': bool(use_selfplay and opp_frozen_env),
+                        'mcts_sims': int(mcts_sims),
+                        'mcts_dets': int(mcts_dets),
+                        'mcts_c_puct': float(mcts_c_puct),
+                        'mcts_root_temp': float(mcts_root_temp),
+                        'mcts_prior_smooth_eps': float(mcts_prior_smooth_eps),
+                        'mcts_dirichlet_alpha': float(mcts_dirichlet_alpha),
+                        'mcts_dirichlet_eps': float(mcts_dirichlet_eps),
+                        'mcts_progress_start': 0.25,
+                        'mcts_progress_full': 0.75,
+                        'mcts_min_sims': 0,
+                        'mcts_train_factor': float(mcts_train_factor),
+                        'seed': int(seed),
+                    }
+                    train_ppo._collector = ParallelCollector(num_envs=int(num_envs), cfg_base=cfg_base, show_progress_env=True, tqdm_base_pos=3)
+                collector: ParallelCollector = train_ppo._collector
+                # Refresh shadow actor snapshot periodically (for frozen non-main seats)
                 if use_selfplay and opp_frozen_env:
                     if (shadow_actor is None) or ((it % shadow_every) == 0):
-                        # clone lightweight copy of actor state
                         shadow_actor = ActionConditionedActor(obs_dim=obs_dim)
                         shadow_actor.load_state_dict(agent.actor.state_dict())
-                batch = collect_trajectory_parallel(agent,
-                                                    num_envs=int(num_envs),
-                                                    episodes_total_hint=episodes_hint,
-                                                    k_history=k_history,
-                                                    gamma=1.0,
-                                                    lam=1.0,
-                                                    use_mcts=parallel_use_mcts,
-                                                    train_both_teams=train_both_teams,
-                                                    main_seats=main_seats,
-                                                    mcts_sims=mcts_sims,
-                                                    mcts_dets=mcts_dets,
-                                                    mcts_c_puct=mcts_c_puct,
-                                                    mcts_root_temp=mcts_root_temp,
-                                                    mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                    mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                    mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                    mcts_train_factor=mcts_train_factor,
-                                                    seed=int(seed),
-                                                    show_progress_env=True,
-                                                    tqdm_base_pos=3,
-                                                    frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None),
-                                                    frozen_non_main=bool(use_selfplay and opp_frozen_env))
+                pipeline_on = True
+                import threading as _th
+                if pipeline_on and not hasattr(train_ppo, '_pipe_prev_single'):
+                    per_env0 = collector.dispatch_budget(episodes_hint)
+                    eps0 = collector.drain_once(agent=agent, expected_total=sum(per_env0), frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None), frozen_non_main=bool(use_selfplay and opp_frozen_env))
+                    train_ppo._pipe_prev_single = eps0
+                if pipeline_on:
+                    # Dispatch next round in background
+                    per_env = collector.dispatch_budget(episodes_hint)
+                    container = {}
+                    def _drain():
+                        container['eps'] = collector.drain_once(agent=agent, expected_total=sum(per_env), frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None), frozen_non_main=bool(use_selfplay and opp_frozen_env))
+                    t = _th.Thread(target=_drain, daemon=True); t.start()
+                    eps_prev = getattr(train_ppo, '_pipe_prev_single')
+                    frozen_for_logp = (shadow_actor if (use_selfplay and opp_frozen_env) else agent.actor)
+                    batch = _postprocess_episodes_to_batch(eps_prev, actor_for_old_logp=frozen_for_logp, agent=agent, train_both_teams=train_both_teams, gamma=1.0, lam=1.0)
+                    t.join()
+                    train_ppo._pipe_prev_single = container.get('eps', [])
+                else:
+                    # Synchronous
+                    per_env = collector.dispatch_budget(episodes_hint)
+                    eps_payloads = collector.drain_once(agent=agent, expected_total=sum(per_env), frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None), frozen_non_main=bool(use_selfplay and opp_frozen_env))
+                    frozen_for_logp = (shadow_actor if (use_selfplay and opp_frozen_env) else agent.actor)
+                    batch = _postprocess_episodes_to_batch(eps_payloads, actor_for_old_logp=frozen_for_logp, agent=agent, train_both_teams=train_both_teams, gamma=1.0, lam=1.0)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
         else:
@@ -4446,7 +4957,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         # Iteration-level timing print (sums to dt)
         if _PAR_TIMING:
             _post = max(0.0, dt - (_iter_t_collect + _iter_t_preproc + _iter_t_update))
-            tqdm.write(f"[iter-timing] total={dt:.3f}s collect={_iter_t_collect:.3f} preproc={_iter_t_preproc:.3f} update={_iter_t_update:.3f} post={_post:.3f}")
+            tqdm.write(f"[iter-timing] total={dt:.3f} collect={_iter_t_collect:.3f} preproc={_iter_t_preproc:.3f} update={_iter_t_update:.3f} post={_post:.3f}")
 
         if writer is not None:
             def _to_float(x):
@@ -4605,6 +5116,28 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         writer.close()
     metrics_bar.close()
     pbar.close()
+    # Graceful shutdown of persistent collectors (if present)
+    try:
+        if hasattr(train_ppo, '_collector') and getattr(train_ppo, '_collector') is not None:
+            try:
+                train_ppo._collector.stop()
+            except Exception:
+                pass
+            train_ppo._collector = None
+        if hasattr(train_ppo, '_collector_A') and getattr(train_ppo, '_collector_A') is not None:
+            try:
+                train_ppo._collector_A.stop()
+            except Exception:
+                pass
+            train_ppo._collector_A = None
+        if hasattr(train_ppo, '_collector_B') and getattr(train_ppo, '_collector_B') is not None:
+            try:
+                train_ppo._collector_B.stop()
+            except Exception:
+                pass
+            train_ppo._collector_B = None
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':

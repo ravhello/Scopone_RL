@@ -131,9 +131,9 @@ os.environ.setdefault('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')  # percorso chec
 seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
-iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
+iters = int(os.environ.get('SCOPONE_ITERS', '10'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
-num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '24'))  # numero di environment paralleli
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
 os.environ.setdefault('BELIEF_AUX_COEF', '0.05')  # coefficiente loss ausiliaria belief (default 0.0)
 os.environ.setdefault('SCOPONE_REWARD_SCALE', '0.1')  # scala ricompense finali (1.0 = nessuna variazione)
 
@@ -163,8 +163,8 @@ if num_envs <= 1:
 else:
     # Multi-env (parallelo): lascia la strategia di batching dinamica del collector.
     # Mantieni min_batch auto (0) e piccola latenza per favorire batch grandi senza alta latenza.
-    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')
-    os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')
+    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '64')
+    os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '1.0')
     # Un thread per worker per evitare oversubscription; usato dai processi figli.
     os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
     # Su Windows, esplicita 'spawn' per sicurezza (altrove il trainer risolve automaticamente).
