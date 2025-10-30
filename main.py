@@ -64,7 +64,7 @@ os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
-os.environ.setdefault('SCOPONE_PROFILE', '1')
+os.environ.setdefault('SCOPONE_PROFILE', '0')
 
 # ===== Section: Diagnostics/Profiling (Both) =====
 # Additional trainer/eval tunables exposed via environment (defaults; override as needed)

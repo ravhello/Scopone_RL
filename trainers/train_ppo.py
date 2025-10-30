@@ -2003,7 +2003,7 @@ class ParallelCollector:
             nonlocal pending_step_reqs, last_activity
             if not pending_step_reqs:
                 return
-            if self._local_infer or (self._action_selector is None):
+            if self._action_selector is None:
                 pending_step_reqs = []
                 return
             self._action_selector.submit_many(pending_step_reqs)
@@ -2072,21 +2072,19 @@ class ParallelCollector:
             other_reqs = []
             last_activity = time.time()
 
-        selector_enabled = (not self._local_infer)
-        if selector_enabled:
-            if self._action_selector is None:
-                self._action_selector = AsyncActionSelector(self.ctx, self.action_queues, self._infer_device, micro_batch, max_latency_s, self._infer_workers)
-            else:
-                self._action_selector.update_config(micro_batch, max_latency_s)
-            if _PAR_TIMING:
-                _t_sel = time.time()
-            self._action_selector.wait_idle()
-            if _PAR_TIMING:
-                _prof_local['selector_wait'] += time.time() - _t_sel
-                _t_sel = time.time()
-            self._action_selector.sync_models(agent.actor, frozen_actor)
-            if _PAR_TIMING:
-                _prof_local['sync_models'] += time.time() - _t_sel
+        if self._action_selector is None:
+            self._action_selector = AsyncActionSelector(self.ctx, self.action_queues, self._infer_device, micro_batch, max_latency_s, self._infer_workers)
+        else:
+            self._action_selector.update_config(micro_batch, max_latency_s)
+        if _PAR_TIMING:
+            _t_sel = time.time()
+        self._action_selector.wait_idle()
+        if _PAR_TIMING:
+            _prof_local['selector_wait'] += time.time() - _t_sel
+            _t_sel = time.time()
+        self._action_selector.sync_models(agent.actor, frozen_actor)
+        if _PAR_TIMING:
+            _prof_local['sync_models'] += time.time() - _t_sel
         if self._local_infer:
             self._broadcast_actor(agent.actor, frozen_actor)
 
@@ -2196,12 +2194,11 @@ class ParallelCollector:
                     f"(expected={int(expected_total)} got={episodes_received}); per-worker: {info or 'no data'}"
                 )
         _drain_request_queue_profiled()
-        if selector_enabled and (self._action_selector is not None):
-            if _PAR_TIMING:
-                _t_sel = time.time()
-            self._action_selector.wait_idle()
-            if _PAR_TIMING:
-                _prof_local['selector_wait'] += time.time() - _t_sel
+        if _PAR_TIMING:
+            _t_sel = time.time()
+        self._action_selector.wait_idle()
+        if _PAR_TIMING:
+            _prof_local['selector_wait'] += time.time() - _t_sel
         _service_other_requests_profiled()
         _drain_episodes_profiled()
         # Debug: report totals
