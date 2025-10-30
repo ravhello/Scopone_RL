@@ -139,7 +139,7 @@ os.environ.setdefault('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')  # percorso chec
 seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
-iters = int(os.environ.get('SCOPONE_ITERS', '10'))  # numero iterazioni di training
+iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
 num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
 os.environ.setdefault('BELIEF_AUX_COEF', '0.05')  # coefficiente loss ausiliaria belief (default 0.0)
@@ -184,7 +184,7 @@ else:
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
 
 # EVAL
-_eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '35'))  # esegui eval ogni N iterazioni
+_eval_every = int(os.environ.get('SCOPONE_EVAL_EVERY', '40'))  # esegui eval ogni N iterazioni
 _eval_kh = int(os.environ.get('SCOPONE_EVAL_K_HISTORY','39'))  # ampiezza cronologia osservazioni (k_history)
 _eval_games = int(os.environ.get('SCOPONE_EVAL_GAMES','10000'))  # numero partite per valutazione
 os.environ.setdefault('SCOPONE_EVAL_MAX_GAMES_PER_CHUNK', '4')  # partite per task/worker (granularità progress)

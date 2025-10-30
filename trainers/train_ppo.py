@@ -2039,16 +2039,13 @@ class ParallelCollector:
                     raise RuntimeError(f"collector: worker wid={ep.get('wid')} reported error:\n{ep.get('error')}")
                 episodes_payloads.append(ep)
                 episodes_received += 1
-                if _PAR_DEBUG:
-                    steps = len(ep.get('obs', [])) if isinstance(ep, dict) else 'n/a'
-                    tqdm.write(f"[collector] episode payload wid={ep.get('wid','?')} recv_count={episodes_received}/{expected_total} steps={steps}")
-                else:
-                    if episodes_received == 1:
+                if episodes_received == 1:
+                    if _PAR_DEBUG:
                         tqdm.write(f"[collector-progress] first episode received (1/{int(expected_total)})")
-                    else:
-                        milestone = max(1, int(expected_total) // 8)
-                        if milestone > 0 and (episodes_received % milestone) == 0:
-                            tqdm.write(f"[collector-progress] episodes_received={episodes_received}/{int(expected_total)}")
+                else:
+                    milestone = max(1, int(expected_total) // 8)
+                    if milestone > 0 and (episodes_received % milestone) == 0 and _PAR_DEBUG:
+                        tqdm.write(f"[collector-progress] episodes_received={episodes_received}/{int(expected_total)}")
                 wid = int(ep.get('wid', -1))
                 wid_counts[wid] = wid_counts.get(wid, 0) + 1
                 if 0 <= wid < len(self.env_pbars) and self.env_pbars[wid] is not None:
@@ -2202,30 +2199,32 @@ class ParallelCollector:
         _service_other_requests_profiled()
         _drain_episodes_profiled()
         # Debug: report totals
-        tot_eps = int(len(episodes_payloads))
-        tot_steps = sum(int(len(_ep.get('obs', []))) for _ep in episodes_payloads)
-        tqdm.write(f"[debug-collect-round] expected_eps={int(expected_total)} got_eps={tot_eps} got_steps={tot_steps}")
+        if _PAR_DEBUG:
+            tot_eps = int(len(episodes_payloads))
+            tot_steps = sum(int(len(_ep.get('obs', []))) for _ep in episodes_payloads)
+            tqdm.write(f"[debug-collect-round] expected_eps={int(expected_total)} got_eps={tot_eps} got_steps={tot_steps}")
         if _PAR_TIMING:
             _COLLECT_PROFILE_COUNT += 1
             for k, v in _prof_local.items():
                 _COLLECT_PROFILE_GLOBAL[k] += float(v)
             total_time = sum(float(v) for key, v in _prof_local.items() if key != 'loops')
-            try:
-                tqdm.write(
-                    "[collect-prof] sync={sync:.3f}s selector_wait={sel:.3f}s wait={wait:.3f}s "
-                    "episodes={eps:.3f}s other={other:.3f}s handle_req={req:.3f}s loops={loops:.0f} total={tot:.3f}s".format(
-                        sync=_prof_local.get('sync_models', 0.0),
-                        sel=_prof_local.get('selector_wait', 0.0),
-                        wait=_prof_local.get('wait_readers', 0.0),
-                        eps=_prof_local.get('drain_eps', 0.0),
-                        other=_prof_local.get('service_other', 0.0),
-                        req=_prof_local.get('handle_req', 0.0),
-                        loops=_prof_local.get('loops', 0.0),
-                        tot=total_time,
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(
+                        "[collect-prof] sync={sync:.3f}s selector_wait={sel:.3f}s wait={wait:.3f}s "
+                        "episodes={eps:.3f}s other={other:.3f}s handle_req={req:.3f}s loops={loops:.0f} total={tot:.3f}s".format(
+                            sync=_prof_local.get('sync_models', 0.0),
+                            sel=_prof_local.get('selector_wait', 0.0),
+                            wait=_prof_local.get('wait_readers', 0.0),
+                            eps=_prof_local.get('drain_eps', 0.0),
+                            other=_prof_local.get('service_other', 0.0),
+                            req=_prof_local.get('handle_req', 0.0),
+                            loops=_prof_local.get('loops', 0.0),
+                            tot=total_time,
+                        )
                     )
-                )
-            except Exception:
-                pass
+                except Exception:
+                    pass
         if episodes_received < int(expected_total):
             missing = int(expected_total) - episodes_received
             upload_info = ", ".join(
@@ -5152,14 +5151,15 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         _iter_t_preproc = 0.0
         _iter_t_update = 0.0
         # DEBUG: stato iterazione
-        try:
-            tqdm.write(
-                f"[debug-iter] it={it+1} par_timing={bool(_PAR_TIMING)} "
-                f"save_every={int(save_every)} eval_every={int(eval_every)} "
-                f"use_parallel={bool(use_parallel)} selfplay={bool(use_selfplay)} dual_team_nets={bool(dual_team_nets)} opp_frozen={bool(opp_frozen_env)}"
-            )
-        except Exception:
-            pass
+        if _PAR_DEBUG:
+            try:
+                tqdm.write(
+                    f"[debug-iter] it={it+1} par_timing={bool(_PAR_TIMING)} "
+                    f"save_every={int(save_every)} eval_every={int(eval_every)} "
+                    f"use_parallel={bool(use_parallel)} selfplay={bool(use_selfplay)} dual_team_nets={bool(dual_team_nets)} opp_frozen={bool(opp_frozen_env)}"
+                )
+            except Exception:
+                pass
         # Partner/opponent selection policy
         # Opponent selection
         # SELFPLAY=1: no frozen unless explicitly requested via OPP_FROZEN (still treated as single learner vs frozen)
@@ -5360,12 +5360,13 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     batch_B = _postprocess_episodes_to_batch(eps_B, actor_for_old_logp=agent_teamB.actor, agent=agent_teamB, train_both_teams=False, gamma=1.0, lam=1.0)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
-                try:
-                    tqdm.write(
-                        f"[debug-batch] it={it+1} dual-live batch sizes: A={int(batch_A['obs'].size(0))} B={int(batch_B['obs'].size(0))}"
-                    )
-                except Exception:
-                    pass
+                if _PAR_DEBUG:
+                    try:
+                        tqdm.write(
+                            f"[debug-batch] it={it+1} dual-live batch sizes: A={int(batch_A['obs'].size(0))} B={int(batch_B['obs'].size(0))}"
+                        )
+                    except Exception:
+                        pass
             elif dual_team_nets and opp_frozen_env:
                 # Opponent frozen: only Team A learns, but experiences both seat permutations simultaneously
                 train_A_now = True
@@ -5414,10 +5415,11 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 batch_B = None
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
-                try:
-                    tqdm.write(f"[debug-batch] it={it+1} dual-frozen (A learns) batch size A={int(batch_A['obs'].size(0))}")
-                except Exception:
-                    pass
+                    if _PAR_DEBUG:
+                        try:
+                            tqdm.write(f"[debug-batch] it={it+1} dual-frozen (A learns) batch size A={int(batch_A['obs'].size(0))}")
+                        except Exception:
+                            pass
             else:
                 # Persistent collector pipeline (CPU-only master), enabled when using parallel collection
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
@@ -5486,10 +5488,11 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     batch = _postprocess_episodes_to_batch(eps_payloads, actor_for_old_logp=frozen_for_logp, agent=agent, train_both_teams=train_both_teams, gamma=1.0, lam=1.0)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
-                try:
-                    tqdm.write(f"[debug-batch] it={it+1} single-net batch size={int(batch['obs'].size(0))}")
-                except Exception:
-                    pass
+                if _PAR_DEBUG:
+                    try:
+                        tqdm.write(f"[debug-batch] it={it+1} single-net batch size={int(batch['obs'].size(0))}")
+                    except Exception:
+                        pass
         else:
             # Strategia MCTS: warmup senza MCTS per le prime iterazioni, poi scala con il progresso mano
             if dual_team_nets and (not opp_frozen_env):
@@ -5661,47 +5664,53 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         # Aumenta minibatch_size approfittando della VRAM ampia
         if dual_team_nets and (not opp_frozen_env):
             _t_u0 = time.time() if _PAR_TIMING else 0.0
-            try:
-                tqdm.write(f"[debug-update] it={it+1} starting updates (dual-live)")
-            except Exception:
-                pass
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(f"[debug-update] it={it+1} starting updates (dual-live)")
+                except Exception:
+                    pass
             info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
             info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
-            try:
-                tqdm.write(f"[debug-update] it={it+1} finished updates (dual-live)")
-            except Exception:
-                pass
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(f"[debug-update] it={it+1} finished updates (dual-live)")
+                except Exception:
+                    pass
         elif dual_team_nets and opp_frozen_env:
             _t_u0 = time.time() if _PAR_TIMING else 0.0
-            try:
-                tqdm.write(f"[debug-update] it={it+1} starting update (dual-frozen {'A' if train_A_now else 'B'})")
-            except Exception:
-                pass
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(f"[debug-update] it={it+1} starting update (dual-frozen {'A' if train_A_now else 'B'})")
+                except Exception:
+                    pass
             if train_A_now:
                 info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
             else:
                 info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
-            try:
-                tqdm.write(f"[debug-update] it={it+1} finished update (dual-frozen)")
-            except Exception:
-                pass
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(f"[debug-update] it={it+1} finished update (dual-frozen)")
+                except Exception:
+                    pass
         else:
             _t_u0 = time.time() if _PAR_TIMING else 0.0
-            try:
-                tqdm.write(f"[debug-update] it={it+1} starting update (single-net)")
-            except Exception:
-                pass
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(f"[debug-update] it={it+1} starting update (single-net)")
+                except Exception:
+                    pass
             info = agent.update(batch, epochs=4, minibatch_size=minibatch_size)
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
-            try:
-                tqdm.write(f"[debug-update] it={it+1} finished update (single-net)")
-            except Exception:
-                pass
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(f"[debug-update] it={it+1} finished update (single-net)")
+                except Exception:
+                    pass
         dt = time.time() - t0
 
         # proxy per best: media return del batch
