@@ -1,6 +1,6 @@
 import torch
 from tqdm import tqdm
-from typing import Any, Dict, List, Callable, Optional, Tuple
+from typing import Any, Dict, List, Callable, Optional, Tuple, Union
 import os
 import time
 import sys
@@ -8,7 +8,11 @@ import multiprocessing as mp
 import platform
 import queue
 import random
+from multiprocessing.connection import wait as _mp_wait
 import numpy as np
+import traceback
+import threading
+from collections import defaultdict
 
 # Ensure project root is on sys.path when running as script
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +23,7 @@ if _PROJECT_ROOT not in sys.path:
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
 from utils.device import get_compute_device
- 
+
 from selfplay.league import League
 from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
@@ -48,6 +52,8 @@ _OTHERS_HANDS_ZERO = torch.zeros((3, 40), dtype=torch.float32)
 _EMPTY_LEGAL = torch.zeros((0, 80), dtype=torch.float32)
 
 _SERIAL_RNG_STATE: Dict[int, Dict[str, Any]] = {}
+_COLLECT_PROFILE_GLOBAL = defaultdict(float)
+_COLLECT_PROFILE_COUNT = 0
 
 
 def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -354,6 +360,356 @@ def _seat_vec_for(cp: int) -> torch.Tensor:
     return v
 
 
+def _resolve_infer_device() -> torch.device:
+    infer_env = os.environ.get('SCOPONE_INFER_DEVICE', '').strip().lower()
+    if not infer_env:
+        infer_env = os.environ.get('SCOPONE_DEVICE', '').strip().lower()
+    resolved: Optional[torch.device] = None
+    if infer_env:
+        if infer_env.startswith('cuda') and not torch.cuda.is_available():
+            infer_env = 'cpu'
+        try:
+            resolved = torch.device(infer_env)
+        except Exception:
+            pass
+    if resolved is None:
+        if torch.cuda.is_available():
+            resolved = torch.device('cuda')
+        else:
+            resolved = torch.device('cpu')
+    os.environ['SCOPONE_INFER_DEVICE_RESOLVED'] = str(resolved)
+    return resolved
+
+
+def _actor_state_dict_cpu(actor: Optional[ActionConditionedActor]) -> Optional[Dict[str, torch.Tensor]]:
+    if actor is None:
+        return None
+    state = {}
+    for k, v in actor.state_dict().items():
+        state[k] = v.detach().to('cpu').clone()
+    return state
+
+
+def _build_actor_from_state(state_dict: Dict[str, torch.Tensor], device: torch.device) -> ActionConditionedActor:
+    actor = ActionConditionedActor()
+    actor.load_state_dict(state_dict)
+    actor.to(device)
+    actor.eval()
+    for p in actor.parameters():
+        p.requires_grad_(False)
+    return actor
+
+
+def _selector_worker_proc(worker_id: int,
+                          device_str: str,
+                          req_queue: mp.Queue,
+                          action_queues: List[mp.Queue],
+                          ctrl_queue: mp.Queue,
+                          ack_queue: mp.Queue,
+                          pending_counter: mp.Value,
+                          micro_batch: int,
+                          max_latency_s: float,
+                          infer_threads: int) -> None:
+    try:
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+    infer_threads = max(1, int(infer_threads))
+    try:
+        os.environ['OMP_NUM_THREADS'] = str(infer_threads)
+        os.environ['MKL_NUM_THREADS'] = str(infer_threads)
+    except Exception:
+        pass
+    try:
+        torch.set_num_threads(infer_threads)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    device = torch.device(device_str)
+    actor_main: Optional[ActionConditionedActor] = None
+    actor_shadow: Optional[ActionConditionedActor] = None
+    current_micro = max(1, int(micro_batch))
+    current_latency = max_latency_s if max_latency_s is not None else 0.0
+    pending_batch: List[Dict] = []
+    pending_start = 0.0
+    running = True
+
+    def _process(batch: List[Dict]) -> None:
+        if not batch:
+            return
+        local_actor_main = actor_main
+        if local_actor_main is None:
+            with pending_counter.get_lock():
+                pending_counter.value = max(0, pending_counter.value - len(batch))
+            return
+        local_actor_shadow = actor_shadow
+        try:
+            device_obj = next(local_actor_main.parameters()).device
+        except StopIteration:
+            device_obj = device
+        try:
+            step_reqs = [r for r in batch if r.get('type') == 'step']
+            shadow_reqs = [r for r in batch if r.get('type') == 'step_shadow']
+            if step_reqs:
+                selections = _batched_select_indices_actor_device(local_actor_main, step_reqs, device_obj)
+                for (wid, idx) in selections:
+                    action_queues[int(wid)].put({'idx': int(idx)}, block=True)
+            if shadow_reqs:
+                actor_used = local_actor_shadow if (local_actor_shadow is not None) else local_actor_main
+                selections = _batched_select_indices_actor_device(actor_used, shadow_reqs, device_obj)
+                for (wid, idx) in selections:
+                    action_queues[int(wid)].put({'idx': int(idx)}, block=True)
+        except Exception as exc:
+            try:
+                tqdm.write(f"[selector-worker {worker_id}] error processing batch: {exc}")
+                traceback.print_exc()
+            except Exception:
+                pass
+        finally:
+            cnt = len(batch)
+            if cnt > 0:
+                with pending_counter.get_lock():
+                    pending_counter.value = max(0, pending_counter.value - cnt)
+
+    while running:
+        # Handle control commands first
+        handled_ctrl = False
+        while True:
+            try:
+                cmd = ctrl_queue.get_nowait()
+            except queue.Empty:
+                break
+            handled_ctrl = True
+            if not isinstance(cmd, dict):
+                continue
+            kind = cmd.get('cmd')
+            if kind == 'sync':
+                main_state = cmd.get('main')
+                shadow_state = cmd.get('shadow')
+                if main_state is None:
+                    actor_main = None
+                    actor_shadow = None
+                else:
+                    if actor_main is None:
+                        actor_main = _build_actor_from_state(main_state, device)
+                    else:
+                        actor_main.load_state_dict(main_state)
+                        actor_main.to(device)
+                        actor_main.eval()
+                        for p in actor_main.parameters():
+                            p.requires_grad_(False)
+                    if shadow_state is not None:
+                        if actor_shadow is None:
+                            actor_shadow = _build_actor_from_state(shadow_state, device)
+                        else:
+                            actor_shadow.load_state_dict(shadow_state)
+                            actor_shadow.to(device)
+                            actor_shadow.eval()
+                            for p in actor_shadow.parameters():
+                                p.requires_grad_(False)
+                    else:
+                        actor_shadow = None
+                try:
+                    ack_queue.put({'cmd': 'synced', 'wid': worker_id}, block=False)
+                except Exception:
+                    pass
+            elif kind == 'config':
+                current_micro = max(1, int(cmd.get('micro_batch', current_micro)))
+                current_latency = max(0.0, float(cmd.get('max_latency', current_latency)))
+            elif kind == 'shutdown':
+                running = False
+            else:
+                continue
+        if not running:
+            break
+        if actor_main is None:
+            time.sleep(0.001 if handled_ctrl else 0.01)
+            continue
+        timeout = current_latency if current_latency > 0 else 0.05
+        try:
+            req = req_queue.get(timeout=timeout)
+            if isinstance(req, dict) and req.get('type') == '__shutdown__':
+                running = False
+                continue
+            if not pending_batch:
+                pending_start = time.time()
+            pending_batch.append(req)
+            if len(pending_batch) >= current_micro:
+                batch = pending_batch
+                pending_batch = []
+                _process(batch)
+        except queue.Empty:
+            if pending_batch:
+                batch = pending_batch
+                pending_batch = []
+                _process(batch)
+            continue
+    if pending_batch:
+        _process(pending_batch)
+    try:
+        ack_queue.put({'cmd': 'stopped', 'wid': worker_id}, block=False)
+    except Exception:
+        pass
+
+
+class AsyncActionSelector:
+    """Background inference service for step/step_shadow requests (process-based)."""
+
+    def __init__(self,
+                 ctx: mp.context.BaseContext,
+                 action_queues: List[mp.Queue],
+                 device: torch.device,
+                 micro_batch: int,
+                 max_latency_s: float,
+                 num_workers: int) -> None:
+        self.ctx = ctx
+        self.action_queues = action_queues
+        self.device = device
+        self.micro_batch = max(1, int(micro_batch))
+        self.max_latency_s = max_latency_s if max_latency_s is not None else 0.0
+        self.num_workers = max(1, int(num_workers))
+        if self.device.type == 'cuda' and self.num_workers > 1:
+            self.num_workers = 1
+        raw_threads = os.environ.get('SCOPONE_INFER_THREADS', '').strip().lower()
+        if raw_threads in ('', 'auto', None):
+            total = max(1, os.cpu_count() or 1)
+            infer_threads = max(1, total // self.num_workers)
+        else:
+            try:
+                infer_threads = max(1, int(raw_threads))
+            except ValueError:
+                total = max(1, os.cpu_count() or 1)
+                infer_threads = max(1, total // self.num_workers)
+        self._infer_threads = infer_threads
+        self._req_queue: mp.Queue = self.ctx.Queue(maxsize=max(1, len(action_queues) * 4))
+        self._pending: mp.Value = self.ctx.Value('i', 0)
+        self._ctrl_queues: List[mp.Queue] = []
+        self._ack_queues: List[mp.Queue] = []
+        self._workers: List[mp.Process] = []
+        self._stopped = False
+        device_str = str(self.device)
+        for wid in range(self.num_workers):
+            ctrl_q = self.ctx.Queue()
+            ack_q = self.ctx.Queue()
+            proc = self.ctx.Process(
+                target=_selector_worker_proc,
+                args=(wid, device_str, self._req_queue, action_queues, ctrl_q, ack_q, self._pending,
+                      self.micro_batch, self.max_latency_s, self._infer_threads),
+                daemon=True
+            )
+            proc.start()
+            self._ctrl_queues.append(ctrl_q)
+            self._ack_queues.append(ack_q)
+            self._workers.append(proc)
+
+    def update_config(self, micro_batch: int, max_latency_s: float) -> None:
+        self.micro_batch = max(1, int(micro_batch))
+        if max_latency_s is not None:
+            self.max_latency_s = max_latency_s
+        cmd = {'cmd': 'config', 'micro_batch': self.micro_batch, 'max_latency': self.max_latency_s}
+        for ctrl in self._ctrl_queues:
+            try:
+                ctrl.put(cmd, block=False)
+            except Exception:
+                ctrl.put(cmd)
+
+    def wait_idle(self, timeout: Optional[float] = None) -> None:
+        deadline = (time.time() + timeout) if timeout is not None else None
+        while True:
+            with self._pending.get_lock():
+                pending = self._pending.value
+            if pending <= 0:
+                return
+            if deadline is not None and time.time() >= deadline:
+                return
+            time.sleep(0.001)
+
+    def sync_models(self,
+                    actor_main: ActionConditionedActor,
+                    actor_shadow: Optional[ActionConditionedActor] = None) -> None:
+        self.wait_idle()
+        main_state = _actor_state_dict_cpu(actor_main)
+        shadow_state = _actor_state_dict_cpu(actor_shadow)
+        cmd = {'cmd': 'sync', 'main': main_state, 'shadow': shadow_state}
+        for ctrl in self._ctrl_queues:
+            ctrl.put(cmd)
+        timeout_s = max(1.0, float(os.environ.get('SCOPONE_INFER_SYNC_TIMEOUT_S', '60')))
+        deadline = time.time() + timeout_s
+        for ack in self._ack_queues:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise RuntimeError("AsyncActionSelector: sync ack timeout")
+            try:
+                msg = ack.get(timeout=remaining)
+                if not isinstance(msg, dict):
+                    continue
+                cmd = msg.get('cmd')
+                if cmd not in ('synced', 'stopped'):
+                    raise RuntimeError(f"AsyncActionSelector: invalid sync ack payload {msg}")
+                if cmd == 'stopped':
+                    continue
+            except queue.Empty as exc:
+                raise RuntimeError("AsyncActionSelector: sync ack timeout") from exc
+
+    def submit(self, req: Dict) -> None:
+        if self._stopped:
+            return
+        with self._pending.get_lock():
+            self._pending.value += 1
+        self._req_queue.put(req)
+
+    def submit_many(self, reqs: List[Dict]) -> None:
+        if self._stopped or not reqs:
+            return
+        count = len(reqs)
+        with self._pending.get_lock():
+            self._pending.value += count
+        for req in reqs:
+            self._req_queue.put(req)
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        for ctrl in self._ctrl_queues:
+            try:
+                ctrl.put({'cmd': 'shutdown'}, block=False)
+            except Exception:
+                ctrl.put({'cmd': 'shutdown'})
+        for _ in range(self.num_workers):
+            try:
+                self._req_queue.put({'type': '__shutdown__'}, block=False)
+            except Exception:
+                pass
+        for ack in self._ack_queues:
+            try:
+                ack.get(timeout=1.0)
+            except Exception:
+                pass
+        for proc in self._workers:
+            try:
+                proc.join(timeout=0.5)
+            except Exception:
+                pass
+        for proc in self._workers:
+            if proc.is_alive():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                proc.join(timeout=0.2)
+        try:
+            while True:
+                self._req_queue.get_nowait()
+        except Exception:
+            pass
+        self._workers.clear()
+
+
 def _to_cpu_float32(tensor_like: torch.Tensor) -> torch.Tensor:
     if torch.is_tensor(tensor_like):
         if tensor_like.device.type == 'cpu' and tensor_like.dtype == torch.float32:
@@ -405,6 +761,10 @@ def _env_worker(worker_id: int,
     rpc_timeout_s = float(os.environ.get('SCOPONE_RPC_TIMEOUT_S', '30'))
     episode_put_timeout_s = float(os.environ.get('SCOPONE_EP_PUT_TIMEOUT_S', '15'))
     belief_aux_coef = float(os.environ.get('BELIEF_AUX_COEF', '0.1'))
+    local_infer_enabled = (str(os.environ.get('SCOPONE_COLLECT_LOCAL_INFER', '0')).strip().lower() in ['1', 'true', 'yes', 'on'])
+    local_infer_device = torch.device(str(os.environ.get('SCOPONE_ENV_INFER_DEVICE', 'cpu')))
+    local_actor_main: Optional[ActionConditionedActor] = None
+    local_actor_shadow: Optional[ActionConditionedActor] = None
 
     # Torch profiler in worker: enabled by default when torch profiler mode is active in the main process
     _tp_active = (os.environ.get('SCOPONE_TORCH_PROF', '0') == '1')
@@ -423,609 +783,654 @@ def _env_worker(worker_id: int,
         )
         _worker_prof.start()
 
-    t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
-    t0_glob = time.time()
-    _wdbg(f"start (episodes_per_env={int(episodes_per_env)})")
-    # In persistent mode (control_q provided) we can receive new budgets and loop forever
-    _persistent = (control_q is not None)
-    while True:
-        # Resolve budget for this round (and apply any dynamic control updates)
-        budget = int(episodes_per_env)
-        if _persistent:
-            # Wait until a positive budget is provided
-            while budget <= 0:
-                try:
-                    cmd = control_q.get()  # type: ignore[union-attr]
-                except Exception:
-                    cmd = None
-                if isinstance(cmd, dict) and cmd.get('cmd') == 'set_budget':
-                    try:
-                        budget = int(cmd.get('episodes', 0))
-                    except Exception:
-                        budget = 0
-                elif isinstance(cmd, dict) and cmd.get('cmd') == 'set_main_seats':
-                    try:
-                        ms = cmd.get('value', None)
-                        if isinstance(ms, (list, tuple)):
-                            main_seats = [int(x) for x in ms]
-                    except Exception:
-                        pass
-                elif isinstance(cmd, dict) and cmd.get('cmd') == 'stop':
-                    # Exit worker gracefully
-                    if _worker_prof is not None:
-                        _worker_prof.stop()
-                    return
-                else:
-                    continue
-        # Produce 'budget' episodes this round
-        for ep in range(max(0, int(budget))):
-            t0 = time.time(); env.reset(); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
-            _wdbg(f"ep {ep} reset")
-            obs_list, next_obs_list = [], []
-            act_list = []
-            rew_list, done_list = [], []
-            seat_team_list = []
-            belief_sum_list = []
-            legals_list, legals_offset, legals_count = [], [], []
-            chosen_index_list = []
-            mcts_policy_list = []
-            mcts_weight_list = []
-            others_hands_list = []
-
-            done = False
-            info = {}
-            step_idx = 0
-            while not done:
-                t0 = time.time();
-                with _record_function('env._get_observation'):
-                    obs = env._get_observation(env.current_player)
-                t_get_obs += (time.time() - t0) if _PAR_TIMING else 0.0
-                if step_idx < 3:
-                    _wdbg(f"ep {ep} step {step_idx}: got obs (cp={env.current_player})")
-                t0 = time.time();
-                with _record_function('env.get_valid_actions'):
-                    legal = env.get_valid_actions()
-                t_get_legals += (time.time() - t0) if _PAR_TIMING else 0.0
-                if step_idx < 3:
-                    _wdbg(f"ep {ep} step {step_idx}: legals={int(len(legal))}")
-                if torch.is_tensor(legal) and (legal.size(0) == 0):
-                    raise RuntimeError(f"collect_trajectory_parallel: worker {worker_id} got 0 legal actions (player={env.current_player})")
-                # Avoid ambiguous truth-value on tensors; treat empty action sets explicitly
-                is_empty = (int(legal.numel()) == 0)
-                if is_empty:
-                    raise RuntimeError(f"worker {worker_id}: no legal actions at episode start (player={env.current_player})")
-                cp = env.current_player
-                seat_vec = _seat_vec_for(cp)
-                seat_cpu = seat_vec
-                obs_cpu = _to_cpu_float32(obs)
-                if torch.is_tensor(legal):
-                    legal_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
-                    legal_cpu_entries = list(legal_cpu_tensor.unbind(0))
-                else:
-                    legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
-                    legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
-                legal_count = len(legal_cpu_entries)
-                is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
-                store_sample = bool(train_both_teams or is_main)
-                policy_entries: List[float] = []
-                policy_weight = 0.0
-                bsum_tensor = _BELIEF_ZERO
-                # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
-                _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
-            if (is_main or _both_sides) and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
-                # Build helper RPCs to master for batched scoring
-                if send_legals:
-                    leg_serial = [x.tolist() for x in legal_cpu_entries]
-                else:
-                    leg_serial = []
-                def policy_fn_mcts(_obs, _legals):
-                    nonlocal t_rpc
-                    # Invia tensori CPU direttamente (no conversione a liste) per ridurre overhead IPC
-                    o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
-                    leg_cpu = torch.stack([ (y.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
-                    t1 = time.time()
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS policy -> send, waiting priors")
-                    request_q.put({
-                        'type': 'score_policy',
-                        'wid': worker_id,
-                        'obs': o_cpu,
-                        'legals': leg_cpu,
-                        'seat': seat_cpu,
-                    })
-                    try:
-                        resp = action_q.get(timeout=rpc_timeout_s)
-                    except queue.Empty as e:
-                        raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_policy priors") from e
-                    t_rpc_local = (time.time() - t1)
-                    if _PAR_TIMING:
-                        t_rpc = t_rpc + t_rpc_local
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS policy <- got priors")
-                    pri = resp.get('priors', None)
-                    import numpy as _np
-                    if pri is None or (len(pri) != len(_legals)):
-                        raise RuntimeError(f"worker {worker_id}: invalid priors from master (priors={type(pri)}, expected_len={len(_legals)})")
-                    return _np.asarray(pri, dtype=_np.float32)
-                def value_fn_mcts(_obs, _env):
-                    s_vec = _seat_vec_for(_env.current_player)
-                    o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS value -> send, waiting value")
-                    request_q.put({
-                        'type': 'score_value',
-                        'wid': worker_id,
-                        'obs': o_cpu,
-                        'seat': s_vec,
-                    })
-                    try:
-                        resp = action_q.get(timeout=rpc_timeout_s)
-                    except queue.Empty as e:
-                        raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_value") from e
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS value <- got value")
-                    return float(resp.get('value', 0.0))
-                def belief_sampler_neural(_env):
-                    o_cur = _env._get_observation(_env.current_player)
-                    s_vec = _seat_vec_for(_env.current_player)
-                    o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS belief -> send, waiting probs")
-                    request_q.put({
-                        'type': 'score_belief',
-                        'wid': worker_id,
-                        'obs': o_cpu,
-                        'seat': s_vec,
-                    })
-                    try:
-                        resp = action_q.get(timeout=rpc_timeout_s)
-                    except queue.Empty as e:
-                        raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_belief") from e
-                    if step_idx < 3:
-                        _wdbg(f"ep {ep} step {step_idx}: MCTS belief <- got probs")
-                    probs_flat = resp.get('belief_probs', None)
-                    if probs_flat is None:
-                        return None
-                    import numpy as _np
-                    probs = _np.asarray(probs_flat, dtype=_np.float32).reshape(3, 40)
-                    # visible mask from obs on worker side
-                    if torch.is_tensor(o_cur):
-                        o_t = o_cur.detach().to('cpu', dtype=torch.float32).unsqueeze(0)
-                    else:
-                        o_t = torch.as_tensor(o_cur, dtype=torch.float32).unsqueeze(0)
-                    hand_table = o_t[:, :83]
-                    hand_mask = hand_table[:, :40] > 0.5
-                    table_mask = hand_table[:, 43:83] > 0.5
-                    captured = o_t[:, 83:165]
-                    cap0_mask = captured[:, :40] > 0.5
-                    cap1_mask = captured[:, 40:80] > 0.5
-                    vis = (hand_mask | table_mask | cap0_mask | cap1_mask).squeeze(0).numpy().astype(bool)
-                    unknown_ids = [cid for cid in range(40) if not vis[cid]]
-                    others = [(_env.current_player + 1) % 4, (_env.current_player + 2) % 4, (_env.current_player + 3) % 4]
-                    counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
-                    caps = [int(counts.get(pid, 0)) for pid in others]
-                    n = len(unknown_ids)
-                    if sum(caps) != n:
-                        caps[2] = max(0, n - caps[0] - caps[1])
-                        if sum(caps) != n:
-                            base = n // 3
-                            rem = n - 3 * base
-                            caps = [base, base, base]
-                            for i in range(rem):
-                                caps[i] += 1
-                    import numpy as _np
-                    noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
-                    costs = []
-                    for cid in unknown_ids:
-                        pc = probs[:, cid]
-                        ps = pc / max(1e-12, pc.sum())
-                        c = [-_np.log(max(1e-12, ps[i])) for i in range(3)]
-                        if noise_scale > 0:
-                            u = _np.random.uniform(1e-9, 1.0-1e-9, size=3)
-                            g = -_np.log(-_np.log(u)) * noise_scale
-                            c = [c[i] + float(g[i]) for i in range(3)]
-                        costs.append(c)
-                    INF = 1e12
-                    cap0, cap1, cap2 = caps
-                    dp = [[[INF]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                    bk = [[[-1]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
-                    dp[0][0][0] = 0.0
-                    for t in range(n):
-                        c0, c1, c2 = costs[t]
-                        for a in range(0, min(t, cap0)+1):
-                            for b in range(0, min(t-a, cap1)+1):
-                                cur = dp[t][a][b]
-                                if cur >= INF:
-                                    continue
-                                if a+1 <= cap0 and dp[t+1][a+1][b] > cur + c0:
-                                    dp[t+1][a+1][b] = cur + c0
-                                    bk[t+1][a+1][b] = 0
-                                if b+1 <= cap1 and dp[t+1][a][b+1] > cur + c1:
-                                    dp[t+1][a][b+1] = cur + c1
-                                    bk[t+1][a][b+1] = 1
-                                assigned2 = t - a - b
-                                if assigned2 + 1 <= cap2 and dp[t+1][a][b] > cur + c2:
-                                    dp[t+1][a][b] = cur + c2
-                                    bk[t+1][a][b] = 2
-                    if dp[n][cap0][cap1] >= INF:
-                        return None
-                    det = {pid: [] for pid in others}
-                    a, b = cap0, cap1
-                    for t in range(n, 0, -1):
-                        choice = bk[t][a][b]
-                        cid = unknown_ids[t-1]
-                        if choice == 0:
-                            det[others[0]].append(cid)
-                            a -= 1
-                        elif choice == 1:
-                            det[others[1]].append(cid)
-                            b -= 1
-                        else:
-                            det[others[2]].append(cid)
-                    logp = -float(dp[n][cap0][cap1])
-                    return {'assignments': det, 'logp': logp}
-                # Progress-based scaling (uniform with single-env) — optionally gated by env
-                progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
-                denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
-                alpha = min(1.0, max(0.0, (progress - mcts_progress_start) / denom))
-                scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
-                # Permetti 0 simulazioni se mcts_min_sims==0
-                base_min = int(mcts_min_sims) if (mcts_min_sims is not None and int(mcts_min_sims) >= 0) else 0
-                import math
-                if mcts_train_factor is not None and float(mcts_train_factor) <= 0.0:
-                    sims_scaled = 0
-                else:
-                    if scaling_on:
-                        sims_base = math.ceil(mcts_sims * (0.25 + 0.75 * alpha))
-                    else:
-                        sims_base = math.ceil(mcts_sims * float(mcts_train_factor if mcts_train_factor is not None else 1.0))
-                    if mcts_train_factor is not None and scaling_on:
-                        sims_base = math.ceil(sims_base * float(mcts_train_factor))
-                    sims_scaled = int(max(base_min, sims_base))
-                    if int(mcts_sims) > 0 and sims_scaled <= 0:
-                        sims_scaled = 1
-                # Root temperature dynamic only when scaling is enabled (or explicitly overridden)
-                root_temp_dyn = (float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0)
-                                 else float(max(0.0, 1.0 - alpha)))
-
-                # Exact-only mode: skip prior MCTS unless near end-of-hand
-                _exact_only = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
-                def _remaining_moves_training(_env):
-                    _hands = _env.game_state.get('hands', None)
-                    if isinstance(_hands, (list, tuple)):
-                        return int(sum(len(h) for h in _hands))
-                    if isinstance(_hands, dict):
-                        return int(sum(len(h) for h in _hands.values()))
-                    return 0
-                def _auto_exact_thresh(_rem):
-                    if _rem <= 0:
-                        return 0
-                    _h = int(round(_rem * 0.45))
-                    return max(6, min(16, _h))
-                _rem_moves = _remaining_moves_training(env)
-                _ovr = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', '')).strip()
-                if _ovr:
-                    try:
-                        _exact_thresh = max(0, int(_ovr))
-                    except ValueError:
-                        _exact_thresh = _auto_exact_thresh(_rem_moves)
-                else:
-                    _exact_thresh = _auto_exact_thresh(_rem_moves)
-                _near_end = (_exact_thresh > 0) and (_rem_moves <= _exact_thresh)
-                _use_mcts_here = sims_scaled > 0 and (not (_exact_only and (not _near_end)))
-
-                if not _use_mcts_here:
-                    # Sims ended up <= 0 despite mcts_sims > 0 — log, optionally raise for debug, then fall back to master step
-                    if (os.environ.get('SCOPONE_RAISE_ON_INVALID_SIMS', '0') == '1'
-                            and not (_exact_only and (not _near_end))):
-                        raise RuntimeError(f"invalid sims_scaled: sims_scaled={sims_scaled} mcts_sims={mcts_sims} progress_start={mcts_progress_start} progress_full={mcts_progress_full} history_len={len(env.game_state.get('history', [])) if isinstance(env.game_state.get('history', []), list) else 'n/a'} alpha={alpha}")
-                    leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
-                    request_q.put({
-                        'type': 'step',
-                        'wid': worker_id,
-                        'obs': obs_cpu,
-                        'legals': leg_serial,
-                        'seat': seat_cpu,
-                    })
-                    try:
-                        resp = action_q.get(timeout=rpc_timeout_s)
-                        idx = int(resp.get('idx', 0))
-                    except queue.Empty as e:
-                        raise TimeoutError('Timeout waiting for step index for MCTS (invalid_sims_scaled)') from e
-                    idx = max(0, min(idx, len(legal) - 1))
-                    act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                    with _record_function('env.step'):
-                        next_obs, rew, done, info = env.step(act_t)
-                    # No distillation target
-                    policy_entries = [0.0] * legal_count
-                    policy_weight = 0.0
-                else:
-                    from algorithms.is_mcts import run_is_mcts
-                    # Dynamic defaults for smoothing and root Dirichlet based on context
-                    t1 = time.time(); priors_probe = policy_fn_mcts(obs, legal); t_mcts += (time.time() - t1) if _PAR_TIMING else 0.0
-                    pri_t = (priors_probe if torch.is_tensor(priors_probe) else torch.as_tensor(priors_probe, dtype=torch.float32))
-                    peak = float(pri_t.max().item()) if pri_t.numel() > 0 else (1.0 / max(1, len(legal)))
-                    A = int(len(legal))
-                    sims_fac = 1.0 if sims_scaled < 128 else (0.5 if sims_scaled < 256 else 0.25)
-                    peak_fac = min(1.0, max(0.0, (peak - 0.5) / 0.4))
-                    prior_eps_eff = 0.1 * sims_fac * peak_fac * (1.0 - alpha)
-                    prior_eps_eff = float(max(0.0, min(0.15, prior_eps_eff)))
-                    if A <= 3:
-                        dir_eps_eff = 0.0
-                    else:
-                        a_fac = min(1.0, max(0.0, (A - 3) / 10.0))
-                        sim_att = (0.7 if sims_scaled >= 256 else 1.0)
-                        prog_att = (0.7 if alpha > 0.7 else 1.0)
-                        dir_eps_eff = 0.25 * a_fac * sim_att * prog_att
-                        dir_eps_eff = float(max(0.0, min(0.3, dir_eps_eff)))
-
-                    # Choose determinisations count depending on whether we expect exact solve (Train-specific only)
-                    _dets_prior = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_PRIOR', str(mcts_dets)))
-                    _dets_exact = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_EXACT', str(mcts_dets)))
-                    _dets_eff = int(_dets_exact if _near_end else _dets_prior)
-
-                    # Ensure per-context depth/exact settings propagate to MCTS core (no ENV fallbacks)
-                    os.environ['SCOPONE_MCTS_MAX_DEPTH'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_MAX_DEPTH', '0'))
-                    os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', ''))
-                    os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '0'))
-
-                    mcts_action, mcts_visits = run_is_mcts(env,
-                        policy_fn=policy_fn_mcts,
-                        value_fn=value_fn_mcts,
-                        num_simulations=int(sims_scaled),
-                        c_puct=float(mcts_c_puct),
-                        belief=None,
-                        num_determinization=int(_dets_eff),
-                        root_temperature=root_temp_dyn,
-                        prior_smooth_eps=prior_eps_eff,
-                        robust_child=True,
-                        root_dirichlet_alpha=float(mcts_dirichlet_alpha),
-                        root_dirichlet_eps=dir_eps_eff,
-                        return_stats=True,
-                        belief_sampler=belief_sampler_neural,
-                        exact_only=_exact_only and not _near_end)
-                    chosen_act = mcts_action if torch.is_tensor(mcts_action) else torch.as_tensor(mcts_action, dtype=torch.float32)
-                    def _act_key(x_t: torch.Tensor):
-                        xt = x_t if torch.is_tensor(x_t) else torch.as_tensor(x_t, dtype=torch.float32)
-                        return tuple(torch.nonzero(xt > 0.5, as_tuple=False).flatten().tolist())
-                    key_target = _act_key(chosen_act)
-                    idx = 0
-                    for i_a, a in enumerate(legal):
-                        if _act_key(a) == key_target:
-                            idx = int(i_a)
-                            break
-                    act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                    t1 = time.time();
-                    with _record_function('env.step'):
-                        next_obs, rew, done, info = env.step(act_t)
-                    t_step += (time.time() - t1) if _PAR_TIMING else 0.0
-                    # Distillation targets
-                    mcts_probs = torch.as_tensor(mcts_visits, dtype=torch.float32)
-                    ssum = float(mcts_probs.sum().item())
-                    if ssum > 0:
-                        mcts_probs = mcts_probs / ssum
-                    policy_entries = (mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs))
-                    policy_weight = 1.0
-            else:
-                # Request action selection from master (GPU)
-                leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
-                if step_idx < 3:
-                    _wdbg(f"ep {ep} step {step_idx}: STEP -> send, waiting idx (A={len(legal)})")
-                t1 = time.time(); request_q.put({
-                    'type': 'step',
-                    'wid': worker_id,
-                    'obs': obs_cpu,
-                    'legals': leg_serial,
-                    'seat': seat_cpu,
-                })
-                try:
-                    resp = action_q.get(timeout=rpc_timeout_s)
-                    idx = int(resp.get('idx', 0))
-                except queue.Empty as e:
-                    raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (main path)") from e
-                t_rpc += (time.time() - t1) if _PAR_TIMING else 0.0
-                if step_idx < 3:
-                    _wdbg(f"ep {ep} step {step_idx}: STEP <- got idx={int(idx)}")
-                idx = max(0, min(idx, len(legal) - 1))
-                act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                t1 = time.time();
-                with _record_function('env.step'):
-                    next_obs, rew, done, info = env.step(act_t)
-                if step_idx < 3:
-                    _wdbg(f"ep {ep} step {step_idx}: env.step done={bool(done)} rew={float(rew)}")
-                step_idx += 1
-                t_step += (time.time() - t1) if _PAR_TIMING else 0.0
-                # No distillation target
-                policy_entries = [0.0] * legal_count
-                policy_weight = 0.0
-
-            next_obs_cpu = _to_cpu_float32(next_obs)
-            act_cpu = _to_cpu_float32(act_t)
-
-            if store_sample:
-                obs_list.append(obs_cpu)
-                next_obs_list.append(next_obs_cpu)
-                act_list.append(act_cpu)
-                rew_list.append(float(rew))
-                done_list.append(bool(done))
-                seat_team_list.append(seat_cpu)
-                belief_sum_list.append(bsum_tensor)
-                legals_offset.append(len(legals_list))
-                legals_count.append(legal_count)
-                if send_legals:
-                    legals_list.extend(legal_cpu_entries)
-                else:
-                    from utils.fallback import notify_fallback
-                    notify_fallback('trainer.collect_trajectory.legals_missing_for_store')
-                chosen_index_list.append(int(idx))
-                entries = policy_entries if len(policy_entries) > 0 else ([0.0] * legal_count)
-                mcts_policy_list.extend(entries)
-                mcts_weight_list.append(policy_weight if len(policy_entries) > 0 else 0.0)
-                # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
-                if belief_aux_coef <= 0.0:
-                    others_hands_list.append(_OTHERS_HANDS_ZERO)
-                else:
-                    hands = env.game_state.get('hands', None)
-                    if hands is not None:
-                        others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
-                        target = torch.zeros((3,40), dtype=torch.float32)
-                        for i,pid in enumerate(others):
-                            for c in hands[pid]:
-                                if isinstance(c, int):
-                                    cid = c
-                                else:
-                                    r, s = c
-                                    suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
-                                    cid = int((r - 1) * 4 + suit_to_int[s])
-                                target[i, int(cid)] = 1.0
-                        others_hands_list.append(target)
-                    else:
-                        others_hands_list.append(_OTHERS_HANDS_ZERO)
-            else:
-                # Non-main seats skipped when training only main seats; ensure last stored sample closes episode
-                if done and len(done_list) > 0:
-                    done_list[-1] = True
-                    if len(next_obs_list) > 0:
-                        next_obs_list[-1] = next_obs_cpu
-
-        # Ensure at least one step per episode to avoid empty payloads
-        if len(obs_list) == 0:
-            obs = env._get_observation(env.current_player)
-            legal = env.get_valid_actions()
-            is_empty = (int(legal.numel()) == 0)
-            if not is_empty:
-                cp = env.current_player
-                seat_vec = _seat_vec_for(cp)
-                seat_cpu = seat_vec
-                obs_cpu = _to_cpu_float32(obs)
-                if torch.is_tensor(legal):
-                    legals_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
-                    legal_entries = list(legals_cpu_tensor.unbind(0))
-                else:
-                    legal_entries = [_to_cpu_float32(x) for x in legal]
-                    legals_cpu_tensor = torch.stack(legal_entries, dim=0) if len(legal_entries) > 0 else _EMPTY_LEGAL
-                leg_serial = legals_cpu_tensor if send_legals else _EMPTY_LEGAL
-                request_q.put({
-                    'type': 'step',
-                    'wid': worker_id,
-                    'obs': obs_cpu,
-                    'legals': leg_serial,
-                    'seat': seat_cpu,
-                })
-                try:
-                    resp = action_q.get(timeout=rpc_timeout_s)
-                    idx = int(resp.get('idx', 0))
-                except queue.Empty as e:
-                    raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (forced first step)") from e
-                idx = max(0, min(idx, len(legal) - 1))
-                act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
-                with _record_function('env.step'):
-                    next_obs, rew, done, info = env.step(act_t)
-                next_obs_cpu = _to_cpu_float32(next_obs)
-                act_cpu = _to_cpu_float32(act_t)
-                obs_list.append(obs_cpu)
-                next_obs_list.append(next_obs_cpu)
-                act_list.append(act_cpu)
-                rew_list.append(float(rew))
-                done_list.append(bool(done))
-                seat_team_list.append(seat_cpu)
-                belief_sum_list.append(_BELIEF_ZERO)
-                legals_offset.append(len(legals_list))
-                legals_count.append(len(legal))
-                if send_legals:
-                    legals_list.extend(legal_entries)
-                chosen_index_list.append(int(idx))
-                # default others_hands zero target for this forced step
-                others_hands_list.append(_OTHERS_HANDS_ZERO)
-        
-        # Episode payload back to master using NumPy arrays (avoid Torch resource_sharer FDs entirely)
-        import numpy as _np
-        if len(obs_list) > 0:
-            t1 = time.time(); obs_t = torch.stack(obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
-        else:
-            obs_t = _np.zeros((0, 1), dtype=_np.float32)
-        if len(next_obs_list) > 0:
-            t1 = time.time(); next_obs_t = torch.stack(next_obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
-        else:
-            next_obs_t = _np.zeros((0, 1), dtype=_np.float32)
-        if len(act_list) > 0:
-            t1 = time.time(); act_t = torch.stack(act_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
-        else:
-            act_t = _np.zeros((0, 80), dtype=_np.float32)
-        if len(seat_team_list) > 0:
-            t1 = time.time(); seat_t = torch.stack(seat_team_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
-        else:
-            seat_t = _np.zeros((0, 6), dtype=_np.float32)
-        if len(belief_sum_list) > 0:
-            t1 = time.time(); belief_t = torch.stack(belief_sum_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
-        else:
-            belief_t = _np.zeros((0, 120), dtype=_np.float32)
-        if len(legals_list) > 0:
-            t1 = time.time(); legals_t = torch.stack(legals_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
-        else:
-            legals_t = _np.zeros((0, 80), dtype=_np.float32)
-        leg_off_t = _np.asarray(legals_offset, dtype=_np.int64)
-        leg_cnt_t = _np.asarray(legals_count, dtype=_np.int64)
-        chosen_idx_t = _np.asarray(chosen_index_list, dtype=_np.int64)
-        mcts_policy_t = _np.asarray(mcts_policy_list, dtype=_np.float32) if len(mcts_policy_list) > 0 else _np.zeros((0,), dtype=_np.float32)
-        mcts_weight_t = _np.asarray(mcts_weight_list, dtype=_np.float32) if len(mcts_weight_list) > 0 else _np.zeros((0,), dtype=_np.float32)
-        if len(others_hands_list) > 0:
-            t1 = time.time(); others_hands_t = torch.stack(others_hands_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
-        else:
-            others_hands_t = _np.zeros((0, 3, 40), dtype=_np.float32)
-
-        # Non-blocking put with timeout to avoid deadlocks if the master is slow
-        payload = {
-            'wid': worker_id,
-            'obs': obs_t,
-            'next_obs': next_obs_t,
-            'act': act_t,
-            'rew': rew_list,
-            'done': done_list,
-            'seat': seat_t,
-            'belief_summary': belief_t,
-            'legals': legals_t,
-            'leg_off': leg_off_t,
-            'leg_cnt': leg_cnt_t,
-            'chosen_idx': chosen_idx_t,
-            'team_rewards': (info.get('team_rewards', [0.0, 0.0]) if isinstance(info, dict) else [0.0, 0.0]),
-            'mcts_policy': mcts_policy_t,
-            'mcts_weight': mcts_weight_t,
-            'others_hands': others_hands_t,
-        }
-        try:
-            if len(obs_list) == 0:
-                raise RuntimeError(f"worker {worker_id}: episode finished with zero steps — invalid episode")
-            _wdbg(f"ep {ep} putting episode payload (steps={len(obs_list)})")
-            episode_q.put(payload, timeout=episode_put_timeout_s)
-            _wdbg(f"ep {ep} payload put ok")
-        except Exception as e:
-            raise RuntimeError(f"worker {worker_id}: episode_q.put failed") from e
-        # End-of-round signalling (like per-iteration)
-        _wdbg("round done -> sending done marker")
-        episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
-        if _PAR_TIMING:
-            total = time.time() - t0_glob
-            episode_q.put({'wid': worker_id, 'type': 'timing',
-                           't_env_reset': t_env_reset,
-                           't_get_obs': t_get_obs,
-                           't_get_legals': t_get_legals,
-                           't_mcts': t_mcts,
-                           't_rpc': t_rpc,
-                           't_step': t_step,
-                           't_pack': t_pack,
-                           't_total': total})
-        # In non-persistent mode produce once and exit; otherwise reset timers and wait for new budget
-        if not _persistent:
-            break
+    try:
         t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
         t0_glob = time.time()
-        episodes_per_env = 0
+        _wdbg(f"start (episodes_per_env={int(episodes_per_env)}) use_mcts={use_mcts} mcts_sims={mcts_sims}")
+        # In persistent mode (control_q provided) we can receive new budgets and loop forever
+        _persistent = (control_q is not None)
+        while True:
+            # Resolve budget for this round (and apply any dynamic control updates)
+            budget = int(episodes_per_env)
+            if _persistent:
+                _wdbg(f"enter persistent loop with initial budget={budget}")
+                # Wait until a positive budget is provided
+                while budget <= 0:
+                    try:
+                        cmd = control_q.get()  # type: ignore[union-attr]
+                        _wdbg(f"[control] received raw cmd={cmd}")
+                    except Exception:
+                        cmd = None
+                    if isinstance(cmd, dict) and cmd.get('cmd') == 'set_budget':
+                        try:
+                            budget = int(cmd.get('episodes', 0))
+                            _wdbg(f"[control] set_budget received -> {budget}")
+                        except Exception:
+                            budget = 0
+                        try:
+                            ms = cmd.get('main_seats', None)
+                            if isinstance(ms, (list, tuple)):
+                                main_seats = [int(x) for x in ms]
+                                _wdbg(f"[control] set_main_seats (inline) -> {main_seats}")
+                        except Exception:
+                            pass
+                    elif isinstance(cmd, dict) and cmd.get('cmd') == 'set_main_seats':
+                        try:
+                            ms = cmd.get('value', None)
+                            if isinstance(ms, (list, tuple)):
+                                main_seats = [int(x) for x in ms]
+                                _wdbg(f"[control] set_main_seats -> {main_seats}")
+                        except Exception:
+                            pass
+                    elif isinstance(cmd, dict) and cmd.get('cmd') == 'stop':
+                        # Exit worker gracefully
+                        if _worker_prof is not None:
+                            _worker_prof.stop()
+                        return
+                    elif local_infer_enabled and isinstance(cmd, dict) and cmd.get('cmd') == 'sync_actor':
+                        state_main = cmd.get('main')
+                        state_shadow = cmd.get('shadow')
+                        if state_main is not None:
+                            if local_actor_main is None:
+                                local_actor_main = ActionConditionedActor()
+                            local_actor_main.load_state_dict(state_main)
+                            local_actor_main.to(local_infer_device)
+                            local_actor_main.eval()
+                            for p in local_actor_main.parameters():
+                                p.requires_grad_(False)
+                        if state_shadow is not None:
+                            if local_actor_shadow is None:
+                                local_actor_shadow = ActionConditionedActor()
+                            local_actor_shadow.load_state_dict(state_shadow)
+                            local_actor_shadow.to(local_infer_device)
+                            local_actor_shadow.eval()
+                            for p in local_actor_shadow.parameters():
+                                p.requires_grad_(False)
+                        else:
+                            local_actor_shadow = None
+                        continue
+                    else:
+                        if cmd is not None:
+                            _wdbg(f"[control] ignoring command {cmd}")
+                        continue
+            # Produce 'budget' episodes this round
+            _wdbg(f"starting production loop with budget={budget}")
+            produced_any = False
+            produced_count_round = 0
+            for ep in range(max(0, int(budget))):
+                t0 = time.time(); env.reset(); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
+                _wdbg(f"ep {ep} reset")
+                obs_list, next_obs_list = [], []
+                act_list = []
+                rew_list, done_list = [], []
+                seat_team_list = []
+                belief_sum_list = []
+                legals_list, legals_offset, legals_count = [], [], []
+                chosen_index_list = []
+                mcts_policy_list = []
+                mcts_weight_list = []
+                others_hands_list = []
+
+                done = False
+                info = {}
+                step_idx = 0
+                while not done:
+                    t0 = time.time();
+                    with _record_function('env._get_observation'):
+                        obs = env._get_observation(env.current_player)
+                    t_get_obs += (time.time() - t0) if _PAR_TIMING else 0.0
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: got obs (cp={env.current_player})")
+                    t0 = time.time();
+                    with _record_function('env.get_valid_actions'):
+                        legal = env.get_valid_actions()
+                    t_get_legals += (time.time() - t0) if _PAR_TIMING else 0.0
+                    if step_idx < 3:
+                        _wdbg(f"ep {ep} step {step_idx}: legals={int(len(legal))}")
+                    if torch.is_tensor(legal) and (legal.size(0) == 0):
+                        raise RuntimeError(f"collect_trajectory_parallel: worker {worker_id} got 0 legal actions (player={env.current_player})")
+                    # Avoid ambiguous truth-value on tensors; treat empty action sets explicitly
+                    is_empty = (int(legal.numel()) == 0)
+                    if is_empty:
+                        raise RuntimeError(f"worker {worker_id}: no legal actions at episode start (player={env.current_player})")
+                    cp = env.current_player
+                    seat_vec = _seat_vec_for(cp)
+                    seat_cpu = seat_vec
+                    obs_cpu = _to_cpu_float32(obs)
+                    if torch.is_tensor(legal):
+                        legal_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
+                        legal_cpu_entries = list(legal_cpu_tensor.unbind(0))
+                    else:
+                        legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
+                        legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
+                    legal_count = len(legal_cpu_entries)
+                    is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
+                    store_sample = bool(train_both_teams or is_main)
+                    policy_entries: List[float] = []
+                    policy_weight = 0.0
+                    bsum_tensor = _BELIEF_ZERO
+                    # Only attempt MCTS in worker if explicitly enabled and mcts_sims > 0
+                    _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
+                    if (is_main or _both_sides) and use_mcts and len(legal) > 0 and int(mcts_sims) > 0:
+                        # Build helper RPCs to master for batched scoring
+                        if send_legals:
+                            leg_serial = [x.tolist() for x in legal_cpu_entries]
+                        else:
+                            leg_serial = []
+                        def policy_fn_mcts(_obs, _legals):
+                            nonlocal t_rpc
+                            # Invia tensori CPU direttamente (no conversione a liste) per ridurre overhead IPC
+                            o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
+                            leg_cpu = torch.stack([ (y.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
+                            t1 = time.time()
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: MCTS policy -> send, waiting priors")
+                            request_q.put({
+                                'type': 'score_policy',
+                                'wid': worker_id,
+                                'obs': o_cpu,
+                                'legals': leg_cpu,
+                                'seat': seat_cpu,
+                            })
+                            try:
+                                resp = action_q.get(timeout=rpc_timeout_s)
+                            except queue.Empty as e:
+                                raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_policy priors") from e
+                            t_rpc_local = (time.time() - t1)
+                            if _PAR_TIMING:
+                                t_rpc = t_rpc + t_rpc_local
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: MCTS policy <- got priors")
+                            pri = resp.get('priors', None)
+                            import numpy as _np
+                            if pri is None or (len(pri) != len(_legals)):
+                                raise RuntimeError(f"worker {worker_id}: invalid priors from master (priors={type(pri)}, expected_len={len(_legals)})")
+                            return _np.asarray(pri, dtype=_np.float32)
+                        def value_fn_mcts(_obs, _env):
+                            s_vec = _seat_vec_for(_env.current_player)
+                            o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: MCTS value -> send, waiting value")
+                            request_q.put({
+                                'type': 'score_value',
+                                'wid': worker_id,
+                                'obs': o_cpu,
+                                'seat': s_vec,
+                            })
+                            try:
+                                resp = action_q.get(timeout=rpc_timeout_s)
+                            except queue.Empty as e:
+                                raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_value") from e
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: MCTS value <- got value")
+                            return float(resp.get('value', 0.0))
+                        def belief_sampler_neural(_env):
+                            o_cur = _env._get_observation(_env.current_player)
+                            s_vec = _seat_vec_for(_env.current_player)
+                            o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: MCTS belief -> send, waiting probs")
+                            request_q.put({
+                                'type': 'score_belief',
+                                'wid': worker_id,
+                                'obs': o_cpu,
+                                'seat': s_vec,
+                            })
+                            try:
+                                resp = action_q.get(timeout=rpc_timeout_s)
+                            except queue.Empty as e:
+                                raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_belief") from e
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: MCTS belief <- got probs")
+                            probs_flat = resp.get('belief_probs', None)
+                            if probs_flat is None:
+                                return None
+                            import numpy as _np
+                            probs = _np.asarray(probs_flat, dtype=_np.float32).reshape(3, 40)
+                            # visible mask from obs on worker side
+                            if torch.is_tensor(o_cur):
+                                o_t = o_cur.detach().to('cpu', dtype=torch.float32).unsqueeze(0)
+                            else:
+                                o_t = torch.as_tensor(o_cur, dtype=torch.float32).unsqueeze(0)
+                            hand_table = o_t[:, :83]
+                            hand_mask = hand_table[:, :40] > 0.5
+                            table_mask = hand_table[:, 43:83] > 0.5
+                            captured = o_t[:, 83:165]
+                            cap0_mask = captured[:, :40] > 0.5
+                            cap1_mask = captured[:, 40:80] > 0.5
+                            vis = (hand_mask | table_mask | cap0_mask | cap1_mask).squeeze(0).numpy().astype(bool)
+                            unknown_ids = [cid for cid in range(40) if not vis[cid]]
+                            others = [(_env.current_player + 1) % 4, (_env.current_player + 2) % 4, (_env.current_player + 3) % 4]
+                            counts = {pid: len(_env.game_state['hands'][pid]) for pid in others}
+                            caps = [int(counts.get(pid, 0)) for pid in others]
+                            n = len(unknown_ids)
+                            if sum(caps) != n:
+                                caps[2] = max(0, n - caps[0] - caps[1])
+                                if sum(caps) != n:
+                                    base = n // 3
+                                    rem = n - 3 * base
+                                    caps = [base, base, base]
+                                    for i in range(rem):
+                                        caps[i] += 1
+                            import numpy as _np
+                            noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
+                            costs = []
+                            for cid in unknown_ids:
+                                pc = probs[:, cid]
+                                ps = pc / max(1e-12, pc.sum())
+                                c = [-_np.log(max(1e-12, ps[i])) for i in range(3)]
+                                if noise_scale > 0:
+                                    u = _np.random.uniform(1e-9, 1.0-1e-9, size=3)
+                                    g = -_np.log(-_np.log(u)) * noise_scale
+                                    c = [c[i] + float(g[i]) for i in range(3)]
+                                costs.append(c)
+                            INF = 1e12
+                            cap0, cap1, cap2 = caps
+                            dp = [[[INF]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
+                            bk = [[[-1]*(cap1+1) for _ in range(cap0+1)] for __ in range(n+1)]
+                            dp[0][0][0] = 0.0
+                            for t in range(n):
+                                c0, c1, c2 = costs[t]
+                                for a in range(0, min(t, cap0)+1):
+                                    for b in range(0, min(t-a, cap1)+1):
+                                        cur = dp[t][a][b]
+                                        if cur >= INF:
+                                            continue
+                                        if a+1 <= cap0 and dp[t+1][a+1][b] > cur + c0:
+                                            dp[t+1][a+1][b] = cur + c0
+                                            bk[t+1][a+1][b] = 0
+                                        if b+1 <= cap1 and dp[t+1][a][b+1] > cur + c1:
+                                            dp[t+1][a][b+1] = cur + c1
+                                            bk[t+1][a][b+1] = 1
+                                        assigned2 = t - a - b
+                                        if assigned2 + 1 <= cap2 and dp[t+1][a][b] > cur + c2:
+                                            dp[t+1][a][b] = cur + c2
+                                            bk[t+1][a][b] = 2
+                            if dp[n][cap0][cap1] >= INF:
+                                return None
+                            det = {pid: [] for pid in others}
+                            a, b = cap0, cap1
+                            for t in range(n, 0, -1):
+                                choice = bk[t][a][b]
+                                cid = unknown_ids[t-1]
+                                if choice == 0:
+                                    det[others[0]].append(cid)
+                                    a -= 1
+                                elif choice == 1:
+                                    det[others[1]].append(cid)
+                                    b -= 1
+                                else:
+                                    det[others[2]].append(cid)
+                            logp = -float(dp[n][cap0][cap1])
+                            return {'assignments': det, 'logp': logp}
+                        # Progress-based scaling (uniform with single-env) — optionally gated by env
+                        progress = float(min(1.0, max(0.0, len(env.game_state.get('history', [])) / 40.0)))
+                        denom = max(1e-6, (mcts_progress_full - mcts_progress_start))
+                        alpha = min(1.0, max(0.0, (progress - mcts_progress_start) / denom))
+                        scaling_on = (str(os.environ.get('SCOPONE_MCTS_SCALING', '1')).strip().lower() in ['1','true','yes','on'])
+                        # Permetti 0 simulazioni se mcts_min_sims==0
+                        base_min = int(mcts_min_sims) if (mcts_min_sims is not None and int(mcts_min_sims) >= 0) else 0
+                        import math
+                        if mcts_train_factor is not None and float(mcts_train_factor) <= 0.0:
+                            sims_scaled = 0
+                        else:
+                            if scaling_on:
+                                sims_base = math.ceil(mcts_sims * (0.25 + 0.75 * alpha))
+                            else:
+                                sims_base = math.ceil(mcts_sims * float(mcts_train_factor if mcts_train_factor is not None else 1.0))
+                            if mcts_train_factor is not None and scaling_on:
+                                sims_base = math.ceil(sims_base * float(mcts_train_factor))
+                            sims_scaled = int(max(base_min, sims_base))
+                            if int(mcts_sims) > 0 and sims_scaled <= 0:
+                                sims_scaled = 1
+                        # Root temperature dynamic only when scaling is enabled (or explicitly overridden)
+                        root_temp_dyn = (float(mcts_root_temp) if (not scaling_on or float(mcts_root_temp) > 0)
+                                         else float(max(0.0, 1.0 - alpha)))
+
+                        # Exact-only mode: skip prior MCTS unless near end-of-hand
+                        _exact_only = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
+                        def _remaining_moves_training(_env):
+                            _hands = _env.game_state.get('hands', None)
+                            if isinstance(_hands, (list, tuple)):
+                                return int(sum(len(h) for h in _hands))
+                            if isinstance(_hands, dict):
+                                return int(sum(len(h) for h in _hands.values()))
+                            return 0
+                        def _auto_exact_thresh(_rem):
+                            if _rem <= 0:
+                                return 0
+                            _h = int(round(_rem * 0.45))
+                            return max(6, min(16, _h))
+                        _rem_moves = _remaining_moves_training(env)
+                        _ovr = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', '')).strip()
+                        if _ovr:
+                            try:
+                                _exact_thresh = max(0, int(_ovr))
+                            except ValueError:
+                                _exact_thresh = _auto_exact_thresh(_rem_moves)
+                        else:
+                            _exact_thresh = _auto_exact_thresh(_rem_moves)
+                        _near_end = (_exact_thresh > 0) and (_rem_moves <= _exact_thresh)
+                        _use_mcts_here = sims_scaled > 0 and (not (_exact_only and (not _near_end)))
+
+                        if not _use_mcts_here:
+                            # Sims ended up <= 0 despite mcts_sims > 0 — log, optionally raise for debug, then fall back to master step
+                            if (os.environ.get('SCOPONE_RAISE_ON_INVALID_SIMS', '0') == '1'
+                                    and not (_exact_only and (not _near_end))):
+                                raise RuntimeError(f"invalid sims_scaled: sims_scaled={sims_scaled} mcts_sims={mcts_sims} progress_start={mcts_progress_start} progress_full={mcts_progress_full} history_len={len(env.game_state.get('history', [])) if isinstance(env.game_state.get('history', []), list) else 'n/a'} alpha={alpha}")
+                            leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
+                            request_q.put({
+                                'type': 'step',
+                                'wid': worker_id,
+                                'obs': obs_cpu,
+                                'legals': leg_serial,
+                                'seat': seat_cpu,
+                            })
+                            try:
+                                resp = action_q.get(timeout=rpc_timeout_s)
+                                idx = int(resp.get('idx', 0))
+                            except queue.Empty as e:
+                                raise TimeoutError('Timeout waiting for step index for MCTS (invalid_sims_scaled)') from e
+                            idx = max(0, min(idx, len(legal) - 1))
+                            act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
+                            with _record_function('env.step'):
+                                next_obs, rew, done, info = env.step(act_t)
+                            # No distillation target
+                            policy_entries = [0.0] * legal_count
+                            policy_weight = 0.0
+                        else:
+                            from algorithms.is_mcts import run_is_mcts
+                            # Dynamic defaults for smoothing and root Dirichlet based on context
+                            t1 = time.time(); priors_probe = policy_fn_mcts(obs, legal); t_mcts += (time.time() - t1) if _PAR_TIMING else 0.0
+                            pri_t = (priors_probe if torch.is_tensor(priors_probe) else torch.as_tensor(priors_probe, dtype=torch.float32))
+                            peak = float(pri_t.max().item()) if pri_t.numel() > 0 else (1.0 / max(1, len(legal)))
+                            A = int(len(legal))
+                            sims_fac = 1.0 if sims_scaled < 128 else (0.5 if sims_scaled < 256 else 0.25)
+                            peak_fac = min(1.0, max(0.0, (peak - 0.5) / 0.4))
+                            prior_eps_eff = 0.1 * sims_fac * peak_fac * (1.0 - alpha)
+                            prior_eps_eff = float(max(0.0, min(0.15, prior_eps_eff)))
+                            if A <= 3:
+                                dir_eps_eff = 0.0
+                            else:
+                                a_fac = min(1.0, max(0.0, (A - 3) / 10.0))
+                                sim_att = (0.7 if sims_scaled >= 256 else 1.0)
+                                prog_att = (0.7 if alpha > 0.7 else 1.0)
+                                dir_eps_eff = 0.25 * a_fac * sim_att * prog_att
+                                dir_eps_eff = float(max(0.0, min(0.3, dir_eps_eff)))
+
+                            # Choose determinisations count depending on whether we expect exact solve (Train-specific only)
+                            _dets_prior = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_PRIOR', str(mcts_dets)))
+                            _dets_exact = int(os.environ.get('SCOPONE_TRAIN_MCTS_DETS_EXACT', str(mcts_dets)))
+                            _dets_eff = int(_dets_exact if _near_end else _dets_prior)
+
+                            # Ensure per-context depth/exact settings propagate to MCTS core (no ENV fallbacks)
+                            os.environ['SCOPONE_MCTS_MAX_DEPTH'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_MAX_DEPTH', '0'))
+                            os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', ''))
+                            os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '0'))
+
+                            mcts_action, mcts_visits = run_is_mcts(env,
+                                policy_fn=policy_fn_mcts,
+                                value_fn=value_fn_mcts,
+                                num_simulations=int(sims_scaled),
+                                c_puct=float(mcts_c_puct),
+                                belief=None,
+                                num_determinization=int(_dets_eff),
+                                root_temperature=root_temp_dyn,
+                                prior_smooth_eps=prior_eps_eff,
+                                robust_child=True,
+                                root_dirichlet_alpha=float(mcts_dirichlet_alpha),
+                                root_dirichlet_eps=dir_eps_eff,
+                                return_stats=True,
+                                belief_sampler=belief_sampler_neural,
+                                exact_only=_exact_only and not _near_end)
+                            chosen_act = mcts_action if torch.is_tensor(mcts_action) else torch.as_tensor(mcts_action, dtype=torch.float32)
+                            def _act_key(x_t: torch.Tensor):
+                                xt = x_t if torch.is_tensor(x_t) else torch.as_tensor(x_t, dtype=torch.float32)
+                                return tuple(torch.nonzero(xt > 0.5, as_tuple=False).flatten().tolist())
+                            key_target = _act_key(chosen_act)
+                            idx = 0
+                            for i_a, a in enumerate(legal):
+                                if _act_key(a) == key_target:
+                                    idx = int(i_a)
+                                    break
+                            act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
+                            t1 = time.time();
+                            with _record_function('env.step'):
+                                next_obs, rew, done, info = env.step(act_t)
+                            t_step += (time.time() - t1) if _PAR_TIMING else 0.0
+                            # Distillation targets
+                            mcts_probs = torch.as_tensor(mcts_visits, dtype=torch.float32)
+                            ssum = float(mcts_probs.sum().item())
+                            if ssum > 0:
+                                mcts_probs = mcts_probs / ssum
+                            policy_entries = (mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs))
+                            policy_weight = 1.0
+                    else:
+                        # Request action selection from master (GPU)
+                        leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
+                        idx = None
+                        if local_infer_enabled and (local_actor_main is not None):
+                            actor_use = local_actor_main
+                            frozen_non_main = bool(cfg.get('frozen_non_main', False))
+                            if frozen_non_main and (not is_main) and (local_actor_shadow is not None):
+                                actor_use = local_actor_shadow
+                            try:
+                                req_local = {
+                                    'obs': obs_cpu,
+                                    'legals': [torch.as_tensor(x, dtype=torch.float32, device='cpu') for x in legal_cpu_entries],
+                                    'seat': seat_cpu,
+                                    'wid': int(worker_id),
+                                }
+                                sel_local = _batched_select_indices_actor_device(actor_use, [req_local], local_infer_device)
+                                if sel_local:
+                                    idx = int(sel_local[0][1])
+                            except Exception as exc:
+                                if step_idx < 3:
+                                    _wdbg(f"ep {ep} step {step_idx}: local infer failed -> {exc}; fallback to RPC")
+                                idx = None
+                        if idx is None:
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: STEP -> send, waiting idx (A={len(legal)})")
+                            t1 = time.time(); request_q.put({
+                                'type': 'step',
+                                'wid': worker_id,
+                                'obs': obs_cpu,
+                                'legals': leg_serial,
+                                'seat': seat_cpu,
+                            })
+                            try:
+                                resp = action_q.get(timeout=rpc_timeout_s)
+                                idx = int(resp.get('idx', 0))
+                            except queue.Empty as e:
+                                raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (main path)") from e
+                            t_rpc += (time.time() - t1) if _PAR_TIMING else 0.0
+                            if step_idx < 3:
+                                _wdbg(f"ep {ep} step {step_idx}: STEP <- got idx={int(idx)}")
+                            idx = max(0, min(idx, len(legal) - 1))
+                        act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
+                        t1 = time.time();
+                        with _record_function('env.step'):
+                            next_obs, rew, done, info = env.step(act_t)
+                        if step_idx < 3:
+                            _wdbg(f"ep {ep} step {step_idx}: env.step done={bool(done)} rew={float(rew)}")
+                        step_idx += 1
+                        t_step += (time.time() - t1) if _PAR_TIMING else 0.0
+                        # No distillation target
+                        policy_entries = [0.0] * legal_count
+                        policy_weight = 0.0
+
+                    next_obs_cpu = _to_cpu_float32(next_obs)
+                    act_cpu = _to_cpu_float32(act_t)
+
+                    if store_sample:
+                        obs_list.append(obs_cpu)
+                        next_obs_list.append(next_obs_cpu)
+                        act_list.append(act_cpu)
+                        rew_list.append(float(rew))
+                        done_list.append(bool(done))
+                        seat_team_list.append(seat_cpu)
+                        belief_sum_list.append(bsum_tensor)
+                        legals_offset.append(len(legals_list))
+                        legals_count.append(legal_count)
+                        if send_legals:
+                            legals_list.extend(legal_cpu_entries)
+                        else:
+                            raise RuntimeError("collect_trajectory_parallel: send_legals disabled in parallel path")
+                        chosen_index_list.append(int(idx))
+                        entries = policy_entries if len(policy_entries) > 0 else ([0.0] * legal_count)
+                        mcts_policy_list.extend(entries)
+                        mcts_weight_list.append(policy_weight if len(policy_entries) > 0 else 0.0)
+                        # Others' hands supervision target (3x40) — skip if BELIEF_AUX_COEF <= 0
+                        if belief_aux_coef <= 0.0:
+                            others_hands_list.append(_OTHERS_HANDS_ZERO)
+                        else:
+                            hands = env.game_state.get('hands', None)
+                            if hands is None:
+                                raise RuntimeError("collect_trajectory_parallel: env hands data missing for belief supervision")
+                            others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
+                            target = torch.zeros((3,40), dtype=torch.float32)
+                            for i,pid in enumerate(others):
+                                for c in hands[pid]:
+                                    if isinstance(c, int):
+                                        cid = c
+                                    else:
+                                        r, s = c
+                                        suit_to_int = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
+                                        cid = int((r - 1) * 4 + suit_to_int[s])
+                                    target[i, int(cid)] = 1.0
+                            others_hands_list.append(target)
+                    else:
+                        # Non-main seats skipped when training only main seats; ensure last stored sample closes episode
+                        if done and len(done_list) > 0:
+                            done_list[-1] = True
+                            if len(next_obs_list) > 0:
+                                next_obs_list[-1] = next_obs_cpu
+
+                # Ensure at least one step per episode to avoid empty payloads
+                if len(obs_list) == 0:
+                    raise RuntimeError(f"collect_trajectory_parallel: worker {worker_id} produced an empty episode payload")
+                if _WDBG:
+                    try:
+                        tqdm.write(
+                            f"[worker {worker_id}] ep {ep} complete steps={len(obs_list)} "
+                            f"rew_sum={float(sum(rew_list) if len(rew_list) > 0 else 0.0)} "
+                            f"done_cnt={int(sum(done_list) if len(done_list) > 0 else 0)} "
+                            f"store_sample={bool(store_sample)}")
+                    except Exception:
+                        pass
+                # Episode payload back to master using NumPy arrays (avoid Torch resource_sharer FDs entirely)
+                import numpy as _np
+                if len(obs_list) > 0:
+                    t1 = time.time(); obs_t = torch.stack(obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+                else:
+                    obs_t = _np.zeros((0, 1), dtype=_np.float32)
+                if len(next_obs_list) > 0:
+                    t1 = time.time(); next_obs_t = torch.stack(next_obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+                else:
+                    next_obs_t = _np.zeros((0, 1), dtype=_np.float32)
+                if len(act_list) > 0:
+                    t1 = time.time(); act_t = torch.stack(act_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+                else:
+                    act_t = _np.zeros((0, 80), dtype=_np.float32)
+                if len(seat_team_list) > 0:
+                    t1 = time.time(); seat_t = torch.stack(seat_team_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+                else:
+                    seat_t = _np.zeros((0, 6), dtype=_np.float32)
+                if len(belief_sum_list) > 0:
+                    t1 = time.time(); belief_t = torch.stack(belief_sum_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+                else:
+                    belief_t = _np.zeros((0, 120), dtype=_np.float32)
+                if len(legals_list) > 0:
+                    t1 = time.time(); legals_t = torch.stack(legals_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+                else:
+                    legals_t = _np.zeros((0, 80), dtype=_np.float32)
+                leg_off_t = _np.asarray(legals_offset, dtype=_np.int64)
+                leg_cnt_t = _np.asarray(legals_count, dtype=_np.int64)
+                chosen_idx_t = _np.asarray(chosen_index_list, dtype=_np.int64)
+                mcts_policy_t = _np.asarray(mcts_policy_list, dtype=_np.float32) if len(mcts_policy_list) > 0 else _np.zeros((0,), dtype=_np.float32)
+                mcts_weight_t = _np.asarray(mcts_weight_list, dtype=_np.float32) if len(mcts_weight_list) > 0 else _np.zeros((0,), dtype=_np.float32)
+                if len(others_hands_list) > 0:
+                    t1 = time.time(); others_hands_t = torch.stack(others_hands_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+                else:
+                    others_hands_t = _np.zeros((0, 3, 40), dtype=_np.float32)
+
+                # Non-blocking put with timeout to avoid deadlocks if the master is slow
+                payload = {
+                    'wid': worker_id,
+                    'obs': obs_t,
+                    'next_obs': next_obs_t,
+                    'act': act_t,
+                    'rew': rew_list,
+                    'done': done_list,
+                    'seat': seat_t,
+                    'belief_summary': belief_t,
+                    'legals': legals_t,
+                    'leg_off': leg_off_t,
+                    'leg_cnt': leg_cnt_t,
+                    'chosen_idx': chosen_idx_t,
+                    'team_rewards': (info.get('team_rewards', [0.0, 0.0]) if isinstance(info, dict) else [0.0, 0.0]),
+                    'mcts_policy': mcts_policy_t,
+                    'mcts_weight': mcts_weight_t,
+                    'others_hands': others_hands_t,
+                }
+                try:
+                    if len(obs_list) == 0:
+                        raise RuntimeError(f"worker {worker_id}: episode finished with zero steps - invalid episode")
+                    _wdbg(f"ep {ep} putting episode payload (steps={len(obs_list)})")
+                    episode_q.put(payload, timeout=episode_put_timeout_s)
+                    _wdbg(f"ep {ep} payload put ok (obs={len(obs_list)} legals_buf={len(legals_list)} chosen={len(chosen_index_list)})")
+                except Exception as e:
+                    raise RuntimeError(f"worker {worker_id}: episode_q.put failed") from e
+                else:
+                    produced_any = True
+                    produced_count_round += 1
+
+            # End-of-round signalling (like per-iteration)
+            if produced_any:
+                _wdbg(f"round done -> sending done marker (episodes={produced_count_round})")
+                episode_q.put({'wid': worker_id, 'type': 'done', 'episodes': produced_count_round}, timeout=2.0)
+                if _PAR_TIMING:
+                    total = time.time() - t0_glob
+                    episode_q.put({'wid': worker_id, 'type': 'timing',
+                                   't_env_reset': t_env_reset,
+                                   't_get_obs': t_get_obs,
+                                   't_get_legals': t_get_legals,
+                                   't_mcts': t_mcts,
+                                   't_rpc': t_rpc,
+                                   't_step': t_step,
+                                   't_pack': t_pack,
+                                   't_total': total})
+            else:
+                _wdbg("round done -> no episodes produced")
+            # In non-persistent mode produce once and exit; otherwise reset timers and wait for new budget
+            if not _persistent:
+                return
+            t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
+            t0_glob = time.time()
+            episodes_per_env = 0
+    except Exception as _worker_exc:
+        err_payload = {
+            'wid': int(worker_id),
+            'type': 'error',
+            'error': ''.join(traceback.format_exception(type(_worker_exc), _worker_exc, _worker_exc.__traceback__)),
+        }
+        try:
+            episode_q.put(err_payload, timeout=2.0)
+        except Exception:
+            pass
+        raise
 def _batched_select_indices(agent: ActionConditionedPPO,
                             reqs: List[Dict]) -> List[Tuple[int, int]]:
     # Returns list of (wid, idx) per req
     if len(reqs) == 0:
         return []
+    if _PAR_DEBUG:
+        try:
+            legals_sizes = [len(r.get('legals', [])) for r in reqs]
+            wid_list = [r.get('wid') for r in reqs]
+            tqdm.write(f"[batched_select] reqs={len(reqs)} wids={wid_list} legals_sizes={legals_sizes}")
+        except Exception:
+            pass
     # Basic validation
     for r in reqs:
         if 'obs' not in r or 'legals' not in r or 'wid' not in r:
@@ -1048,8 +1453,7 @@ def _batched_select_indices(agent: ActionConditionedPPO,
         if cnt > 0:
             flat_legals.extend(r['legals'])
     if len(flat_legals) == 0:
-        # No legals, return zeros
-        return [(int(reqs[i]['wid']), 0) for i in range(len(reqs))]
+        raise RuntimeError("_batched_select_indices: received requests without legal actions")
     if _PAR_TIMING:
         _BATCHSEL_PROF['t_leg_stack'] += (time.time() - _t0)
     _t0 = time.time() if _PAR_TIMING else 0.0
@@ -1125,8 +1529,7 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             for i in range(B):
                 c = int(cnts_t[i].item())
                 if c <= 0:
-                    sel[i] = 0
-                    continue
+                    raise RuntimeError(f"_batched_select_indices: no legal actions for request index {i}")
                 start = int(offs[i])
                 end = start + c
                 # Slice legals for this sample
@@ -1136,32 +1539,115 @@ def _batched_select_indices(agent: ActionConditionedPPO,
                 # Legal positions with chosen card
                 mask_slice = (played_slice == cc)
                 if not bool(mask_slice.any().item()):
-                    # Fallback STRICT: raise
-                    if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                        raise RuntimeError(f"_batched_select_indices: no legal captures for chosen card (sample={i}, card={cc}, cnt={c})")
-                    sel[i] = 0
-                    continue
+                    raise RuntimeError(f"_batched_select_indices: no legal captures for chosen card (sample={i}, card={cc}, cnt={c})")
                 idxs = torch.nonzero(mask_slice, as_tuple=False).flatten()
                 # Compute capture logits for this sample subset
                 emb_slice = a_emb_all_dev[start:end][idxs]
                 cap_logits = (emb_slice * state_proj[i]).sum(dim=1)
                 probs_cap = torch.softmax(cap_logits, dim=0).nan_to_num(0.0)
                 if bool((probs_cap.sum() <= 0) or (~torch.isfinite(probs_cap.sum()))):
-                    if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                        raise RuntimeError(f"_batched_select_indices: invalid capture probabilities (sample={i})")
-                    sel[i] = int(idxs[0].item())
-                    continue
+                    raise RuntimeError(f"_batched_select_indices: invalid capture probabilities (sample={i})")
                 j = int(torch.multinomial(probs_cap, num_samples=1).item())
                 sel[i] = int(idxs[j].item())
             sel_cpu = sel.detach().to('cpu')
             for i in range(B):
                 out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
         else:
-            out_idx = [(int(reqs[i]['wid']), 0) for i in range(B)]
+            raise RuntimeError("_batched_select_indices_with_actor: no legal actions available in any request")
     if _PAR_TIMING:
         _BATCHSEL_PROF['t_total'] += (time.time() - _t_total0)
         _BATCHSEL_PROF['count'] += 1
     return out_idx
+
+
+def _batched_select_indices_actor_device(actor: ActionConditionedActor,
+                                         reqs: List[Dict],
+                                         sel_device: torch.device) -> List[Tuple[int, int]]:
+    if len(reqs) == 0:
+        return []
+    for r in reqs:
+        if 'obs' not in r or 'legals' not in r or 'wid' not in r or 'seat' not in r:
+            raise KeyError("_batched_select_indices_actor_device: missing 'obs'/'legals'/'wid'/'seat' in request")
+    with torch.no_grad():
+        obs_t = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32, device=sel_device) for r in reqs], dim=0)
+        seat_t = torch.stack([torch.as_tensor(r['seat'], dtype=torch.float32, device=sel_device) for r in reqs], dim=0)
+        flat_legals: List[torch.Tensor] = []
+        offs: List[int] = []
+        cnts: List[int] = []
+        for r in reqs:
+            offs.append(len(flat_legals))
+            legals = r.get('legals', [])
+            if isinstance(legals, torch.Tensor):
+                if legals.dim() == 1:
+                    legals = legals.unsqueeze(0)
+                tensors = [legals[i].to(sel_device, dtype=torch.float32) for i in range(legals.size(0))]
+            else:
+                tensors = [torch.as_tensor(x, dtype=torch.float32, device=sel_device) for x in legals]
+            cnt = len(tensors)
+            cnts.append(cnt)
+            if cnt > 0:
+                flat_legals.extend(tensors)
+        if len(flat_legals) == 0:
+            raise RuntimeError("_batched_select_indices_actor_device: received requests without legal actions")
+        leg_t = torch.stack(flat_legals, dim=0)
+        state_proj = actor.compute_state_proj(obs_t, seat_t)
+        a_emb_all = actor.action_enc(leg_t)
+        B = obs_t.size(0)
+        cnts_t = torch.as_tensor(cnts, dtype=torch.long, device=sel_device)
+        max_cnt = int(cnts_t.max().item()) if B > 0 else 0
+        if max_cnt <= 0:
+            raise RuntimeError("_batched_select_indices_actor_device: no legal actions available in any request")
+        pos = torch.arange(max_cnt, device=sel_device, dtype=torch.long)
+        rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
+        mask = rel_pos_2d < cnts_t.unsqueeze(1)
+        offs_t = torch.as_tensor(offs, dtype=torch.long, device=sel_device)
+        abs_idx = (offs_t.unsqueeze(1) + rel_pos_2d)[mask]
+        sample_idx = torch.arange(B, device=sel_device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+        card_logits_all = torch.matmul(state_proj, actor.card_emb_play.t())
+        played_ids_all = torch.argmax(leg_t[:, :40], dim=1)
+        played_ids_mb = played_ids_all[abs_idx]
+        allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=sel_device)
+        allowed_mask[sample_idx, played_ids_mb] = True
+        masked_logits = torch.where(allowed_mask, card_logits_all, torch.full_like(card_logits_all, float('-inf')))
+        probs_cards = torch.softmax(masked_logits, dim=1)
+        valid_rows = (cnts_t > 0)
+        chosen_card = torch.zeros((B,), dtype=torch.long, device=sel_device)
+        if bool(valid_rows.any().item()):
+            pv_cards = probs_cards[valid_rows]
+            pv_cards = pv_cards.nan_to_num(0.0)
+            pv_cards = torch.clamp(pv_cards, min=0.0)
+            rs = pv_cards.sum(dim=1, keepdim=True)
+            if bool(((rs <= 0) | (~torch.isfinite(rs))).any().item()):
+                raise RuntimeError("_batched_select_indices_actor_device: invalid card probability rows (NaN/Inf or zero-sum)")
+            pv_cards = pv_cards / rs
+            chosen_sub = torch.multinomial(pv_cards, num_samples=1).squeeze(1)
+            chosen_card[valid_rows] = chosen_sub
+        sel = torch.zeros((B,), dtype=torch.long, device=sel_device)
+        for i in range(B):
+            c = int(cnts_t[i].item())
+            if c <= 0:
+                raise RuntimeError(f"_batched_select_indices_actor_device: no legal actions for request index {i}")
+            start = int(offs[i])
+            end = start + c
+            played_slice = played_ids_all[start:end]
+            cc = int(chosen_card[i].item())
+            mask_slice = (played_slice == cc)
+            if not bool(mask_slice.any().item()):
+                raise RuntimeError(f"_batched_select_indices_actor_device: no legal captures for chosen card (sample={i}, card={cc}, cnt={c})")
+            idxs = torch.nonzero(mask_slice, as_tuple=False).flatten()
+            emb_slice = a_emb_all[start:end][idxs]
+            cap_logits = (emb_slice * state_proj[i]).sum(dim=1)
+            probs_cap = torch.softmax(cap_logits, dim=0).nan_to_num(0.0)
+            if bool((probs_cap.sum() <= 0) or (~torch.isfinite(probs_cap.sum()))):
+                raise RuntimeError(f"_batched_select_indices_actor_device: invalid capture probabilities (sample={i})")
+            j = int(torch.multinomial(probs_cap, num_samples=1).item())
+            sel[i] = int(idxs[j].item())
+        sel_cpu = sel.detach().to('cpu')
+        out_idx: List[Tuple[int, int]] = []
+        for i in range(B):
+            out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
+        return out_idx
+
 
 def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict]:
     """Service batched policy/value/belief scoring requests.
@@ -1204,7 +1690,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                     policy_cnts.append(cnt)
                     policy_legals_rows.append(leg)
                 else:
-                    results[i] = {'priors': []}
+                    raise RuntimeError("_batched_service: score_policy request without legal actions")
             else:
                 # list-like
                 cnt = len(leg)
@@ -1213,7 +1699,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                     policy_cnts.append(cnt)
                     policy_legals_rows.append(torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in leg], dim=0))
                 else:
-                    results[i] = {'priors': []}
+                    raise RuntimeError("_batched_service: score_policy request without legal actions")
 
     if len(policy_positions) > 0:
         _t_policy0 = time.time() if _PAR_TIMING else 0.0
@@ -1298,8 +1784,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                         pri = []
                     results[pos_j] = {'priors': pri}
             else:
-                for pos_j in policy_positions:
-                    results[pos_j] = {'priors': []}
+                raise RuntimeError("_batched_service: unable to compute priors for policy requests (no legal actions)")
         if _PAR_TIMING:
             try:
                 _SERVICE_PROF['policy']['calls'] += 1
@@ -1375,15 +1860,18 @@ class ParallelCollector:
     def __init__(self, num_envs: int, cfg_base: Dict, show_progress_env: bool, tqdm_base_pos: int):
         available_methods = set(mp.get_all_start_methods())
         override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
-        if override in {'spawn', 'fork', 'forkserver'} and override in available_methods:
+        if override in {'spawn', 'fork', 'forkserver'}:
+            if override not in available_methods:
+                raise RuntimeError(f"ParallelCollector: requested start method '{override}' unavailable (available={sorted(available_methods)})")
             start_method = override
         else:
             if platform.system().lower() == 'windows':
-                start_method = 'spawn'
+                candidate = 'spawn'
             else:
-                start_method = 'fork' if 'fork' in available_methods else ('spawn' if 'spawn' in available_methods else next(iter(available_methods)))
-            if start_method not in available_methods:
-                start_method = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
+                candidate = 'fork' if 'fork' in available_methods else 'spawn'
+            if candidate not in available_methods:
+                raise RuntimeError(f"ParallelCollector: start method '{candidate}' unsupported on this platform (available={sorted(available_methods)})")
+            start_method = candidate
         self.ctx = mp.get_context(start_method)
         self.num_envs = int(num_envs)
         self.request_q = self.ctx.Queue(maxsize=self.num_envs * 4)
@@ -1397,6 +1885,13 @@ class ParallelCollector:
             p = self.ctx.Process(target=_env_worker, args=(wid, cfg, self.request_q, self.action_queues[wid], self.episode_q, self.control_queues[wid]), daemon=True)
             p.start()
             self.workers.append(p)
+        self._infer_device = _resolve_infer_device()
+        self._infer_workers = max(1, int(os.environ.get('SCOPONE_INFER_WORKERS', '1')))
+        self._infer_workers = min(self._infer_workers, max(1, self.num_envs))
+        if self._infer_device.type == 'cuda':
+            self._infer_workers = 1
+        self._local_infer = (str(os.environ.get('SCOPONE_COLLECT_LOCAL_INFER', '0')).strip().lower() in ['1', 'true', 'yes', 'on'])
+        self._action_selector: Optional[AsyncActionSelector] = None
         _TQDM_DISABLE = (os.environ.get('TQDM_DISABLE','0') in ['1','true','yes','on'])
         _PER_ENV_TQDM = (str(os.environ.get('SCOPONE_PER_ENV_TQDM', '1')).strip().lower() in ['1','true','yes','on'])
         self._show_pb = bool(show_progress_env) and _PER_ENV_TQDM and (not _TQDM_DISABLE) and (not _PAR_DEBUG)
@@ -1406,91 +1901,358 @@ class ParallelCollector:
                 self.env_pbars.append(tqdm(total=0, desc=f"env {wid}", position=(tqdm_base_pos + wid), leave=False, dynamic_ncols=True, disable=_TQDM_DISABLE))
         else:
             self.env_pbars = [None] * self.num_envs
+        self._ensure_workers_alive(stage="startup")
 
-    def dispatch_budget(self, total_episodes: int, main_seats: Optional[List[int]] = None) -> List[int]:
+    def _ensure_workers_alive(self, stage: str = "") -> None:
+        dead = []
+        for wid, proc in enumerate(self.workers):
+            if proc is None or (not proc.is_alive()):
+                dead.append((wid, getattr(proc, 'pid', None), getattr(proc, 'exitcode', None)))
+        if dead:
+            detail = ', '.join(f"wid={wid} pid={pid} exitcode={exitcode}" for wid, pid, exitcode in dead)
+            context = f" during {stage}" if stage else ""
+            raise RuntimeError(f"ParallelCollector: workers not alive{context}: {detail}")
+
+    def _broadcast_actor(self, actor_main: ActionConditionedActor, actor_shadow: Optional[ActionConditionedActor]) -> None:
+        if not self._local_infer:
+            return
+        main_state = _actor_state_dict_cpu(actor_main)
+        shadow_state = _actor_state_dict_cpu(actor_shadow) if actor_shadow is not None else None
+        cmd = {'cmd': 'sync_actor', 'main': main_state, 'shadow': shadow_state}
+        for ctrl in self.control_queues:
+            try:
+                ctrl.put(cmd, block=False)
+            except Exception:
+                ctrl.put(cmd)
+
+    def dispatch_budget(self, total_episodes: int, main_seats: Optional[Union[List[int], str]] = None) -> List[int]:
+        self._ensure_workers_alive(stage="dispatch_budget")
         base = int(total_episodes) // self.num_envs
         rem = int(total_episodes) % self.num_envs
         per_env = [base + (1 if i < rem else 0) for i in range(self.num_envs)]
+        if _PAR_DEBUG:
+            tqdm.write(f"[collector] dispatch_budget total={total_episodes} per_env={per_env} main_seats={main_seats}")
+        mix_main_seats = False
+        resolved_main_seats: Optional[List[int]] = None
+        if isinstance(main_seats, str):
+            mode = main_seats.strip().lower()
+            if mode in ('mix', 'both', 'alternate'):
+                mix_main_seats = True
+            elif mode in ('even', '02', 'zero-two', 'team_a'):
+                resolved_main_seats = [0, 2]
+            elif mode in ('odd', '13', 'one-three', 'team_b'):
+                resolved_main_seats = [1, 3]
+            else:
+                raise ValueError(f"dispatch_budget: unsupported main_seats mode '{main_seats}'")
+        elif main_seats is not None:
+            resolved_main_seats = list(main_seats)
         for wid in range(self.num_envs):
-            try:
-                self.control_queues[wid].put({'cmd': 'set_budget', 'episodes': int(per_env[wid])}, block=False)
-                if main_seats is not None:
-                    self.control_queues[wid].put({'cmd': 'set_main_seats', 'value': list(main_seats)}, block=False)
-                if self.env_pbars[wid] is not None:
-                    self.env_pbars[wid].reset(total=int(per_env[wid]))
-            except Exception:
-                pass
+            cmd = {'cmd': 'set_budget', 'episodes': int(per_env[wid])}
+            if mix_main_seats:
+                cmd['main_seats'] = [0, 2] if (wid % 2 == 0) else [1, 3]
+            elif resolved_main_seats is not None:
+                cmd['main_seats'] = list(resolved_main_seats)
+            self.control_queues[wid].put(cmd, block=False)
+            if _PAR_DEBUG:
+                tqdm.write(f"[collector] sent set_budget wid={wid} episodes={int(per_env[wid])} main_seats={cmd.get('main_seats')}")
+            if self.env_pbars[wid] is not None:
+                self.env_pbars[wid].reset(total=int(per_env[wid]))
         return per_env
 
     def drain_once(self, agent: ActionConditionedPPO, expected_total: int, frozen_actor: Optional[ActionConditionedActor], frozen_non_main: bool) -> List[Dict]:
+        global _COLLECT_PROFILE_GLOBAL, _COLLECT_PROFILE_COUNT
         episodes_payloads: List[Dict[str, Any]] = []
         episodes_received = 0
+        wid_counts: Dict[int, int] = {}
+        wid_done_counts: Dict[int, int] = {}
         min_batch = int(os.environ.get('SCOPONE_COLLECT_MIN_BATCH', '0'))
         if min_batch <= 0:
             min_batch = max(32, 2 * int(self.num_envs))
         batch_target = max(min_batch, 64)
+        micro_batch = int(os.environ.get('SCOPONE_COLLECT_MICRO_BATCH', str(min(16, batch_target))))
+        if micro_batch <= 0:
+            micro_batch = 1
+        batch_target = max(batch_target, micro_batch)
         max_latency_s = max(0.0, float(os.environ.get('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')) / 1000.0)
+        _stall_env = float(os.environ.get('SCOPONE_COLLECTOR_STALL_S', '30'))
+        stall_timeout_s = None if _stall_env <= 0.0 else _stall_env
         last_activity = time.time()
-        while episodes_received < int(expected_total):
-            # Drain episodes
+        if _PAR_TIMING:
+            _prof_local = {
+                'selector_wait': 0.0,
+                'sync_models': 0.0,
+                'drain_eps': 0.0,
+                'service_other': 0.0,
+                'handle_req': 0.0,
+                'wait_readers': 0.0,
+                'loops': 0.0,
+            }
+        else:
+            _prof_local = {}
+
+        episode_reader = getattr(self.episode_q, "_reader", None)
+        request_reader = getattr(self.request_q, "_reader", None)
+        can_wait = (episode_reader is not None) and (request_reader is not None)
+        readers = [request_reader, episode_reader] if can_wait else []
+
+        other_reqs: List[Dict] = []
+        pending_step_reqs: List[Dict] = []
+        step_batch_limit = max(1, micro_batch)
+
+        def _flush_step_reqs() -> None:
+            nonlocal pending_step_reqs, last_activity
+            if not pending_step_reqs:
+                return
+            if self._local_infer or (self._action_selector is None):
+                pending_step_reqs = []
+                return
+            self._action_selector.submit_many(pending_step_reqs)
+            pending_step_reqs = []
+            last_activity = time.time()
+
+        def _drain_episodes() -> None:
+            nonlocal episodes_received, last_activity
             while True:
                 try:
                     ep = self.episode_q.get_nowait()
-                    if isinstance(ep, dict) and ep.get('type') == 'done':
-                        wid = int(ep.get('wid', -1))
-                        if 0 <= wid < len(self.env_pbars) and self.env_pbars[wid] is not None:
-                            self.env_pbars[wid].close(); self.env_pbars[wid] = None
-                        continue
-                    elif isinstance(ep, dict) and ep.get('type') == 'timing':
-                        continue
-                    else:
-                        episodes_payloads.append(ep)
-                        episodes_received += 1
-                        wid = int(ep.get('wid', -1))
-                        if 0 <= wid < len(self.env_pbars) and self.env_pbars[wid] is not None:
-                            self.env_pbars[wid].update(1)
-                        last_activity = time.time()
                 except queue.Empty:
                     break
-            # Gather micro-batch of requests
-            reqs: List[Dict] = []
-            try:
-                r0 = self.request_q.get(timeout=max_latency_s)
-                reqs.append(r0)
-            except queue.Empty:
-                pass
-            while len(reqs) < batch_target:
-                try:
-                    reqs.append(self.request_q.get_nowait())
-                except queue.Empty:
-                    break
-            if len(reqs) > 0:
-                step_reqs = [r for r in reqs if r.get('type') == 'step']
-                shadow_reqs = [r for r in reqs if r.get('type') == 'step_shadow']
-                other_reqs = [r for r in reqs if r.get('type') not in ('step', 'step_shadow')]
-                if len(step_reqs) > 0:
-                    sel = _batched_select_indices(agent, step_reqs)
-                    for wid, idx in sel:
-                        self.action_queues[wid].put({'idx': int(idx)}, block=False)
-                if len(shadow_reqs) > 0:
-                    if frozen_actor is None:
-                        sel = _batched_select_indices(agent, shadow_reqs)
+                if isinstance(ep, dict) and ep.get('type') == 'done':
+                    wid = int(ep.get('wid', -1))
+                    if _PAR_DEBUG:
+                        eps_done = ep.get('episodes')
+                        try:
+                            tqdm.write(f"[collector] got DONE from wid={wid} episodes={eps_done}")
+                        except Exception:
+                            pass
+                    try:
+                        eps_val = int(ep.get('episodes', 0))
+                        wid_done_counts[wid] = eps_val
+                    except Exception:
+                        pass
+                    if 0 <= wid < len(self.env_pbars) and self.env_pbars[wid] is not None:
+                        self.env_pbars[wid].close(); self.env_pbars[wid] = None
+                    continue
+                if isinstance(ep, dict) and ep.get('type') == 'timing':
+                    continue
+                if isinstance(ep, dict) and ep.get('type') == 'error':
+                    raise RuntimeError(f"collector: worker wid={ep.get('wid')} reported error:\n{ep.get('error')}")
+                episodes_payloads.append(ep)
+                episodes_received += 1
+                if _PAR_DEBUG:
+                    steps = len(ep.get('obs', [])) if isinstance(ep, dict) else 'n/a'
+                    tqdm.write(f"[collector] episode payload wid={ep.get('wid','?')} recv_count={episodes_received}/{expected_total} steps={steps}")
+                else:
+                    if episodes_received == 1:
+                        tqdm.write(f"[collector-progress] first episode received (1/{int(expected_total)})")
                     else:
-                        sel = _batched_select_indices_with_actor(frozen_actor, shadow_reqs)
-                    for wid, idx in sel:
-                        self.action_queues[wid].put({'idx': int(idx)}, block=False)
-                if len(other_reqs) > 0:
-                    outs = _batched_service(agent, other_reqs)
-                    for r, out in zip(other_reqs, outs):
-                        wid = int(r.get('wid', 0))
-                        self.action_queues[wid].put(out, block=False)
+                        milestone = max(1, int(expected_total) // 8)
+                        if milestone > 0 and (episodes_received % milestone) == 0:
+                            tqdm.write(f"[collector-progress] episodes_received={episodes_received}/{int(expected_total)}")
+                wid = int(ep.get('wid', -1))
+                wid_counts[wid] = wid_counts.get(wid, 0) + 1
+                if 0 <= wid < len(self.env_pbars) and self.env_pbars[wid] is not None:
+                    self.env_pbars[wid].update(1)
                 last_activity = time.time()
-            # Watchdog
-            if (time.time() - last_activity) > float(os.environ.get('SCOPONE_COLLECTOR_STALL_S', '30')):
-                break
+
+        def _service_other_requests() -> None:
+            nonlocal other_reqs, last_activity
+            if len(other_reqs) == 0:
+                return
+            outs = _batched_service(agent, other_reqs)
+            if _PAR_DEBUG:
+                try:
+                    kinds = [(r.get('wid'), r.get('type'), list(out.keys())) for r, out in zip(other_reqs, outs)]
+                    tqdm.write(f"[collector] responded other_reqs details={kinds}")
+                except Exception:
+                    pass
+            for r, out in zip(other_reqs, outs):
+                wid = int(r.get('wid', 0))
+                self.action_queues[wid].put(out, block=False)
+            other_reqs = []
+            last_activity = time.time()
+
+        selector_enabled = (not self._local_infer)
+        if selector_enabled:
+            if self._action_selector is None:
+                self._action_selector = AsyncActionSelector(self.ctx, self.action_queues, self._infer_device, micro_batch, max_latency_s, self._infer_workers)
+            else:
+                self._action_selector.update_config(micro_batch, max_latency_s)
+            if _PAR_TIMING:
+                _t_sel = time.time()
+            self._action_selector.wait_idle()
+            if _PAR_TIMING:
+                _prof_local['selector_wait'] += time.time() - _t_sel
+                _t_sel = time.time()
+            self._action_selector.sync_models(agent.actor, frozen_actor)
+            if _PAR_TIMING:
+                _prof_local['sync_models'] += time.time() - _t_sel
+        if self._local_infer:
+            self._broadcast_actor(agent.actor, frozen_actor)
+
+        def _handle_request(req: Dict) -> None:
+            nonlocal other_reqs, last_activity
+            if req is None:
+                return
+            r_type = req.get('type')
+            if r_type in ('step', 'step_shadow'):
+                pending_step_reqs.append(req)
+                if len(pending_step_reqs) >= step_batch_limit:
+                    _flush_step_reqs()
+            else:
+                other_reqs.append(req)
+
+        def _drain_request_queue_nowait() -> None:
+            while True:
+                try:
+                    pending_req = self.request_q.get_nowait()
+                except queue.Empty:
+                    break
+                if _PAR_TIMING:
+                    _t_handle = time.time()
+                _handle_request(pending_req)
+                if _PAR_TIMING:
+                    _prof_local['handle_req'] += time.time() - _t_handle
+            _flush_step_reqs()
+
+        def _drain_episodes_profiled() -> None:
+            if _PAR_TIMING:
+                _t0 = time.time()
+            _drain_episodes()
+            if _PAR_TIMING:
+                _prof_local['drain_eps'] += time.time() - _t0
+
+        def _service_other_requests_profiled() -> None:
+            if _PAR_TIMING:
+                _t0 = time.time()
+            _service_other_requests()
+            if _PAR_TIMING:
+                _prof_local['service_other'] += time.time() - _t0
+
+        def _drain_request_queue_profiled() -> None:
+            if _PAR_TIMING:
+                _t0 = time.time()
+            _drain_request_queue_nowait()
+            if _PAR_TIMING:
+                _prof_local['handle_req'] += time.time() - _t0
+
+        while episodes_received < int(expected_total):
+            if _PAR_DEBUG:
+                try:
+                    tqdm.write(f"[collector] loop top episodes_received={episodes_received} expected={expected_total}")
+                except Exception:
+                    pass
+            if _PAR_TIMING:
+                _prof_local['loops'] += 1.0
+            _drain_episodes_profiled()
+            _service_other_requests_profiled()
+            if can_wait:
+                wait_timeout = max_latency_s if max_latency_s > 0 else None
+                if _PAR_TIMING:
+                    _t_wait = time.time()
+                ready = _mp_wait(readers, wait_timeout) if wait_timeout is not None else _mp_wait(readers)
+                if _PAR_TIMING:
+                    _prof_local['wait_readers'] += time.time() - _t_wait
+                if not ready:
+                    self._ensure_workers_alive(stage='drain_once-req_wait')
+                else:
+                    if request_reader in ready:
+                        _drain_request_queue_profiled()
+                        _service_other_requests_profiled()
+                    if episode_reader in ready:
+                        _drain_episodes_profiled()
+            else:
+                try:
+                    timeout = max_latency_s if max_latency_s > 0 else 0.05
+                    if _PAR_TIMING:
+                        _t_wait = time.time()
+                    req = self.request_q.get(timeout=timeout)
+                    if _PAR_TIMING:
+                        _prof_local['wait_readers'] += time.time() - _t_wait
+                    if _PAR_TIMING:
+                        _t_handle = time.time()
+                    _handle_request(req)
+                    if _PAR_TIMING:
+                        _prof_local['handle_req'] += time.time() - _t_handle
+                    _drain_request_queue_profiled()
+                    _service_other_requests_profiled()
+                except queue.Empty:
+                    self._ensure_workers_alive(stage='drain_once-req_wait')
+                _drain_episodes_profiled()
+            self._ensure_workers_alive(stage='drain_once-loop')
+            for wid, proc in enumerate(self.workers):
+                if (proc is not None) and (not proc.is_alive()):
+                    exitcode = proc.exitcode
+                    pid = proc.pid
+                    raise RuntimeError(f"collector: worker wid={wid} pid={pid} exited unexpectedly (exitcode={exitcode})")
+            if (stall_timeout_s is not None) and ((time.time() - last_activity) > stall_timeout_s):
+                inactive_s = time.time() - last_activity
+                info = ', '.join(
+                    f"wid={wid}:payloads={wid_counts.get(wid,0)},done={wid_done_counts.get(wid,'?')},alive={self.workers[wid].is_alive()},exit={self.workers[wid].exitcode}"
+                    for wid in range(self.num_envs)
+                )
+                raise RuntimeError(
+                    f"collector stalled after {inactive_s:.2f}s of inactivity "
+                    f"(expected={int(expected_total)} got={episodes_received}); per-worker: {info or 'no data'}"
+                )
+        _drain_request_queue_profiled()
+        if selector_enabled and (self._action_selector is not None):
+            if _PAR_TIMING:
+                _t_sel = time.time()
+            self._action_selector.wait_idle()
+            if _PAR_TIMING:
+                _prof_local['selector_wait'] += time.time() - _t_sel
+        _service_other_requests_profiled()
+        _drain_episodes_profiled()
+        # Debug: report totals
+        tot_eps = int(len(episodes_payloads))
+        tot_steps = sum(int(len(_ep.get('obs', []))) for _ep in episodes_payloads)
+        tqdm.write(f"[debug-collect-round] expected_eps={int(expected_total)} got_eps={tot_eps} got_steps={tot_steps}")
+        if _PAR_TIMING:
+            _COLLECT_PROFILE_COUNT += 1
+            for k, v in _prof_local.items():
+                _COLLECT_PROFILE_GLOBAL[k] += float(v)
+            total_time = sum(float(v) for key, v in _prof_local.items() if key != 'loops')
+            try:
+                tqdm.write(
+                    "[collect-prof] sync={sync:.3f}s selector_wait={sel:.3f}s wait={wait:.3f}s "
+                    "episodes={eps:.3f}s other={other:.3f}s handle_req={req:.3f}s loops={loops:.0f} total={tot:.3f}s".format(
+                        sync=_prof_local.get('sync_models', 0.0),
+                        sel=_prof_local.get('selector_wait', 0.0),
+                        wait=_prof_local.get('wait_readers', 0.0),
+                        eps=_prof_local.get('drain_eps', 0.0),
+                        other=_prof_local.get('service_other', 0.0),
+                        req=_prof_local.get('handle_req', 0.0),
+                        loops=_prof_local.get('loops', 0.0),
+                        tot=total_time,
+                    )
+                )
+            except Exception:
+                pass
+        if episodes_received < int(expected_total):
+            missing = int(expected_total) - episodes_received
+            upload_info = ", ".join(
+                f"wid={wid}:payloads={wid_counts.get(wid,0)},done={wid_done_counts.get(wid,'?')},alive={self.workers[wid].is_alive()},exit={self.workers[wid].exitcode}"
+                for wid in range(self.num_envs)
+            )
+            tqdm.write(f"[collector-warning] incomplete collection: expected={int(expected_total)} got={episodes_received} missing={missing}. per-worker: {upload_info or 'no data'}")
+        if episodes_received < int(expected_total):
+            info = ", ".join(f"wid={wid}:payloads={wid_counts.get(wid,0)},done={wid_done_counts.get(wid,'?')}"
+                             for wid in sorted(set(list(wid_counts.keys()) + list(wid_done_counts.keys()))))
+            raise RuntimeError(
+                f"collector incomplete: expected {int(expected_total)} episodes but received {episodes_received} "
+                f"(missing={missing}); per-worker: {info or 'no data'}"
+            )
         return episodes_payloads
 
     def stop(self) -> None:
+        if self._action_selector is not None:
+            try:
+                self._action_selector.wait_idle()
+            except Exception:
+                pass
+            self._action_selector.stop()
+            self._action_selector = None
         for q in self.control_queues:
             try:
                 q.put({'cmd': 'stop'}, block=False)
@@ -1530,7 +2292,7 @@ def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List
         if cnt > 0:
             flat_legals.extend(r['legals'])
     if len(flat_legals) == 0:
-        return [(int(reqs[i]['wid']), 0) for i in range(len(reqs))]
+        raise RuntimeError("_batched_select_indices_with_actor: received requests without legal actions")
     leg_cpu = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in flat_legals], dim=0)
     with torch.no_grad():
         # Use CPU to avoid device churn
@@ -1559,22 +2321,23 @@ def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List
             probs = torch.where(mask, probs, torch.zeros_like(probs))
             valid_rows = (cnts_t > 0)
             sel = torch.zeros((B,), dtype=torch.long)
-            if bool(valid_rows.any()):
-                pv = probs[valid_rows]
-                mv = mask[valid_rows]
-                pv = pv.nan_to_num(0.0)
-                pv = torch.clamp(pv, min=0.0)
-                rs = pv.sum(dim=1, keepdim=True)
-                bad_rows = (~torch.isfinite(rs)) | (rs <= 0)
-                if bool(bad_rows.any()):
-                    raise RuntimeError("_batched_select_indices_with_actor: invalid probability rows (NaN/Inf or zero-sum)")
-                sub = torch.multinomial(pv, num_samples=1).squeeze(1)
-                sel[valid_rows] = sub
+            if not bool(valid_rows.all()):
+                bad = torch.nonzero(~valid_rows, as_tuple=False).flatten().tolist()
+                raise RuntimeError(f"_batched_select_indices_with_actor: zero legal actions for samples {bad}")
+            pv = probs[valid_rows]
+            pv = pv.nan_to_num(0.0)
+            pv = torch.clamp(pv, min=0.0)
+            rs = pv.sum(dim=1, keepdim=True)
+            bad_rows = (~torch.isfinite(rs)) | (rs <= 0)
+            if bool(bad_rows.any()):
+                raise RuntimeError("_batched_select_indices_with_actor: invalid probability rows (NaN/Inf or zero-sum)")
+            sub = torch.multinomial(pv, num_samples=1).squeeze(1)
+            sel[valid_rows] = sub
             sel_cpu = sel.detach()
             for i in range(B):
                 out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
         else:
-            out_idx = [(int(reqs[i]['wid']), 0) for i in range(B)]
+            raise RuntimeError("_batched_select_indices_with_actor: no legal actions available in any request")
     if _PAR_TIMING:
         _BATCHSEL_PROF['t_total'] += (time.time() - _t_total0)
         _BATCHSEL_PROF['count'] += 1
@@ -1622,7 +2385,7 @@ def _postprocess_episodes_to_batch(episodes_payloads: List[Dict],
             rew_list.append(t0 if team0_flag else t1)
         done_list.extend([bool(d) for d in ep['done']])
 
-    _obs_dim = int(episodes_payloads[0]['obs'][0].__len__()) if episodes_payloads and episodes_payloads[0]['obs'] else 1
+    _obs_dim = len(episodes_payloads[0]['obs'][0]) if episodes_payloads and len(episodes_payloads[0]['obs']) > 0 else 1
     obs_cpu_t = torch.stack(obs_cpu, dim=0) if len(obs_cpu) > 0 else torch.zeros((0, _obs_dim), dtype=torch.float32)
     next_obs_cpu_t = torch.stack(next_obs_cpu, dim=0) if len(next_obs_cpu) > 0 else torch.zeros_like(obs_cpu_t)
     act_cpu_t = torch.stack(act_cpu, dim=0) if len(act_cpu) > 0 else torch.zeros((0, 80), dtype=torch.float32)
@@ -2221,8 +2984,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     if sum(caps) != n:
                         caps[2] = max(0, n - caps[0] - caps[1])
                         if sum(caps) != n:
-                            from utils.fallback import notify_fallback
-                            notify_fallback('trainer.worker.belief_sampler.uniform_caps')
+                            raise RuntimeError(f"belief_sampler_neural: inconsistent capacities (caps={caps}, missing_cards={n})")
                     # Costi = -log p con piccolo rumore per diversità
                     noise_scale = float(os.environ.get('DET_NOISE', '0.0'))
                     costs = []  # shape (n,3)
@@ -2265,8 +3027,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                                         dp[t+1][a][b] = cur + c2
                                         bk[t+1][a][b] = 2
                     if dp[n][cap0][cap1] >= INF:
-                        from utils.fallback import notify_fallback
-                        notify_fallback('trainer.belief_sampler.dp_infeasible')
+                        raise RuntimeError("belief_sampler_neural: DP assignment infeasible")
                     det = {pid: [] for pid in others}
                     a, b = cap0, cap1
                     for t in range(n, 0, -1):
@@ -2431,10 +3192,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     done_list[-1] = True
                     try:
                         final_obs = _to_cpu_float32(next_obs)
-                    except Exception:
-                        if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                            raise
-                        final_obs = torch.zeros_like(next_obs_list[-1]) if len(next_obs_list) > 0 else _to_cpu_float32(next_obs)
+                    except Exception as exc:
+                        raise RuntimeError("collect_trajectory_parallel: failed to convert final observation for storage") from exc
                     if len(next_obs_list) > 0:
                         next_obs_list[-1] = final_obs
             # costruisci target mani reali altrui (3x40) vettoriale sfruttando bitset CPU
@@ -2454,9 +3213,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                             target[i] = mask
                         others_hands_targets.append(target)
                     else:
-                        from utils.fallback import notify_fallback
-                        notify_fallback('trainer.others_hands_targets.slow_game_state_path')
-                        others_hands_targets.append(_OTHERS_HANDS_ZERO)
+                        raise RuntimeError("collect_trajectory_parallel: env missing _hands_bits_t/_id_range for others_hands_targets")
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
             is_partner_seat = (cp in [0, 2] and (main_seats == [1, 3])) or (cp in [1, 3] and (main_seats == [0, 2]))
@@ -3092,12 +3849,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
     available_methods = set(mp.get_all_start_methods())
     if override in {'spawn', 'fork', 'forkserver'}:
-        if override in available_methods:
-            start_method = override
-        else:
-            fallback = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
-            print(f"[collector] mp start method '{override}' unavailable; falling back to '{fallback}'", flush=True)
-            start_method = fallback
+        if override not in available_methods:
+            raise RuntimeError(f"collect_trajectory_parallel: requested start method '{override}' unavailable (available={sorted(available_methods)})")
+        start_method = override
     else:
         if platform.system().lower() == 'windows':
             start_method = 'spawn'
@@ -3108,10 +3862,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             else:
                 start_method = 'fork'
         if start_method not in available_methods:
-            fallback = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
-            if start_method != fallback:
-                print(f"[collector] mp start method '{start_method}' not supported; using '{fallback}'", flush=True)
-            start_method = fallback
+            raise RuntimeError(f"collect_trajectory_parallel: required start method '{start_method}' unsupported on this platform (available={sorted(available_methods)})")
     ctx = mp.get_context(start_method)
     request_q = ctx.Queue(maxsize=num_envs * 4)
     # Make episode queue large enough to avoid backpressure when multiple workers finish close together
@@ -3158,6 +3909,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         p = ctx.Process(target=_env_worker, args=(wid, cfg, request_q, action_queues[wid], episode_q, control_queues[wid]), daemon=True)
         p.start()
         workers.append(p)
+    for wid, proc in enumerate(workers):
+        if proc is None or (not proc.is_alive()):
+            raise RuntimeError(f"collect_trajectory_parallel: worker wid={wid} failed to start (pid={getattr(proc,'pid',None)} exitcode={getattr(proc,'exitcode',None)})")
 
     episodes_received = 0
     episodes_payloads = []
@@ -3208,10 +3962,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             pass
     # On first round, set per-worker budgets; on next rounds we can re-use the same workers
     for wid in range(num_envs):
-        try:
-            control_queues[wid].put({'cmd': 'set_budget', 'episodes': int(episodes_per_env_list[wid])}, block=False)
-        except Exception:
-            pass
+        control_queues[wid].put({'cmd': 'set_budget', 'episodes': int(episodes_per_env_list[wid])}, block=False)
     while episodes_received < _expected_total:
         # 1) Drain any completed episodes first to free episode_q
         drained_any = False
@@ -3391,7 +4142,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             if len(shadow_reqs) > 0:
                 # Use frozen actor to score non-main seats if provided
                 if frozen_actor is None:
-                    # Fallback: select with main actor if frozen not provided
+                    # If no frozen actor is supplied, rely on the main actor
                     _t0 = time.time() if _PAR_TIMING else 0.0
                     sel = _batched_select_indices(agent, shadow_reqs)
                     if _PAR_TIMING:
@@ -3421,6 +4172,12 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     action_queues[wid].put(out, block=False)
                 if _PAR_TIMING:
                     t_dispatch += (time.time() - _t0d)
+            # Early detection of worker crashes (avoid silent stalls)
+            for _wid, _proc in enumerate(workers):
+                if (_proc is not None) and (not _proc.is_alive()):
+                    exitcode = _proc.exitcode
+                    pid = _proc.pid
+                    raise RuntimeError(f"collect_trajectory_parallel: worker wid={_wid} pid={pid} exited unexpectedly (exitcode={exitcode})")
 
         # 4) Detect worker crashes and stale state
         for _wid, _p in enumerate(workers):
@@ -4270,7 +5027,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         _refresh_league_from_disk(league)
     else:
         tqdm.write("[league] Startup refresh disabled (SCOPONE_LEAGUE_REFRESH=0)")
-        
+
     # Purge any bootstrap entries from league history on startup
     if getattr(league, 'history', None):
         boot_hist = [p for p in list(league.history) if 'bootstrap' in os.path.basename(p).lower()]
@@ -4297,7 +5054,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         ranked = sorted(hist, key=lambda p: float(elo_map.get(p, 1000.0)), reverse=True)
         return ranked[:max(0, int(k))]
 
-    
+
 
     # Warm-start policy controlled by SCOPONE_WARM_START: '0' start-from-scratch, '1' force top1 clone, '2' use top2 if available
     warm_start_mode = str(os.environ.get('SCOPONE_WARM_START', '2')).strip()
@@ -4397,6 +5154,15 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         _iter_t_collect = 0.0
         _iter_t_preproc = 0.0
         _iter_t_update = 0.0
+        # DEBUG: stato iterazione
+        try:
+            tqdm.write(
+                f"[debug-iter] it={it+1} par_timing={bool(_PAR_TIMING)} "
+                f"save_every={int(save_every)} eval_every={int(eval_every)} "
+                f"use_parallel={bool(use_parallel)} selfplay={bool(use_selfplay)} dual_team_nets={bool(dual_team_nets)} opp_frozen={bool(opp_frozen_env)}"
+            )
+        except Exception:
+            pass
         # Partner/opponent selection policy
         # Opponent selection
         # SELFPLAY=1: no frozen unless explicitly requested via OPP_FROZEN (still treated as single learner vs frozen)
@@ -4555,6 +5321,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     train_ppo._pipe_prev_B = eps_B0
                 # Se pipelined, avvia subito la produzione del prossimo round durante l'update
                 if pipeline_on:
+                    try:
+                        tqdm.write(f"[debug-collect] it={it+1} dual-live dispatch next round A&B (episodes={episodes_hint})")
+                    except Exception:
+                        pass
                     # Dispatch round k+1 in background
                     msB_next = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
                     collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
@@ -4574,6 +5344,12 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     batch_B = _postprocess_episodes_to_batch(eps_B, actor_for_old_logp=agent_teamB.actor, agent=agent_teamB, train_both_teams=False, gamma=1.0, lam=1.0)
                     # Al termine dell'update, attendi i nuovi payload e sostituisci i prev
                     tA.join(); tB.join()
+                    try:
+                        tqdm.write(
+                            f"[debug-collect] it={it+1} dual-live new payload sizes: A={len(container_A.get('eps', []))} B={len(container_B.get('eps', []))}"
+                        )
+                    except Exception:
+                        pass
                     train_ppo._pipe_prev_A = container_A.get('eps', [])
                     train_ppo._pipe_prev_B = container_B.get('eps', [])
                 else:
@@ -4587,10 +5363,18 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     batch_B = _postprocess_episodes_to_batch(eps_B, actor_for_old_logp=agent_teamB.actor, agent=agent_teamB, train_both_teams=False, gamma=1.0, lam=1.0)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
+                try:
+                    tqdm.write(
+                        f"[debug-batch] it={it+1} dual-live batch sizes: A={int(batch_A['obs'].size(0))} B={int(batch_B['obs'].size(0))}"
+                    )
+                except Exception:
+                    pass
             elif dual_team_nets and opp_frozen_env:
-                # Alternate training: one team learns while the other team acts frozen (no update on the frozen team)
+                # Opponent frozen: only Team A learns, but experiences both seat permutations simultaneously
+                train_A_now = True
+                main_seats = 'mix'
+                main_seats_B = 'mix'
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
-                # Persistent collectors
                 if not hasattr(train_ppo, '_collector_A'):
                     cfg_base_A = {
                         'rules': {'shape_scopa': False},
@@ -4598,7 +5382,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         'send_legals': True,
                         'use_mcts': bool(parallel_use_mcts),
                         'train_both_teams': False,
-                        'main_seats': main_seats,
+                        'main_seats': 'mix',
                         'frozen_non_main': True,
                         'mcts_sims': int(mcts_sims),
                         'mcts_dets': int(mcts_dets),
@@ -4614,50 +5398,34 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         'seed': int(seed),
                     }
                     train_ppo._collector_A = ParallelCollector(num_envs=int(num_envs), cfg_base=cfg_base_A, show_progress_env=True, tqdm_base_pos=3)
-                if not hasattr(train_ppo, '_collector_B'):
-                    cfg_base_B = dict(cfg_base_A)
-                    cfg_base_B['main_seats'] = main_seats_B
-                    cfg_base_B['seed'] = int(seed + 1)
-                    train_ppo._collector_B = ParallelCollector(num_envs=int(num_envs), cfg_base=cfg_base_B, show_progress_env=True, tqdm_base_pos=4)
                 collector_A: ParallelCollector = train_ppo._collector_A
-                collector_B: ParallelCollector = train_ppo._collector_B
                 import threading as _th
-                if train_A_now:
-                    # Prefill pipeline if needed
-                    if not hasattr(train_ppo, '_pipe_prev_froz_A'):
-                        collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
-                        eps0 = collector_A.drain_once(agent=agent, expected_total=episodes_hint, frozen_actor=agent_teamB.actor, frozen_non_main=True)
-                        train_ppo._pipe_prev_froz_A = eps0
-                    # Dispatch next while aggiornamento di batch precedente
-                    collector_A.dispatch_budget(episodes_hint, main_seats=main_seats)
-                    cont = {}
-                    def _drainA():
-                        cont['eps'] = collector_A.drain_once(agent=agent, expected_total=episodes_hint, frozen_actor=agent_teamB.actor, frozen_non_main=True)
-                    t = _th.Thread(target=_drainA, daemon=True); t.start()
-                    eps_prev = getattr(train_ppo, '_pipe_prev_froz_A')
-                    batch_A = _postprocess_episodes_to_batch(eps_prev, actor_for_old_logp=agent.actor, agent=agent, train_both_teams=False, gamma=1.0, lam=1.0)
-                    t.join()
-                    train_ppo._pipe_prev_froz_A = cont.get('eps', [])
-                else:
-                    if not hasattr(train_ppo, '_pipe_prev_froz_B'):
-                        collector_B.dispatch_budget(episodes_hint, main_seats=main_seats_B)
-                        eps0 = collector_B.drain_once(agent=agent_teamB, expected_total=episodes_hint, frozen_actor=agent.actor, frozen_non_main=True)
-                        train_ppo._pipe_prev_froz_B = eps0
-                    collector_B.dispatch_budget(episodes_hint, main_seats=main_seats_B)
-                    contB = {}
-                    def _drainB():
-                        contB['eps'] = collector_B.drain_once(agent=agent_teamB, expected_total=episodes_hint, frozen_actor=agent.actor, frozen_non_main=True)
-                    tB = _th.Thread(target=_drainB, daemon=True); tB.start()
-                    eps_prev_B = getattr(train_ppo, '_pipe_prev_froz_B')
-                    batch_B = _postprocess_episodes_to_batch(eps_prev_B, actor_for_old_logp=agent_teamB.actor, agent=agent_teamB, train_both_teams=False, gamma=1.0, lam=1.0)
-                    tB.join()
-                    train_ppo._pipe_prev_froz_B = contB.get('eps', [])
+                if not hasattr(train_ppo, '_pipe_prev_froz_A'):
+                    per_env0 = collector_A.dispatch_budget(episodes_hint, main_seats='mix')
+                    eps0 = collector_A.drain_once(agent=agent, expected_total=sum(per_env0), frozen_actor=agent_teamB.actor, frozen_non_main=True)
+                    train_ppo._pipe_prev_froz_A = eps0
+                per_env = collector_A.dispatch_budget(episodes_hint, main_seats='mix')
+                container_mix: Dict[str, List[Dict]] = {}
+                def _drain_mix():
+                    container_mix['eps'] = collector_A.drain_once(agent=agent, expected_total=sum(per_env), frozen_actor=agent_teamB.actor, frozen_non_main=True)
+                t_mix = _th.Thread(target=_drain_mix, daemon=True)
+                t_mix.start()
+                eps_prev = getattr(train_ppo, '_pipe_prev_froz_A')
+                batch_A = _postprocess_episodes_to_batch(eps_prev, actor_for_old_logp=agent.actor, agent=agent, train_both_teams=False, gamma=1.0, lam=1.0)
+                t_mix.join()
+                train_ppo._pipe_prev_froz_A = container_mix.get('eps', [])
+                batch_B = None
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
+                try:
+                    tqdm.write(f"[debug-batch] it={it+1} dual-frozen (A learns) batch size A={int(batch_A['obs'].size(0))}")
+                except Exception:
+                    pass
             else:
                 # Persistent collector pipeline (CPU-only master), enabled when using parallel collection
                 _t_c0 = time.time() if _PAR_TIMING else 0.0
                 # Build collector once and reuse across iterations to avoid spawn/teardown
+                dispatch_main_seats = 'mix'
                 if not hasattr(train_ppo, '_collector'):
                     cfg_base = {
                         'rules': {'shape_scopa': False},
@@ -4665,7 +5433,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         'send_legals': True,
                         'use_mcts': bool(parallel_use_mcts),
                         'train_both_teams': bool(train_both_teams),
-                        'main_seats': main_seats if main_seats is not None else [0,2],
+                        'main_seats': dispatch_main_seats if dispatch_main_seats is not None else [0,2],
                         'frozen_non_main': bool(use_selfplay and opp_frozen_env),
                         'mcts_sims': int(mcts_sims),
                         'mcts_dets': int(mcts_dets),
@@ -4690,12 +5458,16 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 pipeline_on = True
                 import threading as _th
                 if pipeline_on and not hasattr(train_ppo, '_pipe_prev_single'):
-                    per_env0 = collector.dispatch_budget(episodes_hint)
+                    per_env0 = collector.dispatch_budget(episodes_hint, main_seats=dispatch_main_seats)
                     eps0 = collector.drain_once(agent=agent, expected_total=sum(per_env0), frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None), frozen_non_main=bool(use_selfplay and opp_frozen_env))
                     train_ppo._pipe_prev_single = eps0
                 if pipeline_on:
+                    try:
+                        tqdm.write(f"[debug-collect] it={it+1} single-net dispatch next round (episodes={episodes_hint})")
+                    except Exception:
+                        pass
                     # Dispatch next round in background
-                    per_env = collector.dispatch_budget(episodes_hint)
+                    per_env = collector.dispatch_budget(episodes_hint, main_seats=dispatch_main_seats)
                     container = {}
                     def _drain():
                         container['eps'] = collector.drain_once(agent=agent, expected_total=sum(per_env), frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None), frozen_non_main=bool(use_selfplay and opp_frozen_env))
@@ -4704,15 +5476,23 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     frozen_for_logp = (shadow_actor if (use_selfplay and opp_frozen_env) else agent.actor)
                     batch = _postprocess_episodes_to_batch(eps_prev, actor_for_old_logp=frozen_for_logp, agent=agent, train_both_teams=train_both_teams, gamma=1.0, lam=1.0)
                     t.join()
+                    try:
+                        tqdm.write(f"[debug-collect] it={it+1} single-net new payload size: {len(container.get('eps', []))}")
+                    except Exception:
+                        pass
                     train_ppo._pipe_prev_single = container.get('eps', [])
                 else:
                     # Synchronous
-                    per_env = collector.dispatch_budget(episodes_hint)
+                    per_env = collector.dispatch_budget(episodes_hint, main_seats=dispatch_main_seats)
                     eps_payloads = collector.drain_once(agent=agent, expected_total=sum(per_env), frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None), frozen_non_main=bool(use_selfplay and opp_frozen_env))
                     frozen_for_logp = (shadow_actor if (use_selfplay and opp_frozen_env) else agent.actor)
                     batch = _postprocess_episodes_to_batch(eps_payloads, actor_for_old_logp=frozen_for_logp, agent=agent, train_both_teams=train_both_teams, gamma=1.0, lam=1.0)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
+                try:
+                    tqdm.write(f"[debug-batch] it={it+1} single-net batch size={int(batch['obs'].size(0))}")
+                except Exception:
+                    pass
         else:
             # Strategia MCTS: warmup senza MCTS per le prime iterazioni, poi scala con il progresso mano
             if dual_team_nets and (not opp_frozen_env):
@@ -4865,6 +5645,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             mb = minibatch_size
             drop = (B_now % mb)
             if B_now > 0 and drop > 0:
+                try:
+                    tqdm.write(f"[ensure_mb] batch_size={B_now} minibatch={mb} drop={drop}")
+                except Exception:
+                    pass
                 raise RuntimeError(f"train_ppo: batch size {B_now} is not a multiple of minibatch_size={mb}; adjust horizon/collection to avoid dropping {drop} transitions")
         if dual_team_nets and (not opp_frozen_env):
             _ensure_mb(batch_A); _ensure_mb(batch_B)
@@ -4880,23 +5664,47 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         # Aumenta minibatch_size approfittando della VRAM ampia
         if dual_team_nets and (not opp_frozen_env):
             _t_u0 = time.time() if _PAR_TIMING else 0.0
+            try:
+                tqdm.write(f"[debug-update] it={it+1} starting updates (dual-live)")
+            except Exception:
+                pass
             info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
             info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
+            try:
+                tqdm.write(f"[debug-update] it={it+1} finished updates (dual-live)")
+            except Exception:
+                pass
         elif dual_team_nets and opp_frozen_env:
             _t_u0 = time.time() if _PAR_TIMING else 0.0
+            try:
+                tqdm.write(f"[debug-update] it={it+1} starting update (dual-frozen {'A' if train_A_now else 'B'})")
+            except Exception:
+                pass
             if train_A_now:
                 info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
             else:
                 info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
+            try:
+                tqdm.write(f"[debug-update] it={it+1} finished update (dual-frozen)")
+            except Exception:
+                pass
         else:
             _t_u0 = time.time() if _PAR_TIMING else 0.0
+            try:
+                tqdm.write(f"[debug-update] it={it+1} starting update (single-net)")
+            except Exception:
+                pass
             info = agent.update(batch, epochs=4, minibatch_size=minibatch_size)
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
+            try:
+                tqdm.write(f"[debug-update] it={it+1} finished update (single-net)")
+            except Exception:
+                pass
         dt = time.time() - t0
 
         # proxy per best: media return del batch
@@ -5039,6 +5847,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         do_eval = (not _disable_eval) and bool(eval_every and (it + 1) % eval_every == 0)
         do_save = (not _disable_save) and (((it + 1) % save_every == 0) or ((it + 1) == num_iterations))
         if do_eval:
+            try:
+                tqdm.write(f"[debug-save] it={it+1} do_eval=True (saving official checkpoint)")
+            except Exception:
+                pass
             do_save = False  # l'eval include già un salvataggio ufficiale
             out_A, out_B = _save_official_checkpoint('eval')
             new_ckpts = [out_A] + ([out_B] if out_B else [])
@@ -5107,6 +5919,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     writer.add_scalar('league/elo_current_B', league.elo.get(out_B, 1000.0), it)
             _cleanup_bootstrap()
         elif do_save:
+            try:
+                tqdm.write(f"[debug-save] it={it+1} do_save=True (every {int(save_every)} iters)")
+            except Exception:
+                pass
             _save_official_checkpoint('save')
             _cleanup_bootstrap()
         # Optional profiler or external hook per-iteration

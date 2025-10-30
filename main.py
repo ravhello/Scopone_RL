@@ -50,6 +50,12 @@ os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
 
 # Imposta ENV_DEVICE una sola volta coerente con SCOPONE_DEVICE o disponibilità CUDA
 os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+os.environ.setdefault('SCOPONE_INFER_DEVICE', '')  # '' => auto (prefers SCOPONE_DEVICE or CUDA if available)
+os.environ.setdefault('SCOPONE_INFER_WORKERS', '8')
+os.environ.setdefault('SCOPONE_INFER_THREADS', '3')
+os.environ.setdefault('SCOPONE_INFER_SYNC_TIMEOUT_S', '60')
+os.environ.setdefault('SCOPONE_COLLECT_LOCAL_INFER', '1')
+os.environ.setdefault('SCOPONE_ENV_INFER_DEVICE', 'cpu')
 os.environ.setdefault('ENV_DEVICE', 'cpu')
 
 # Training compute device (models stay on CPU during env collection; moved only inside update)
@@ -103,6 +109,8 @@ _opp_frozen = os.environ.get('SCOPONE_OPP_FROZEN','1') in ['1','true','yes','on'
 # SCOPONE_TRAIN_FROM_BOTH_TEAMS: effective ONLY when SELFPLAY=1 and OPP_FROZEN=0.
 # Uses transitions from both teams for the single net; otherwise ignored (on-policy).
 _tfb = os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS','1') in ['1','true','yes','on']
+if _opp_frozen:
+    _tfb = False
 
 # Warm-start policy controlled by SCOPONE_WARM_START: '0' start-from-scratch, '1' force top1 clone, '2' use top2 if available
 os.environ.setdefault('SCOPONE_WARM_START', '2')
@@ -163,8 +171,9 @@ if num_envs <= 1:
 else:
     # Multi-env (parallelo): lascia la strategia di batching dinamica del collector.
     # Mantieni min_batch auto (0) e piccola latenza per favorire batch grandi senza alta latenza.
-    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '64')
-    os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '1.0')
+    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '96')
+    os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '1')
+    os.environ.setdefault('SCOPONE_COLLECT_MICRO_BATCH', '96')
     # Un thread per worker per evitare oversubscription; usato dai processi figli.
     os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
     # Su Windows, esplicita 'spawn' per sicurezza (altrove il trainer risolve automaticamente).
@@ -293,7 +302,6 @@ if _SILENCE_ABSL and os.name != 'nt':
     _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
     _t.start()
 
-os.environ.setdefault('ENV_DEVICE', 'cpu')
 ## Imposta metodo mp sicuro per CUDA: forkserver su POSIX, spawn su Windows (override con SCOPONE_MP_START)
 # Nota: per il collector parallelo impostiamo già SCOPONE_MP_START nel blocco single/multi-env;
 # qui manteniamo solo un default globale compatibile per altri usi (es. script esterni)
@@ -332,6 +340,26 @@ if __name__ == "__main__":
     tqdm.write(f"Using device: {device}")
     _train_dev_raw = str(os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')).strip().lower()
     tqdm.write(f"Training compute device: {_train_dev_raw}")
+    _infer_env_raw = str(os.environ.get('SCOPONE_INFER_DEVICE', '')).strip()
+    _infer_candidate = _infer_env_raw.lower()
+    _infer_source = 'SCOPONE_INFER_DEVICE' if _infer_env_raw else (
+        'SCOPONE_DEVICE' if str(os.environ.get('SCOPONE_DEVICE', '')).strip() else 'auto'
+    )
+    if not _infer_candidate:
+        _infer_candidate = str(os.environ.get('SCOPONE_DEVICE', '')).strip().lower()
+    if _infer_candidate:
+        if _infer_candidate.startswith('cuda') and not torch.cuda.is_available():
+            tqdm.write("Requested CUDA inference device but CUDA is unavailable; falling back to CPU.")
+            _infer_candidate = 'cpu'
+        try:
+            _infer_resolved_device = torch.device(_infer_candidate)
+        except Exception:
+            tqdm.write(f"Invalid SCOPONE_INFER_DEVICE value '{_infer_candidate}', defaulting to CPU.")
+            _infer_resolved_device = torch.device('cpu')
+    else:
+        _infer_resolved_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    os.environ['SCOPONE_INFER_DEVICE_RESOLVED'] = str(_infer_resolved_device)
+    tqdm.write(f"Collector inference device: {_infer_resolved_device} (source={_infer_source})")
     tqdm.write(f"Self-play: {'ON' if _selfplay else 'OFF (League)'}")
     # Configura i thread CPU del processo principale in modo adattivo:
     # - Se multi-env e training su GPU: pochi thread CPU (riduce la contesa con i worker)

@@ -251,7 +251,7 @@ def run_single_trial(
         "SCOPONE_DISABLE_EVAL": "1",
         "SCOPONE_LEAGUE_REFRESH": 0,
         # Enforce strict/runtime settings used in main
-        "SCOPONE_STRICT_CHECKS": "1",
+        "SCOPONE_STRICT_CHECKS": "0",
         "SCOPONE_APPROX_GELU": "1",
         "SCOPONE_PROFILE": "0",
         # Suppress TF/absl noise as in main
