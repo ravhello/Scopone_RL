@@ -7,7 +7,7 @@ from contextlib import nullcontext
 
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
 from utils.device import get_compute_device, get_amp_dtype
-from utils.compile import maybe_compile_module, maybe_compile_function
+from utils.compile import maybe_compile_module, maybe_compile_function, is_enabled as compile_is_enabled
 from utils.torch_load import safe_torch_load
 import os as _os
 device = get_compute_device()
@@ -122,6 +122,8 @@ class ActionConditionedPPO:
             'value_clip': value_clip,
             'target_kl': target_kl,
         }
+        self.profile_update_detail = int(_os.environ.get('SCOPONE_PROFILE_UPDATE_DETAIL', '0'))
+        self._loss_profile_allowed = (self.profile_update_detail >= 2) and (not compile_is_enabled())
 
         # Perf flags
         try:
@@ -507,7 +509,7 @@ class ActionConditionedPPO:
         profiling_bins['sampling'] += (time.perf_counter() - t_sampling)
         return chosen_act, logp_total, idx_t
 
-    def compute_loss(self, batch):
+    def compute_loss(self, batch, profile: Optional[Dict[str, float]] = None):
         """
         batch:
           - obs: (B, obs_dim)
@@ -520,6 +522,13 @@ class ActionConditionedPPO:
           - legals_count: (B) numero di azioni legali per sample
           - chosen_index: (B) indice della scelta nel proprio sottoinsieme legale
         """
+        prof_enabled = profile is not None
+        _t_total = time.perf_counter() if prof_enabled else 0.0
+
+        def _prof_add(name: str, duration: float) -> None:
+            if prof_enabled:
+                profile[name] = profile.get(name, 0.0) + float(duration)
+
         def to_f32(x):
             if torch.is_tensor(x):
                 # Evita copie inutili se già su device e dtype corretto
@@ -567,6 +576,7 @@ class ActionConditionedPPO:
         for key in ('obs','act','old_logp','ret','adv','legals','legals_offset','legals_count','chosen_index','seat_team'):
             if key not in batch:
                 raise KeyError(f"compute_loss: missing batch key '{key}'")
+        _t_inputs = time.perf_counter() if prof_enabled else 0.0
         obs = to_cuda_nb(batch['obs'], torch.float32)
         seat = to_cuda_nb(batch['seat_team'], torch.float32)
         act = to_cuda_nb(batch['act'], torch.float32)
@@ -597,6 +607,8 @@ class ActionConditionedPPO:
             raise RuntimeError("compute_loss: ragged indices sizes mismatch with batch size")
         # Optional precomputed global action embeddings to avoid recomputation per minibatch
         a_emb_global = batch.get('a_emb_global', None)
+        if prof_enabled:
+            _prof_add('inputs', time.perf_counter() - _t_inputs)
         # distillazione MCTS (targets raggruppati per sample): policy piatta e peso per-sample
         mcts_policy_flat = to_cuda_nb(batch.get('mcts_policy', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
         mcts_weight = to_cuda_nb(batch.get('mcts_weight', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
@@ -639,7 +651,10 @@ class ActionConditionedPPO:
                 raise RuntimeError("compute_loss: chosen_index out of range for some rows")
         row_idx = torch.arange(B, device=device, dtype=torch.long)
         # Compute state features once; reuse for actor and critic
+        _t_state_feat = time.perf_counter() if prof_enabled else 0.0
         state_feat = self.actor.compute_state_features(obs, seat)  # (B,256)
+        if prof_enabled:
+            _prof_add('state_features', time.perf_counter() - _t_state_feat)
         if STRICT_CHECKS and (not torch.isfinite(state_feat).all()):
             bad = state_feat[~torch.isfinite(state_feat)]
             raise RuntimeError(f"compute_loss: state_feat non-finite (count={int(bad.numel())})")
@@ -652,11 +667,14 @@ class ActionConditionedPPO:
         cap1_mask = captured[:, 40:80] > 0.5
         visible_mask_40 = (hand_mask | table_mask | cap0_mask | cap1_mask)
         # State projection e logits per carta
+        _t_state_proj = time.perf_counter() if prof_enabled else 0.0
         state_proj = self.actor.compute_state_proj_from_state(state_feat, obs, visible_mask_40=visible_mask_40)  # (B,64)
         if STRICT_CHECKS and (not torch.isfinite(state_proj).all()):
             bad = state_proj[~torch.isfinite(state_proj)]
             raise RuntimeError(f"compute_loss: state_proj non-finite (count={int(bad.numel())})")
         card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t())       # (B,40)
+        if prof_enabled:
+            _prof_add('state_proj', time.perf_counter() - _t_state_proj)
         # Guard extreme magnitudes before exp/softmax usage
         if STRICT_CHECKS and (not torch.isfinite(card_logits_all).all()):
             bad = card_logits_all[~torch.isfinite(card_logits_all)]
@@ -664,6 +682,7 @@ class ActionConditionedPPO:
         max_abs_cl = float(card_logits_all.abs().max().item()) if card_logits_all.numel() > 0 else 0.0
         if max_abs_cl > 1e3:
             raise RuntimeError(f"compute_loss: card_logits_all magnitude too large (max_abs={max_abs_cl})")
+        _t_policy_block = time.perf_counter() if prof_enabled else 0.0
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -708,6 +727,8 @@ class ActionConditionedPPO:
             logp_card = card_logits_all[row_idx, chosen_card_ids] - lse_allowed[row_idx]
             # capture logits per-legal via action embedding
             # Prefer precomputed global embeddings to avoid recomputation per minibatch
+            if prof_enabled:
+                _t_action_emb = time.perf_counter()
             if a_emb_global is not None:
                 a_emb_mb = a_emb_global[abs_idx]
             else:
@@ -717,6 +738,10 @@ class ActionConditionedPPO:
                 else:
                     a_tbl = self.actor.get_action_emb_table_cached(device=legals_mb.device, dtype=state_proj.dtype)
                     a_emb_mb = torch.matmul(legals_mb, a_tbl)             # (M_mb,64)
+            if prof_enabled:
+                _prof_add('action_emb', time.perf_counter() - _t_action_emb)
+            if prof_enabled:
+                _t_policy_core = time.perf_counter()
             if STRICT_CHECKS and (not torch.isfinite(a_emb_mb).all()):
                 bad = a_emb_mb[~torch.isfinite(a_emb_mb)]
                 raise RuntimeError(f"compute_loss: a_emb_mb non-finite (count={int(bad.numel())})")
@@ -744,9 +769,12 @@ class ActionConditionedPPO:
             logp_new = logp_card + logp_cap
             if not torch.isfinite(logp_new).all():
                 raise RuntimeError("compute_loss: logp_new non-finite")
+            if prof_enabled:
+                _prof_add('policy_ragged', time.perf_counter() - _t_policy_core)
             # Distribuzione completa sui legali per entropia/KL (computata solo se serve)
             need_entropy = (float(self.entropy_coef) > 0.0)
             if need_entropy:
+                _t_entropy = time.perf_counter() if prof_enabled else 0.0
                 # Entropia per-sample sui soli sample con legali: H = -Σ p * log p
                 logp_cards_allowed_per_legal = (card_logits_all[sample_idx_per_legal, played_ids_mb] - lse_allowed[sample_idx_per_legal])
                 logp_total_per_legal = logp_cards_allowed_per_legal + logp_cap_per_legal
@@ -758,6 +786,8 @@ class ActionConditionedPPO:
                 valid_rows.index_fill_(0, sample_idx_per_legal.unique(), True)
                 denom = valid_rows.to(ent_per_row.dtype).sum().clamp_min(1.0)
                 entropy = (ent_per_row[valid_rows].sum() / denom)
+                if prof_enabled:
+                    _prof_add('entropy', time.perf_counter() - _t_entropy)
             else:
                 entropy = torch.tensor(0.0, device=device)
             if not torch.isfinite(entropy).all():
@@ -766,11 +796,15 @@ class ActionConditionedPPO:
             logp_new = torch.zeros((B,), device=device, dtype=state_proj.dtype)
             entropy = torch.tensor(0.0, device=device)
 
+        if prof_enabled:
+            _prof_add('policy_total', time.perf_counter() - _t_policy_block)
+
         # Ratio: assert inputs finite and gaps not extreme; raise early with diagnostics
         if STRICT_CHECKS and (not torch.isfinite(logp_new).all()):
             raise RuntimeError("compute_loss: logp_new non-finite before ratio")
         if STRICT_CHECKS and (not torch.isfinite(old_logp).all()):
             raise RuntimeError("compute_loss: old_logp non-finite before ratio")
+        _t_ratio = time.perf_counter() if prof_enabled else 0.0
         diff = (logp_new - old_logp)
         if STRICT_CHECKS and (not torch.isfinite(diff).all()):
             raise RuntimeError("compute_loss: non-finite (logp_new - old_logp)")
@@ -799,12 +833,15 @@ class ActionConditionedPPO:
             loss_pi = -(ppo_term.sum() / denom)
         else:
             loss_pi = -(torch.min(ratio * adv, clipped)).mean()
+        if prof_enabled:
+            _prof_add('ratio', time.perf_counter() - _t_ratio)
         # Guard against non-finite intermediates spilling into the loss
         for name, tensor in (("ratio", ratio), ("adv", adv), ("ret", ret)):
             if STRICT_CHECKS and (not torch.isfinite(tensor).all()):
                 raise RuntimeError(f"compute_loss: non-finite {name}")
 
         # Passa others_hands (se disponibile) al critico per percorso CTDE opzionale
+        _t_critic = time.perf_counter() if prof_enabled else 0.0
         v = self.critic.forward_from_state(state_feat, obs, batch.get('others_hands', None), visible_mask_40=visible_mask_40)
         if STRICT_CHECKS and (not torch.isfinite(v).all()):
             bad = v[~torch.isfinite(v)]
@@ -814,6 +851,8 @@ class ActionConditionedPPO:
             loss_v = torch.max((v - ret) ** 2, (v_clipped - ret) ** 2).mean()
         else:
             loss_v = nn.MSELoss()(v, ret)
+        if prof_enabled:
+            _prof_add('critic', time.perf_counter() - _t_critic)
 
         # Schedula coefficienti (prima per evitare calcoli inutili)
         distill_coef_base = float(_os.environ.get('DISTILL_COEF', '0.1'))
@@ -826,6 +865,8 @@ class ActionConditionedPPO:
         # Loss ausiliaria per BeliefNet solo se necessario
         belief_aux = torch.tensor(0.0, device=device)
         if (coef > 0.0) and max_cnt > 0 and mcts_weight.numel() == B and (mcts_weight.sum() > 0) and mcts_policy_flat.numel() >= int(cnts.sum().item()):
+            if prof_enabled:
+                _t_distill = time.perf_counter()
             if STRICT_CHECKS and (not torch.isfinite(mcts_policy_flat).all()):
                 raise RuntimeError("compute_loss: mcts_policy_flat non-finite")
             # Ricostruisci (B, max_cnt) target evitando loop Python: usa masked_scatter
@@ -862,9 +903,13 @@ class ActionConditionedPPO:
                 distill_loss = (kl_per_row * w).sum() / torch.clamp_min(w.sum(), 1.0)
             if STRICT_CHECKS and (not torch.isfinite(distill_loss).all()):
                 raise RuntimeError("compute_loss: distill_loss non-finite")
+            if prof_enabled:
+                _prof_add('distill', time.perf_counter() - _t_distill)
         # Prepara target belief supervision (se batch fornisce mani reali degli altri)
         real_hands = batch.get('others_hands', None)  # shape (B,3,40) one-hot o multi-hot per altri giocatori
         if (belief_coef > 0.0) and (real_hands is not None):
+            if prof_enabled:
+                _t_belief = time.perf_counter()
             rh = to_cuda_nb(real_hands, torch.float32)
             # riusa state_feat già calcolato e la visible_mask_40 già costruita
             logits_b = self.actor.belief_net(state_feat)  # (B,120)
@@ -881,6 +926,8 @@ class ActionConditionedPPO:
             ce_per_card = ce_per_card * m.squeeze(1)
             denom = m.sum(dim=(1,2)).clamp_min(1.0)
             belief_aux = (ce_per_card.sum(dim=1) / denom).mean()
+            if prof_enabled:
+                _prof_add('belief', time.perf_counter() - _t_belief)
 
         loss = loss_pi + self.value_coef * loss_v - self.entropy_coef * entropy + coef * distill_loss + belief_coef * belief_aux
         approx_kl = (old_logp - logp_new).mean()
@@ -899,6 +946,8 @@ class ActionConditionedPPO:
             clip_frac = (torch.abs(ratio - 1.0) > self.clip_ratio).float().mean()
         else:
             clip_frac = torch.tensor(0.0, device=device)
+        if prof_enabled:
+            _prof_add('total', time.perf_counter() - _t_total)
         # Restituisci TENSORS su device; conversione a float avverrà nel trainer in un'unica sync
         return loss, {
             'loss_pi': loss_pi.detach(),
@@ -910,13 +959,26 @@ class ActionConditionedPPO:
             'belief_aux': belief_aux.detach()
         }
 
-    def update(self, batch, epochs: int = 4, minibatch_size: int = 256):
+    def update(self, batch, epochs: int = 4, minibatch_size: int = 256, profiling_bins: Optional[Dict[str, float]] = None):
         """
         Esegue update PPO con più epoche e minibatch sul batch corrente.
         Le azioni legali restano passate come array globale (ragged via offset/len per sample).
         """
+        prof_enabled = profiling_bins is not None
+        if prof_enabled:
+            for key in ('stage', 'minibatch_prepare', 'forward', 'backward', 'optim', 'move_model', 'move_back', 'loop'):
+                profiling_bins.setdefault(key, 0.0)
+            profiling_bins.setdefault('epochs', 0)
+            profiling_bins.setdefault('mb_count', 0)
+        loss_profile_enabled = prof_enabled and self._loss_profile_allowed
+        loss_bins_total: Optional[Dict[str, float]] = None
+        if loss_profile_enabled:
+            loss_bins_total = {}
+            profiling_bins['loss'] = loss_bins_total
         # Move models to training device (GPU for big compute if requested) just for the update
         models_were_cpu = (next(self.actor.parameters()).device.type == 'cpu') and (self.train_device.type != 'cpu')
+        if prof_enabled and models_were_cpu:
+            _t_move_model = time.perf_counter()
         if models_were_cpu:
             self.actor.to(self.train_device)
             self.critic.to(self.train_device)
@@ -933,7 +995,11 @@ class ActionConditionedPPO:
                             for key, val in list(state.items()):
                                 if torch.is_tensor(val) and val.device.type != self.train_device.type:
                                     state[key] = val.to(self.train_device)
+        if prof_enabled and models_were_cpu:
+            profiling_bins['move_model'] += (time.perf_counter() - _t_move_model)
         num_samples = len(batch['obs'])
+        if prof_enabled:
+            profiling_bins['samples'] = int(num_samples)
         last_info = {}
         avg_kl_acc, avg_clip_acc, count_mb = 0.0, 0.0, 0
         early_stop = False
@@ -948,6 +1014,8 @@ class ActionConditionedPPO:
 
         check_every = 1  # sample ogni minibatch: più controlli -> KL aderente al target
         # Stage intero batch su device una sola volta (CPU-friendly: evita .to no-op)
+        if prof_enabled:
+            _t_stage = time.perf_counter()
         batch_cuda = {}
         for k, v in batch.items():
             if k in ('routing_log',):
@@ -977,12 +1045,18 @@ class ActionConditionedPPO:
                     raise RuntimeError("Failed to precompute global action embeddings (a_emb_global)") from e
             else:
                 batch_cuda['a_emb_global'] = None
+        if prof_enabled:
+            profiling_bins['stage'] += (time.perf_counter() - _t_stage)
 
         # Stabilizza forme tra minibatch: usa massimo globale di legali e minibatch costante che divide il totale
         global_max_cnt = int(batch_cuda['legals_count'].max().item()) if num_samples > 0 else 0
         pos_global = (torch.arange(global_max_cnt, device=device, dtype=torch.long) if global_max_cnt > 0 else torch.zeros((0,), device=device, dtype=torch.long))
 
+        if prof_enabled:
+            _t_loop = time.perf_counter()
         for ep in range(epochs):
+            if prof_enabled:
+                profiling_bins['epochs'] += 1
             # Indici su device; scegli un minibatch_size effettivo che divida num_samples
             perm = torch.randperm(num_samples, device=device)
             mb_eff = int(minibatch_size)
@@ -997,6 +1071,9 @@ class ActionConditionedPPO:
                 if not found:
                     mb_eff = max(1, num_samples)
             for start in range(0, num_samples, mb_eff):
+                if prof_enabled:
+                    profiling_bins['mb_count'] += 1
+                    _t_mb_prep = time.perf_counter()
                 idx_t = perm[start:start+mb_eff]
                 # Slice direttamente su CUDA
                 def sel_cuda(x):
@@ -1043,11 +1120,19 @@ class ActionConditionedPPO:
                     'mcts_policy': mcts_policy_mb,
                     'mcts_weight': mcts_weight_mb,
                 }
+                if prof_enabled:
+                    profiling_bins['minibatch_prepare'] += (time.perf_counter() - _t_mb_prep)
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
+                loss_profile_mb = {} if loss_profile_enabled else None
                 if self.scaler is not None:
+                    if prof_enabled:
+                        _t_forward = time.perf_counter()
                     with torch.autocast(device_type=self.train_device.type, dtype=autocast_dtype):
-                        loss, info = self.compute_loss(mini)
+                        loss, info = self.compute_loss(mini, profile=loss_profile_mb)
+                    if prof_enabled:
+                        profiling_bins['forward'] += (time.perf_counter() - _t_forward)
+                        _t_backward = time.perf_counter()
                     self.scaler.scale(loss).backward()
                     # Unscale prima del grad clip
                     self.scaler.unscale_(self.opt_actor)
@@ -1060,6 +1145,9 @@ class ActionConditionedPPO:
                     # garanzia tensor per logging coerente
                     gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
                     gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
+                    if prof_enabled:
+                        profiling_bins['backward'] += (time.perf_counter() - _t_backward)
+                        _t_opt = time.perf_counter()
                     self.scaler.step(self.opt_actor)
                     self.scaler.step(self.opt_critic)
                     self.scaler.update()
@@ -1073,8 +1161,15 @@ class ActionConditionedPPO:
                         self.actor.invalidate_action_cache()
                     except Exception as e:
                         raise RuntimeError('ppo.update.invalidate_action_cache_failed') from e
+                    if prof_enabled:
+                        profiling_bins['optim'] += (time.perf_counter() - _t_opt)
                 else:
-                    loss, info = self.compute_loss(mini)
+                    if prof_enabled:
+                        _t_forward = time.perf_counter()
+                    loss, info = self.compute_loss(mini, profile=loss_profile_mb)
+                    if prof_enabled:
+                        profiling_bins['forward'] += (time.perf_counter() - _t_forward)
+                        _t_backward = time.perf_counter()
                     loss.backward()
                     # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
                     gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
@@ -1083,6 +1178,9 @@ class ActionConditionedPPO:
                         raise RuntimeError("update: non-finite gradients detected (norm)")
                     gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
                     gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
+                    if prof_enabled:
+                        profiling_bins['backward'] += (time.perf_counter() - _t_backward)
+                        _t_opt = time.perf_counter()
                     self.opt_actor.step()
                     self.opt_critic.step()
                     # Post-step: parametri finiti
@@ -1096,6 +1194,11 @@ class ActionConditionedPPO:
                         self.actor.invalidate_action_cache()
                     except Exception as e:
                         raise RuntimeError('ppo.update.invalidate_action_cache_failed') from e
+                    if prof_enabled:
+                        profiling_bins['optim'] += (time.perf_counter() - _t_opt)
+                if loss_profile_mb is not None and loss_bins_total is not None:
+                    for _lk, _lv in loss_profile_mb.items():
+                        loss_bins_total[_lk] = loss_bins_total.get(_lk, 0.0) + float(_lv)
                 last_info = info
                 self.update_steps += 1
                 avg_kl_acc += info.get('approx_kl', torch.tensor(0.0, device=device))
@@ -1127,6 +1230,8 @@ class ActionConditionedPPO:
                     raise RuntimeError('ppo.update.entropy_schedule_failed') from e
             if early_stop:
                 break
+        if prof_enabled:
+            profiling_bins['loop'] += (time.perf_counter() - _t_loop)
         # riduzione LR automatica quando KL alto ripetuto
         if self._high_kl_count >= self._high_kl_patience:
             for opt in (self.opt_actor, self.opt_critic):
@@ -1140,6 +1245,8 @@ class ActionConditionedPPO:
             last_info['avg_clip_frac'] = (avg_clip_acc / count_mb).detach()
             last_info['early_stop'] = torch.tensor(1.0 if early_stop else 0.0, device=device)
         # Move back to CPU for collection if we temporarily moved to CUDA
+        if prof_enabled and models_were_cpu:
+            _t_move_back = time.perf_counter()
         if models_were_cpu:
             self.actor.to('cpu')
             self.critic.to('cpu')
@@ -1156,6 +1263,8 @@ class ActionConditionedPPO:
                             for key, val in list(state.items()):
                                 if torch.is_tensor(val) and val.device.type != 'cpu':
                                     state[key] = val.to('cpu')
+        if prof_enabled and models_were_cpu:
+            profiling_bins['move_back'] += (time.perf_counter() - _t_move_back)
         return last_info
 
     def add_lr_schedulers(self, actor_scheduler, critic_scheduler):

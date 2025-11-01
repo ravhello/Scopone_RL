@@ -4747,6 +4747,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     _mb_env = int(_os.environ.get('SCOPONE_MINIBATCH', str(minibatch_size)))
     if _mb_env > 0:
         minibatch_size = _mb_env
+    ppo_epochs = max(1, int(_os.environ.get('SCOPONE_PPO_EPOCHS', '4')))
     # Determine effective per-episode useful transitions based on desired collection semantics
     _tfb_env = str(_os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS', '0')).strip().lower() in ['1','true','yes','on']
     _frozen_env = str(_os.environ.get('SCOPONE_OPP_FROZEN', '1')).strip().lower() in ['1','true','yes','on']
@@ -5144,6 +5145,42 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     pbar = tqdm(range(num_iterations), desc="PPO iterations", dynamic_ncols=True, position=1, leave=True, disable=_TQDM_DISABLE)
     shadow_actor = None
     shadow_every = max(1, int(os.environ.get('SCOPONE_FROZEN_UPDATE_EVERY', '1')))
+
+    def _log_update_profile(tag: str, bins: Optional[Dict[str, float]], call_time: float) -> None:
+        if (not _PAR_TIMING) or (not bins):
+            return
+        try:
+            stage_t = float(bins.get('stage', 0.0))
+            loop_t = float(bins.get('loop', 0.0))
+            prep_t = float(bins.get('minibatch_prepare', 0.0))
+            forward_t = float(bins.get('forward', 0.0))
+            backward_t = float(bins.get('backward', 0.0))
+            optim_t = float(bins.get('optim', 0.0))
+            move_in = float(bins.get('move_model', 0.0))
+            move_out = float(bins.get('move_back', 0.0))
+            mb_count = int(bins.get('mb_count', 0))
+            epochs = int(bins.get('epochs', 0))
+            samples = int(bins.get('samples', 0))
+            overhead_t = max(0.0, loop_t - (prep_t + forward_t + backward_t + optim_t))
+            avg_forward = (forward_t / mb_count) if mb_count else 0.0
+            avg_backward = (backward_t / mb_count) if mb_count else 0.0
+            msg = (
+                f"[update-profile:{tag}] call={call_time:.3f}s stage={stage_t:.3f}s loop={loop_t:.3f}s "
+                f"prep={prep_t:.3f}s fwd={forward_t:.3f}s bwd={backward_t:.3f}s opt={optim_t:.3f}s "
+                f"overhead={overhead_t:.3f}s move_in={move_in:.3f}s move_out={move_out:.3f}s "
+                f"mb={mb_count} epochs={epochs} samples={samples} "
+                f"avg_fwd={avg_forward:.3f}s avg_bwd={avg_backward:.3f}s"
+            )
+            loss_bins = bins.get('loss') if isinstance(bins, dict) else None
+            if isinstance(loss_bins, dict) and loss_bins:
+                top_loss = sorted(loss_bins.items(), key=lambda kv: kv[1], reverse=True)
+                snippet = " ".join([f"{k}={v:.3f}s" for k, v in top_loss[:4]])
+                if snippet:
+                    msg += f" | loss:{snippet}"
+            tqdm.write(msg)
+        except Exception:
+            pass
+
     for it in pbar:
         t0 = time.time()
         # Iteration-level timing breakdown (enabled by SCOPONE_PROFILE=1)
@@ -5669,10 +5706,22 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     tqdm.write(f"[debug-update] it={it+1} starting updates (dual-live)")
                 except Exception:
                     pass
-            info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
-            info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
+            update_prof_A: Optional[Dict[str, float]] = {} if _PAR_TIMING else None
+            update_prof_B: Optional[Dict[str, float]] = {} if _PAR_TIMING else None
             if _PAR_TIMING:
-                _iter_t_update = (time.time() - _t_u0)
+                _t_call_A = time.time()
+            info_A = agent.update(batch_A, epochs=ppo_epochs, minibatch_size=minibatch_size, profiling_bins=update_prof_A)
+            if _PAR_TIMING:
+                _t_after_A = time.time()
+                call_dt_A = _t_after_A - _t_call_A
+                _t_call_B = time.time()
+            info_B = agent_teamB.update(batch_B, epochs=ppo_epochs, minibatch_size=minibatch_size, profiling_bins=update_prof_B)
+            if _PAR_TIMING:
+                _t_after_B = time.time()
+                call_dt_B = _t_after_B - _t_call_B
+                _iter_t_update = (_t_after_B - _t_u0)
+                _log_update_profile('A', update_prof_A, call_dt_A)
+                _log_update_profile('B', update_prof_B, call_dt_B)
             if _PAR_DEBUG:
                 try:
                     tqdm.write(f"[debug-update] it={it+1} finished updates (dual-live)")
@@ -5685,12 +5734,18 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     tqdm.write(f"[debug-update] it={it+1} starting update (dual-frozen {'A' if train_A_now else 'B'})")
                 except Exception:
                     pass
-            if train_A_now:
-                info_A = agent.update(batch_A, epochs=4, minibatch_size=minibatch_size)
-            else:
-                info_B = agent_teamB.update(batch_B, epochs=4, minibatch_size=minibatch_size)
+            update_prof: Optional[Dict[str, float]] = {} if _PAR_TIMING else None
             if _PAR_TIMING:
-                _iter_t_update = (time.time() - _t_u0)
+                _t_call = time.time()
+            if train_A_now:
+                info_A = agent.update(batch_A, epochs=ppo_epochs, minibatch_size=minibatch_size, profiling_bins=update_prof)
+            else:
+                info_B = agent_teamB.update(batch_B, epochs=ppo_epochs, minibatch_size=minibatch_size, profiling_bins=update_prof)
+            if _PAR_TIMING:
+                _t_after = time.time()
+                call_dt = _t_after - _t_call
+                _iter_t_update = (_t_after - _t_u0)
+                _log_update_profile('A-frozen' if train_A_now else 'B-frozen', update_prof, call_dt)
             if _PAR_DEBUG:
                 try:
                     tqdm.write(f"[debug-update] it={it+1} finished update (dual-frozen)")
@@ -5703,9 +5758,15 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     tqdm.write(f"[debug-update] it={it+1} starting update (single-net)")
                 except Exception:
                     pass
-            info = agent.update(batch, epochs=4, minibatch_size=minibatch_size)
+            update_prof_single: Optional[Dict[str, float]] = {} if _PAR_TIMING else None
             if _PAR_TIMING:
-                _iter_t_update = (time.time() - _t_u0)
+                _t_call = time.time()
+            info = agent.update(batch, epochs=ppo_epochs, minibatch_size=minibatch_size, profiling_bins=update_prof_single)
+            if _PAR_TIMING:
+                _t_after = time.time()
+                call_dt = _t_after - _t_call
+                _iter_t_update = (_t_after - _t_u0)
+                _log_update_profile('single', update_prof_single, call_dt)
             if _PAR_DEBUG:
                 try:
                     tqdm.write(f"[debug-update] it={it+1} finished update (single-net)")
