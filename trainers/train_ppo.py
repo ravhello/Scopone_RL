@@ -5623,17 +5623,17 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     _iter_t_collect = (time.time() - _t_c0)
         if dual_team_nets and (not opp_frozen_env):
             if len(batch_A['obs']) == 0 or len(batch_B['obs']) == 0:
-                continue
+                raise RuntimeError("train_ppo: collector returned empty batch for one of the live teams (len(obs)==0)")
         elif dual_team_nets and opp_frozen_env:
             if train_A_now:
                 if len(batch_A['obs']) == 0:
-                    continue
+                    raise RuntimeError("train_ppo: collector returned empty batch for frozen-A update (len(obs)==0)")
             else:
                 if len(batch_B['obs']) == 0:
-                    continue
+                    raise RuntimeError("train_ppo: collector returned empty batch for frozen-B update (len(obs)==0)")
         else:
             if len(batch['obs']) == 0:
-                continue
+                raise RuntimeError("train_ppo: collector returned empty batch (len(obs)==0)")
         # normalizza vantaggi completamente su GPU (no sync)
         _t_p0 = time.time() if _PAR_TIMING else 0.0
         if dual_team_nets and (not opp_frozen_env):
