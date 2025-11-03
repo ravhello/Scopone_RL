@@ -18,7 +18,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
-from utils.device import get_compute_device
+from utils.device import get_compute_device, get_infer_device
  
 from selfplay.league import League
 from models.action_conditioned import ActionConditionedActor
@@ -30,6 +30,7 @@ from evaluation.eval import evaluate_pair_actors, evaluate_pair_actors_parallel
 import torch.optim as optim
 
 device = get_compute_device()
+_INFER_DEVICE = get_infer_device()
 # Global perf flags
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
@@ -148,6 +149,28 @@ def _dbg_verbose(msg: str) -> None:
             tqdm.write(str(msg))
         except Exception:
             print(str(msg), flush=True)
+
+
+def _move_module_to_device(module: torch.nn.Module, target: torch.device) -> None:
+    if module is None:
+        return
+    try:
+        first_param = next(module.parameters())
+    except StopIteration:
+        first_param = None
+    if first_param is not None and first_param.device == target:
+        return
+    module.to(target)
+
+
+def _ensure_agent_infer_device(agent: ActionConditionedPPO, target: torch.device) -> None:
+    _move_module_to_device(agent.actor, target)
+    if hasattr(agent, 'critic'):
+        _move_module_to_device(agent.critic, target)
+
+
+def _ensure_actor_infer_device(actor: ActionConditionedActor, target: torch.device) -> None:
+    _move_module_to_device(actor, target)
 
 
 def _flatten_cpu(tensor: Optional[torch.Tensor], dtype: Optional[torch.dtype] = torch.float32) -> Optional[torch.Tensor]:
@@ -1031,7 +1054,7 @@ def _batched_select_indices(agent: ActionConditionedPPO,
     for r in reqs:
         if 'obs' not in r or 'legals' not in r or 'wid' not in r:
             raise KeyError("_batched_select_indices: missing 'obs'/'legals'/'wid' in request")
-    # Stack CPU tensors; keep selection on CPU to avoid small GPU kernels
+    # Stack CPU tensors; move to inference device in a single pass
     _t_total0 = time.time() if _PAR_TIMING else 0.0
     _t0 = time.time() if _PAR_TIMING else 0.0
     obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
@@ -1059,10 +1082,14 @@ def _batched_select_indices(agent: ActionConditionedPPO,
         _BATCHSEL_PROF['t_leg_stack'] += (time.time() - _t0)
     with torch.no_grad():
         # Keep selection on CPU device
-        cpu_device = torch.device('cpu')
-        o_t = obs_cpu
-        s_t = seat_cpu
-        leg_t = leg_cpu
+        if _INFER_DEVICE.type == 'cuda':
+            o_t = obs_cpu.pin_memory().to(_INFER_DEVICE, non_blocking=True)
+            s_t = seat_cpu.pin_memory().to(_INFER_DEVICE, non_blocking=True)
+            leg_t = leg_cpu.pin_memory().to(_INFER_DEVICE, non_blocking=True)
+        else:
+            o_t = obs_cpu.to(_INFER_DEVICE)
+            s_t = seat_cpu.to(_INFER_DEVICE)
+            leg_t = leg_cpu.to(_INFER_DEVICE)
         # Validate legal encoding in STRICT mode only
         if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
             ones = leg_t[:, :40].sum(dim=1)
@@ -1077,9 +1104,9 @@ def _batched_select_indices(agent: ActionConditionedPPO,
         if _PAR_TIMING:
             _BATCHSEL_PROF['t_action_enc'] += (time.time() - _t0)
         B = o_t.size(0)
-        cnts_t = torch.as_tensor(cnts, dtype=torch.long, device=device)
+        cnts_t = torch.as_tensor(cnts, dtype=torch.long, device=_INFER_DEVICE)
         max_cnt = int(cnts_t.max().item()) if B > 0 else 0
-        pos = torch.arange(max_cnt, device=device, dtype=torch.long) if max_cnt > 0 else None
+        pos = torch.arange(max_cnt, device=_INFER_DEVICE, dtype=torch.long) if max_cnt > 0 else None
         out_idx = []
         if _PAR_TIMING:
             _BATCHSEL_PROF['sum_B'] += int(B)
@@ -1090,24 +1117,24 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             _t0 = time.time() if _PAR_TIMING else 0.0
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
             mask = rel_pos_2d < cnts_t.unsqueeze(1)
-            offs_t = torch.as_tensor(offs, dtype=torch.long, device=device)
+            offs_t = torch.as_tensor(offs, dtype=torch.long, device=_INFER_DEVICE)
             abs_idx = (offs_t.unsqueeze(1) + rel_pos_2d)[mask]
-            sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+            sample_idx = torch.arange(B, device=_INFER_DEVICE, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
             if _PAR_TIMING:
                 _BATCHSEL_PROF['t_mask'] += (time.time() - _t0)
             # Two-stage selection: card → capture
             # Card logits (B,40)
             card_logits_all = torch.matmul(state_proj, agent.actor.card_emb_play.t())
             # Allowed mask per sample
-            played_ids_all = torch.argmax(leg_t[:, :40], dim=1).to(device)
+            played_ids_all = torch.argmax(leg_t[:, :40], dim=1)
             played_ids_mb = played_ids_all[abs_idx]
-            allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
+            allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=_INFER_DEVICE)
             allowed_mask[sample_idx, played_ids_mb] = True
             masked_logits = torch.where(allowed_mask, card_logits_all, torch.full_like(card_logits_all, float('-inf')))
             probs_cards = torch.softmax(masked_logits, dim=1)
             # Sample card per sample for valid rows
             valid_rows = (cnts_t > 0)
-            chosen_card = torch.zeros((B,), dtype=torch.long, device=device)
+            chosen_card = torch.zeros((B,), dtype=torch.long, device=_INFER_DEVICE)
             if bool(valid_rows.any()):
                 pv_cards = probs_cards[valid_rows]
                 # numerical guards
@@ -1120,9 +1147,7 @@ def _batched_select_indices(agent: ActionConditionedPPO,
                 chosen_sub = torch.multinomial(pv_cards, num_samples=1).squeeze(1)
                 chosen_card[valid_rows] = chosen_sub
             # For each sample, sample capture within chosen card group
-            sel = torch.zeros((B,), dtype=torch.long, device=device)
-            # Precompute per-legal action embeddings on device
-            a_emb_all_dev = agent.actor.action_enc(leg_t.to(device=device))
+            sel = torch.zeros((B,), dtype=torch.long, device=_INFER_DEVICE)
             for i in range(B):
                 c = int(cnts_t[i].item())
                 if c <= 0:
@@ -1144,7 +1169,7 @@ def _batched_select_indices(agent: ActionConditionedPPO,
                     continue
                 idxs = torch.nonzero(mask_slice, as_tuple=False).flatten()
                 # Compute capture logits for this sample subset
-                emb_slice = a_emb_all_dev[start:end][idxs]
+                emb_slice = a_emb_all[start:end][idxs]
                 cap_logits = (emb_slice * state_proj[i]).sum(dim=1)
                 probs_cap = torch.softmax(cap_logits, dim=0).nan_to_num(0.0)
                 if bool((probs_cap.sum() <= 0) or (~torch.isfinite(probs_cap.sum()))):
@@ -1154,9 +1179,9 @@ def _batched_select_indices(agent: ActionConditionedPPO,
                     continue
                 j = int(torch.multinomial(probs_cap, num_samples=1).item())
                 sel[i] = int(idxs[j].item())
-            sel_cpu = sel.detach().to('cpu')
-            for i in range(B):
-                out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
+                sel_cpu = sel.detach().to('cpu')
+                for i in range(B):
+                    out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
         else:
             out_idx = [(int(reqs[i]['wid']), 0) for i in range(B)]
     if _PAR_TIMING:
@@ -1173,18 +1198,15 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
     # Stack obs/seat for all reqs once
     obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
     seat_cpu = torch.stack([torch.as_tensor(r.get('seat', [0,0,0,0,0,0]), dtype=torch.float32) for r in reqs], dim=0)
+    infer_device = _INFER_DEVICE
+    use_cuda = (infer_device.type == 'cuda')
     with torch.no_grad():
-        # Use CPU tensors directly when not targeting CUDA to avoid unnecessary pinned memory
-        if getattr(device, 'type', str(device)) == 'cuda':
-            if device.type == 'cuda':
-                o_t = obs_cpu.pin_memory().to(device=device, non_blocking=True)
-                s_t = seat_cpu.pin_memory().to(device=device, non_blocking=True)
-            else:
-                o_t = obs_cpu.to(device=device)
-                s_t = seat_cpu.to(device=device)
+        if use_cuda:
+            o_t = obs_cpu.pin_memory().to(device=infer_device, non_blocking=True)
+            s_t = seat_cpu.pin_memory().to(device=infer_device, non_blocking=True)
         else:
-            o_t = obs_cpu
-            s_t = seat_cpu
+            o_t = obs_cpu.to(infer_device)
+            s_t = seat_cpu.to(infer_device)
         state_proj_all = agent.actor.compute_state_proj(o_t, s_t)  # (N,64)
 
     results: List[Dict] = [{} for _ in reqs]
@@ -1220,16 +1242,16 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
         with torch.no_grad():
             # Concatenate legals
             legals_flat = torch.cat(policy_legals_rows, dim=0)
-            if device.type == 'cuda':
-                legals_flat = legals_flat.pin_memory().to(device=device, non_blocking=True)
+            if use_cuda:
+                legals_flat = legals_flat.pin_memory().to(device=infer_device, non_blocking=True)
             else:
-                legals_flat = legals_flat.to(device=device)
+                legals_flat = legals_flat.to(device=infer_device)
             Bp = len(policy_positions)
-            cnts_t = torch.as_tensor(policy_cnts, dtype=torch.long, device=device)
+            cnts_t = torch.as_tensor(policy_cnts, dtype=torch.long, device=infer_device)
             max_cnt = int(cnts_t.max().item()) if Bp > 0 else 0
             # Map from each legal to its policy-sample index
-            sample_idx_per_legal = torch.repeat_interleave(torch.arange(Bp, device=device, dtype=torch.long), cnts_t)
-            sp = state_proj_all[torch.as_tensor(policy_positions, dtype=torch.long, device=device)]  # (Bp,64)
+            sample_idx_per_legal = torch.repeat_interleave(torch.arange(Bp, device=infer_device, dtype=torch.long), cnts_t)
+            sp = state_proj_all[torch.as_tensor(policy_positions, dtype=torch.long, device=infer_device)]  # (Bp,64)
 
             # Card logits and mask per sample
             card_logits_all = torch.matmul(sp, agent.actor.card_emb_play.t())  # (Bp,40)
@@ -1243,11 +1265,11 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
             # Log-softmax within (sample,card) group
             group_ids = sample_idx_per_legal * 40 + played_ids_all
             num_groups = Bp * 40
-            group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
+            group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=infer_device)
             group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
             gmax_per_legal = group_max[group_ids]
             exp_shifted = torch.exp(cap_logits - gmax_per_legal).to(cap_logits.dtype)
-            group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
+            group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=infer_device)
             group_sum.index_add_(0, group_ids, exp_shifted)
             lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
             logp_cap_per_legal = cap_logits - lse_per_legal
@@ -1258,18 +1280,18 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
 
             # Softmax over legals per sample (strict validation)
             if max_cnt > 0:
-                pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+                pos = torch.arange(max_cnt, device=infer_device, dtype=torch.long)
                 rel_pos_2d = pos.unsqueeze(0).expand(Bp, max_cnt)
                 mask = rel_pos_2d < cnts_t.unsqueeze(1)
-                padded = torch.full((Bp, max_cnt), float('-inf'), dtype=logp_total_per_legal.dtype, device=device)
+                padded = torch.full((Bp, max_cnt), float('-inf'), dtype=logp_total_per_legal.dtype, device=infer_device)
                 # Write in flatten order
                 # Compute absolute indices in flattened per-sample view (vectorized)
                 if Bp > 0:
-                    cnts_t = torch.as_tensor(policy_cnts, dtype=torch.long, device=device)
+                    cnts_t = torch.as_tensor(policy_cnts, dtype=torch.long, device=infer_device)
                     starts = torch.cumsum(torch.nn.functional.pad(cnts_t[:-1], (1, 0)), dim=0)
                     offs_t = torch.repeat_interleave(starts, cnts_t)
                 else:
-                    offs_t = torch.zeros((0,), dtype=torch.long, device=device)
+                    offs_t = torch.zeros((0,), dtype=torch.long, device=infer_device)
                 # Above is heavy; alternatively fill by iterating slices
                 # Use a simple loop in CUDA graph-free context for clarity
                 start = 0
@@ -1366,32 +1388,36 @@ def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List
         return [(int(reqs[i]['wid']), 0) for i in range(len(reqs))]
     leg_cpu = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in flat_legals], dim=0)
     with torch.no_grad():
-        # Use CPU to avoid device churn
-        o_t = obs_cpu
-        s_t = seat_cpu
-        leg_t = leg_cpu
+        if _INFER_DEVICE.type == 'cuda':
+            o_t = obs_cpu.pin_memory().to(_INFER_DEVICE, non_blocking=True)
+            s_t = seat_cpu.pin_memory().to(_INFER_DEVICE, non_blocking=True)
+            leg_t = leg_cpu.pin_memory().to(_INFER_DEVICE, non_blocking=True)
+        else:
+            o_t = obs_cpu.to(_INFER_DEVICE)
+            s_t = seat_cpu.to(_INFER_DEVICE)
+            leg_t = leg_cpu.to(_INFER_DEVICE)
         # State projection via frozen actor's encoder
         state_proj = actor.compute_state_proj(o_t, s_t)
         a_emb_all = actor.action_enc(leg_t)
         B = o_t.size(0)
-        cnts_t = torch.as_tensor(cnts, dtype=torch.long)
+        cnts_t = torch.as_tensor(cnts, dtype=torch.long, device=_INFER_DEVICE)
         max_cnt = int(cnts_t.max().item()) if B > 0 else 0
-        pos = torch.arange(max_cnt, dtype=torch.long) if max_cnt > 0 else None
+        pos = torch.arange(max_cnt, device=_INFER_DEVICE, dtype=torch.long) if max_cnt > 0 else None
         out_idx = []
         if max_cnt > 0:
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
             mask = rel_pos_2d < cnts_t.unsqueeze(1)
-            offs_t = torch.as_tensor(offs, dtype=torch.long)
+            offs_t = torch.as_tensor(offs, dtype=torch.long, device=_INFER_DEVICE)
             abs_idx = (offs_t.unsqueeze(1) + rel_pos_2d)[mask]
-            sample_idx = torch.arange(B, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+            sample_idx = torch.arange(B, device=_INFER_DEVICE, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
             a_emb_mb = a_emb_all[abs_idx]
             legal_scores = (a_emb_mb * state_proj[sample_idx]).sum(dim=1)
-            padded = torch.full((B, max_cnt), -1e9, dtype=legal_scores.dtype)
+            padded = torch.full((B, max_cnt), -1e9, dtype=legal_scores.dtype, device=_INFER_DEVICE)
             padded[mask] = legal_scores
             probs = torch.softmax(padded, dim=1)
             probs = torch.where(mask, probs, torch.zeros_like(probs))
             valid_rows = (cnts_t > 0)
-            sel = torch.zeros((B,), dtype=torch.long)
+            sel = torch.zeros((B,), dtype=torch.long, device=_INFER_DEVICE)
             if bool(valid_rows.any()):
                 pv = probs[valid_rows]
                 mv = mask[valid_rows]
@@ -1403,7 +1429,7 @@ def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List
                     raise RuntimeError("_batched_select_indices_with_actor: invalid probability rows (NaN/Inf or zero-sum)")
                 sub = torch.multinomial(pv, num_samples=1).squeeze(1)
                 sel[valid_rows] = sub
-            sel_cpu = sel.detach()
+            sel_cpu = sel.detach().to('cpu')
             for i in range(B):
                 out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
         else:
@@ -1504,7 +1530,7 @@ def _load_frozen_actor(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
     actor = ActionConditionedActor(obs_dim=obs_dim)
     actor = maybe_compile_module(actor, name='ActionConditionedActor[trainer_partner]')
     try:
-        ckpt = safe_torch_load(ckpt_path, map_location=device)
+        ckpt = safe_torch_load(ckpt_path, map_location=_INFER_DEVICE)
         if isinstance(ckpt, dict) and 'actor' in ckpt:
             actor.load_state_dict(ckpt['actor'])
         # else: leave randomly init
@@ -1533,6 +1559,7 @@ def _load_frozen_actor(ckpt_path: str, obs_dim: int) -> ActionConditionedActor:
         # Optional: escalate failure for CI/debug
         if _os.environ.get('SCOPONE_RAISE_ON_CKPT_FAIL', '0') == '1':
             raise RuntimeError(f"Checkpoint load failed: {ckpt_path} (reason={reason}, type={etype}, size={max(size_b,0)}B)") from e
+    _ensure_actor_infer_device(actor, _INFER_DEVICE)
     actor.eval()
     return actor
 
@@ -3659,6 +3686,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     obs_dim = env.observation_space.shape[0]
     # Passa k_history al modello per evitare inferenze fragili di k
     agent = ActionConditionedPPO(obs_dim=obs_dim, k_history=k_history)
+    _ensure_agent_infer_device(agent, _INFER_DEVICE)
     # Allow big-compute-on-GPU during update while env/collection stays on CPU.
     # Controlled by env var SCOPONE_TRAIN_DEVICE (cpu|cuda[:id]). Defaults to cpu.
     # Models live on CPU for collection; moved to train device inside agent.update.
@@ -3952,7 +3980,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     resume_A = None
     resume_B = None
     if warm_start_mode == '0':
-        resume_A = None; resume_B = None
+        resume_A = None
+        resume_B = None
     elif warm_start_mode == '1':
         resume_A = (topN[0] if len(topN) >= 1 else resume_ckpt)
         resume_B = resume_A
@@ -3962,6 +3991,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     # Apply resume to main agent (always)
     if resume_A:
         agent.load(resume_A, map_location='cpu')
+        _ensure_agent_infer_device(agent, _INFER_DEVICE)
         tqdm.write(f"[resume] Loaded agent(A) from {resume_A}")
 
     partner_actor = None
@@ -3990,6 +4020,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         # so treat per-episode util as 20 everywhere in collection paths
         train_both_teams = False
         agent_teamB = ActionConditionedPPO(obs_dim=obs_dim, k_history=k_history)
+        _ensure_agent_infer_device(agent_teamB, _INFER_DEVICE)
         # Load resume_B according to warm-start policy
         if warm_start_mode == '0':
             resumeB = None
@@ -3999,6 +4030,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             resumeB = resume_B
         if resumeB:
             agent_teamB.load(resumeB, map_location='cpu')
+            _ensure_agent_infer_device(agent_teamB, _INFER_DEVICE)
             tqdm.write(f"[resume] Loaded team-B agent from {resumeB}")
     # alterna il main actor tra seat 0/2 e 1/3 per episodi
     even_main_seats = [0, 2]
@@ -4285,6 +4317,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                         # clone lightweight copy of actor state
                         shadow_actor = ActionConditionedActor(obs_dim=obs_dim)
                         shadow_actor.load_state_dict(agent.actor.state_dict())
+                        _ensure_actor_infer_device(shadow_actor, _INFER_DEVICE)
                 batch = collect_trajectory_parallel(agent,
                                                     num_envs=int(num_envs),
                                                     episodes_total_hint=episodes_hint,

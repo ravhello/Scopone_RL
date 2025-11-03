@@ -45,6 +45,17 @@ def get_env_device() -> torch.device:
     return get_compute_device()
 
 
+def get_infer_device() -> torch.device:
+    """
+    Device used for actor inference during data collection.
+    Falls back to the compute device when SCOPONE_INFER_DEVICE is unset.
+    """
+    infer_dev = os.environ.get('SCOPONE_INFER_DEVICE')
+    if infer_dev:
+        return _safe_make_device(infer_dev)
+    return get_compute_device()
+
+
 def get_amp_dtype() -> torch.dtype:
     """
     Return autocast dtype based on AMP_DTYPE env var: 'bf16' or 'fp16' (default).

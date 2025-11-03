@@ -48,12 +48,11 @@ os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
 os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
 os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
 
-# Imposta ENV_DEVICE una sola volta coerente con SCOPONE_DEVICE o disponibilità CUDA
-os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
-os.environ.setdefault('ENV_DEVICE', 'cpu')
-
 # Training compute device (models stay on CPU during env collection; moved only inside update)
-os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
+os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cuda')
+os.environ.setdefault('SCOPONE_INFER_DEVICE', 'cuda')
+os.environ.setdefault('SCOPONE_DEVICE', 'cuda')
+os.environ.setdefault('ENV_DEVICE', 'cpu')
 
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
