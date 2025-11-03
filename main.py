@@ -59,10 +59,11 @@ os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
 os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
 os.environ.setdefault('SCOPONE_PROFILE', '1')
+os.environ.setdefault('SCOPONE_PPO_EPOCHS', '4')
 
 # ===== Section: Diagnostics/Profiling (Both) =====
 # Additional trainer/eval tunables exposed via environment (defaults; override as needed)
-os.environ.setdefault('SCOPONE_PAR_DEBUG', '0')  # abilita log di debug per raccolta parallela/eval
+os.environ.setdefault('SCOPONE_PAR_DEBUG', '1')  # abilita log di debug per raccolta parallela/eval
 os.environ.setdefault('SCOPONE_PPO_DEBUG', '0')  # abilita log di debug per PPO
 os.environ.setdefault('SCOPONE_TORCH_PROF', '0')  # abilita PyTorch profiler (main/workers)
 os.environ.setdefault('SCOPONE_TORCH_TB_DIR', '')  # directory TensorBoard per tracce profiler
@@ -133,7 +134,7 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
 iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
-num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '24'))  # numero di environment paralleli
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
 os.environ.setdefault('BELIEF_AUX_COEF', '0.05')  # coefficiente loss ausiliaria belief (default 0.0)
 os.environ.setdefault('SCOPONE_REWARD_SCALE', '0.1')  # scala ricompense finali (1.0 = nessuna variazione)
 
