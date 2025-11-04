@@ -1179,9 +1179,9 @@ def _batched_select_indices(agent: ActionConditionedPPO,
                     continue
                 j = int(torch.multinomial(probs_cap, num_samples=1).item())
                 sel[i] = int(idxs[j].item())
-                sel_cpu = sel.detach().to('cpu')
-                for i in range(B):
-                    out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
+            sel_cpu = sel.detach().to('cpu')
+            for i in range(B):
+                out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
         else:
             out_idx = [(int(reqs[i]['wid']), 0) for i in range(B)]
     if _PAR_TIMING:
