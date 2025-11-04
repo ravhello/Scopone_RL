@@ -7,7 +7,7 @@ def compute_final_score_breakdown(game_state, rules=None):
     Breakdown finale calcolato su CUDA; i valori restituiti sono scalari Python.
     """
     # Esegui su CPU per evitare dipendenze forzate da GPU (env/logica punteggio lato CPU)
-    device = torch.device(os.environ.get('REW_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')))
+    device = torch.device(os.environ.get('REW_DEVICE', 'cpu'))
     # Allinea i tensori costanti di indicizzazione al device di lavoro per evitare mismatch
     RID = RANK_OF_ID.to(device=device)
     SUID = SUITCOL_OF_ID.to(device=device)
@@ -121,7 +121,7 @@ def compute_final_reward_from_breakdown(breakdown):
     Calcola la ricompensa finale come differenza di punteggio tra i team.
     Ritorna un dizionario {0: reward_team0, 1: reward_team1}.
     """
-    device = torch.device(os.environ.get('REW_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')))
+    device = torch.device(os.environ.get('REW_DEVICE', 'cpu'))
     diff = torch.tensor(breakdown[0]["total"] - breakdown[1]["total"], dtype=torch.float32, device=device)
     scale = float(os.environ.get('SCOPONE_REWARD_SCALE', '1.0'))
     scaled = diff * scale

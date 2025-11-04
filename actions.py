@@ -2,11 +2,8 @@
 import os
 import torch
 
-# Device for action encoding/decoding. Prefer ENV_DEVICE (env-side), then explicit ACTIONS_DEVICE, then SCOPONE_DEVICE, else CPU
-_ACTIONS_DEVICE_STR = os.environ.get(
-    "ACTIONS_DEVICE",
-    os.environ.get('ENV_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')),
-)
+# Device for action encoding/decoding — controlled exclusively via ACTIONS_DEVICE (default CPU)
+_ACTIONS_DEVICE_STR = os.environ.get("ACTIONS_DEVICE", "cpu")
 device = torch.device(_ACTIONS_DEVICE_STR)
 def encode_action_from_ids_tensor(played_id_t: torch.Tensor, captured_ids_t: torch.Tensor) -> torch.Tensor:
     """

@@ -1,6 +1,5 @@
 import torch
 import os
-from utils.device import get_env_device
 import gymnasium as gym
 from gymnasium import spaces
 import time
@@ -19,9 +18,18 @@ from observation import (
 from utils.compile import maybe_compile_function
 import torch.nn.functional as F
 
-# Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU.
-# Può essere forzato impostando ENV_DEVICE, ma di default resta CPU.
-device = get_env_device()
+# Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU (override via ENV_DEVICE).
+def _device_from_env(env_key: str, default: str = 'cpu') -> torch.device:
+    val = os.environ.get(env_key, default)
+    try:
+        if val.startswith('cuda') and not torch.cuda.is_available():
+            return torch.device('cpu')
+        return torch.device(val)
+    except Exception:
+        return torch.device('cpu')
+
+
+device = _device_from_env('ENV_DEVICE')
 _SKIP_STEP_VALIDATION = (os.environ.get('SCOPONE_SKIP_STEP_VALIDATION', '1') == '1')
 
 def _suit_to_int(suit):

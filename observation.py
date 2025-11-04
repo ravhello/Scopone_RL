@@ -17,7 +17,7 @@ suit_to_col = {'denari': 0, 'coppe': 1, 'spade': 2, 'bastoni': 3}
 
 # ===== Device control (CPU default) =====
 import os as _os
-OBS_DEVICE = torch.device(_os.environ.get('OBS_DEVICE', _os.environ.get('SCOPONE_DEVICE', 'cpu')))
+OBS_DEVICE = torch.device(_os.environ.get('OBS_DEVICE', 'cpu'))
 # Disabilita di default le feature probabilistiche per lasciare che la rete impari il belief
 OBS_INCLUDE_INFERRED = os.environ.get('OBS_INCLUDE_INFERRED', '0') == '1'
 OBS_INCLUDE_RANK_PROBS = os.environ.get('OBS_INCLUDE_RANK_PROBS', '0') == '1'

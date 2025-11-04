@@ -18,7 +18,6 @@ if _PROJECT_ROOT not in sys.path:
 
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
-from utils.device import get_compute_device, get_infer_device
  
 from selfplay.league import League
 from models.action_conditioned import ActionConditionedActor
@@ -29,8 +28,18 @@ from evaluation.eval import evaluate_pair_actors, evaluate_pair_actors_parallel
 
 import torch.optim as optim
 
-device = get_compute_device()
-_INFER_DEVICE = get_infer_device()
+def _device_from_env(env_key: str, default: Optional[str] = None) -> torch.device:
+    val = os.environ.get(env_key, default if default is not None else 'cpu')
+    try:
+        if val.startswith('cuda') and not torch.cuda.is_available():
+            return torch.device('cpu')
+        return torch.device(val)
+    except Exception:
+        return torch.device('cpu')
+
+
+device = _device_from_env('SCOPONE_DEVICE')
+_INFER_DEVICE = _device_from_env('SCOPONE_INFER_DEVICE', default=os.environ.get('SCOPONE_DEVICE', 'cpu'))
 # Global perf flags
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True

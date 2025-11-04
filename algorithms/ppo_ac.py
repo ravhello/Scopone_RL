@@ -6,14 +6,29 @@ from typing import List, Tuple, Optional, Dict
 from contextlib import nullcontext
 
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
-from utils.device import get_compute_device, get_amp_dtype
 from utils.compile import maybe_compile_module, maybe_compile_function
 from utils.torch_load import safe_torch_load
 import os as _os
-device = get_compute_device()
+
+
+def _device_from_env(env_key: str, default: str = 'cpu') -> torch.device:
+    val = _os.environ.get(env_key, default)
+    try:
+        if val.startswith('cuda') and not torch.cuda.is_available():
+            return torch.device('cpu')
+        return torch.device(val)
+    except Exception:
+        return torch.device('cpu')
+
+
+def _get_amp_dtype() -> torch.dtype:
+    amp = _os.environ.get('AMP_DTYPE', 'fp16').lower()
+    return torch.bfloat16 if amp == 'bf16' else torch.float16
+
+
+device = _device_from_env('SCOPONE_DEVICE')
 autocast_device = device.type
-autocast_dtype = get_amp_dtype()
-import os as _os
+autocast_dtype = _get_amp_dtype()
 STRICT_CHECKS = (_os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
 
 

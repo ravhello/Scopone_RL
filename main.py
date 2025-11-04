@@ -302,10 +302,23 @@ if _SILENCE_ABSL and os.name != 'nt':
 os.environ.setdefault('SCOPONE_MP_START', os.environ.get('SCOPONE_MP_START', _DEFAULT_MP_START))
 
 import torch
-from utils.device import get_compute_device
 from tqdm import tqdm
 from trainers.train_ppo import train_ppo
 from utils.seed import resolve_seed
+
+
+def _device_from_env(env_key: str, default: str = 'cpu') -> torch.device:
+    val = os.environ.get(env_key, default)
+    try:
+        if val.startswith('cuda') and not torch.cuda.is_available():
+            return torch.device('cpu')
+        return torch.device(val)
+    except Exception:
+        return torch.device('cpu')
+
+
+def _compute_device() -> torch.device:
+    return _device_from_env('SCOPONE_DEVICE')
 
 def _maybe_launch_tensorboard():
     """Launch TensorBoard in background if enabled.
@@ -330,7 +343,7 @@ def _maybe_launch_tensorboard():
 
 # Minimal entrypoint: launch PPO training only
 if __name__ == "__main__":
-    device = get_compute_device()
+    device = _compute_device()
     tqdm.write(f"Using device: {device}")
     _train_dev_raw = str(os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')).strip().lower()
     tqdm.write(f"Training compute device: {_train_dev_raw}")
