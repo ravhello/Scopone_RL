@@ -17,6 +17,15 @@ os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # disable oneDNN custom ops
 # Abilita TensorBoard di default (override con SCOPONE_DISABLE_TB=1 per disattivarlo)
 os.environ.setdefault('SCOPONE_DISABLE_TB', '0')
 
+# ===== Section: Device Layout (Both) =====
+os.environ.setdefault('SCOPONE_DEVICE', 'cpu')  # Device di fallback usato da ogni modulo che non imposta un device specifico
+os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')  # Device su cui vengono eseguiti gli update PPO/gradienti
+os.environ.setdefault('SCOPONE_INFER_DEVICE', 'cpu')  # Device usato dalla policy durante la raccolta azioni (collector/mcts)
+os.environ.setdefault('ENV_DEVICE', 'cpu')  # Device per l'ambiente e le sue strutture di stato
+os.environ.setdefault('OBS_DEVICE', 'cpu')  # Device su cui risiedono le costanti dell'osservazione e gli encoder
+os.environ.setdefault('ACTIONS_DEVICE', 'cpu')  # Device per l'encoding/decoding vettoriale delle azioni
+os.environ.setdefault('REW_DEVICE', 'cpu')  # Device di calcolo per le funzioni di reward ausiliarie
+
 # ===== Section: Torch Compile/Inductor (Both) =====
 ## Abilita torch.compile di default per l'intero progetto (override via env)
 os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
@@ -47,12 +56,6 @@ os.environ.setdefault('OBS_INCLUDE_DEALER', '1')
 os.environ.setdefault('OBS_INCLUDE_INFERRED', '0')
 os.environ.setdefault('OBS_INCLUDE_RANK_PROBS', '0')
 os.environ.setdefault('OBS_INCLUDE_SCOPA_PROBS', '0')
-
-# Training compute device (models stay on CPU during env collection; moved only inside update)
-os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cuda')
-os.environ.setdefault('SCOPONE_INFER_DEVICE', 'cuda')
-os.environ.setdefault('SCOPONE_DEVICE', 'cuda')
-os.environ.setdefault('ENV_DEVICE', 'cpu')
 
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
@@ -293,7 +296,6 @@ if _SILENCE_ABSL and os.name != 'nt':
     _t = threading.Thread(target=_stderr_reader, args=(_r_fd, _orig_fd2, _SUPPRESS_SUBSTRINGS), daemon=True)
     _t.start()
 
-os.environ.setdefault('ENV_DEVICE', 'cpu')
 ## Imposta metodo mp sicuro per CUDA: forkserver su POSIX, spawn su Windows (override con SCOPONE_MP_START)
 # Nota: per il collector parallelo impostiamo già SCOPONE_MP_START nel blocco single/multi-env;
 # qui manteniamo solo un default globale compatibile per altri usi (es. script esterni)
