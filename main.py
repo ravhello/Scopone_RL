@@ -74,6 +74,8 @@ os.environ.setdefault('SCOPONE_RAISE_ON_CKPT_FAIL', '0')  # solleva se fallisce 
 os.environ.setdefault('ENABLE_BELIEF_SUMMARY', '0')  # stampa riassunti belief (diagnostica)
 os.environ.setdefault('DET_NOISE', '0.0')  # rumore per determinizzazioni MCTS (IS-MCTS)
 os.environ.setdefault('SCOPONE_COLLECTOR_STALL_S', '30')  # watchdog: tempo di stallo consentito (s)
+#os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')  # 0=auto, >0 forza min batch size per collector
+#os.environ.setdefault('SCOPONE_COLLECT_BATCH_TARGET', '0')  # 0=auto, >0 forza batch target del collector
 
 # ===== Section: Topology & League (Both) =====
 # Gameplay/training topology flags
@@ -164,7 +166,8 @@ if num_envs <= 1:
 else:
     # Multi-env (parallelo): lascia la strategia di batching dinamica del collector.
     # Mantieni min_batch auto (0) e piccola latenza per favorire batch grandi senza alta latenza.
-    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '0')
+    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '512')
+    os.environ.setdefault('SCOPONE_COLLECT_BATCH_TARGET', '512')  # 0=auto, >0 forza batch target del collector
     os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')
     # Un thread per worker per evitare oversubscription; usato dai processi figli.
     os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')

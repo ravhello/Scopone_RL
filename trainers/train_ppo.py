@@ -2936,10 +2936,22 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
 
         # 2) Gather a micro-batch of requests without blocking
         reqs = []
-        min_batch = int(os.environ.get('SCOPONE_COLLECT_MIN_BATCH', '0'))
-        if min_batch <= 0:
+        min_batch_env = os.environ.get('SCOPONE_COLLECT_MIN_BATCH', '').strip()
+        if min_batch_env:
+            try:
+                min_batch = max(1, int(min_batch_env))
+            except ValueError:
+                min_batch = max(32, 2 * int(num_envs))
+        else:
             min_batch = max(32, 2 * int(num_envs))
-        batch_target = max(min_batch, 64)
+        batch_target_env = os.environ.get('SCOPONE_COLLECT_BATCH_TARGET', '').strip()
+        if batch_target_env:
+            try:
+                batch_target = max(1, int(batch_target_env))
+            except ValueError:
+                batch_target = max(min_batch, 64)
+        else:
+            batch_target = max(min_batch, 64)
         max_latency_ms = float(os.environ.get('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0'))
         max_latency_s = max(0.0, max_latency_ms / 1000.0)
         t0_get = time.time() if _PAR_TIMING else 0.0
