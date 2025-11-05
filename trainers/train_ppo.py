@@ -1072,14 +1072,9 @@ def _batched_select_indices(agent: ActionConditionedPPO,
         state_proj = agent.actor.compute_state_proj(o_t, s_t)  # (B,64)
         if _PAR_TIMING:
             _BATCHSEL_PROF['t_state_proj'] += (time.time() - _t0)
-        _t0 = time.time() if _PAR_TIMING else 0.0
-        a_emb_all = agent.actor.action_enc(leg_t)             # (M,64)
-        if _PAR_TIMING:
-            _BATCHSEL_PROF['t_action_enc'] += (time.time() - _t0)
         B = o_t.size(0)
         cnts_t = torch.as_tensor(cnts, dtype=torch.long, device=device)
         max_cnt = int(cnts_t.max().item()) if B > 0 else 0
-        pos = torch.arange(max_cnt, device=device, dtype=torch.long) if max_cnt > 0 else None
         out_idx = []
         if _PAR_TIMING:
             _BATCHSEL_PROF['sum_B'] += int(B)
@@ -1088,30 +1083,31 @@ def _batched_select_indices(agent: ActionConditionedPPO,
             ch[max_cnt] = int(ch.get(int(max_cnt), 0)) + 1
         if max_cnt > 0:
             _t0 = time.time() if _PAR_TIMING else 0.0
-            rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
-            mask = rel_pos_2d < cnts_t.unsqueeze(1)
             offs_t = torch.as_tensor(offs, dtype=torch.long, device=device)
-            abs_idx = (offs_t.unsqueeze(1) + rel_pos_2d)[mask]
-            sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+            batch_idx = torch.arange(B, device=device, dtype=torch.long)
+            sample_idx = torch.repeat_interleave(batch_idx, cnts_t)
+            rel_pos = torch.arange(leg_t.size(0), device=device, dtype=torch.long) - offs_t[sample_idx]
             if _PAR_TIMING:
                 _BATCHSEL_PROF['t_mask'] += (time.time() - _t0)
-            # Two-stage selection: card → capture
-            # Card logits (B,40)
+            strict_checks = os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1'
+            num_cards = agent.actor.card_emb_play.size(0)
+            _t0_enc = time.time() if _PAR_TIMING else 0.0
+            leg_dev = leg_t.to(device=device)
+            a_emb_all_dev = agent.actor.action_enc(leg_dev)
+            if _PAR_TIMING:
+                _BATCHSEL_PROF['t_action_enc'] += (time.time() - _t0_enc)
             card_logits_all = torch.matmul(state_proj, agent.actor.card_emb_play.t())
-            # Allowed mask per sample
-            played_ids_all = torch.argmax(leg_t[:, :40], dim=1).to(device)
-            played_ids_mb = played_ids_all[abs_idx]
-            allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
-            allowed_mask[sample_idx, played_ids_mb] = True
-            masked_logits = torch.where(allowed_mask, card_logits_all, torch.full_like(card_logits_all, float('-inf')))
+            played_ids_all = torch.argmax(leg_dev[:, :num_cards], dim=1)
+            card_values = card_logits_all[sample_idx, played_ids_all]
+            card_key = sample_idx * num_cards + played_ids_all
+            masked_logits = torch.full((B * num_cards,), float('-inf'), device=device)
+            masked_logits.scatter_reduce_(0, card_key, card_values, reduce='amax', include_self=False)
+            masked_logits = masked_logits.view(B, num_cards)
             probs_cards = torch.softmax(masked_logits, dim=1)
-            # Sample card per sample for valid rows
             valid_rows = (cnts_t > 0)
             chosen_card = torch.zeros((B,), dtype=torch.long, device=device)
             if bool(valid_rows.any()):
-                pv_cards = probs_cards[valid_rows]
-                # numerical guards
-                pv_cards = pv_cards.nan_to_num(0.0)
+                pv_cards = probs_cards[valid_rows].nan_to_num(0.0)
                 pv_cards = torch.clamp(pv_cards, min=0.0)
                 rs = pv_cards.sum(dim=1, keepdim=True)
                 if bool(((rs <= 0) | (~torch.isfinite(rs))).any()):
@@ -1119,41 +1115,60 @@ def _batched_select_indices(agent: ActionConditionedPPO,
                 pv_cards = pv_cards / rs
                 chosen_sub = torch.multinomial(pv_cards, num_samples=1).squeeze(1)
                 chosen_card[valid_rows] = chosen_sub
-            # For each sample, sample capture within chosen card group
+            state_proj_per_legal = state_proj[sample_idx]
+            scores = (a_emb_all_dev * state_proj_per_legal).sum(dim=1)
+            group_key = sample_idx * num_cards + played_ids_all
+            group_max = torch.full((B * num_cards,), float('-inf'), device=device)
+            group_max.scatter_reduce_(0, group_key, scores, reduce='amax', include_self=False)
+            stable_scores = scores - group_max[group_key]
+            exp_scores = torch.exp(stable_scores)
+            group_sum = torch.zeros((B * num_cards,), device=device)
+            group_sum.scatter_reduce_(0, group_key, exp_scores, reduce='sum', include_self=False)
+            group_sum_per_legal = group_sum[group_key]
+            probs_cond = torch.zeros_like(exp_scores)
+            valid_entries = (group_sum_per_legal > 0) & torch.isfinite(group_sum_per_legal)
+            probs_cond[valid_entries] = exp_scores[valid_entries] / group_sum_per_legal[valid_entries]
+            mask_chosen = (played_ids_all == chosen_card[sample_idx])
+            prob_matrix = torch.zeros((B, max_cnt), dtype=probs_cond.dtype, device=device)
+            if bool(mask_chosen.any()):
+                prob_matrix[sample_idx[mask_chosen], rel_pos[mask_chosen]] = probs_cond[mask_chosen]
+            has_capture = torch.zeros((B,), dtype=torch.bool, device=device)
+            if bool(mask_chosen.any()):
+                has_capture[sample_idx[mask_chosen]] = True
+            missing_capture = valid_rows & ~has_capture
+            if bool(missing_capture.any()) and strict_checks:
+                idx = int(torch.nonzero(missing_capture, as_tuple=False)[0].item())
+                cc = int(chosen_card[idx].item())
+                cnt = int(cnts_t[idx].item())
+                raise RuntimeError(f"_batched_select_indices: no legal captures for chosen card (sample={idx}, card={cc}, cnt={cnt})")
+            first_cap_idx = torch.full((B,), max_cnt, dtype=torch.long, device=device)
+            if bool(mask_chosen.any()):
+                first_cap_idx.scatter_reduce_(0, sample_idx[mask_chosen], rel_pos[mask_chosen], reduce='amin', include_self=False)
+            first_cap_idx = torch.where(first_cap_idx == max_cnt, torch.zeros_like(first_cap_idx), first_cap_idx)
             sel = torch.zeros((B,), dtype=torch.long, device=device)
-            # Precompute per-legal action embeddings on device
-            a_emb_all_dev = agent.actor.action_enc(leg_t.to(device=device))
-            for i in range(B):
-                c = int(cnts_t[i].item())
-                if c <= 0:
-                    sel[i] = 0
-                    continue
-                start = int(offs[i])
-                end = start + c
-                # Slice legals for this sample
-                played_slice = played_ids_all[start:end]
-                # Ensure chosen_card index is valid
-                cc = int(chosen_card[i].item())
-                # Legal positions with chosen card
-                mask_slice = (played_slice == cc)
-                if not bool(mask_slice.any().item()):
-                    # Fallback STRICT: raise
-                    if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                        raise RuntimeError(f"_batched_select_indices: no legal captures for chosen card (sample={i}, card={cc}, cnt={c})")
-                    sel[i] = 0
-                    continue
-                idxs = torch.nonzero(mask_slice, as_tuple=False).flatten()
-                # Compute capture logits for this sample subset
-                emb_slice = a_emb_all_dev[start:end][idxs]
-                cap_logits = (emb_slice * state_proj[i]).sum(dim=1)
-                probs_cap = torch.softmax(cap_logits, dim=0).nan_to_num(0.0)
-                if bool((probs_cap.sum() <= 0) or (~torch.isfinite(probs_cap.sum()))):
-                    if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                        raise RuntimeError(f"_batched_select_indices: invalid capture probabilities (sample={i})")
-                    sel[i] = int(idxs[0].item())
-                    continue
-                j = int(torch.multinomial(probs_cap, num_samples=1).item())
-                sel[i] = int(idxs[j].item())
+            samples_with_capture = torch.nonzero(has_capture, as_tuple=False).flatten()
+            if samples_with_capture.numel() > 0:
+                probs_cap = prob_matrix[samples_with_capture].nan_to_num(0.0)
+                probs_cap = torch.clamp(probs_cap, min=0.0)
+                sums = probs_cap.sum(dim=1)
+                invalid_cap_rows = (sums <= 0) | (~torch.isfinite(sums))
+                if bool(invalid_cap_rows.any()):
+                    if strict_checks:
+                        bad_idx = torch.nonzero(invalid_cap_rows, as_tuple=False).flatten()
+                        idx = int(samples_with_capture[bad_idx[0]].item())
+                        raise RuntimeError(f"_batched_select_indices: invalid capture probabilities (sample={idx})")
+                    fallback_samples = samples_with_capture[invalid_cap_rows]
+                    if fallback_samples.numel() > 0:
+                        sel[fallback_samples] = first_cap_idx[fallback_samples]
+                valid_cap_rows = ~invalid_cap_rows
+                if bool(valid_cap_rows.any()):
+                    probs_valid = probs_cap[valid_cap_rows]
+                    sums_valid = sums[valid_cap_rows].unsqueeze(1)
+                    probs_valid = probs_valid / sums_valid
+                    chosen_local = torch.multinomial(probs_valid, num_samples=1).squeeze(1)
+                    sel_samples = samples_with_capture[valid_cap_rows]
+                    sel[sel_samples] = chosen_local
+            sel[missing_capture] = 0
             sel_cpu = sel.detach().to('cpu')
             for i in range(B):
                 out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
