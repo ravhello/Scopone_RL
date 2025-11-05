@@ -365,6 +365,12 @@ _GETREQS_PROF = {
     't_nowait_drain': 0.0,
     't_topup_block': 0.0,
     't_post_drain': 0.0,
+    't_nowait_queue': 0.0,
+    't_nowait_process': 0.0,
+    't_topup_process': 0.0,
+    't_shadow_retag': 0.0,
+    'cnt_shadow_retag': 0,
+    't_classify_split': 0.0,
     'cnt_first_ok': 0,
     'cnt_first_to': 0,
     'cnt_nowait_ok': 0,
@@ -3005,7 +3011,12 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         t0_now = time.time() if _PAR_TIMING else 0.0
         while len(reqs) < batch_target:
             try:
+                if _PAR_TIMING:
+                    t_queue_start = time.time()
                 r = request_q.get_nowait()
+                if _PAR_TIMING:
+                    t_process_start = time.time()
+                    _GETREQS_PROF['t_nowait_queue'] += (t_process_start - t_queue_start)
                 # If configured, label non-main requests for shadow (frozen) selection
                 if bool(cfg_base.get('frozen_non_main', False)) and isinstance(r, dict) and r.get('type') == 'step':
                     main_flag = r.get('is_main')
@@ -3019,12 +3030,22 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                             is_main = (seat_idx in main_set)
                         main_flag = is_main
                     if not bool(main_flag):
+                        if _PAR_TIMING:
+                            t_shadow_start = time.time()
                         r = dict(r)
                         r['type'] = 'step_shadow'
+                        if _PAR_TIMING:
+                            t_shadow_end = time.time()
+                            _GETREQS_PROF['t_shadow_retag'] += (t_shadow_end - t_shadow_start)
+                            _GETREQS_PROF['cnt_shadow_retag'] += 1
                 reqs.append(r)
                 if _PAR_TIMING:
+                    t_process_end = time.time()
+                    _GETREQS_PROF['t_nowait_process'] += (t_process_end - t_process_start)
                     cnt_nowait_ok += 1
                     _GETREQS_PROF['cnt_nowait_ok'] += 1
+                else:
+                    cnt_nowait_ok += 1
             except queue.Empty:
                 if _PAR_TIMING:
                     cnt_nowait_empty += 1
@@ -3040,21 +3061,36 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 remaining = max(0.0, deadline - time.time())
                 t0_blk = time.time() if _PAR_TIMING else 0.0
                 r = request_q.get(timeout=remaining)
+                if _PAR_TIMING:
+                    t_block_end = time.time()
+                    delta_block = (t_block_end - t0_blk)
+                    cnt_block_ok += 1
+                    t_get_block += delta_block
+                    _GETREQS_PROF['cnt_topup_ok'] += 1
+                    _GETREQS_PROF['t_topup_block'] += delta_block
+                    t_topup_process_start = time.time()
                 reqs.append(r)
                 if _PAR_TIMING:
-                    cnt_block_ok += 1
-                    t_get_block += (time.time() - t0_blk)
-                    _GETREQS_PROF['cnt_topup_ok'] += 1
-                    _GETREQS_PROF['t_topup_block'] += (time.time() - t0_blk)
+                    t_topup_process_end = time.time()
+                    _GETREQS_PROF['t_topup_process'] += (t_topup_process_end - t_topup_process_start)
                 # Opportunistically drain any burst
                 t0_now = time.time() if _PAR_TIMING else 0.0
                 while len(reqs) < batch_target:
                     try:
+                        if _PAR_TIMING:
+                            t_queue_start = time.time()
                         r2 = request_q.get_nowait()
+                        if _PAR_TIMING:
+                            t_process_start = time.time()
+                            _GETREQS_PROF['t_nowait_queue'] += (t_process_start - t_queue_start)
                         reqs.append(r2)
                         if _PAR_TIMING:
+                            t_process_end = time.time()
+                            _GETREQS_PROF['t_nowait_process'] += (t_process_end - t_process_start)
                             cnt_nowait_ok += 1
                             _GETREQS_PROF['cnt_nowait_ok'] += 1
+                        else:
+                            cnt_nowait_ok += 1
                     except queue.Empty:
                         if _PAR_TIMING:
                             cnt_nowait_empty += 1
@@ -3084,10 +3120,14 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 _GETREQS_PROF['bs_hist'][len(reqs)] = int(_GETREQS_PROF['bs_hist'].get(len(reqs), 0)) + 1
             if _PAR_TIMING:
                 bs_hist[len(reqs)] = bs_hist.get(len(reqs), 0) + 1
+            if _PAR_TIMING:
+                t_split_start = time.time()
             step_reqs = [r for r in reqs if r.get('type') == 'step']
             shadow_reqs = [r for r in reqs if r.get('type') == 'step_shadow']
             other_reqs = [r for r in reqs if r.get('type') != 'step']
             other_reqs = [r for r in other_reqs if r.get('type') != 'step_shadow']
+            if _PAR_TIMING:
+                _GETREQS_PROF['t_classify_split'] += (time.time() - t_split_start)
             if _PAR_TIMING:
                 step_reqs_count += len(step_reqs)
                 other_reqs_count += len(other_reqs)
@@ -3255,6 +3295,13 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 f"nowait_drain={_GETREQS_PROF['t_nowait_drain']:.3f}s(ok={_GETREQS_PROF['cnt_nowait_ok']} empty={_GETREQS_PROF['cnt_nowait_empty']})\n"
                 f"  topup_block={_GETREQS_PROF['t_topup_block']:.3f}s(ok={_GETREQS_PROF['cnt_topup_ok']} to={_GETREQS_PROF['cnt_topup_to']}) post_drain={_GETREQS_PROF['t_post_drain']:.3f}s\n"
                 f"  bs_top_bins={bins_str}"
+            )
+            tqdm.write(
+                f"[par-getreqs-detail] nowait_queue={_GETREQS_PROF['t_nowait_queue']:.3f}s "
+                f"nowait_process={_GETREQS_PROF['t_nowait_process']:.3f}s "
+                f"shadow_retag={_GETREQS_PROF['t_shadow_retag']:.3f}s(count={_GETREQS_PROF['cnt_shadow_retag']}) "
+                f"topup_process={_GETREQS_PROF['t_topup_process']:.3f}s "
+                f"classify_split={_GETREQS_PROF['t_classify_split']:.3f}s"
             )
         if _PAR_TIMING:
             # Batch size histogram summary (top bins)
@@ -4676,14 +4723,21 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 _b_used = batch_A  # primary reference
             else:
                 _b_used = batch
-            seats_t = torch.argmax(_b_used['seat_team'][:, :4], dim=1)
             ret_t = _b_used['ret']
+            seat_tensor = _b_used['seat_team']
+            if not torch.is_tensor(seat_tensor):
+                seat_tensor = torch.as_tensor(seat_tensor, dtype=torch.float32, device=ret_t.device)
+            else:
+                seat_tensor = seat_tensor.to(ret_t.device, dtype=torch.float32)
+            seats_t = torch.argmax(seat_tensor[:, :4], dim=1)
             mask_02_t = (seats_t == 0) | (seats_t == 2)
             mask_13_t = (seats_t == 1) | (seats_t == 3)
-            cnt_02 = mask_02_t.float().sum()
-            cnt_13 = mask_13_t.float().sum()
-            sum_ret_02 = (ret_t * mask_02_t.float()).sum()
-            sum_ret_13 = (ret_t * mask_13_t.float()).sum()
+            mask_02_f = mask_02_t.float()
+            mask_13_f = mask_13_t.float()
+            cnt_02 = mask_02_f.sum()
+            cnt_13 = mask_13_f.sum()
+            sum_ret_02 = (ret_t * mask_02_f).sum()
+            sum_ret_13 = (ret_t * mask_13_f).sum()
             mean_ret_02 = torch.where(cnt_02 > 0, sum_ret_02 / cnt_02, torch.zeros((), device=device, dtype=torch.float32))
             mean_ret_13 = torch.where(cnt_13 > 0, sum_ret_13 / cnt_13, torch.zeros((), device=device, dtype=torch.float32))
             diag = _compute_per_seat_diagnostics(agent, _b_used)
