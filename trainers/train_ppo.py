@@ -4539,19 +4539,24 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             _t_u0 = time.time() if _PAR_TIMING else 0.0
             info_A = agent.update(batch_A, epochs=ppo_epochs, minibatch_size=minibatch_size)
             info_B = agent_teamB.update(batch_B, epochs=ppo_epochs, minibatch_size=minibatch_size)
+            agent.sync_actor_replicas()
+            agent_teamB.sync_actor_replicas()
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
         elif dual_team_nets and opp_frozen_env:
             _t_u0 = time.time() if _PAR_TIMING else 0.0
             if train_A_now:
                 info_A = agent.update(batch_A, epochs=ppo_epochs, minibatch_size=minibatch_size)
+                agent.sync_actor_replicas()
             else:
                 info_B = agent_teamB.update(batch_B, epochs=ppo_epochs, minibatch_size=minibatch_size)
+                agent_teamB.sync_actor_replicas()
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
         else:
             _t_u0 = time.time() if _PAR_TIMING else 0.0
             info = agent.update(batch, epochs=ppo_epochs, minibatch_size=minibatch_size)
+            agent.sync_actor_replicas()
             if _PAR_TIMING:
                 _iter_t_update = (time.time() - _t_u0)
         if _PAR_DEBUG:
@@ -4785,6 +4790,10 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         writer.close()
     metrics_bar.close()
     pbar.close()
+    if hasattr(agent, 'shutdown_actor_replicas'):
+        agent.shutdown_actor_replicas()
+    if dual_team_nets and ('agent_teamB' in locals()) and hasattr(agent_teamB, 'shutdown_actor_replicas'):
+        agent_teamB.shutdown_actor_replicas()
 
 
 if __name__ == '__main__':

@@ -137,6 +137,7 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
 num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
+os.environ.setdefault('SCOPONE_ACTOR_REPLICAS', '4')  # numero di repliche degli attori
 os.environ.setdefault('BELIEF_AUX_COEF', '0.05')  # coefficiente loss ausiliaria belief (default 0.0)
 os.environ.setdefault('SCOPONE_REWARD_SCALE', '0.1')  # scala ricompense finali (1.0 = nessuna variazione)
 

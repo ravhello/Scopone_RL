@@ -10,6 +10,7 @@ from utils.device import get_compute_device, get_amp_dtype
 from utils.compile import maybe_compile_module, maybe_compile_function
 from utils.torch_load import safe_torch_load
 import os as _os
+import warnings
 device = get_compute_device()
 autocast_device = device.type
 autocast_dtype = get_amp_dtype()
@@ -63,7 +64,7 @@ class ActionConditionedPPO:
         self.critic = maybe_compile_module(self.critic, name='CentralValueNet')
         # Forward hotspots (safe on CPU/CUDA)
         try:
-            self.actor.compute_state_proj = maybe_compile_function(self.actor.compute_state_proj, name='ActionConditionedActor.compute_state_proj')
+            self.actor._compute_state_proj_direct = maybe_compile_function(self.actor._compute_state_proj_direct, name='ActionConditionedActor.compute_state_proj')
         except Exception as e:
             raise RuntimeError('ppo.init.compile_compute_state_proj_failed') from e
         try:
@@ -88,6 +89,18 @@ class ActionConditionedPPO:
             self.compute_loss = maybe_compile_function(self.compute_loss, name='ActionConditionedPPO.compute_loss')
         except Exception as e:
             raise RuntimeError('ppo.init.compile_compute_loss_failed') from e
+
+        self.actor_pool = None
+        replicas_env = int(_os.environ.get('SCOPONE_ACTOR_REPLICAS', '1') or '1')
+        if (device.type == 'cpu') and (replicas_env > 1):
+            try:
+                from utils.actor_pool import ActorReplicaPool
+                self.actor_pool = ActorReplicaPool(self.actor, replicas=replicas_env)
+                self.actor.attach_inference_pool(self.actor_pool)
+                print(f"[ActorReplicaPool] inizializzate {replicas_env} repliche su CPU")
+            except Exception as exc:
+                warnings.warn(f"ActorReplicaPool init failed ({exc}); uso fallback eager.", RuntimeWarning)
+                self.actor_pool = None
 
         # Ensure parameters start on the intended device for optimizer state placement
         self.actor.to('cpu')
@@ -1164,6 +1177,16 @@ class ActionConditionedPPO:
     def set_entropy_schedule(self, schedule_fn):
         """Imposta una funzione schedule_fn(step)->entropy_coef."""
         self._entropy_schedule = schedule_fn
+
+    def sync_actor_replicas(self) -> None:
+        if self.actor_pool is not None:
+            self.actor_pool.sync_weights(self.actor)
+
+    def shutdown_actor_replicas(self) -> None:
+        if self.actor_pool is not None:
+            self.actor_pool.close()
+            self.actor.detach_inference_pool()
+            self.actor_pool = None
 
     def save(self, path: str):
         torch.save({

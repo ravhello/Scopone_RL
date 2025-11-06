@@ -524,6 +524,9 @@ class ActionConditionedActor(torch.nn.Module):
         # Cache embedding azioni per device/dtype (solo per inference)
         self._cached_action_emb = None  # legacy single-cache for backward compat
         self._cached_action_emb_variants: Dict[Tuple[str, torch.dtype], torch.Tensor] = {}
+        self._compiled_backend: Optional[str] = None
+        self._inference_pool = None
+        self._pool_debug_once = False
         self.to(device)
 
     @staticmethod
@@ -538,7 +541,7 @@ class ActionConditionedActor(torch.nn.Module):
         cap1_mask = captured[:, 40:80]
         return hand_mask | table_mask | cap0_mask | cap1_mask
 
-    def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
+    def _compute_state_proj_direct(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
         target_device = next(self.parameters()).device
         _par = (os.environ.get('SCOPONE_PROFILE', '0') != '0')
         t_state_enc = 0.0; t_belief_logits = 0.0; t_belief_probs = 0.0
@@ -656,6 +659,26 @@ class ActionConditionedActor(torch.nn.Module):
             from utils.prof import accum_actor_stateproj
             accum_actor_stateproj(t_state_enc, t_belief_logits, t_belief_probs, t_partner + t_opp, t_merge, t_proj)
         return state_proj
+
+    def compute_state_proj(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
+        if (self._inference_pool is not None) and (not torch.is_grad_enabled()):
+            if not self._pool_debug_once:
+                replicas = getattr(self._inference_pool, 'replicas', None)
+                msg = "[ActorReplicaPool] delega compute_state_proj alle repliche"
+                if replicas is not None:
+                    msg += f" (repliche={int(replicas)})"
+                print(msg)
+                self._pool_debug_once = True
+            return self._inference_pool.compute_state_proj(obs, seat_team_vec)
+        return self._compute_state_proj_direct(obs, seat_team_vec)
+
+    def attach_inference_pool(self, pool: "ActorReplicaPool") -> None:
+        self._inference_pool = pool
+        self._pool_debug_once = False
+
+    def detach_inference_pool(self) -> None:
+        self._inference_pool = None
+        self._pool_debug_once = False
 
     def compute_state_features(self, obs: torch.Tensor, seat_team_vec: torch.Tensor) -> torch.Tensor:
         """Calcola solo le feature di stato (256) dal pair (obs, seat)."""
