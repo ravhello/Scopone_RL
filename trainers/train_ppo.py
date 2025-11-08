@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Callable, Optional, Tuple
 import os
 import time
 import sys
+from datetime import datetime
 import multiprocessing as mp
 import platform
 import queue
@@ -54,6 +55,22 @@ _PAR_DEBUG_LEVEL = _parse_debug_level(os.environ.get('SCOPONE_PAR_DEBUG', '0'))
 _PAR_DEBUG = (_PAR_DEBUG_LEVEL >= 1)
 _PAR_DEBUG_VERBOSE = (_PAR_DEBUG_LEVEL >= 2)
 _PPO_DEBUG = (os.environ.get('SCOPONE_PPO_DEBUG', '0').strip().lower() in ['1', 'true', 'yes', 'on'])
+
+# Track timestamps to report how long each debug section takes
+_DBG_TS_START = time.perf_counter()
+_DBG_TS_LAST = _DBG_TS_START
+
+
+def _format_par_debug_message(msg: Any) -> str:
+    """Return msg prefixed with wall-clock time plus delta and total elapsed seconds."""
+    global _DBG_TS_LAST
+    now_perf = time.perf_counter()
+    delta = now_perf - _DBG_TS_LAST
+    total = now_perf - _DBG_TS_START
+    _DBG_TS_LAST = now_perf
+    wall = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    return f"[{wall} | +{delta:7.3f}s | {total:8.3f}s] {str(msg)}"
+
 
 # Reuse cached tensors to limit per-step allocations inside workers
 _SEAT_VEC_CACHE: Dict[int, torch.Tensor] = {}
@@ -136,18 +153,20 @@ def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
 
 def _dbg(msg: str) -> None:
     if _PAR_DEBUG:
+        formatted = _format_par_debug_message(msg)
         try:
-            tqdm.write(str(msg))
+            tqdm.write(formatted)
         except Exception:
-            print(str(msg), flush=True)
+            print(formatted, flush=True)
 
 
 def _dbg_verbose(msg: str) -> None:
     if _PAR_DEBUG_VERBOSE:
+        formatted = _format_par_debug_message(msg)
         try:
-            tqdm.write(str(msg))
+            tqdm.write(formatted)
         except Exception:
-            print(str(msg), flush=True)
+            print(formatted, flush=True)
 
 
 def _flatten_cpu(tensor: Optional[torch.Tensor], dtype: Optional[torch.dtype] = torch.float32) -> Optional[torch.Tensor]:
