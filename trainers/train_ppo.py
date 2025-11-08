@@ -397,6 +397,13 @@ def _env_worker(worker_id: int,
                 tqdm.write(f"[worker {int(worker_id)} pid={os.getpid()}] {msg}")
             except Exception:
                 print(f"[worker {int(worker_id)} pid={os.getpid()}] {msg}", flush=True)
+
+    def _enqueue_request(payload: Dict[str, Any]) -> None:
+        msg = payload
+        if _PAR_TIMING:
+            msg = dict(payload)
+            msg['ts_send'] = time.time()
+        request_q.put(msg)
     # Limit CPU threads per worker to reduce contention on the host
     wt = int(os.environ.get('SCOPONE_WORKER_THREADS', '1'))
     os.environ['OMP_NUM_THREADS'] = str(wt)
@@ -458,6 +465,18 @@ def _env_worker(worker_id: int,
         _worker_prof.start()
 
     t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
+    rpc_wait_breakdown: Dict[str, Dict[str, float]] = {}
+
+    def _rpc_wait_commit(kind: str, t_start: float) -> None:
+        nonlocal t_rpc
+        if not _PAR_TIMING or t_start <= 0.0:
+            return
+        dt = time.time() - t_start
+        t_rpc += dt
+        slot = rpc_wait_breakdown.setdefault(kind, {'time': 0.0, 'count': 0})
+        slot['time'] += dt
+        slot['count'] = int(slot['count']) + 1
+
     t0_glob = time.time()
     _wdbg(f"start (episodes_per_env={int(episodes_per_env)})")
     for ep in range(episodes_per_env):
@@ -530,10 +549,10 @@ def _env_worker(worker_id: int,
                     # Invia tensori CPU direttamente (no conversione a liste) per ridurre overhead IPC
                     o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
                     leg_cpu = torch.stack([ (y.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
-                    t1 = time.time()
+                    t1 = time.time() if _PAR_TIMING else 0.0
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS policy -> send, waiting priors")
-                    request_q.put({
+                    _enqueue_request({
                         'type': 'score_policy',
                         'wid': worker_id,
                         'obs': o_cpu,
@@ -544,9 +563,7 @@ def _env_worker(worker_id: int,
                         resp = action_q.get(timeout=rpc_timeout_s)
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_policy priors") from e
-                    t_rpc_local = (time.time() - t1)
-                    if _PAR_TIMING:
-                        t_rpc = t_rpc + t_rpc_local
+                    _rpc_wait_commit('score_policy', t1)
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS policy <- got priors")
                     pri = resp.get('priors', None)
@@ -559,7 +576,8 @@ def _env_worker(worker_id: int,
                     o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS value -> send, waiting value")
-                    request_q.put({
+                    t1 = time.time() if _PAR_TIMING else 0.0
+                    _enqueue_request({
                         'type': 'score_value',
                         'wid': worker_id,
                         'obs': o_cpu,
@@ -569,6 +587,7 @@ def _env_worker(worker_id: int,
                         resp = action_q.get(timeout=rpc_timeout_s)
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_value") from e
+                    _rpc_wait_commit('score_value', t1)
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS value <- got value")
                     return float(resp.get('value', 0.0))
@@ -578,7 +597,8 @@ def _env_worker(worker_id: int,
                     o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS belief -> send, waiting probs")
-                    request_q.put({
+                    t1 = time.time() if _PAR_TIMING else 0.0
+                    _enqueue_request({
                         'type': 'score_belief',
                         'wid': worker_id,
                         'obs': o_cpu,
@@ -588,6 +608,7 @@ def _env_worker(worker_id: int,
                         resp = action_q.get(timeout=rpc_timeout_s)
                     except queue.Empty as e:
                         raise TimeoutError(f"worker {worker_id}: Timeout waiting for score_belief") from e
+                    _rpc_wait_commit('score_belief', t1)
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS belief <- got probs")
                     probs_flat = resp.get('belief_probs', None)
@@ -727,19 +748,22 @@ def _env_worker(worker_id: int,
                             and not (_exact_only and (not _near_end))):
                         raise RuntimeError(f"invalid sims_scaled: sims_scaled={sims_scaled} mcts_sims={mcts_sims} progress_start={mcts_progress_start} progress_full={mcts_progress_full} history_len={len(env.game_state.get('history', [])) if isinstance(env.game_state.get('history', []), list) else 'n/a'} alpha={alpha}")
                     leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
-                    request_q.put({
+                    t1 = time.time() if _PAR_TIMING else 0.0
+                    _enqueue_request({
                         'type': 'step',
                         'wid': worker_id,
                         'obs': obs_cpu,
                         'legals': leg_serial,
                         'seat': seat_cpu,
                         'is_main': bool(store_sample),
+                        'req_tag': 'step_mcts_fallback',
                     })
                     try:
                         resp = action_q.get(timeout=rpc_timeout_s)
                         idx = int(resp.get('idx', 0))
                     except queue.Empty as e:
                         raise TimeoutError('Timeout waiting for step index for MCTS (invalid_sims_scaled)') from e
+                    _rpc_wait_commit('step_mcts_fallback', t1)
                     idx = max(0, min(idx, len(legal) - 1))
                     act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
                     with _record_function('env.step'):
@@ -819,20 +843,23 @@ def _env_worker(worker_id: int,
                 leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
                 if step_idx < 3:
                     _wdbg(f"ep {ep} step {step_idx}: STEP -> send, waiting idx (A={len(legal)})")
-                t1 = time.time(); request_q.put({
+                req_kind = 'step_main' if bool(store_sample) else 'step_shadow'
+                t1 = time.time() if _PAR_TIMING else 0.0
+                _enqueue_request({
                     'type': 'step',
                     'wid': worker_id,
                     'obs': obs_cpu,
                     'legals': leg_serial,
                     'seat': seat_cpu,
                     'is_main': bool(store_sample),
+                    'req_tag': req_kind,
                 })
                 try:
                     resp = action_q.get(timeout=rpc_timeout_s)
                     idx = int(resp.get('idx', 0))
                 except queue.Empty as e:
                     raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (main path)") from e
-                t_rpc += (time.time() - t1) if _PAR_TIMING else 0.0
+                _rpc_wait_commit(req_kind, t1)
                 if step_idx < 3:
                     _wdbg(f"ep {ep} step {step_idx}: STEP <- got idx={int(idx)}")
                 idx = max(0, min(idx, len(legal) - 1))
@@ -914,19 +941,23 @@ def _env_worker(worker_id: int,
                     legal_entries = [_to_cpu_float32(x) for x in legal]
                     legals_cpu_tensor = torch.stack(legal_entries, dim=0) if len(legal_entries) > 0 else _EMPTY_LEGAL
                 leg_serial = legals_cpu_tensor if send_legals else _EMPTY_LEGAL
-                request_q.put({
+                forced_kind = 'step_forced_main' if bool(store_sample) else 'step_forced_shadow'
+                t1 = time.time() if _PAR_TIMING else 0.0
+                _enqueue_request({
                     'type': 'step',
                     'wid': worker_id,
                     'obs': obs_cpu,
                     'legals': leg_serial,
                     'seat': seat_cpu,
                     'is_main': bool(store_sample),
+                    'req_tag': forced_kind,
                 })
                 try:
                     resp = action_q.get(timeout=rpc_timeout_s)
                     idx = int(resp.get('idx', 0))
                 except queue.Empty as e:
                     raise TimeoutError(f"worker {worker_id}: Timeout waiting for step index (forced first step)") from e
+                _rpc_wait_commit(forced_kind, t1)
                 idx = max(0, min(idx, len(legal) - 1))
                 act_t = legal[idx] if torch.is_tensor(legal[idx]) else torch.as_tensor(legal[idx], dtype=torch.float32)
                 with _record_function('env.step'):
@@ -1030,6 +1061,12 @@ def _env_worker(worker_id: int,
     episode_q.put({'wid': worker_id, 'type': 'done'}, timeout=2.0)
     if _PAR_TIMING:
         total = time.time() - t0_glob
+        rb_payload = {
+            str(k): {
+                'time': float(v.get('time', 0.0)),
+                'count': int(v.get('count', 0)),
+            } for k, v in rpc_wait_breakdown.items()
+        }
         episode_q.put({'wid': worker_id, 'type': 'timing',
                        't_env_reset': t_env_reset,
                        't_get_obs': t_get_obs,
@@ -1038,7 +1075,8 @@ def _env_worker(worker_id: int,
                        't_rpc': t_rpc,
                        't_step': t_step,
                        't_pack': t_pack,
-                       't_total': total})
+                       't_total': total,
+                       'rpc_breakdown': rb_payload})
 
 
 def _batched_select_indices(agent: ActionConditionedPPO,
@@ -2888,6 +2926,23 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     produced_count = [0 for _ in range(num_envs)]
     # Optional timing buffers
     timing_from_workers = [] if _PAR_TIMING else None
+    req_latency_stats: Optional[Dict[str, Dict[str, float]]] = {} if _PAR_TIMING else None
+
+    def _record_req_latency(msg: Dict[str, Any]) -> None:
+        if not _PAR_TIMING or req_latency_stats is None:
+            return
+        ts_send = msg.pop('ts_send', None)
+        if ts_send is None:
+            return
+        try:
+            ts = float(ts_send)
+        except Exception:
+            return
+        dt = max(0.0, time.time() - ts)
+        req_type = str(msg.pop('req_tag', msg.get('type', 'unknown')))
+        slot = req_latency_stats.setdefault(req_type, {'time': 0.0, 'count': 0})
+        slot['time'] += dt
+        slot['count'] = int(slot['count']) + 1
     t_drain = 0.0; t_get_reqs = 0.0; t_batch_select = 0.0; t_batch_service = 0.0; t_dispatch = 0.0
     # Fine-grained get_reqs profiling (new consolidated struct)
     getreqs_batches = 0
@@ -2994,6 +3049,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         try:
             t0_blk = time.time() if _PAR_TIMING else 0.0
             r0 = request_q.get(timeout=max_latency_s)
+            _record_req_latency(r0)
             reqs.append(r0)
             if _PAR_TIMING:
                 cnt_block_ok += 1
@@ -3016,6 +3072,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         while len(reqs) < batch_target:
             try:
                 r = request_q.get_nowait()
+                _record_req_latency(r)
                 # If configured, label non-main requests for shadow (frozen) selection
                 if bool(cfg_base.get('frozen_non_main', False)) and isinstance(r, dict) and r.get('type') == 'step':
                     main_flag = r.get('is_main')
@@ -3050,6 +3107,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 remaining = max(0.0, deadline - time.time())
                 t0_blk = time.time() if _PAR_TIMING else 0.0
                 r = request_q.get(timeout=remaining)
+                _record_req_latency(r)
                 reqs.append(r)
                 if _PAR_TIMING:
                     cnt_block_ok += 1
@@ -3061,6 +3119,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 while len(reqs) < batch_target:
                     try:
                         r2 = request_q.get_nowait()
+                        _record_req_latency(r2)
                         reqs.append(r2)
                         if _PAR_TIMING:
                             cnt_nowait_ok += 1
@@ -3249,6 +3308,30 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             s_tot, m_tot, M_tot = _agg('t_total')
             tqdm.write(f"[par-timing] workers={num_envs} workers_total={s_tot:.3f}s (avg={m_tot:.3f}, max={M_tot:.3f})\n"
                         f"  env.reset={s_env:.3f} get_obs={s_obs:.3f} get_legals={s_leg:.3f} rpc_wait={s_rpc:.3f} mcts={s_mcts:.3f} env.step={s_step:.3f} pack={s_pack:.3f}")
+            rpc_agg: Dict[str, Dict[str, float]] = {}
+            for entry in timing_from_workers:
+                per = entry.get('rpc_breakdown')
+                if not per:
+                    continue
+                for kind, stats in per.items():
+                    slot = rpc_agg.setdefault(kind, {'time': 0.0, 'count': 0})
+                    slot['time'] += float(stats.get('time', 0.0))
+                    slot['count'] += int(stats.get('count', 0))
+            if len(rpc_agg) > 0:
+                parts = []
+                for kind, stats in sorted(rpc_agg.items(), key=lambda kv: kv[1]['time'], reverse=True)[:8]:
+                    cnt = max(1, int(stats['count']))
+                    avg_ms = 1000.0 * (stats['time'] / cnt)
+                    parts.append(f"{kind}={stats['time']:.3f}s/{cnt} avg={avg_ms:.2f}ms")
+                tqdm.write(f"[par-rpc-breakdown] {'  '.join(parts)}")
+            if req_latency_stats:
+                parts = []
+                for kind, stats in sorted(req_latency_stats.items(), key=lambda kv: kv[1]['time'], reverse=True)[:8]:
+                    cnt = max(1, int(stats['count']))
+                    avg_ms = 1000.0 * (stats['time'] / cnt)
+                    parts.append(f"{kind}={stats['time']:.3f}s/{cnt} avg={avg_ms:.2f}ms")
+                if parts:
+                    tqdm.write(f"[par-request-lag] {'  '.join(parts)}")
         tqdm.write(f"[par-timing-master] total={master_total:.3f}s drain={t_drain:.3f} get_reqs={t_get_reqs:.3f} batch_select={t_batch_select:.3f} batch_service={t_batch_service:.3f} dispatch={t_dispatch:.3f}")
         # Detailed get_reqs breakdown
         avg_batch = (getreqs_total_reqs / max(getreqs_batches, 1))
