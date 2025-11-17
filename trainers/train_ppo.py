@@ -8,7 +8,6 @@ from datetime import datetime
 import multiprocessing as mp
 import platform
 import queue
-import random
 import numpy as np
 
 # Ensure project root is on sys.path when running as script
@@ -77,79 +76,6 @@ _SEAT_VEC_CACHE: Dict[int, torch.Tensor] = {}
 _BELIEF_ZERO = torch.zeros(120, dtype=torch.float32)
 _OTHERS_HANDS_ZERO = torch.zeros((3, 40), dtype=torch.float32)
 _EMPTY_LEGAL = torch.zeros((0, 80), dtype=torch.float32)
-
-_SERIAL_RNG_STATE: Dict[int, Dict[str, Any]] = {}
-
-
-def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
-    if seed is None:
-        return None
-    try:
-        seed_key = int(seed)
-    except Exception:
-        return None
-    if seed_key < 0:
-        return None
-    py_outer = random.getstate()
-    try:
-        np_outer = np.random.get_state()
-    except AttributeError:
-        np_outer = None
-    torch_outer = torch.get_rng_state()
-    cuda_outer = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-
-    stored = _SERIAL_RNG_STATE.get(seed_key)
-    if stored is None:
-        set_global_seeds(seed_key)
-    else:
-        py_state = stored.get('py')
-        if py_state is not None:
-            random.setstate(py_state)
-        np_state = stored.get('np')
-        if np_state is not None:
-            np.random.set_state(np_state)  # type: ignore[arg-type]
-        torch_state = stored.get('torch')
-        if torch_state is not None:
-            torch.set_rng_state(torch_state)
-        cuda_state = stored.get('cuda')
-        if cuda_state is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(cuda_state)  # type: ignore[arg-type]
-
-    return {
-        'seed': seed_key,
-        'py_outer': py_outer,
-        'np_outer': np_outer,
-        'torch_outer': torch_outer,
-        'cuda_outer': cuda_outer,
-    }
-
-
-def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
-    if token is None:
-        return
-    seed_key = int(token['seed'])
-    try:
-        np_new = np.random.get_state()
-    except AttributeError:
-        np_new = None
-    _SERIAL_RNG_STATE[seed_key] = {
-        'py': random.getstate(),
-        'np': np_new,
-        'torch': torch.get_rng_state(),
-        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-    }
-    py_outer = token.get('py_outer')
-    if py_outer is not None:
-        random.setstate(py_outer)
-    np_outer = token.get('np_outer')
-    if np_outer is not None:
-        np.random.set_state(np_outer)  # type: ignore[arg-type]
-    torch_outer = token.get('torch_outer')
-    if torch_outer is not None:
-        torch.set_rng_state(torch_outer)
-    cuda_outer = token.get('cuda_outer')
-    if cuda_outer is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(cuda_outer)  # type: ignore[arg-type]
 
 def _dbg(msg: str) -> None:
     if _PAR_DEBUG:
@@ -2989,6 +2915,9 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         _iter_t_collect = 0.0
         _iter_t_preproc = 0.0
         _iter_t_update = 0.0
+        batch_A = None
+        batch_B = None
+        batch = None
         # Partner/opponent selection policy
         # Opponent selection
         # SELFPLAY=1: no frozen unless explicitly requested via OPP_FROZEN (still treated as single learner vs frozen)
@@ -3071,7 +3000,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         main_seats = even_main_seats if (it % 2 == 0) else odd_main_seats
         # Complementary seats for the other team (used when swapping A<->B)
         main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
-        use_parallel = (num_envs is not None and int(num_envs) > 1)
         if bool(mcts_train):
             mcts_train_factor = 0.0 if it < warmup_iters else 1.0
         else:
@@ -3080,186 +3008,164 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         agent.actor.eval()
         agent.critic.eval()
         if _PAR_DEBUG:
-            _dbg(f"[train] iter {it + 1}: begin data collection mode={'parallel' if use_parallel else 'serial'} train_A_now={train_A_now}")
-        if use_parallel:
-            if _PAR_DEBUG:
-                _dbg(f"[train] iter {it + 1}: collecting trajectories (dual_team_nets={dual_team_nets}, opp_frozen_env={opp_frozen_env}, parallel_workers={int(num_envs) if num_envs is not None else 1})")
-            # Mirror single-env logic: choose episodes so that batch B is a multiple of minibatch_size
-            per_ep_util = (40 if train_both_teams else 20)
-            # Compute LCM(mb, per_ep_util) and derive episodes from aligned horizon
-            import math as _math
-            lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
-            if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
-                new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
-                print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
-                horizon = new_h
-            episodes_hint = max(1, horizon // per_ep_util)
-            if _PPO_DEBUG:
-                # Debug: mostra hint e distribuzione per-env
-                eps_per_env_dbg = max(1, (episodes_hint + int(num_envs) - 1) // int(num_envs))
-                total_eps_dbg = eps_per_env_dbg * int(num_envs)
-                tqdm.write(
-                    f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
-                    f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}"
-                )
-            # Abilita/disabilita MCTS in parallelo in base al flag di training
-            parallel_use_mcts = bool(mcts_train and mcts_train_factor > 0.0)
-            if dual_team_nets and (not opp_frozen_env):
-                # Collect for team A vs live team B
-                _t_c0 = time.time() if _PAR_TIMING else 0.0
-                main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
-                batch_A = collect_trajectory_parallel(agent,
-                                                       num_envs=int(num_envs),
-                                                       episodes_total_hint=episodes_hint,
-                                                       k_history=k_history,
-                                                       gamma=1.0,
-                                                       lam=1.0,
-                                                       use_mcts=parallel_use_mcts,
-                                                       train_both_teams=False,
-                                                       main_seats=main_seats,
-                                                       mcts_sims=mcts_sims,
-                                                       mcts_dets=mcts_dets,
-                                                       mcts_c_puct=mcts_c_puct,
-                                                       mcts_root_temp=mcts_root_temp,
-                                                       mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                       mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                       mcts_train_factor=mcts_train_factor,
-                                                       seed=int(seed),
-                                                       show_progress_env=True,
-                                                       tqdm_base_pos=3,
-                                                       alternate_main_seats=True,
-                                                       secondary_main_seats=main_seats_B,
-                                                       alternate_main_start=0)
-                # Collect for team B vs live team A (swap seats)
-                batch_B = collect_trajectory_parallel(agent_teamB,
-                                                       num_envs=int(num_envs),
-                                                       episodes_total_hint=episodes_hint,
-                                                       k_history=k_history,
-                                                       gamma=1.0,
-                                                       lam=1.0,
-                                                       use_mcts=parallel_use_mcts,
-                                                       train_both_teams=False,
-                                                       main_seats=main_seats_B,
-                                                       mcts_sims=mcts_sims,
-                                                       mcts_dets=mcts_dets,
-                                                       mcts_c_puct=mcts_c_puct,
-                                                       mcts_root_temp=mcts_root_temp,
-                                                       mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                       mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                       mcts_train_factor=mcts_train_factor,
-                                                       seed=int(seed + 1),
-                                                       show_progress_env=True,
-                                                       tqdm_base_pos=4,
-                                                       alternate_main_seats=True,
-                                                       secondary_main_seats=main_seats,
-                                                       alternate_main_start=0)
-                if _PAR_TIMING:
-                    _iter_t_collect = (time.time() - _t_c0)
-            elif dual_team_nets and opp_frozen_env:
-                # Alternate training: one team learns while the other team acts frozen (no update)
-                _t_c0 = time.time() if _PAR_TIMING else 0.0
-                if train_A_now:
-                    batch_A = collect_trajectory_parallel(agent,
-                                                           num_envs=int(num_envs),
-                                                           episodes_total_hint=episodes_hint,
-                                                           k_history=k_history,
-                                                           gamma=1.0,
-                                                           lam=1.0,
-                                                           use_mcts=parallel_use_mcts,
-                                                           train_both_teams=False,
-                                                           main_seats=main_seats,
-                                                           mcts_sims=mcts_sims,
-                                                           mcts_dets=mcts_dets,
-                                                           mcts_c_puct=mcts_c_puct,
-                                                           mcts_root_temp=mcts_root_temp,
-                                                           mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                           mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                           mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                           mcts_train_factor=mcts_train_factor,
-                                                           seed=int(seed),
-                                                           show_progress_env=True,
-                                                           tqdm_base_pos=3,
-                                                           alternate_main_seats=True,
-                                                           secondary_main_seats=main_seats_B,
-                                                           alternate_main_start=0,
-                                                           frozen_actor=agent_teamB.actor,
-                                                           frozen_non_main=True)
-                else:
-                    batch_B = collect_trajectory_parallel(agent_teamB,
-                                                           num_envs=int(num_envs),
-                                                           episodes_total_hint=episodes_hint,
-                                                           k_history=k_history,
-                                                           gamma=1.0,
-                                                           lam=1.0,
-                                                           use_mcts=parallel_use_mcts,
-                                                           train_both_teams=False,
-                                                           main_seats=main_seats_B,
-                                                           mcts_sims=mcts_sims,
-                                                           mcts_dets=mcts_dets,
-                                                           mcts_c_puct=mcts_c_puct,
-                                                           mcts_root_temp=mcts_root_temp,
-                                                           mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                           mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                           mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                           mcts_train_factor=mcts_train_factor,
-                                                           seed=int(seed + 1),
-                                                           show_progress_env=True,
-                                                           tqdm_base_pos=4,
-                                                           alternate_main_seats=True,
-                                                           secondary_main_seats=main_seats,
-                                                           alternate_main_start=0,
-                                                           frozen_actor=agent.actor,
-                                                           frozen_non_main=True)
-                if _PAR_TIMING:
-                    _iter_t_collect = (time.time() - _t_c0)
-            else:
-                _t_c0 = time.time() if _PAR_TIMING else 0.0
-                # Refresh shadow actor on schedule in selfplay+frozen
-                # SCOPONE_FROZEN_UPDATE_EVERY: in selfplay+frozen, how often to refresh the
-                #   "shadow" opponent from the current live net. The shadow remains fixed
-                #   between refreshes to create a stationary opponent for the non-main seats.
-                if use_selfplay and opp_frozen_env:
-                    if (shadow_actor is None) or ((it % shadow_every) == 0):
-                        # clone lightweight copy of actor state
-                        shadow_actor = ActionConditionedActor(obs_dim=obs_dim)
-                        shadow_actor.load_state_dict(agent.actor.state_dict())
-                batch = collect_trajectory_parallel(agent,
-                                                    num_envs=int(num_envs),
-                                                    episodes_total_hint=episodes_hint,
-                                                    k_history=k_history,
-                                                    gamma=1.0,
-                                                    lam=1.0,
-                                                    use_mcts=parallel_use_mcts,
-                                                    train_both_teams=train_both_teams,
-                                                    main_seats=main_seats,
-                                                    mcts_sims=mcts_sims,
-                                                    mcts_dets=mcts_dets,
-                                                    mcts_c_puct=mcts_c_puct,
-                                                    mcts_root_temp=mcts_root_temp,
-                                                    mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                                                    mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                                                    mcts_dirichlet_eps=mcts_dirichlet_eps,
-                                                    mcts_train_factor=mcts_train_factor,
-                                                    seed=int(seed),
-                                                    show_progress_env=True,
-                                                    tqdm_base_pos=3,
-                                                    frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None),
-                                                    frozen_non_main=bool(use_selfplay and opp_frozen_env))
-                if _PAR_TIMING:
-                    _iter_t_collect = (time.time() - _t_c0)
+            _dbg(f"[train] iter {it + 1}: begin data collection mode=parallel train_A_now={train_A_now}")
+        if _PAR_DEBUG:
+            _dbg(f"[train] iter {it + 1}: collecting trajectories (dual_team_nets={dual_team_nets}, opp_frozen_env={opp_frozen_env}, parallel_workers={int(num_envs) if num_envs is not None else 1})")
+        # Mirror single-env logic: choose episodes so that batch B is a multiple of minibatch_size
+        per_ep_util = (40 if train_both_teams else 20)
+        # Compute LCM(mb, per_ep_util) and derive episodes from aligned horizon
+        import math as _math
+        lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
+        if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
+            new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
+            print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+            horizon = new_h
+        episodes_hint = max(1, horizon // per_ep_util)
+        if _PPO_DEBUG:
+            # Debug: mostra hint e distribuzione per-env
+            eps_per_env_dbg = max(1, (episodes_hint + int(num_envs) - 1) // int(num_envs))
+            total_eps_dbg = eps_per_env_dbg * int(num_envs)
+            tqdm.write(
+                f"[episodes] it={it+1} horizon={horizon} num_envs={num_envs} episodes_hint={episodes_hint} "
+                f"episodes_per_env={eps_per_env_dbg} total_env_episodes={total_eps_dbg}"
+            )
+        # Abilita/disabilita MCTS in parallelo in base al flag di training
+        parallel_use_mcts = bool(mcts_train and mcts_train_factor > 0.0)
+        _t_c0 = time.time() if _PAR_TIMING else 0.0
         if dual_team_nets and (not opp_frozen_env):
+            batch_A = collect_trajectory_parallel(agent,
+                                                  num_envs=int(num_envs),
+                                                  episodes_total_hint=episodes_hint,
+                                                  k_history=k_history,
+                                                  gamma=1.0,
+                                                  lam=1.0,
+                                                  use_mcts=parallel_use_mcts,
+                                                  train_both_teams=False,
+                                                  main_seats=main_seats,
+                                                  mcts_sims=mcts_sims,
+                                                  mcts_dets=mcts_dets,
+                                                  mcts_c_puct=mcts_c_puct,
+                                                  mcts_root_temp=mcts_root_temp,
+                                                  mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                  mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                  mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                  mcts_train_factor=mcts_train_factor,
+                                                  seed=int(seed),
+                                                  show_progress_env=True,
+                                                  tqdm_base_pos=3,
+                                                  alternate_main_seats=True,
+                                                  secondary_main_seats=main_seats_B,
+                                                  alternate_main_start=0)
+            batch_B = collect_trajectory_parallel(agent_teamB,
+                                                  num_envs=int(num_envs),
+                                                  episodes_total_hint=episodes_hint,
+                                                  k_history=k_history,
+                                                  gamma=1.0,
+                                                  lam=1.0,
+                                                  use_mcts=parallel_use_mcts,
+                                                  train_both_teams=False,
+                                                  main_seats=main_seats_B,
+                                                  mcts_sims=mcts_sims,
+                                                  mcts_dets=mcts_dets,
+                                                  mcts_c_puct=mcts_c_puct,
+                                                  mcts_root_temp=mcts_root_temp,
+                                                  mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                  mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                  mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                  mcts_train_factor=mcts_train_factor,
+                                                  seed=int(seed + 1),
+                                                  show_progress_env=True,
+                                                  tqdm_base_pos=4,
+                                                  alternate_main_seats=True,
+                                                  secondary_main_seats=main_seats,
+                                                  alternate_main_start=0)
+        elif dual_team_nets and opp_frozen_env:
+            active_agent = agent if train_A_now else agent_teamB
+            active_main_seats = main_seats if train_A_now else main_seats_B
+            secondary_seats = main_seats_B if train_A_now else main_seats
+            frozen_actor_ref = agent_teamB.actor if train_A_now else agent.actor
+            tqdm_pos = 3 if train_A_now else 4
+            seed_offset = 0 if train_A_now else 1
+            active_batch = collect_trajectory_parallel(active_agent,
+                                                       num_envs=int(num_envs),
+                                                       episodes_total_hint=episodes_hint,
+                                                       k_history=k_history,
+                                                       gamma=1.0,
+                                                       lam=1.0,
+                                                       use_mcts=parallel_use_mcts,
+                                                       train_both_teams=False,
+                                                       main_seats=active_main_seats,
+                                                       mcts_sims=mcts_sims,
+                                                       mcts_dets=mcts_dets,
+                                                       mcts_c_puct=mcts_c_puct,
+                                                       mcts_root_temp=mcts_root_temp,
+                                                       mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                       mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                       mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                       mcts_train_factor=mcts_train_factor,
+                                                       seed=int(seed + seed_offset),
+                                                       show_progress_env=True,
+                                                       tqdm_base_pos=tqdm_pos,
+                                                       alternate_main_seats=True,
+                                                       secondary_main_seats=secondary_seats,
+                                                       alternate_main_start=0,
+                                                       frozen_actor=frozen_actor_ref,
+                                                       frozen_non_main=True)
+            if train_A_now:
+                batch_A = active_batch
+            else:
+                batch_B = active_batch
+        else:
+            if use_selfplay and opp_frozen_env:
+                if (shadow_actor is None) or ((it % shadow_every) == 0):
+                    shadow_actor = ActionConditionedActor(obs_dim=obs_dim)
+                    shadow_actor.load_state_dict(agent.actor.state_dict())
+            batch = collect_trajectory_parallel(agent,
+                                                num_envs=int(num_envs),
+                                                episodes_total_hint=episodes_hint,
+                                                k_history=k_history,
+                                                gamma=1.0,
+                                                lam=1.0,
+                                                use_mcts=parallel_use_mcts,
+                                                train_both_teams=train_both_teams,
+                                                main_seats=main_seats,
+                                                mcts_sims=mcts_sims,
+                                                mcts_dets=mcts_dets,
+                                                mcts_c_puct=mcts_c_puct,
+                                                mcts_root_temp=mcts_root_temp,
+                                                mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                                                mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                                                mcts_dirichlet_eps=mcts_dirichlet_eps,
+                                                mcts_train_factor=mcts_train_factor,
+                                                seed=int(seed),
+                                                show_progress_env=True,
+                                                tqdm_base_pos=3,
+                                                frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None),
+                                                frozen_non_main=bool(use_selfplay and opp_frozen_env))
+        if _PAR_TIMING:
+            _iter_t_collect = (time.time() - _t_c0)
+
+
+
+        if dual_team_nets and (not opp_frozen_env):
+            if batch_A is None or batch_B is None:
+                raise RuntimeError("train_ppo: batch_A/B missing in dual-team non-frozen mode")
             if len(batch_A['obs']) == 0 or len(batch_B['obs']) == 0:
                 continue
         elif dual_team_nets and opp_frozen_env:
             if train_A_now:
+                if batch_A is None:
+                    raise RuntimeError("train_ppo: batch_A missing in frozen mode")
                 if len(batch_A['obs']) == 0:
                     continue
             else:
+                if batch_B is None:
+                    raise RuntimeError("train_ppo: batch_B missing in frozen mode")
                 if len(batch_B['obs']) == 0:
                     continue
         else:
+            if batch is None:
+                raise RuntimeError("train_ppo: batch missing in single-team mode")
             if len(batch['obs']) == 0:
                 continue
         # normalizza vantaggi completamente su GPU (no sync)

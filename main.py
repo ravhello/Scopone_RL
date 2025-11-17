@@ -149,32 +149,17 @@ try:
 except Exception:
     _is_windows = False
 
-if num_envs <= 1:
-    # Single-env (seriale): niente batching/attese nel collector; sfrutta tutti i thread della CPU.
-    # Forza latenza zero e batch minimo 1 (solo se qualcuno non li ha già impostati diversamente nel processo).
-    os.environ['SCOPONE_COLLECT_MAX_LATENCY_MS'] = '0'
-    os.environ['SCOPONE_COLLECT_MIN_BATCH'] = '1'
-    # Limita i thread dei processi worker (es. eval) a 1 per evitare oversubscription.
-    os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
-    # Ottimizza BLAS/Torch per processo unico (i worker paralleli non vengono creati).
-    if 'OMP_NUM_THREADS' not in os.environ:
-        try:
-            os.environ['OMP_NUM_THREADS'] = str(max(1, (os.cpu_count() or 1)))
-        except Exception:
-            os.environ['OMP_NUM_THREADS'] = '8'
-    if 'MKL_NUM_THREADS' not in os.environ:
-        os.environ['MKL_NUM_THREADS'] = os.environ.get('OMP_NUM_THREADS', '8')
-else:
-    # Multi-env (parallelo): lascia la strategia di batching dinamica del collector.
-    # Mantieni min_batch auto (0) e piccola latenza per favorire batch grandi senza alta latenza.
-    os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '512')
-    os.environ.setdefault('SCOPONE_COLLECT_BATCH_TARGET', '512')  # 0=auto, >0 forza batch target del collector
-    os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')
-    # Un thread per worker per evitare oversubscription; usato dai processi figli.
-    os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
-    # Su Windows, esplicita 'spawn' per sicurezza (altrove il trainer risolve automaticamente).
-    if _is_windows:
-        os.environ.setdefault('SCOPONE_MP_START', 'spawn')
+
+# Multi-env (parallelo): lascia la strategia di batching dinamica del collector.
+# Mantieni min_batch auto (0) e piccola latenza per favorire batch grandi senza alta latenza.
+os.environ.setdefault('SCOPONE_COLLECT_MIN_BATCH', '512')
+os.environ.setdefault('SCOPONE_COLLECT_BATCH_TARGET', '512')  # 0=auto, >0 forza batch target del collector
+os.environ.setdefault('SCOPONE_COLLECT_MAX_LATENCY_MS', '3.0')
+# Un thread per worker per evitare oversubscription; usato dai processi figli.
+os.environ.setdefault('SCOPONE_WORKER_THREADS', '1')
+# Su Windows, esplicita 'spawn' per sicurezza (altrove il trainer risolve automaticamente).
+if _is_windows:
+    os.environ.setdefault('SCOPONE_MP_START', 'spawn')
 
 # Read checkpoint path from env for training
 ckpt_path_env = os.environ.get('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')
