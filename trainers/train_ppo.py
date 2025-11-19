@@ -407,9 +407,12 @@ def _env_worker(worker_id: int,
     t_env_reset = 0.0; t_get_obs = 0.0; t_get_legals = 0.0; t_mcts = 0.0; t_rpc = 0.0; t_step = 0.0; t_pack = 0.0
     t0_glob = time.time()
     _wdbg(f"start (episodes_per_env={int(episodes_per_env)})")
+    next_starting_player = 0
     for ep in range(episodes_per_env):
-        t0 = time.time(); env.reset(); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
-        _wdbg(f"ep {ep} reset")
+        starting_player = next_starting_player
+        next_starting_player = 1 - next_starting_player
+        t0 = time.time(); env.reset(starting_player=starting_player); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
+        _wdbg(f"ep {ep} reset (starting_player={starting_player})")
         obs_list, next_obs_list = [], []
         act_list = []
         rew_list, done_list = [], []
@@ -1579,11 +1582,14 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     current_ep_start_idx = 0
     ep_slices: List[Tuple[int, int]] = []
     ep_team_rewards: List[List[float]] = []
+    next_starting_player = 1  # env.__init__ already started at 0; alternate afterwards
     while True:
         if env.done:
             if _PAR_TIMING:
                 _t0_env_reset = time.time()
-            env.reset()
+            starting_player = next_starting_player
+            next_starting_player = 1 - next_starting_player
+            env.reset(starting_player=starting_player)
             if _PAR_TIMING:
                 t_env_reset += (time.time() - _t0_env_reset)
                 env_reset_count += 1
