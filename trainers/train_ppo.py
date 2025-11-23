@@ -370,7 +370,19 @@ def _env_worker(worker_id: int,
     send_legals = bool(cfg.get('send_legals', True))
     use_mcts = bool(cfg.get('use_mcts', False))
     train_both_teams = bool(cfg.get('train_both_teams', False))
-    main_seats = cfg.get('main_seats', None)
+    configured_main_seats = cfg.get('main_seats', None)
+    alternate_main_seats = bool(cfg.get('alternate_main_seats', True))
+    main_seat_phase = int(cfg.get('main_seat_phase', 0))
+    even_main_seats = [0, 2]
+    odd_main_seats = [1, 3]
+    def _toggle_main_seats(curr: Optional[List[int]]) -> List[int]:
+        curr_set = set(curr or even_main_seats)
+        return odd_main_seats if curr_set == set(even_main_seats) else even_main_seats
+    base_main = list(configured_main_seats) if configured_main_seats is not None else list(even_main_seats)
+    if alternate_main_seats and (main_seat_phase % 2 == 1):
+        current_main_seats = list(_toggle_main_seats(base_main))
+    else:
+        current_main_seats = list(base_main)
     # MCTS config
     mcts_sims = int(cfg.get('mcts_sims', 128))
     mcts_dets = int(cfg.get('mcts_dets', 4))
@@ -409,6 +421,7 @@ def _env_worker(worker_id: int,
     _wdbg(f"start (episodes_per_env={int(episodes_per_env)})")
     next_starting_player = 0
     for ep in range(episodes_per_env):
+        episode_main_seats = list(current_main_seats)
         starting_player = next_starting_player
         next_starting_player = 1 - next_starting_player
         t0 = time.time(); env.reset(starting_player=starting_player); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
@@ -457,7 +470,7 @@ def _env_worker(worker_id: int,
                 legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
                 legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
             legal_count = len(legal_cpu_entries)
-            is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
+            is_main = True if train_both_teams else (cp in episode_main_seats)
             store_sample = bool(train_both_teams or is_main)
             policy_entries: List[float] = []
             policy_weight = 0.0
@@ -769,6 +782,7 @@ def _env_worker(worker_id: int,
                     'obs': obs_cpu,
                     'legals': leg_serial,
                     'seat': seat_cpu,
+                    'main_seats': list(episode_main_seats),
                 })
                 try:
                     resp = action_q.get(timeout=rpc_timeout_s)
@@ -863,6 +877,7 @@ def _env_worker(worker_id: int,
                     'obs': obs_cpu,
                     'legals': leg_serial,
                     'seat': seat_cpu,
+                    'main_seats': list(episode_main_seats),
                 })
                 try:
                     resp = action_q.get(timeout=rpc_timeout_s)
@@ -953,6 +968,8 @@ def _env_worker(worker_id: int,
             _wdbg(f"ep {ep} payload put ok")
         except Exception as e:
             raise RuntimeError(f"worker {worker_id}: episode_q.put failed") from e
+        if alternate_main_seats:
+            current_main_seats = _toggle_main_seats(episode_main_seats)
         # Do not advance worker profiler schedule per-episode to avoid Kineto stack issues
     # Stop and export worker torch profiler if active
     if _worker_prof is not None:
@@ -1406,6 +1423,8 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
         # Action embeddings for all legals in the batch
         a_emb_global = agent.actor.action_enc(legals)  # (M_all,64)
         max_cnt = int(cnts.max().item()) if B > 0 else 0
+        if B > 0 and (int(cnts.min().item()) <= 0):
+            raise RuntimeError("_compute_per_seat_diagnostics: trovato legals_count<=0 nel batch (dati malformati)")
         if max_cnt > 0:
             pos = torch.arange(max_cnt, device=device, dtype=torch.long)
             rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
@@ -1415,15 +1434,18 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
             abs_idx = abs_idx_2d[mask]
             a_emb_mb = a_emb_global[abs_idx]
             legal_scores = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
-            padded = torch.full((B, max_cnt), -float('inf'), device=device, dtype=legal_scores.dtype)
+            padded = torch.full((B, max_cnt), -1e9, device=device, dtype=legal_scores.dtype)
             padded[mask] = legal_scores
+            if not torch.isfinite(padded).all():
+                raise RuntimeError("_compute_per_seat_diagnostics: logit non finiti (NaN/Inf) nei legal_scores")
+            logp_group = torch.log_softmax(padded, dim=1)
+            probs_group = torch.softmax(padded, dim=1)
+            entropy[:] = (-(probs_group * logp_group).sum(dim=1))
+            chosen_clamped = torch.minimum(chosen_idx, (cnts - 1).clamp_min(0))
+            new_logp_chosen = logp_group[torch.arange(B, device=device), chosen_clamped]
         else:
-            padded = torch.full((B, 0), -float('inf'), device=device, dtype=state_proj.dtype)
-        logp_group = torch.log_softmax(padded, dim=1)
-        probs_group = torch.softmax(padded, dim=1)
-        entropy[:] = (-(probs_group * logp_group).sum(dim=1))
-        chosen_clamped = torch.minimum(chosen_idx, (cnts - 1).clamp_min(0)) if max_cnt > 0 else chosen_idx
-        new_logp_chosen = logp_group[torch.arange(B, device=device), chosen_clamped]
+            entropy[:] = 0.0
+            new_logp_chosen = old_logp
         approx_kl[:] = (old_logp - new_logp_chosen).abs()
     # clip fraction per-sample sul chosen
     # ricalcolo ratio corretto: new_logp_chosen - old_logp
@@ -1513,7 +1535,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                        mcts_progress_start: float = 0.25,
                        mcts_progress_full: float = 0.75,
                        mcts_min_sims: int = 0,
-                       train_both_teams: bool = False) -> Dict:
+                       train_both_teams: bool = False,
+                       alternate_main_seats: bool = True) -> Dict:
     # Enforce minimum horizon of 40 (full hand length)
     horizon = max(40, int(horizon))
     # Enforce horizon multiple of LCM(minibatch_size, per-episode useful transitions)
@@ -1582,6 +1605,13 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     current_ep_start_idx = 0
     ep_slices: List[Tuple[int, int]] = []
     ep_team_rewards: List[List[float]] = []
+    even_main_seats = [0, 2]
+    odd_main_seats = [1, 3]
+    def _toggle_main_seats(curr: Optional[List[int]]) -> List[int]:
+        curr_set = set(curr or even_main_seats)
+        return odd_main_seats if curr_set == set(even_main_seats) else even_main_seats
+    active_main_seats = list(main_seats) if main_seats is not None else list(even_main_seats)
+    episode_main_seats = list(active_main_seats)
     next_starting_player = 1  # env.__init__ already started at 0; alternate afterwards
     while True:
         if env.done:
@@ -1594,6 +1624,9 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 t_env_reset += (time.time() - _t0_env_reset)
                 env_reset_count += 1
             current_ep_start_idx = len(obs_list)
+            if alternate_main_seats:
+                active_main_seats = _toggle_main_seats(active_main_seats)
+            episode_main_seats = list(active_main_seats)
 
         # All env logic on CPU
         if _PAR_TIMING:
@@ -1619,7 +1652,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         seat_vec = _seat_vec_for(cp)
 
         # Selezione azione: se train_both_teams è True, tutti i seat sono "main"
-        is_main = True if train_both_teams else ((main_seats is None and cp in [0, 2]) or (main_seats is not None and cp in main_seats))
+        is_main = True if train_both_teams else (cp in episode_main_seats)
         # Solo i seat "main" devono contribuire alle transizioni quando train_both_teams è False
         store_sample = bool(train_both_teams or is_main)
         bsum_tensor = _BELIEF_ZERO
@@ -2072,7 +2105,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                         others_hands_targets.append(_OTHERS_HANDS_ZERO)
         else:
             # partner congelato sui seat del compagno; opponent sugli avversari
-            is_partner_seat = (cp in [0, 2] and (main_seats == [1, 3])) or (cp in [1, 3] and (main_seats == [0, 2]))
+            is_partner_seat = (cp in [0, 2] and (episode_main_seats == [1, 3])) or (cp in [1, 3] and (episode_main_seats == [0, 2]))
             frozen = partner_actor if (is_partner_seat and partner_actor is not None) else opponent_actor
             if frozen is not None:
                 # Fast, inference-only path for frozen actor
@@ -2624,7 +2657,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                        mcts_progress_full: float = 0.75,
                        mcts_min_sims: int = 0,
                        train_both_teams: bool = False,
-                       seed: Optional[int] = None) -> Dict:
+                       seed: Optional[int] = None,
+                       alternate_main_seats: bool = True) -> Dict:
     seed_token = _serial_seed_enter(seed)
     try:
         return _collect_trajectory_impl(env=env,
@@ -2651,7 +2685,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                                         mcts_progress_start=mcts_progress_start,
                                         mcts_progress_full=mcts_progress_full,
                                         mcts_min_sims=mcts_min_sims,
-                                        train_both_teams=train_both_teams)
+                                        train_both_teams=train_both_teams,
+                                        alternate_main_seats=alternate_main_seats)
     finally:
         _serial_seed_exit(seed_token)
 
@@ -2680,7 +2715,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                                 show_progress_env: bool = True,
                                 tqdm_base_pos: int = 2,
                                 frozen_actor: ActionConditionedActor = None,
-                                frozen_non_main: bool = False) -> Dict:
+                                frozen_non_main: bool = False,
+                                alternate_main_seats: bool = True) -> Dict:
     # Validate configuration invariants
     if int(num_envs) <= 0:
         raise ValueError("collect_trajectory_parallel: num_envs must be > 0")
@@ -2750,6 +2786,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'use_mcts': bool(use_mcts),
         'train_both_teams': bool(train_both_teams),
         'main_seats': main_seats if main_seats is not None else [0,2],
+        'alternate_main_seats': bool(alternate_main_seats),
+        'main_seat_phase': 0,
         'frozen_non_main': bool(frozen_non_main),
         'mcts_sims': int(mcts_sims),
         'mcts_dets': int(mcts_dets),
@@ -2767,6 +2805,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     for wid in range(num_envs):
         cfg = dict(cfg_base)
         cfg['episodes_per_env'] = int(episodes_per_env_list[wid])
+        if alternate_main_seats:
+            cfg['main_seat_phase'] = int(wid % 2)
         p = ctx.Process(target=_env_worker, args=(wid, cfg, request_q, action_queues[wid], episode_q), daemon=True)
         p.start()
         workers.append(p)
@@ -2899,7 +2939,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     if seat is not None:
                         st = torch.as_tensor(seat, dtype=torch.float32)
                         seat_idx = int(torch.argmax(st[:4]).item())
-                        main_set = set(cfg_base.get('main_seats', [0, 2]))
+                        seat_override = r.get('main_seats', cfg_base.get('main_seats', [0, 2]))
+                        main_set = set(seat_override if seat_override is not None else [0, 2])
                         is_main = (seat_idx in main_set)
                     if not is_main:
                         r = dict(r)
@@ -3194,22 +3235,11 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         next_obs_ep = [torch.as_tensor(x, dtype=torch.float32) for x in ep['next_obs']]
         act_ep = [torch.as_tensor(x, dtype=torch.float32) for x in ep['act']]
         seat_ep = [torch.as_tensor(x, dtype=torch.float32) for x in ep['seat']]
-        # Determina reward episodio dal team 0/1 (proporzionale al risultato)
-        tr = ep.get('team_rewards', [0.0, 0.0])
-        t0 = float(tr[0])
-        t1 = float(tr[1])
-        rew_ep = []
-        for st in seat_ep:
-            team0_flag = bool(float(st[4]) > 0.5)
-            if not team0_flag:
-                seat_idx = int(torch.argmax(st[:4]).item())
-                team0_flag = seat_idx in [0, 2]
-            rew_ep.append(t0 if team0_flag else t1)
-
         obs_cpu.extend(obs_ep)
         next_obs_cpu.extend(next_obs_ep)
         act_cpu.extend(act_ep)
-        rew_list.extend(rew_ep)
+        # Usa i reward step-by-step dell'episodio (già firmati dall'ambiente)
+        rew_list.extend(ep.get('rew', []))
         done_list.extend(ep['done'])
         seat_cpu.extend(seat_ep)
         belief_cpu.extend([torch.as_tensor(x, dtype=torch.float32) for x in ep['belief_summary']])
@@ -3925,6 +3955,14 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     # alterna il main actor tra seat 0/2 e 1/3 per episodi
     even_main_seats = [0, 2]
     odd_main_seats = [1, 3]
+    # Default policy: alterna per episodio quando alleni una sola net (selfplay)
+    # o quando alterni A/B contro avversario congelato. In co-training live (due net
+    # che imparano entrambe) mantieni i seat fissi per squadra.
+    _alt_env_raw = str(os.environ.get('SCOPONE_ALT_MAIN_SEATS', '')).strip().lower()
+    if _alt_env_raw:
+        alternate_main_seats = (_alt_env_raw in ['1','true','yes','on'])
+    else:
+        alternate_main_seats = (not dual_team_nets) or bool(opp_frozen_env)
 
     best_return = -1e9
 
@@ -4097,7 +4135,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                        mcts_train_factor=mcts_train_factor,
                                                        seed=int(seed),
                                                        show_progress_env=True,
-                                                       tqdm_base_pos=3)
+                                                       tqdm_base_pos=3,
+                                                       alternate_main_seats=alternate_main_seats)
                 # Collect for team B vs live team A (swap seats)
                 main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
                 batch_B = collect_trajectory_parallel(agent_teamB,
@@ -4119,7 +4158,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                        mcts_train_factor=mcts_train_factor,
                                                        seed=int(seed + 1),
                                                        show_progress_env=True,
-                                                       tqdm_base_pos=4)
+                                                       tqdm_base_pos=4,
+                                                       alternate_main_seats=alternate_main_seats)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             elif dual_team_nets and opp_frozen_env:
@@ -4147,7 +4187,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                            show_progress_env=True,
                                                            tqdm_base_pos=3,
                                                            frozen_actor=agent_teamB.actor,
-                                                           frozen_non_main=True)
+                                                           frozen_non_main=True,
+                                                           alternate_main_seats=alternate_main_seats)
                 else:
                     batch_B = collect_trajectory_parallel(agent_teamB,
                                                            num_envs=int(num_envs),
@@ -4170,7 +4211,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                            show_progress_env=True,
                                                            tqdm_base_pos=4,
                                                            frozen_actor=agent.actor,
-                                                           frozen_non_main=True)
+                                                           frozen_non_main=True,
+                                                           alternate_main_seats=alternate_main_seats)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             else:
@@ -4205,7 +4247,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                     show_progress_env=True,
                                                     tqdm_base_pos=3,
                                                     frozen_actor=(shadow_actor if (use_selfplay and opp_frozen_env) else None),
-                                                    frozen_non_main=bool(use_selfplay and opp_frozen_env))
+                                                    frozen_non_main=bool(use_selfplay and opp_frozen_env),
+                                                    alternate_main_seats=alternate_main_seats)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
         else:
@@ -4226,7 +4269,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  train_both_teams=False,
                                                  gamma=1.0,
                                                  lam=1.0,
-                                                 seed=int(seed))
+                                                 seed=int(seed),
+                                                 alternate_main_seats=alternate_main_seats)
                 # Team B as main vs live team A (swap seats)
                 main_seats_B = odd_main_seats if (main_seats == even_main_seats) else even_main_seats
                 batch_B = collect_trajectory(env, agent_teamB, horizon=horizon, partner_actor=agent.actor, opponent_actor=agent.actor, main_seats=main_seats_B,
@@ -4242,7 +4286,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  train_both_teams=False,
                                                  gamma=1.0,
                                                  lam=1.0,
-                                                 seed=int(seed + 1))
+                                                 seed=int(seed + 1),
+                                                 alternate_main_seats=alternate_main_seats)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             elif dual_team_nets and opp_frozen_env:
@@ -4262,7 +4307,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  train_both_teams=False,
                                                  gamma=1.0,
                                                  lam=1.0,
-                                                 seed=int(seed))
+                                                 seed=int(seed),
+                                                 alternate_main_seats=alternate_main_seats)
                 else:
                     # Team B learns vs frozen Team A
                     batch_B = collect_trajectory(env, agent_teamB, horizon=horizon, partner_actor=agent.actor, opponent_actor=agent.actor, main_seats=main_seats,
@@ -4278,7 +4324,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                                  train_both_teams=False,
                                                  gamma=1.0,
                                                  lam=1.0,
-                                                 seed=int(seed + 1))
+                                                 seed=int(seed + 1),
+                                                 alternate_main_seats=alternate_main_seats)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
             else:
@@ -4296,7 +4343,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                                            train_both_teams=train_both_teams,
                                            gamma=1.0,
                                            lam=1.0,
-                                           seed=int(seed))
+                                           seed=int(seed),
+                                           alternate_main_seats=alternate_main_seats)
                 if _PAR_TIMING:
                     _iter_t_collect = (time.time() - _t_c0)
         if dual_team_nets and (not opp_frozen_env):
@@ -4487,7 +4535,11 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     writer.add_scalar(f'train/{k}', _to_float(v), it)
                 writer.add_scalar('train/episode_time_s', dt, it)
                 writer.add_scalar('train/avg_return', avg_return, it)
-            writer.add_text('train/main_seats', str(main_seats), it)
+            if alternate_main_seats:
+                seat_text = f"{main_seats} (per-episode toggle)"
+            else:
+                seat_text = str(main_seats)
+            writer.add_text('train/main_seats', seat_text, it)
             # Log by seat completamente su GPU; singola sync per tutto il blocco
             if dual_team_nets and opp_frozen_env:
                 _b_used = (batch_A if train_A_now else batch_B)

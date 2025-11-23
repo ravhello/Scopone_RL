@@ -57,7 +57,7 @@ os.environ.setdefault('SCOPONE_TRAIN_DEVICE', 'cpu')
 
 # Enable approximate GELU and gate all runtime checks via a single flag
 os.environ.setdefault('SCOPONE_APPROX_GELU', '1')
-os.environ.setdefault('SCOPONE_STRICT_CHECKS', '0')
+os.environ.setdefault('SCOPONE_STRICT_CHECKS', '1')
 os.environ.setdefault('SCOPONE_PROFILE', '0')
 
 # ===== Section: Diagnostics/Profiling (Both) =====
@@ -102,7 +102,7 @@ _opp_frozen = os.environ.get('SCOPONE_OPP_FROZEN','1') in ['1','true','yes','on'
 
 # SCOPONE_TRAIN_FROM_BOTH_TEAMS: effective ONLY when SELFPLAY=1 and OPP_FROZEN=0.
 # Uses transitions from both teams for the single net; otherwise ignored (on-policy).
-_tfb = os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS','1') in ['1','true','yes','on']
+os.environ.setdefault('SCOPONE_TRAIN_FROM_BOTH_TEAMS','1')
 
 # Warm-start policy controlled by SCOPONE_WARM_START: '0' start-from-scratch, '1' force top1 clone, '2' use top2 if available
 os.environ.setdefault('SCOPONE_WARM_START', '2')
@@ -133,7 +133,7 @@ seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
 iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
-num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '24'))  # numero di environment paralleli
+num_envs = int(os.environ.get('SCOPONE_NUM_ENVS', '32'))  # numero di environment paralleli
 os.environ.setdefault('BELIEF_AUX_COEF', '0.05')  # coefficiente loss ausiliaria belief (default 0.0)
 os.environ.setdefault('SCOPONE_REWARD_SCALE', '0.1')  # scala ricompense finali (1.0 = nessuna variazione)
 
@@ -355,7 +355,7 @@ if __name__ == "__main__":
     _maybe_launch_tensorboard()
 
     tqdm.write(f"Parallel envs: {num_envs}  (SCOPONE_PROFILE={os.environ.get('SCOPONE_PROFILE','0')})")
-    tqdm.write(f"Train from both team transitions: {'ON' if _tfb else 'OFF'}")
+    tqdm.write(f"Train from both team transitions: {'ON' if os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS','0') in ['1','true','yes','on'] and _selfplay and not _opp_frozen else 'OFF'}")
     tqdm.write(f"Opponent frozen: {'ON' if _opp_frozen else 'OFF'}")
     tqdm.write(f"Warm start mode: {os.environ.get('SCOPONE_WARM_START','2')}")
     tqdm.write(f"League startup refresh: {'ON' if os.environ.get('SCOPONE_LEAGUE_REFRESH','1') in ['1','true','yes','on'] else 'OFF'}")
@@ -420,5 +420,4 @@ if __name__ == "__main__":
               eval_games=_eval_games,
               seed=seed_env,
               use_selfplay=_selfplay,
-              train_both_teams=_tfb,
               mcts_warmup_iters=_mcts_warmup_iters)
