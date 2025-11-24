@@ -10,7 +10,7 @@ from utils.device import get_compute_device, get_amp_dtype
 from utils.compile import maybe_compile_module, maybe_compile_function
 from utils.torch_load import safe_torch_load
 import os as _os
-device = get_compute_device()
+device = torch.device('cpu')
 autocast_device = device.type
 autocast_dtype = get_amp_dtype()
 import os as _os
@@ -36,27 +36,9 @@ class ActionConditionedPPO:
         self.actor = ActionConditionedActor(obs_dim, action_dim, state_encoder=shared_enc)
         self.critic = CentralValueNet(obs_dim, state_encoder=shared_enc)
 
-        # Training device override: keep models on CPU for env/collection, move to GPU only in update if requested
-        train_dev_str = _os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu').strip().lower()
-        if train_dev_str.startswith('cuda') and (not torch.cuda.is_available()):
-            train_dev_str = 'cpu'
-        self.train_device = torch.device(train_dev_str)
-        # AMP GradScaler only when training on CUDA
+        # Training device forced to CPU; disable CUDA/autocast branches
+        self.train_device = torch.device('cpu')
         self.scaler = None
-        if self.train_device.type == 'cuda':
-            self.scaler = torch.amp.GradScaler(device='cuda')
-
-        # Warm-up forward to materialize any Lazy modules (e.g., LazyLinear) only when CUDA
-        if device.type == 'cuda':
-            with torch.enable_grad():
-                _obs_w = torch.zeros((2, obs_dim), dtype=torch.float32, device=device, requires_grad=True)
-                _seat_w = torch.zeros((2, 6), dtype=torch.float32, device=device)
-                _seat_w[0, 0] = 1.0; _seat_w[0, 4] = 1.0
-                _seat_w[1, 1] = 1.0; _seat_w[1, 5] = 1.0
-                cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype)
-                with cm:
-                    _ = self.actor.compute_state_proj(_obs_w, _seat_w)
-                    _ = self.critic(_obs_w, _seat_w)
 
         # Unified compile: allow CPU and CUDA. Avoid compiling backward-heavy compute_loss on CPU.
         self.actor = maybe_compile_module(self.actor, name='ActionConditionedActor')
@@ -96,8 +78,8 @@ class ActionConditionedPPO:
         shared_ids = {id(p) for p in self.actor.state_enc.parameters()}
         actor_params = list(self.actor.parameters())
         critic_params = [p for p in self.critic.parameters() if id(p) not in shared_ids]
-        self.opt_actor = optim.Adam(actor_params, lr=lr, fused=(self.train_device.type == 'cuda'))
-        self.opt_critic = optim.Adam(critic_params, lr=lr, fused=(self.train_device.type == 'cuda'))
+        self.opt_actor = optim.Adam(actor_params, lr=lr, fused=False)
+        self.opt_critic = optim.Adam(critic_params, lr=lr, fused=False)
         self.clip_ratio = clip_ratio
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
@@ -123,55 +105,14 @@ class ActionConditionedPPO:
             'target_kl': target_kl,
         }
 
-        # Perf flags
-        try:
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.enabled = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.set_float32_matmul_precision('high')
-        except Exception as e:
-            raise RuntimeError('ppo.init.set_matmul_precision_failed') from e
+        # Perf flags (CPU-only)
+        torch.set_float32_matmul_precision('high')
 
-        # (train_device and scaler already set above)
-
-        # Pre-allocate pinned CPU buffers to cut repeated pin_memory/allocations in select_action
-        # These are sized for single-step inference (batch size 1) and dynamic actions buffer
-        if device.type == 'cuda':
-            try:
-                self._obs_cpu_pinned = torch.empty((1, obs_dim), dtype=torch.float32, pin_memory=True)
-                self._seat_cpu_pinned = torch.empty((1, 6), dtype=torch.float32, pin_memory=True)
-            except Exception as e:
-                raise RuntimeError('ppo.init.pin_memory_unavailable') from e
-            self._actions_cpu_pinned = None
-            self._actions_cpu_capacity = 0
-        else:
-            self._obs_cpu_pinned = None
-            self._seat_cpu_pinned = None
-            self._actions_cpu_pinned = None
-            self._actions_cpu_capacity = 0
-
-    def _ensure_actions_pinned_capacity(self, capacity: int):
-        # Lazily allocate or grow the pinned actions buffer
-        if (self._actions_cpu_pinned is None) or (capacity > self._actions_cpu_capacity):
-            new_cap = max(capacity, int(self._actions_cpu_capacity * 1.5) if self._actions_cpu_capacity > 0 else 64)
-            try:
-                if device.type == 'cuda':
-                    self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32, pin_memory=True)
-                else:
-                    self._actions_cpu_pinned = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32)
-                self._actions_cpu_capacity = new_cap
-            except Exception as e:
-                raise RuntimeError('ppo.ensure_actions_pinned_capacity.pin_memory_unavailable') from e
-
-    def _ensure_actions_cpu_capacity(self, capacity: int):
-        # Allocate or grow a CPU tensor (A,80) buffer for legal actions on CPU path
-        if not hasattr(self, '_actions_cpu_buf_capacity'):
-            self._actions_cpu_buf_capacity = 0
-            self._actions_cpu_buf = None
-        if (self._actions_cpu_buf is None) or (capacity > self._actions_cpu_buf_capacity):
-            new_cap = max(capacity, int(self._actions_cpu_buf_capacity * 2) if self._actions_cpu_buf_capacity > 0 else 64)
-            self._actions_cpu_buf = torch.empty((new_cap, self.run_config['action_dim']), dtype=torch.float32)
-            self._actions_cpu_buf_capacity = new_cap
+        # CPU buffers only
+        self._obs_cpu_pinned = None
+        self._seat_cpu_pinned = None
+        self._actions_cpu_pinned = None
+        self._actions_cpu_capacity = 0
 
     def select_action(self, obs, legal_actions: List, seat_team_vec = None, profiling_bins: Optional[Dict[str, float]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(legal_actions) == 0:
@@ -204,82 +145,30 @@ class ActionConditionedPPO:
                     s = float(a0[:40].sum())
                     if abs(s - 1.0) > 1e-6:
                         raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
-        # Accept obs on CPU by staging through pinned memory when needed
+        # Accept obs on CPU (CPU-only path)
         if torch.is_tensor(obs):
-            if obs.device.type == device.type:
-                obs_t = obs.to(dtype=torch.float32)
-                if obs_t.dim() == 1:
-                    obs_t = obs_t.unsqueeze(0)
-            elif obs.device.type == 'cpu':
-                o_cpu = obs.detach().to('cpu', dtype=torch.float32)
-                if o_cpu.dim() == 1:
-                    o_cpu = o_cpu.unsqueeze(0)
-                if device.type == 'cuda':
-                    self._obs_cpu_pinned.copy_(o_cpu, non_blocking=True)
-                    obs_t = self._obs_cpu_pinned.to(device=device, non_blocking=True)
-                else:
-                    obs_t = o_cpu
-            else:
-                raise RuntimeError('select_action expects obs tensor on compute device or CPU tensor')
+            obs_t = obs.detach().to('cpu', dtype=torch.float32)
+            if obs_t.dim() == 1:
+                obs_t = obs_t.unsqueeze(0)
         else:
-            import numpy as _np
             o_cpu = torch.as_tensor(obs, dtype=torch.float32, device='cpu')
             if o_cpu.dim() == 1:
                 o_cpu = o_cpu.unsqueeze(0)
-            obs_t = (o_cpu.pin_memory().to(device=device, non_blocking=True) if device.type == 'cuda' else o_cpu)
+            obs_t = o_cpu
 
-        # Legal actions: accept CPU and list inputs, stage via pinned memory when needed
+        # Legal actions: always stage to CPU tensor
         if torch.is_tensor(legal_actions):
-            if legal_actions.device.type == device.type:
-                actions_t = legal_actions.to(dtype=torch.float32)
-            elif legal_actions.device.type == 'cpu':
-                la_cpu = legal_actions.detach().to('cpu', dtype=torch.float32)
-                A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
-                if A > 0:
-                    if device.type == 'cuda':
-                        self._ensure_actions_pinned_capacity(A)
-                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                    else:
-                        actions_t = la_cpu
-                else:
-                    actions_t = la_cpu.to(device=device)
-            else:
-                raise RuntimeError('select_action expects legal_actions tensor on compute device or CPU tensor')
+            if legal_actions.dim() != 2 or legal_actions.size(1) != self.run_config['action_dim']:
+                raise ValueError(f"legal actions tensor must be shape (A, 80), got {tuple(legal_actions.shape)}")
+            actions_t = legal_actions.detach().to('cpu', dtype=torch.float32)
         elif isinstance(legal_actions, list) and len(legal_actions) > 0:
             if torch.is_tensor(legal_actions[0]):
-                # Prefer buffer reuse on CPU to avoid per-step stack allocations
-                if device.type == 'cuda':
-                    # GPU path: keep existing pinned+stack pipeline
-                    la_cpu = torch.stack([x.detach().to('cpu', dtype=torch.float32) for x in legal_actions], dim=0)
-                    A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
-                    if A > 0:
-                        self._ensure_actions_pinned_capacity(A)
-                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                    else:
-                        actions_t = la_cpu.to(device=device)
-                else:
-                    # CPU path: copy into reusable CPU buffer directly
-                    A = len(legal_actions)
-                    self._ensure_actions_cpu_capacity(A)
-                    buf = self._actions_cpu_buf[:A]
-                    for i, a in enumerate(legal_actions):
-                        buf[i].copy_(a.detach().to('cpu', dtype=torch.float32))
-                    actions_t = buf
+                stacked = torch.stack([a.detach().to('cpu', dtype=torch.float32) for a in legal_actions], dim=0)
             else:
-                import numpy as _np
-                la_cpu = torch.as_tensor(_np.asarray(legal_actions, dtype=_np.float32), dtype=torch.float32, device='cpu')
-                A = int(la_cpu.size(0)) if la_cpu.dim() > 0 else 0
-                if A > 0:
-                    if device.type == 'cuda':
-                        self._ensure_actions_pinned_capacity(A)
-                        self._actions_cpu_pinned[:A].copy_(la_cpu, non_blocking=True)
-                        actions_t = self._actions_cpu_pinned[:A].to(device=device, non_blocking=True)
-                    else:
-                        actions_t = la_cpu
-                else:
-                    actions_t = la_cpu.to(device=device)
+                stacked = torch.as_tensor(legal_actions, dtype=torch.float32, device='cpu')
+            if stacked.dim() != 2 or stacked.size(1) != self.run_config['action_dim']:
+                raise ValueError(f"each legal action vector must be shape (80,), got {tuple(stacked.shape)}")
+            actions_t = stacked
         else:
             raise RuntimeError('select_action expects non-empty legal_actions')
         # Validate each legal row has exactly one played bit
@@ -296,23 +185,12 @@ class ActionConditionedPPO:
 
         st = None
         if seat_team_vec is not None:
-            if torch.is_tensor(seat_team_vec) and (seat_team_vec.device.type == device.type):
-                st = seat_team_vec.to(dtype=torch.float32)
-                if st.dim() == 1:
-                    st = st.unsqueeze(0)
+            if torch.is_tensor(seat_team_vec):
+                st = seat_team_vec.detach().to('cpu', dtype=torch.float32)
             else:
-                if torch.is_tensor(seat_team_vec):
-                    st_cpu = seat_team_vec.detach().to('cpu', dtype=torch.float32)
-                else:
-                    st_cpu = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
-                if device.type == 'cuda':
-                    if (self._seat_cpu_pinned is not None) and (st_cpu.numel() == self._seat_cpu_pinned.size(1)):
-                        self._seat_cpu_pinned[0].copy_(st_cpu, non_blocking=True)
-                        st = self._seat_cpu_pinned.to(device=device, non_blocking=True)
-                    else:
-                        raise RuntimeError('select_action expects seat_team_vec on compute device or as CUDA-ready tensor')
-                else:
-                    st = st_cpu.unsqueeze(0) if st_cpu.dim() == 1 else st_cpu
+                st = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
+            if st.dim() == 1:
+                st = st.unsqueeze(0)
             # Validate seat one-hot + team flags (after staging)
             if st is not None:
                 if st.size(1) != 6:
@@ -344,8 +222,7 @@ class ActionConditionedPPO:
             raise ValueError(f"_select_action_core expects actions_t with shape (A, {self.run_config['action_dim']}), got {tuple(actions_t.shape)}")
         if seat_team_t is not None and (seat_team_t.dim() != 2 or seat_team_t.size(1) != 6):
             raise ValueError(f"_select_action_core expects seat_team_t with shape (1, 6), got {None if seat_team_t is None else tuple(seat_team_t.shape)}")
-        cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
-        with cm:
+        with nullcontext():
             # Scoring simultaneo via fattorizzazione: proiezione di stato e logits carta
             state_proj = self.actor.compute_state_proj(obs_t, seat_team_t)  # (1,64)
             # Logits carta su tutte le 40 carte (mantieni dentro autocast per allineamento dtype)
@@ -434,9 +311,8 @@ class ActionConditionedPPO:
         if seat_team_t is not None and (seat_team_t.dim() != 2 or seat_team_t.size(1) != 6):
             raise ValueError(f"_select_action_core expects seat_team_t with shape (1, 6), got {None if seat_team_t is None else tuple(seat_team_t.shape)}")
 
-        cm = torch.autocast(device_type=autocast_device, dtype=autocast_dtype) if device.type == 'cuda' else nullcontext()
         t_state = time.perf_counter()
-        with cm:
+        with nullcontext():
             state_proj = self.actor.compute_state_proj(obs_t, seat_team_t)  # (1,64)
             card_logits_all = torch.matmul(state_proj, self.actor.card_emb_play.t()).squeeze(0)  # (40)
         profiling_bins['state_proj'] += (time.perf_counter() - t_state)
@@ -522,62 +398,41 @@ class ActionConditionedPPO:
         """
         def to_f32(x):
             if torch.is_tensor(x):
-                # Evita copie inutili se già su device e dtype corretto
-                if (x.device.type == device.type) and (x.dtype == torch.float32):
+                if (x.device.type == 'cpu') and (x.dtype == torch.float32):
                     return x
-                # Se è già su device ma dtype diverso, cambia solo dtype
-                if x.device.type == device.type:
-                    return x.to(dtype=torch.float32, non_blocking=True)
-                # Altrimenti porta su CPU con dtype corretto (pin in to_cuda_nb se serve)
                 return x.detach().to('cpu', dtype=torch.float32)
-            return torch.as_tensor(x, dtype=torch.float32, device=device)
+            return torch.as_tensor(x, dtype=torch.float32, device='cpu')
         def to_long(x):
             if torch.is_tensor(x):
-                if (x.device.type == device.type) and (x.dtype == torch.long):
+                if (x.device.type == 'cpu') and (x.dtype == torch.long):
                     return x
-                if x.device.type == device.type:
-                    return x.to(dtype=torch.long, non_blocking=True)
                 return x.detach().to('cpu', dtype=torch.long)
-            return torch.as_tensor(x, dtype=torch.long, device=device)
+            return torch.as_tensor(x, dtype=torch.long, device='cpu')
 
-        # Accept CPU inputs; move to CUDA once in a pinned, non_blocking way
-        # Route all compute in this function to the training device (can be CUDA while env stays on CPU)
-        device = self.train_device
+        # CPU-only compute path
+        device = torch.device('cpu')
 
-        def to_cuda_nb(x, dtype):
-            # Se il tensore è già su device/dtype corretti, restituisci direttamente
+        def to_cpu(x, dtype):
             if torch.is_tensor(x):
-                if (x.device.type == device.type) and (x.dtype == dtype):
+                if (x.device.type == 'cpu') and (x.dtype == dtype):
                     return x
-                if x.device.type == device.type:
-                    return x.to(dtype=dtype, non_blocking=True)
-                x_cpu = x.detach().to('cpu', dtype=dtype)
-            else:
-                x_cpu = torch.as_tensor(x, dtype=dtype, device='cpu')
-            if device.type == 'cuda':
-                import torch._dynamo as _dyn  # type: ignore
-                is_compiling = bool(getattr(_dyn, 'is_compiling', lambda: False)())
-                if is_compiling or (x_cpu.numel() == 0):
-                    return x_cpu.to(device=device, dtype=dtype, non_blocking=True)
-                return x_cpu.pin_memory().to(device=device, dtype=dtype, non_blocking=True)
-            else:
-                return x_cpu
+                return x.detach().to('cpu', dtype=dtype)
+            return torch.as_tensor(x, dtype=dtype, device='cpu')
 
         # Required keys validation
         for key in ('obs','act','old_logp','ret','adv','legals','legals_offset','legals_count','chosen_index','seat_team'):
             if key not in batch:
                 raise KeyError(f"compute_loss: missing batch key '{key}'")
-        obs = to_cuda_nb(batch['obs'], torch.float32)
-        seat = to_cuda_nb(batch['seat_team'], torch.float32)
-        act = to_cuda_nb(batch['act'], torch.float32)
-        # Move core scalars to training device to avoid CPU↔CUDA mismatches
-        old_logp = to_cuda_nb(batch['old_logp'], torch.float32)
-        ret = to_cuda_nb(batch['ret'], torch.float32)
-        adv = to_cuda_nb(batch['adv'], torch.float32)
-        legals = to_cuda_nb(batch['legals'], torch.float32)
-        offs = to_cuda_nb(batch['legals_offset'], torch.long)
-        cnts = to_cuda_nb(batch['legals_count'], torch.long)
-        chosen_idx = to_cuda_nb(batch['chosen_index'], torch.long)
+        obs = to_cpu(batch['obs'], torch.float32)
+        seat = to_cpu(batch['seat_team'], torch.float32)
+        act = to_cpu(batch['act'], torch.float32)
+        old_logp = to_cpu(batch['old_logp'], torch.float32)
+        ret = to_cpu(batch['ret'], torch.float32)
+        adv = to_cpu(batch['adv'], torch.float32)
+        legals = to_cpu(batch['legals'], torch.float32)
+        offs = to_cpu(batch['legals_offset'], torch.long)
+        cnts = to_cpu(batch['legals_count'], torch.long)
+        chosen_idx = to_cpu(batch['chosen_index'], torch.long)
         # Plausibility checks on old_logp early to catch bad batches
         if STRICT_CHECKS and (not torch.isfinite(old_logp).all()):
             raise RuntimeError("compute_loss: old_logp contains non-finite values")
@@ -598,8 +453,8 @@ class ActionConditionedPPO:
         # Optional precomputed global action embeddings to avoid recomputation per minibatch
         a_emb_global = batch.get('a_emb_global', None)
         # distillazione MCTS (targets raggruppati per sample): policy piatta e peso per-sample
-        mcts_policy_flat = to_cuda_nb(batch.get('mcts_policy', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
-        mcts_weight = to_cuda_nb(batch.get('mcts_weight', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
+        mcts_policy_flat = to_cpu(batch.get('mcts_policy', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
+        mcts_weight = to_cpu(batch.get('mcts_weight', torch.zeros((0,), dtype=torch.float32, device=device)), torch.float32)
 
         # Filtra eventuali sample senza azioni legali per evitare NaN
         valid_mask = cnts > 0
@@ -865,7 +720,7 @@ class ActionConditionedPPO:
         # Prepara target belief supervision (se batch fornisce mani reali degli altri)
         real_hands = batch.get('others_hands', None)  # shape (B,3,40) one-hot o multi-hot per altri giocatori
         if (belief_coef > 0.0) and (real_hands is not None):
-            rh = to_cuda_nb(real_hands, torch.float32)
+            rh = to_cpu(real_hands, torch.float32)
             # riusa state_feat già calcolato e la visible_mask_40 già costruita
             logits_b = self.actor.belief_net(state_feat)  # (B,120)
             if STRICT_CHECKS and (not torch.isfinite(logits_b).all()):
@@ -915,24 +770,8 @@ class ActionConditionedPPO:
         Esegue update PPO con più epoche e minibatch sul batch corrente.
         Le azioni legali restano passate come array globale (ragged via offset/len per sample).
         """
-        # Move models to training device (GPU for big compute if requested) just for the update
-        models_were_cpu = (next(self.actor.parameters()).device.type == 'cpu') and (self.train_device.type != 'cpu')
-        if models_were_cpu:
-            self.actor.to(self.train_device)
-            self.critic.to(self.train_device)
-            # Move optimizer state to the same device as parameters to avoid CPU/GPU mismatch under fused Adam
-            if self.train_device.type == 'cuda':
-                for opt in (self.opt_actor, self.opt_critic):
-                    for group in opt.param_groups:
-                        for p in group['params']:
-                            if p is None:
-                                continue
-                            state = opt.state.get(p)
-                            if not state:
-                                continue
-                            for key, val in list(state.items()):
-                                if torch.is_tensor(val) and val.device.type != self.train_device.type:
-                                    state[key] = val.to(self.train_device)
+        # Modelli già su CPU: nessun move necessario
+        models_were_cpu = False
         num_samples = len(batch['obs'])
         last_info = {}
         avg_kl_acc, avg_clip_acc, count_mb = 0.0, 0.0, 0
@@ -947,39 +786,29 @@ class ActionConditionedPPO:
             return total_sq.sqrt()
 
         check_every = 1  # sample ogni minibatch: più controlli -> KL aderente al target
-        # Stage intero batch su device una sola volta (CPU-friendly: evita .to no-op)
-        batch_cuda = {}
+        # Stage intero batch su CPU (unico device supportato)
+        batch_cpu = {}
         for k, v in batch.items():
             if k in ('routing_log',):
                 continue
             if torch.is_tensor(v):
-                # mappa tensori principali su device
-                dtype = v.dtype
-                if k in ('obs', 'act', 'ret', 'adv'):
-                    dtype = torch.float32
-                if v.device.type == device.type and v.dtype == dtype:
-                    batch_cuda[k] = v.detach()
-                else:
-                    batch_cuda[k] = v.detach().to(device=device, dtype=dtype, non_blocking=(device.type == 'cuda'))
+                dtype = torch.float32 if k in ('obs', 'act', 'ret', 'adv') else v.dtype
+                batch_cpu[k] = v.detach().to(device='cpu', dtype=dtype)
             else:
-                batch_cuda[k] = v
-        # 'legals' è globale: porta su device una volta
-        if 'legals' in batch_cuda:
-            lv = batch_cuda['legals']
+                batch_cpu[k] = v
+        if 'legals' in batch_cpu:
+            lv = batch_cpu['legals']
             if not (torch.is_tensor(lv) and lv.device.type == device.type and lv.dtype == torch.float32):
-                batch_cuda['legals'] = lv.to(device=device, dtype=torch.float32, non_blocking=(device.type == 'cuda'))
-            # Precompute global embeddings ONLY when not training to avoid graph reuse across backward
-            # which leads to "Trying to backward through the graph a second time" errors.
+                batch_cpu['legals'] = lv.to(device=device, dtype=torch.float32)
             if not self.actor.training:
                 try:
-                    batch_cuda['a_emb_global'] = self.actor.action_enc(batch_cuda['legals']).detach()
+                    batch_cpu['a_emb_global'] = self.actor.action_enc(batch_cpu['legals']).detach()
                 except Exception as e:
                     raise RuntimeError("Failed to precompute global action embeddings (a_emb_global)") from e
             else:
-                batch_cuda['a_emb_global'] = None
+                batch_cpu['a_emb_global'] = None
 
-        # Stabilizza forme tra minibatch: usa massimo globale di legali e minibatch costante che divide il totale
-        global_max_cnt = int(batch_cuda['legals_count'].max().item()) if num_samples > 0 else 0
+        global_max_cnt = int(batch_cpu['legals_count'].max().item()) if num_samples > 0 else 0
         pos_global = (torch.arange(global_max_cnt, device=device, dtype=torch.long) if global_max_cnt > 0 else torch.zeros((0,), device=device, dtype=torch.long))
 
         for ep in range(epochs):
@@ -998,104 +827,73 @@ class ActionConditionedPPO:
                     mb_eff = max(1, num_samples)
             for start in range(0, num_samples, mb_eff):
                 idx_t = perm[start:start+mb_eff]
-                # Slice direttamente su CUDA
-                def sel_cuda(x):
+                # Slice helper su CPU
+                def sel_cpu(x):
                     return torch.index_select(x, 0, idx_t)
                 # Seleziona sottovettori offs/cnts del minibatch (no fallback)
-                offs_mb = sel_cuda(batch_cuda['legals_offset'])
-                cnts_mb = sel_cuda(batch_cuda['legals_count'])
+                offs_mb = sel_cpu(batch_cpu['legals_offset'])
+                cnts_mb = sel_cpu(batch_cpu['legals_count'])
                 B_mb = int(cnts_mb.size(0))
                 # Fissa la dimensione al massimo globale per stabilità delle forme compilate
                 max_cnt_mb = int(global_max_cnt)
                 # Verifica presenza mcts_weight
-                if batch_cuda.get('mcts_weight', None) is None:
+                if batch_cpu.get('mcts_weight', None) is None:
                     raise RuntimeError('update: missing mcts_weight in batch')
-                mcts_weight_mb = sel_cuda(batch_cuda['mcts_weight'])
+                mcts_weight_mb = sel_cpu(batch_cpu['mcts_weight'])
                 # Costruisci indice assoluto sui legali globali per estrarre la porzione di mcts_policy, solo se necessario
                 if max_cnt_mb > 0 and bool((mcts_weight_mb > 0).any().item()):
-                    if batch_cuda.get('mcts_policy', None) is None:
+                    if batch_cpu.get('mcts_policy', None) is None:
                         raise RuntimeError("update: 'mcts_policy' is required when mcts_weight>0 in minibatch")
-                    if batch_cuda['mcts_policy'].dim() != 1:
+                    if batch_cpu['mcts_policy'].dim() != 1:
                         raise RuntimeError('update: mcts_policy must be 1D flat vector')
-                    if int(batch_cuda['mcts_policy'].numel()) < int(batch_cuda['legals'].size(0)):
+                    if int(batch_cpu['mcts_policy'].numel()) < int(batch_cpu['legals'].size(0)):
                         raise RuntimeError('update: mcts_policy length smaller than total legals')
                     pos = pos_global
                     rel_pos_2d = (pos.unsqueeze(0).expand(B_mb, max_cnt_mb) if max_cnt_mb > 0 else torch.zeros((B_mb, 0), device=device, dtype=torch.long))
                     mask = rel_pos_2d < cnts_mb.unsqueeze(1)
                     abs_idx = (offs_mb.unsqueeze(1) + rel_pos_2d)[mask]
-                    mcts_policy_mb = batch_cuda['mcts_policy'][abs_idx].contiguous()
+                    mcts_policy_mb = batch_cpu['mcts_policy'][abs_idx].contiguous()
                 else:
                     mcts_policy_mb = torch.zeros((0,), dtype=torch.float32, device=device)
 
                 mini = {
-                    'obs': sel_cuda(batch_cuda['obs']),
-                    'act': sel_cuda(batch_cuda['act']),
-                    'old_logp': sel_cuda(batch_cuda['old_logp']),
-                    'ret': sel_cuda(batch_cuda['ret']),
-                    'adv': sel_cuda(batch_cuda['adv']),
-                    'legals': batch_cuda['legals'],  # globale su device
+                    'obs': sel_cpu(batch_cpu['obs']),
+                    'act': sel_cpu(batch_cpu['act']),
+                    'old_logp': sel_cpu(batch_cpu['old_logp']),
+                    'ret': sel_cpu(batch_cpu['ret']),
+                    'adv': sel_cpu(batch_cpu['adv']),
+                    'legals': batch_cpu['legals'],  # globale su device
                     'legals_offset': offs_mb,
                     'legals_count': cnts_mb,
-                    'chosen_index': sel_cuda(batch_cuda['chosen_index']),
-                    'seat_team': sel_cuda(batch_cuda['seat_team']) if batch_cuda.get('seat_team', None) is not None else None,
-                    'others_hands': sel_cuda(batch_cuda['others_hands']) if batch_cuda.get('others_hands', None) is not None else None,
-                    'a_emb_global': batch_cuda.get('a_emb_global', None),
+                    'chosen_index': sel_cpu(batch_cpu['chosen_index']),
+                    'seat_team': sel_cpu(batch_cpu['seat_team']) if batch_cpu.get('seat_team', None) is not None else None,
+                    'others_hands': sel_cpu(batch_cpu['others_hands']) if batch_cpu.get('others_hands', None) is not None else None,
+                    'a_emb_global': batch_cpu.get('a_emb_global', None),
                     'mcts_policy': mcts_policy_mb,
                     'mcts_weight': mcts_weight_mb,
                 }
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
-                if self.scaler is not None:
-                    with torch.autocast(device_type=self.train_device.type, dtype=autocast_dtype):
-                        loss, info = self.compute_loss(mini)
-                    self.scaler.scale(loss).backward()
-                    # Unscale prima del grad clip
-                    self.scaler.unscale_(self.opt_actor)
-                    self.scaler.unscale_(self.opt_critic)
-                    # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
-                    gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                    gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-                    if STRICT_CHECKS and ((not torch.isfinite(gn_actor)) or (not torch.isfinite(gn_critic))):
-                        raise RuntimeError("update: non-finite gradients detected (norm)")
-                    # garanzia tensor per logging coerente
-                    gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
-                    gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
-                    self.scaler.step(self.opt_actor)
-                    self.scaler.step(self.opt_critic)
-                    self.scaler.update()
-                    # Post-step: parametri finiti (cattura divergenze immediate)
-
-                    if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
-                        if STRICT_CHECKS and (not torch.isfinite(self.actor.state_enc.card_emb).all()):
-                            raise RuntimeError("update: state_enc.card_emb became non-finite after step")
-                    # invalidate any inference caches after params changed
-                    try:
-                        self.actor.invalidate_action_cache()
-                    except Exception as e:
-                        raise RuntimeError('ppo.update.invalidate_action_cache_failed') from e
-                else:
-                    loss, info = self.compute_loss(mini)
-                    loss.backward()
-                    # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
-                    gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                    gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-                    if STRICT_CHECKS and ((not torch.isfinite(gn_actor)) or (not torch.isfinite(gn_critic))):
-                        raise RuntimeError("update: non-finite gradients detected (norm)")
-                    gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
-                    gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
-                    self.opt_actor.step()
-                    self.opt_critic.step()
-                    # Post-step: parametri finiti
-                    try:
-                        if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
-                            if STRICT_CHECKS and (not torch.isfinite(self.actor.state_enc.card_emb).all()):
-                                raise RuntimeError("update: state_enc.card_emb became non-finite after step")
-                    except Exception:
-                        raise
-                    try:
-                        self.actor.invalidate_action_cache()
-                    except Exception as e:
-                        raise RuntimeError('ppo.update.invalidate_action_cache_failed') from e
+                loss, info = self.compute_loss(mini)
+                loss.backward()
+                # grad norm (usa il valore restituito da clip_grad_norm_ per evitare un secondo pass)
+                gn_actor = nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                gn_critic = nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                if STRICT_CHECKS and ((not torch.isfinite(gn_actor)) or (not torch.isfinite(gn_critic))):
+                    raise RuntimeError("update: non-finite gradients detected (norm)")
+                gn_actor = torch.as_tensor(gn_actor, device=device, dtype=torch.float32)
+                gn_critic = torch.as_tensor(gn_critic, device=device, dtype=torch.float32)
+                self.opt_actor.step()
+                self.opt_critic.step()
+                # Post-step: parametri finiti (cattura divergenze immediate)
+                if hasattr(self.actor, 'state_enc') and hasattr(self.actor.state_enc, 'card_emb'):
+                    if STRICT_CHECKS and (not torch.isfinite(self.actor.state_enc.card_emb).all()):
+                        raise RuntimeError("update: state_enc.card_emb became non-finite after step")
+                # invalidate any inference caches after params changed
+                try:
+                    self.actor.invalidate_action_cache()
+                except Exception as e:
+                    raise RuntimeError('ppo.update.invalidate_action_cache_failed') from e
                 last_info = info
                 self.update_steps += 1
                 avg_kl_acc += info.get('approx_kl', torch.tensor(0.0, device=device))
@@ -1139,23 +937,7 @@ class ActionConditionedPPO:
             last_info['avg_kl'] = (avg_kl_acc / count_mb).detach()
             last_info['avg_clip_frac'] = (avg_clip_acc / count_mb).detach()
             last_info['early_stop'] = torch.tensor(1.0 if early_stop else 0.0, device=device)
-        # Move back to CPU for collection if we temporarily moved to CUDA
-        if models_were_cpu:
-            self.actor.to('cpu')
-            self.critic.to('cpu')
-            # Move optimizer state back to CPU to match parameters for next collection iteration
-            if self.train_device.type == 'cuda':
-                for opt in (self.opt_actor, self.opt_critic):
-                    for group in opt.param_groups:
-                        for p in group['params']:
-                            if p is None:
-                                continue
-                            state = opt.state.get(p)
-                            if not state:
-                                continue
-                            for key, val in list(state.items()):
-                                if torch.is_tensor(val) and val.device.type != 'cpu':
-                                    state[key] = val.to('cpu')
+        # Modelli restano su CPU
         return last_info
 
     def add_lr_schedulers(self, actor_scheduler, critic_scheduler):

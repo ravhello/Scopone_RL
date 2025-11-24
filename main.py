@@ -333,19 +333,11 @@ if __name__ == "__main__":
     _train_dev_raw = str(os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')).strip().lower()
     tqdm.write(f"Training compute device: {_train_dev_raw}")
     tqdm.write(f"Self-play: {'ON' if _selfplay else 'OFF (League)'}")
-    # Configura i thread CPU del processo principale in modo adattivo:
-    # - Se multi-env e training su GPU: pochi thread CPU (riduce la contesa con i worker)
-    # - Se multi-env e training su CPU: usa tutti i core
-    # - Se single-env: usa i valori calcolati in testa (_n_threads/_n_interop)
+    # Configura i thread CPU del processo principale in modo adattivo (CPU-only)
     _cores = max(1, (os.cpu_count() or 1))
     if int(num_envs) > 1:
-        _train_is_cuda = ('cuda' in _train_dev_raw)
-        if _train_is_cuda:
-            _thr = max(1, min(4, _cores // 4))
-            _interop = 1
-        else:
-            _thr = _cores
-            _interop = max(1, _cores // 8)
+        _thr = _cores
+        _interop = max(1, _cores // 8)
     else:
         _thr = _n_threads
         _interop = _n_interop

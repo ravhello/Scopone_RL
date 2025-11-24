@@ -14,7 +14,7 @@ except Exception:
     _sdpa_kernel_ctx = None  # type: ignore
     _SDPBackend = None  # type: ignore
 
-device = get_compute_device()
+device = torch.device('cpu')
 autocast_device = device.type
 autocast_dtype = get_amp_dtype()
 STRICT = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
@@ -89,10 +89,6 @@ class StateEncoderCompact(nn.Module):
         self.register_buffer('_hist_pos_ids', torch.arange(40, dtype=torch.long, device=device))
 
     def _attn_ctx(self):
-        if device.type == 'cuda':
-            if _sdpa_kernel_ctx is not None and _SDPBackend is not None:
-                return _sdpa_kernel_ctx([_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION])
-            return torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
         return nullcontext()
 
     def _safe_mha(self, mha: nn.Module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
@@ -199,9 +195,7 @@ class StateEncoderCompact(nn.Module):
                         found = True
                         break
 
-        # Autocast per tutto il compute del forward compatto
-        cm = torch.autocast(device_type=target_device.type, dtype=autocast_dtype) if target_device.type == 'cuda' else nullcontext()
-        with cm:
+        with nullcontext():
             # Sezioni
             hand_table = obs[:, :83]
             captured = obs[:, 83:165]

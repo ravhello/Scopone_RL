@@ -19,8 +19,6 @@ except Exception:
 def set_global_seeds(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
     if _NP_AVAILABLE:
         _np.random.seed(seed)
 
@@ -43,7 +41,7 @@ def resolve_seed(seed: int) -> int:
 @contextmanager
 def temporary_seed(seed: int):
     """
-    Temporarily set RNG seeds for Python, NumPy and Torch (CPU/GPU), restoring
+    Temporarily set RNG seeds for Python, NumPy and Torch (CPU only), restoring
     previous RNG states on exit. Useful to make eval/MCTS deterministic without
     affecting training randomness.
     """
@@ -54,7 +52,7 @@ def temporary_seed(seed: int):
     else:
         np_state = None
     torch_state = torch.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    cuda_states = None
 
     # Apply temporary seed
     set_global_seeds(int(seed))
@@ -68,7 +66,6 @@ def temporary_seed(seed: int):
             _np.random.set_state(np_state)
         if torch_state is not None:
             torch.set_rng_state(torch_state)
-        if cuda_states is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(cuda_states)
+        # No CUDA state restore in CPU-only mode
 
 

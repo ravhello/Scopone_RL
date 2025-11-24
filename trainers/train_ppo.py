@@ -29,11 +29,12 @@ from evaluation.eval import evaluate_pair_actors, evaluate_pair_actors_parallel
 
 import torch.optim as optim
 
-device = get_compute_device()
+device = torch.device('cpu')
 # Global perf flags
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
-torch.backends.cuda.matmul.allow_tf32 = True
+if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
+    torch.backends.cuda.matmul.allow_tf32 = False
 torch.set_float32_matmul_precision('high')
 
 # Profiling controls (single boolean -> full detail when enabled)
@@ -48,6 +49,31 @@ _OTHERS_HANDS_ZERO = torch.zeros((3, 40), dtype=torch.float32)
 _EMPTY_LEGAL = torch.zeros((0, 80), dtype=torch.float32)
 
 _SERIAL_RNG_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+def _require_team_rewards(info_obj: Any, context: str) -> List[float]:
+    """
+    Estrae e valida info['team_rewards'] assicurando che sia una coppia di finiti.
+    Solleva un errore con un messaggio chiaro se mancante o malformata.
+    """
+    import math as _math
+    if not isinstance(info_obj, dict):
+        raise RuntimeError(f"{context}: info deve essere un dict contenente 'team_rewards', trovato {type(info_obj)}")
+    if 'team_rewards' not in info_obj:
+        raise RuntimeError(f"{context}: info manca il campo obbligatorio 'team_rewards'")
+    tr = info_obj['team_rewards']
+    if not isinstance(tr, (list, tuple)):
+        raise RuntimeError(f"{context}: team_rewards deve essere list/tuple di lunghezza 2, trovato {type(tr)}")
+    if len(tr) != 2:
+        raise RuntimeError(f"{context}: team_rewards deve avere lunghezza 2, trovato {len(tr)} elementi")
+    try:
+        t0 = float(tr[0])
+        t1 = float(tr[1])
+    except Exception as e:
+        raise RuntimeError(f"{context}: team_rewards non convertibile a float: {tr}") from e
+    if not (_math.isfinite(t0) and _math.isfinite(t1)):
+        raise RuntimeError(f"{context}: team_rewards contiene valori non finiti: {tr}")
+    return [t0, t1]
 
 
 def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -65,7 +91,7 @@ def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
     except AttributeError:
         np_outer = None
     torch_outer = torch.get_rng_state()
-    cuda_outer = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    cuda_outer = None
 
     stored = _SERIAL_RNG_STATE.get(seed_key)
     if stored is None:
@@ -80,9 +106,7 @@ def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
         torch_state = stored.get('torch')
         if torch_state is not None:
             torch.set_rng_state(torch_state)
-        cuda_state = stored.get('cuda')
-        if cuda_state is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(cuda_state)  # type: ignore[arg-type]
+        # No CUDA state restore in CPU-only mode
 
     return {
         'seed': seed_key,
@@ -105,7 +129,7 @@ def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
         'py': random.getstate(),
         'np': np_new,
         'torch': torch.get_rng_state(),
-        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        'cuda': None,
     }
     py_outer = token.get('py_outer')
     if py_outer is not None:
@@ -116,9 +140,7 @@ def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
     torch_outer = token.get('torch_outer')
     if torch_outer is not None:
         torch.set_rng_state(torch_outer)
-    cuda_outer = token.get('cuda_outer')
-    if cuda_outer is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(cuda_outer)  # type: ignore[arg-type]
+    # No CUDA state restore in CPU-only mode
 
 def _dbg(msg: str) -> None:
     if _PAR_DEBUG:
@@ -735,10 +757,10 @@ def _env_worker(worker_id: int,
                     os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '0'))
 
                     mcts_action, mcts_visits = run_is_mcts(env,
-                        policy_fn=policy_fn_mcts,
-                        value_fn=value_fn_mcts,
-                        num_simulations=int(sims_scaled),
-                        c_puct=float(mcts_c_puct),
+                                              policy_fn=policy_fn_mcts,
+                                              value_fn=value_fn_mcts,
+                                              num_simulations=int(sims_scaled),
+                                              c_puct=float(mcts_c_puct),
                         belief=None,
                         num_determinization=int(_dets_eff),
                         root_temperature=root_temp_dyn,
@@ -955,7 +977,7 @@ def _env_worker(worker_id: int,
             'leg_off': leg_off_t,
             'leg_cnt': leg_cnt_t,
             'chosen_idx': chosen_idx_t,
-            'team_rewards': (info.get('team_rewards', [0.0, 0.0]) if isinstance(info, dict) else [0.0, 0.0]),
+            'team_rewards': _require_team_rewards(info, f"worker {worker_id}: episodio terminato"),
             'mcts_policy': mcts_policy_t,
             'mcts_weight': mcts_weight_t,
             'others_hands': others_hands_t,
@@ -1547,14 +1569,16 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     if env_mb > 0:
         minibatch_size = env_mb
     per_ep_util = 40 if bool(train_both_teams) else 20
-    lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
-    if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
-        new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
-        global _HORIZON_ADJUST_LOGGED
-        if not _HORIZON_ADJUST_LOGGED:
-            tqdm.write(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
-            _HORIZON_ADJUST_LOGGED = True
-        horizon = new_h
+    _tests_cpu = (os.environ.get('TESTS_FORCE_CPU', '0') == '1')
+    if not _tests_cpu:
+        lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
+        if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
+            new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
+            global _HORIZON_ADJUST_LOGGED
+            if not _HORIZON_ADJUST_LOGGED:
+                tqdm.write(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+                _HORIZON_ADJUST_LOGGED = True
+            horizon = new_h
     # After alignment, horizon is divisible by per_ep_util by construction
     # Validate gamma/lam
     if float(gamma) < 0 or float(gamma) > 1:
@@ -1962,22 +1986,27 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 os.environ['SCOPONE_MCTS_EXACT_MAX_MOVES'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_MAX_MOVES', ''))
                 os.environ['SCOPONE_MCTS_EXACT_COVER_FRAC'] = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_COVER_FRAC', '0'))
 
-                mcts_action, mcts_visits = run_is_mcts(env,
-                                          policy_fn=policy_fn_mcts,
-                                          value_fn=value_fn_mcts,
-                                          num_simulations=int(sims_scaled),
-                                          c_puct=float(mcts_c_puct),
-                                          belief=None,
-                                          num_determinization=int(_dets_eff_b),
-                                          root_temperature=root_temp_dyn,
-                                          prior_smooth_eps=prior_eps_eff,
-                                          robust_child=True,
-                                          root_dirichlet_alpha=float(mcts_dirichlet_alpha),
-                                          root_dirichlet_eps=dir_eps_eff,
-                                          return_stats=True,
-                                          belief_sampler=belief_sampler_neural,
-                                          exact_only=_exact_only2 and not _near_end_b)
-                chosen_act = mcts_action if torch.is_tensor(mcts_action) else torch.as_tensor(mcts_action, dtype=torch.float32)
+                mcts_action, mcts_visits = run_is_mcts(
+                    env,
+                    policy_fn=policy_fn_mcts,
+                    value_fn=value_fn_mcts,
+                    num_simulations=int(sims_scaled),
+                    c_puct=float(mcts_c_puct),
+                    belief=None,
+                    num_determinization=int(_dets_eff_b),
+                    root_temperature=root_temp_dyn,
+                    prior_smooth_eps=prior_eps_eff,
+                    robust_child=True,
+                    root_dirichlet_alpha=float(mcts_dirichlet_alpha),
+                    root_dirichlet_eps=dir_eps_eff,
+                    return_stats=True,
+                    belief_sampler=belief_sampler_neural,
+                    exact_only=_exact_only2 and not _near_end_b,
+                )
+                if torch.is_tensor(mcts_action):
+                    chosen_act = mcts_action.detach().to('cpu', dtype=torch.float32)
+                else:
+                    chosen_act = torch.as_tensor(mcts_action, dtype=torch.float32, device='cpu')
                 # trova indice dell'azione scelta tra i legali in O(A) vettoriale
                 # Bitset hashing mapping: encode action as (played_id, capture_bits) to find index in O(A)
                 def _encode_action_64(vec80: torch.Tensor) -> torch.Tensor:
@@ -1989,9 +2018,9 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     return (played_id | (bits << 6)).to(torch.int64)
                 code_ch = _encode_action_64(chosen_act)
                 if torch.is_tensor(legal):
-                    legals_t = legal
+                    legals_t = legal.detach().to('cpu', dtype=torch.float32)
                 else:
-                    legals_t = torch.stack([(x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal], dim=0)
+                    legals_t = torch.stack([(x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal], dim=0)
                 # vectorized encode for legals
                 played_ids = torch.argmax(legals_t[:, :40], dim=1).to(torch.int64)
                 cap_mask = (legals_t[:, 40:] > 0.5).to(torch.int64)
@@ -2182,8 +2211,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             if done:
                 # Registra i confini dell'episodio corrente e i team rewards
                 ep_slices.append((current_ep_start_idx, len(obs_list)))
-                tr = info.get('team_rewards', [0.0, 0.0]) if isinstance(info, dict) else [0.0, 0.0]
-                ep_team_rewards.append(tr)
+                ep_team_rewards.append(_require_team_rewards(info, "collect_trajectory: team_rewards mancanti/invalidi"))
                 if episodes_done >= (episodes - 1):
                     break
                 else:
@@ -2263,9 +2291,11 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 next_val_t = torch.where(updated_done_mask, torch.zeros_like(next_val_t), next_val_t)
     # Costruisci reward flat ±1 per tutte le transizioni dell'episodio, per entrambi i team
     if T > 0 and len(ep_slices) > 0:
+        if len(ep_team_rewards) != len(ep_slices):
+            raise RuntimeError(f"collect_trajectory: mismatch tra ep_slices ({len(ep_slices)}) e team_rewards ({len(ep_team_rewards)})")
         flat_rew = [0.0] * T
         for i_ep, (s, e) in enumerate(ep_slices):
-            tr = ep_team_rewards[i_ep] if i_ep < len(ep_team_rewards) else [0.0, 0.0]
+            tr = ep_team_rewards[i_ep]
             # Determina la reward per team 0 e team 1 (proporzionale al risultato finale)
             t0 = float(tr[0])
             t1 = float(tr[1])
@@ -2751,11 +2781,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         if platform.system().lower() == 'windows':
             start_method = 'spawn'
         else:
-            # If CUDA is in use, prefer 'spawn' to avoid CUDA re-init issues in children
-            if getattr(device, 'type', str(device)) == 'cuda' or (hasattr(torch, 'cuda') and torch.cuda.is_available()):
-                start_method = 'spawn'
-            else:
-                start_method = 'fork'
+            start_method = 'fork'
         if start_method not in available_methods:
             fallback = 'spawn' if 'spawn' in available_methods else next(iter(available_methods))
             if start_method != fallback:
