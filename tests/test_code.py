@@ -1056,7 +1056,12 @@ def test_policy_prefers_optimal_ace_king_sequence_with_checkpoint():
         if os.path.getsize(ckpt_path) == 0:
             pytest.skip(f"Checkpoint vuoto ({ckpt_path}); salto test.")
         try:
-            state = torch.load(ckpt_path, map_location=device)
+            load_kwargs = {'map_location': device}
+            # Use weights_only when available to avoid pickle warnings on newer torch.
+            import inspect
+            if 'weights_only' in inspect.signature(torch.load).parameters:
+                load_kwargs['weights_only'] = True
+            state = torch.load(ckpt_path, **load_kwargs)
             # Estrai esclusivamente lo state_dict dell'attore
             sd = None
             if isinstance(state, dict):

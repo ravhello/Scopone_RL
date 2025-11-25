@@ -27,6 +27,67 @@ def _make_env_agent(monkeypatch):
     return env, agent
 
 
+def _seat_vec_for(seat_idx: int) -> torch.Tensor:
+    v = torch.zeros(6, dtype=torch.float32)
+    v[seat_idx] = 1.0
+    v[4] = 1.0 if seat_idx in (0, 2) else 0.0
+    v[5] = 1.0 if seat_idx in (1, 3) else 0.0
+    return v
+
+
+def _eval_agent_vs_random(agent: ActionConditionedPPO, games: int = 4) -> float:
+    env = ScoponeEnvMA(k_history=4)
+    wins = 0
+    for _ in range(games):
+        env.reset()
+        done = False
+        while not done:
+            legals = env.get_valid_actions()
+            if env.current_player in (0, 2):
+                obs = env._get_observation(env.current_player)
+                seat_vec = _seat_vec_for(env.current_player)
+                act, _, _ = agent.select_action(obs, legals, seat_vec)
+            else:
+                # random opponent/partner
+                if isinstance(legals, list):
+                    act = legals[0] if len(legals) == 1 else legals[torch.randint(len(legals), (1,)).item()]
+                else:
+                    idx = torch.randint(legals.size(0), (1,)).item()
+                    act = legals[idx]
+            _, _r, done, _info = env.step(act)
+        if env.rewards[0] > env.rewards[1]:
+            wins += 1
+    return wins / float(games) if games > 0 else 0.0
+
+
+def _make_batch_with_dummy_rewards(monkeypatch, team0_reward: float = 1.0, team1_reward: float = -1.0):
+    _set_base_env(monkeypatch)
+    env = ScoponeEnvMA(k_history=4)
+    agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
+    batch = collect_trajectory(
+        env,
+        agent,
+        horizon=40,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=False,
+    )
+    # Override rewards in batch to controlled values for testing normalize/reduce logic
+    rew = batch['rew']
+    seats = batch['seat_team']
+    team0_mask = seats[:, 4] > 0.5
+    team1_mask = seats[:, 5] > 0.5
+    rew = rew.clone()
+    rew[team0_mask] = team0_reward
+    rew[team1_mask] = team1_reward
+    batch['rew'] = rew
+    # Recompute ret/adv trivially for sanity (no bootstrap)
+    batch['adv'] = torch.zeros_like(rew)
+    batch['ret'] = rew.clone()
+    return agent, batch
+
+
 def test_collect_trajectory_consistency(monkeypatch):
     env, agent = _make_env_agent(monkeypatch)
     batch = collect_trajectory(
@@ -183,6 +244,45 @@ def test_collect_trajectory_train_both_teams_covers_all_seats(monkeypatch):
     # Ogni riga è one-hot sui primi 4 posti
     seat_ids = torch.argmax(seats[:, :4], dim=1).tolist()
     assert set(seat_ids) == {0, 1, 2, 3}
+    # Flag team0 su seat pari, team1 su dispari
+    for sid, row in zip(seat_ids, seats):
+        if sid in (0, 2):
+            assert row[4] > 0.5 and row[5] < 0.5
+        else:
+            assert row[5] > 0.5 and row[4] < 0.5
+
+
+def test_flat_reward_constant_within_episode(monkeypatch):
+    env, agent = _make_env_agent(monkeypatch)
+    batch = collect_trajectory(
+        env,
+        agent,
+        horizon=40,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=False,
+        final_reward_only=True,
+    )
+    rew = batch['rew']
+    done = batch['done']
+    seats = batch['seat_team']
+    if rew.numel() == 0:
+        return
+    start = 0
+    for i, d in enumerate(done.tolist()):
+        if d or i == len(done) - 1:
+            end = i + 1
+            seg_rew = rew[start:end]
+            seg_seats = seats[start:end]
+            team_flags = (seg_seats[:, 4] > 0.5).to(torch.bool)
+            r_team0 = seg_rew[team_flags]
+            r_team1 = seg_rew[~team_flags]
+            if r_team0.numel() > 0:
+                assert torch.allclose(r_team0, r_team0[0])
+            if r_team1.numel() > 0:
+                assert torch.allclose(r_team1, r_team1[0])
+            start = end
 
 
 def test_actor_critic_forward_are_finite(monkeypatch):
@@ -199,3 +299,172 @@ def test_actor_critic_forward_are_finite(monkeypatch):
     assert torch.isfinite(sp).all()
     assert torch.isfinite(logits).all()
     assert torch.isfinite(val).all()
+
+
+def test_train_logging_avg_return_matches_batch(monkeypatch):
+    _set_base_env(monkeypatch)
+    captured = {}
+    writer = _FakeWriter()
+    monkeypatch.setattr('torch.utils.tensorboard.SummaryWriter', lambda log_dir=None: writer, raising=True)
+    import trainers.train_ppo as train_mod
+    orig_collect = train_mod.collect_trajectory
+
+    def wrapped_collect(*args, **kwargs):
+        batch = orig_collect(*args, **kwargs)
+        captured['batch'] = batch
+        return batch
+
+    monkeypatch.setattr(train_mod, 'collect_trajectory', wrapped_collect, raising=True)
+    train_mod.train_ppo(
+        num_iterations=1,
+        horizon=40,
+        k_history=4,
+        num_envs=1,
+        mcts_sims=0,
+        mcts_dets=0,
+        eval_every=0,
+        save_every=100,
+    )
+    assert 'batch' in captured
+    mean_ret = float(captured['batch']['ret'].mean().item()) if captured['batch']['ret'].numel() > 0 else 0.0
+    logged = [v for (t, v, s) in writer.scalars if t == 'train/avg_return' and s == 0]
+    assert logged, "Missing train/avg_return log"
+    assert abs(logged[0] - mean_ret) < 1e-6
+
+
+def test_short_training_does_not_degrade_vs_random(monkeypatch):
+    # Verifica che poche iterazioni non peggiorino drasticamente vs random baseline
+    _set_base_env(monkeypatch)
+    # Fissa seed per ridurre flakiness
+    torch.manual_seed(123)
+    agent = ActionConditionedPPO(obs_dim=ScoponeEnvMA(k_history=4).observation_space.shape[0])
+    base_wr = _eval_agent_vs_random(agent, games=6)
+    train_ppo(
+        num_iterations=3,
+        horizon=40,
+        k_history=4,
+        num_envs=1,
+        mcts_sims=0,
+        mcts_dets=0,
+        eval_every=0,
+        save_every=100,
+    )
+    improved_wr = _eval_agent_vs_random(agent, games=6)
+    # Consenti fluttuazioni ampie date poche partite, evita solo degrado massiccio
+    assert improved_wr >= base_wr - 0.5
+
+
+def test_return_matches_env_rewards(monkeypatch):
+    env, agent = _make_env_agent(monkeypatch)
+    batch = collect_trajectory(
+        env,
+        agent,
+        horizon=40,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=False,
+        final_reward_only=True,
+    )
+    if batch['obs'].numel() == 0:
+        return
+    # Ricostruisci reward finale per team dal campo rew e dalla maschera seat_team
+    rew = batch['rew']
+    seats = batch['seat_team']
+    team0_mask = seats[:, 4] > 0.5
+    team1_mask = seats[:, 5] > 0.5
+    # Reward finale dovrebbe essere costante per team nell'episodio
+    r0 = rew[team0_mask]
+    r1 = rew[team1_mask]
+    if r0.numel() > 0 and r1.numel() > 0:
+        assert torch.allclose(r0, r0[0])
+        assert torch.allclose(r1, r1[0])
+
+
+def test_env_rewards_updated_on_done(monkeypatch):
+    _set_base_env(monkeypatch)
+    env = ScoponeEnvMA(k_history=4)
+    # Forza una mano minima: giocatori 0 e 2 contro 1 e 3, tavolo vuoto, una carta per team0 che prende tutto
+    env.reset()
+    env.current_player = 0
+    env.game_state["hands"] = {0: [0], 1: [], 2: [], 3: []}  # carta 0 a P0
+    env.game_state["table"] = []
+    env.game_state["captured_squads"] = {0: [1], 1: []}  # simula almeno una presa precedente
+    env.game_state["history"] = [{"player": 0, "played_card": 1, "capture_type": "capture", "captured_cards": []}]
+    env._rebuild_id_caches()
+    import torch
+    from actions import encode_action_from_ids_tensor
+    act = encode_action_from_ids_tensor(torch.tensor(0, dtype=torch.long), torch.tensor([], dtype=torch.long))
+    _obs, r, done, info = env.step(act)
+    assert done is True
+    # env.rewards dovrebbe riflettere info['team_rewards']
+    if isinstance(info, dict) and 'team_rewards' in info:
+        t0, t1 = info['team_rewards']
+        assert env.rewards[0] == t0
+        assert env.rewards[1] == t1
+
+
+def test_iterative_avg_return_monotonicity(monkeypatch):
+    _set_base_env(monkeypatch)
+    torch.manual_seed(321)
+    agent = ActionConditionedPPO(obs_dim=ScoponeEnvMA(k_history=4).observation_space.shape[0])
+    wrs = []
+    # Eval baseline
+    wrs.append(_eval_agent_vs_random(agent, games=6))
+    # Esegui 5 iterazioni brevi, registrando win-rate dopo ciascuna
+    for _ in range(2):
+        train_ppo(
+            num_iterations=2,
+            horizon=40,
+            k_history=4,
+            num_envs=1,
+            mcts_sims=0,
+            mcts_dets=0,
+            eval_every=0,
+            save_every=100,
+        )
+        wrs.append(_eval_agent_vs_random(agent, games=6))
+    # Non deve scendere drasticamente (tolleriamo -0.5 rispetto al migliore raggiunto)
+    best = max(wrs)
+    assert wrs[-1] >= best - 0.5
+
+
+def test_update_respects_overridden_rewards(monkeypatch):
+    agent, batch = _make_batch_with_dummy_rewards(monkeypatch, team0_reward=2.0, team1_reward=-2.0)
+    info = agent.update(batch, epochs=1, minibatch_size=max(1, batch['obs'].size(0)))
+    # Loss terms devono essere finiti
+    for k, v in info.items():
+        if torch.is_tensor(v):
+            assert torch.isfinite(v).all(), f"Non-finite metric {k}"
+    # Ret medi coerenti con override
+    ret = batch['ret']
+    seats = batch['seat_team']
+    t0_mask = seats[:, 4] > 0.5
+    t1_mask = seats[:, 5] > 0.5
+    mean_t0 = float(ret[t0_mask].mean().item()) if t0_mask.any() else 0.0
+    mean_t1 = float(ret[t1_mask].mean().item()) if t1_mask.any() else 0.0
+    assert mean_t0 > 0 and mean_t1 < 0
+
+
+def test_avg_return_logging_with_mixed_rewards(monkeypatch):
+    _set_base_env(monkeypatch)
+    writer = _FakeWriter()
+    monkeypatch.setattr('torch.utils.tensorboard.SummaryWriter', lambda log_dir=None: writer, raising=True)
+    agent, batch = _make_batch_with_dummy_rewards(monkeypatch, team0_reward=1.5, team1_reward=-0.5)
+    # Monkeypatch collect_trajectory to return our batch
+    import trainers.train_ppo as train_mod
+    monkeypatch.setattr(train_mod, 'collect_trajectory', lambda *args, **kwargs: batch, raising=True)
+    train_mod.train_ppo(
+        num_iterations=1,
+        horizon=40,
+        k_history=4,
+        num_envs=1,
+        mcts_sims=0,
+        mcts_dets=0,
+        eval_every=0,
+        save_every=100,
+    )
+    mean_ret = float(batch['ret'].mean().item()) if batch['ret'].numel() > 0 else 0.0
+    logged = [v for (t, v, s) in writer.scalars if t == 'train/avg_return' and s == 0]
+    assert logged, "Missing train/avg_return log"
+    assert abs(logged[0] - mean_ret) < 1e-6

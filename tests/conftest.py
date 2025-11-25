@@ -1,6 +1,20 @@
 # Keep this file minimal. GPU-dependent tests will self-skip via decorators.
 import pytest  # noqa: F401
 import os
+import warnings
+
+# Silence noisy third-party deprecation chatter that does not impact behavior.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Type google\.protobuf\.pyext\._message\..*PyType_Spec",
+    category=DeprecationWarning,
+)
+# Extra guard: silence the same warning via module regex in case message changes slightly.
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r".*google\.protobuf\.pyext\._message",
+)
 
 
 @pytest.fixture(autouse=True, scope="session")

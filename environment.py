@@ -727,7 +727,8 @@ class ScoponeEnvMA(gym.Env):
                 "score_breakdown": final_breakdown,
                 "team_rewards": [final_reward[0], final_reward[1]]
             }
-            
+            # Aggiorna rewards cumulativi visibili esternamente
+            self.rewards = [float(final_reward[0]), float(final_reward[1])]            
             # OTTIMIZZAZIONE: Crea uno stato finale di zeri senza ricalcolo (rimane tensor su CUDA)
             obs_final = torch.zeros(self.observation_space.shape, dtype=torch.float32, device=device)
             
