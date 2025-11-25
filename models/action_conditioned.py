@@ -5,7 +5,6 @@ import time
 import os
 from contextlib import nullcontext
 from typing import Dict, Tuple, Optional
-from utils.device import get_compute_device, get_amp_dtype
 from utils.fallback import notify_fallback
 try:
     # Prefer new SDPA backend selector if available (PyTorch >= 2.3)
@@ -16,7 +15,7 @@ except Exception:
 
 device = torch.device('cpu')
 autocast_device = device.type
-autocast_dtype = get_amp_dtype()
+autocast_dtype = torch.float16
 STRICT = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
 
 # Observation flags are now imported from observation.py to ensure consistency.

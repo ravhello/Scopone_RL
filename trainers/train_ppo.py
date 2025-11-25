@@ -18,8 +18,6 @@ if _PROJECT_ROOT not in sys.path:
 
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
-from utils.device import get_compute_device
- 
 from selfplay.league import League
 from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
@@ -156,8 +154,8 @@ def _flatten_cpu(tensor: Optional[torch.Tensor], dtype: Optional[torch.dtype] = 
     if not torch.is_tensor(tensor):
         tensor = torch.as_tensor(tensor)
     if tensor.numel() == 0:
-        return tensor.detach().to('cpu', dtype=dtype) if dtype is not None else tensor.detach().to('cpu')
-    out = tensor.detach().to('cpu')
+        return tensor.detach().to(dtype=dtype) if dtype is not None else tensor.detach()
+    out = tensor.detach()
     if dtype is not None and out.dtype != dtype:
         out = out.to(dtype=dtype)
     return out.reshape(-1)
@@ -360,10 +358,19 @@ def _seat_vec_for(cp: int) -> torch.Tensor:
 
 def _to_cpu_float32(tensor_like: torch.Tensor) -> torch.Tensor:
     if torch.is_tensor(tensor_like):
-        if tensor_like.device.type == 'cpu' and tensor_like.dtype == torch.float32:
+        if tensor_like.dtype == torch.float32:
             return tensor_like.detach()
-        return tensor_like.detach().to('cpu', dtype=torch.float32)
+        return tensor_like.detach().to(dtype=torch.float32)
     return torch.as_tensor(tensor_like, dtype=torch.float32)
+
+
+def _encode_action_64_cpu(vec80: torch.Tensor) -> torch.Tensor:
+    v = vec80.detach().to(dtype=torch.float32)
+    played_id = torch.argmax(v[:40]).to(torch.int64)
+    cap_mask = (v[40:] > 0.5).to(torch.int64)
+    idxs = torch.arange(40, dtype=torch.int64)
+    bits = (cap_mask << idxs).sum()
+    return (played_id | (bits << 6)).to(torch.int64)
 
 
 def _env_worker(worker_id: int,
@@ -486,7 +493,7 @@ def _env_worker(worker_id: int,
             seat_cpu = seat_vec
             obs_cpu = _to_cpu_float32(obs)
             if torch.is_tensor(legal):
-                legal_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
+                legal_cpu_tensor = legal.detach().to(dtype=torch.float32)
                 legal_cpu_entries = list(legal_cpu_tensor.unbind(0))
             else:
                 legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
@@ -508,8 +515,8 @@ def _env_worker(worker_id: int,
                 def policy_fn_mcts(_obs, _legals):
                     nonlocal t_rpc
                     # Invia tensori CPU direttamente (no conversione a liste) per ridurre overhead IPC
-                    o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
-                    leg_cpu = torch.stack([ (y.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
+                    o_cpu = (_obs.detach().to(dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
+                    leg_cpu = torch.stack([ (y.detach().to(dtype=torch.float32) if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)) for y in _legals ], dim=0)
                     t1 = time.time()
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS policy -> send, waiting priors")
@@ -536,7 +543,7 @@ def _env_worker(worker_id: int,
                     return _np.asarray(pri, dtype=_np.float32)
                 def value_fn_mcts(_obs, _env):
                     s_vec = _seat_vec_for(_env.current_player)
-                    o_cpu = (_obs.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
+                    o_cpu = (_obs.detach().to(dtype=torch.float32) if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32))
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS value -> send, waiting value")
                     request_q.put({
@@ -555,7 +562,7 @@ def _env_worker(worker_id: int,
                 def belief_sampler_neural(_env):
                     o_cur = _env._get_observation(_env.current_player)
                     s_vec = _seat_vec_for(_env.current_player)
-                    o_cpu = (o_cur.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
+                    o_cpu = (o_cur.detach().to(dtype=torch.float32) if torch.is_tensor(o_cur) else torch.as_tensor(o_cur, dtype=torch.float32))
                     if step_idx < 3:
                         _wdbg(f"ep {ep} step {step_idx}: MCTS belief -> send, waiting probs")
                     request_q.put({
@@ -577,7 +584,7 @@ def _env_worker(worker_id: int,
                     probs = _np.asarray(probs_flat, dtype=_np.float32).reshape(3, 40)
                     # visible mask from obs on worker side
                     if torch.is_tensor(o_cur):
-                        o_t = o_cur.detach().to('cpu', dtype=torch.float32).unsqueeze(0)
+                        o_t = o_cur.detach().to(dtype=torch.float32).unsqueeze(0)
                     else:
                         o_t = torch.as_tensor(o_cur, dtype=torch.float32).unsqueeze(0)
                     hand_table = o_t[:, :83]
@@ -887,7 +894,7 @@ def _env_worker(worker_id: int,
                 seat_cpu = seat_vec
                 obs_cpu = _to_cpu_float32(obs)
                 if torch.is_tensor(legal):
-                    legals_cpu_tensor = legal.detach().to('cpu', dtype=torch.float32)
+                    legals_cpu_tensor = legal.detach().to(dtype=torch.float32)
                     legal_entries = list(legals_cpu_tensor.unbind(0))
                 else:
                     legal_entries = [_to_cpu_float32(x) for x in legal]
@@ -930,27 +937,27 @@ def _env_worker(worker_id: int,
         # Episode payload back to master using NumPy arrays (avoid Torch resource_sharer FDs entirely)
         import numpy as _np
         if len(obs_list) > 0:
-            t1 = time.time(); obs_t = torch.stack(obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+            t1 = time.time(); obs_t = torch.stack(obs_list, dim=0).to(dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             obs_t = _np.zeros((0, 1), dtype=_np.float32)
         if len(next_obs_list) > 0:
-            t1 = time.time(); next_obs_t = torch.stack(next_obs_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+            t1 = time.time(); next_obs_t = torch.stack(next_obs_list, dim=0).to(dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             next_obs_t = _np.zeros((0, 1), dtype=_np.float32)
         if len(act_list) > 0:
-            t1 = time.time(); act_t = torch.stack(act_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+            t1 = time.time(); act_t = torch.stack(act_list, dim=0).to(dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             act_t = _np.zeros((0, 80), dtype=_np.float32)
         if len(seat_team_list) > 0:
-            t1 = time.time(); seat_t = torch.stack(seat_team_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+            t1 = time.time(); seat_t = torch.stack(seat_team_list, dim=0).to(dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             seat_t = _np.zeros((0, 6), dtype=_np.float32)
         if len(belief_sum_list) > 0:
-            t1 = time.time(); belief_t = torch.stack(belief_sum_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+            t1 = time.time(); belief_t = torch.stack(belief_sum_list, dim=0).to(dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             belief_t = _np.zeros((0, 120), dtype=_np.float32)
         if len(legals_list) > 0:
-            t1 = time.time(); legals_t = torch.stack(legals_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+            t1 = time.time(); legals_t = torch.stack(legals_list, dim=0).to(dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             legals_t = _np.zeros((0, 80), dtype=_np.float32)
         leg_off_t = _np.asarray(legals_offset, dtype=_np.int64)
@@ -959,7 +966,7 @@ def _env_worker(worker_id: int,
         mcts_policy_t = _np.asarray(mcts_policy_list, dtype=_np.float32) if len(mcts_policy_list) > 0 else _np.zeros((0,), dtype=_np.float32)
         mcts_weight_t = _np.asarray(mcts_weight_list, dtype=_np.float32) if len(mcts_weight_list) > 0 else _np.zeros((0,), dtype=_np.float32)
         if len(others_hands_list) > 0:
-            t1 = time.time(); others_hands_t = torch.stack(others_hands_list, dim=0).to('cpu', dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
+            t1 = time.time(); others_hands_t = torch.stack(others_hands_list, dim=0).to(dtype=torch.float32).numpy(); t_pack += (time.time() - t1) if _PAR_TIMING else 0.0
         else:
             others_hands_t = _np.zeros((0, 3, 40), dtype=_np.float32)
 
@@ -1154,7 +1161,7 @@ def _batched_select_indices(agent: ActionConditionedPPO,
                     continue
                 j = int(torch.multinomial(probs_cap, num_samples=1).item())
                 sel[i] = int(idxs[j].item())
-            sel_cpu = sel.detach().to('cpu')
+            sel_cpu = sel.detach().to()
             for i in range(B):
                 out_idx.append((int(reqs[i]['wid']), int(sel_cpu[i].item())))
         else:
@@ -1177,8 +1184,8 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
         # Use CPU tensors directly when not targeting CUDA to avoid unnecessary pinned memory
         if getattr(device, 'type', str(device)) == 'cuda':
             if device.type == 'cuda':
-                o_t = obs_cpu.pin_memory().to(device=device, non_blocking=True)
-                s_t = seat_cpu.pin_memory().to(device=device, non_blocking=True)
+                o_t = obs_cpu.to(device=device, non_blocking=True)
+                s_t = seat_cpu.to(device=device, non_blocking=True)
             else:
                 o_t = obs_cpu.to(device=device)
                 s_t = seat_cpu.to(device=device)
@@ -1221,7 +1228,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
             # Concatenate legals
             legals_flat = torch.cat(policy_legals_rows, dim=0)
             if device.type == 'cuda':
-                legals_flat = legals_flat.pin_memory().to(device=device, non_blocking=True)
+                legals_flat = legals_flat.to(device=device, non_blocking=True)
             else:
                 legals_flat = legals_flat.to(device=device)
             Bp = len(policy_positions)
@@ -1293,7 +1300,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                 start = 0
                 for j, (pos_j, c) in enumerate(zip(policy_positions, policy_cnts)):
                     if c > 0:
-                        pri = priors_padded[j, :c].detach().to('cpu').tolist()
+                        pri = priors_padded[j, :c].detach().to().tolist()
                     else:
                         pri = []
                     results[pos_j] = {'priors': pri}
@@ -1324,7 +1331,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                 probs_flat = agent.actor.belief_net.probs(logits, visible_mask)
                 oh = probs_flat.view(1, 3, 40)
                 val = agent.critic(o_one, s_one, oh).squeeze(0)
-            results[i] = {'value': float(val.detach().cpu().item())}
+            results[i] = {'value': float(val.detach().item())}
         elif rtype == 'score_belief':
             with torch.no_grad():
                 _state = agent.actor.state_enc(o_t[i:i+1], s_t[i:i+1])
@@ -1339,7 +1346,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                 cap0_mask = captured[:, :40] > 0.5
                 cap1_mask = captured[:, 40:80] > 0.5
                 visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
-                probs_flat = agent.actor.belief_net.probs(logits, visible_mask).squeeze(0).detach().cpu().tolist()
+                probs_flat = agent.actor.belief_net.probs(logits, visible_mask).squeeze(0).detach().tolist()
             results[i] = {'belief_probs': probs_flat}
 
     return results
@@ -1566,11 +1573,13 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     import math as _math
     minibatch_size = 4096
     env_mb = int(_os.environ.get('SCOPONE_MINIBATCH', str(minibatch_size)))
+    align_disabled = str(_os.environ.get('SCOPONE_MINIBATCH_ALIGN', '0')).strip().lower() in ['0', 'false', 'off', 'no']
     if env_mb > 0:
         minibatch_size = env_mb
+    else:
+        align_disabled = True
     per_ep_util = 40 if bool(train_both_teams) else 20
-    _tests_cpu = (os.environ.get('TESTS_FORCE_CPU', '0') == '1')
-    if not _tests_cpu:
+    if not align_disabled:
         lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
         if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
             new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
@@ -1664,6 +1673,11 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         legal = env.get_valid_actions()
         if _PAR_TIMING:
             t_get_legals += (time.time() - _t0_get_legals)
+        # Normalizza azioni legali su CPU
+        if torch.is_tensor(legal):
+            legal = legal.detach().to(dtype=torch.float32)
+        elif isinstance(legal, list):
+            legal = [(x.detach().to(dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal]
         if torch.is_tensor(legal) and (legal.size(0) == 0):
             cp = env.current_player
             hand_ids_dbg = list(env._hands_ids.get(cp, [])) if hasattr(env, '_hands_ids') else []
@@ -1684,7 +1698,9 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         sims_scaled = 0
         alpha = 0.0
         root_temp_dyn = float(mcts_root_temp)
-        _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '1')).strip().lower() in ['1','true','yes','on']
+        _both_sides = str(os.environ.get('SCOPONE_MCTS_BOTH_SIDES', '0')).strip().lower() in ['1','true','yes','on']
+        if not train_both_teams:
+            _both_sides = False
         if is_main or _both_sides:
             # Exact-only mode flag (training): read once per decision to avoid unbound access when MCTS is disabled
             _exact_only2 = str(os.environ.get('SCOPONE_TRAIN_MCTS_EXACT_ONLY', '0')).strip().lower() in ['1','true','yes','on']
@@ -1741,14 +1757,10 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             # Belief summary per il giocatore corrente: opzionale (disabilitato di default)
             _enable_bsum = (os.environ.get('ENABLE_BELIEF_SUMMARY', '0') == '1')
             if _enable_bsum and use_mcts_cur:
-                o_cpu = obs.clone().detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device='cpu')
-                s_cpu = seat_vec.detach().to('cpu', dtype=torch.float32)
-                if device.type == 'cuda':
-                    o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                    s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                else:
-                    o_t = o_cpu.unsqueeze(0).to(device=device)
-                    s_t = s_cpu.unsqueeze(0).to(device=device)
+                o_cpu = obs.clone().detach().to(dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)
+                s_cpu = seat_vec.detach().to(dtype=torch.float32)
+                o_t = o_cpu.unsqueeze(0)
+                s_t = s_cpu.unsqueeze(0)
                 with torch.no_grad():
                     state_feat = agent.actor.state_enc(o_t, s_t)
                     bn_dtype = agent.actor.belief_net.fc_in.weight.dtype
@@ -1763,7 +1775,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     cap1_mask = captured[:, 40:80] > 0.5
                     visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)
                     probs_flat = agent.actor.belief_net.probs(logits, visible_mask)
-                bsum_tensor = probs_flat.squeeze(0).detach().to('cpu')
+                bsum_tensor = probs_flat.squeeze(0).detach().to()
             if use_mcts_cur:
                 if _PAR_TIMING:
                     _t0_mcts = time.time()
@@ -1775,16 +1787,12 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     # Prior coerenti con policy fattorizzata (carta ⊕ presa)
                     o_cpu = _obs if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32)
                     if torch.is_tensor(o_cpu):
-                        o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
+                        o_cpu = o_cpu.detach().to(dtype=torch.float32)
                     leg_cpu = torch.stack([
-                        (x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32))
+                        (x.detach().to(dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32))
                     for x in _legals], dim=0)
-                    if device.type == 'cuda':
-                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
-                    else:
-                        o_t = o_cpu.unsqueeze(0).to(device=device)
-                        leg_t = leg_cpu.to(device=device)
+                    o_t = o_cpu.unsqueeze(0)
+                    leg_t = leg_cpu
                     with torch.no_grad():
                         sp = agent.actor.compute_state_proj(o_t, _seat_vec_for(env.current_player).unsqueeze(0).to(device=device))
                         # Evita cast/copie ripetute del parametro
@@ -1812,13 +1820,13 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                         ssum = priors.sum()
                         if (not torch.isfinite(ssum)) or (ssum <= 0):
                             raise RuntimeError("collect_trajectory.policy_fn_mcts: invalid priors (NaN/Inf or zero-sum)")
-                    return priors.detach().cpu().numpy()
+                    return priors.detach().numpy()
                 # Value: usa il critic con belief neurale interno e others_hands predetto
                 def value_fn_mcts(_obs, _env):
                     # Prepara seat_team
                     o_cpu = _obs if torch.is_tensor(_obs) else torch.as_tensor(_obs, dtype=torch.float32)
                     if torch.is_tensor(o_cpu):
-                        o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
+                        o_cpu = o_cpu.detach().to(dtype=torch.float32)
                     # seat vector
                     seat_vec = torch.zeros(6, dtype=torch.float32)
                     cp_loc = _env.current_player
@@ -1827,8 +1835,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     seat_vec[5] = 1.0 if cp_loc in [1, 3] else 0.0
                     # To CUDA
                     if device.type == 'cuda':
-                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        s_t = seat_vec.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        o_t = o_cpu.unsqueeze(0).to(device=device, non_blocking=True)
+                        s_t = seat_vec.unsqueeze(0).to(device=device, non_blocking=True)
                     else:
                         o_t = o_cpu.unsqueeze(0).to(device=device)
                         s_t = seat_vec.unsqueeze(0).to(device=device)
@@ -1849,18 +1857,18 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                         probs_flat = agent.actor.belief_net.probs(logits, visible_mask)  # (1,120)
                         oh = probs_flat.view(1, 3, 40)
                         v = agent.critic(o_t, s_t, oh)
-                    return float(v.squeeze(0).detach().cpu().item())
+                    return float(v.squeeze(0).detach().item())
                 # Belief determinization sampler dal BeliefNet: campiona assignment coerenti
                 def belief_sampler_neural(_env):
                     # Costruisci marginali 3x40 dal BeliefNet
                     obs_cur = _env._get_observation(_env.current_player)
                     o_cpu = obs_cur if torch.is_tensor(obs_cur) else torch.as_tensor(obs_cur, dtype=torch.float32)
                     if torch.is_tensor(o_cpu):
-                        o_cpu = o_cpu.detach().to('cpu', dtype=torch.float32)
-                    s_cpu = _seat_vec_for(_env.current_player).detach().to('cpu', dtype=torch.float32)
+                        o_cpu = o_cpu.detach().to(dtype=torch.float32)
+                    s_cpu = _seat_vec_for(_env.current_player).detach().to(dtype=torch.float32)
                     if device.type == 'cuda':
-                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        o_t = o_cpu.unsqueeze(0).to(device=device, non_blocking=True)
+                        s_t = s_cpu.unsqueeze(0).to(device=device, non_blocking=True)
                     else:
                         o_t = o_cpu.unsqueeze(0).to(device=device)
                         s_t = s_cpu.unsqueeze(0).to(device=device)
@@ -1879,8 +1887,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                         cap1_mask = captured[:, 40:80] > 0.5
                         visible_mask = (hand_mask | table_mask | cap0_mask | cap1_mask)  # (1,40)
                         probs_flat = agent.actor.belief_net.probs(logits, visible_mask)  # (1,120)
-                    probs = probs_flat.view(3, 40).detach().cpu().numpy()  # (3,40)
-                    vis = visible_mask.squeeze(0).detach().cpu().numpy().astype(bool)
+                    probs = probs_flat.view(3, 40).detach().numpy()  # (3,40)
+                    vis = visible_mask.squeeze(0).detach().numpy().astype(bool)
                     unknown_ids = [cid for cid in range(40) if not vis[cid]]
                     # Capacità (conteggi mano) correnti degli altri giocatori
                     others = [(_env.current_player + 1) % 4, (_env.current_player + 2) % 4, (_env.current_player + 3) % 4]
@@ -2004,23 +2012,16 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     exact_only=_exact_only2 and not _near_end_b,
                 )
                 if torch.is_tensor(mcts_action):
-                    chosen_act = mcts_action.detach().to('cpu', dtype=torch.float32)
+                    chosen_act = mcts_action.detach().to(dtype=torch.float32)
                 else:
-                    chosen_act = torch.as_tensor(mcts_action, dtype=torch.float32, device='cpu')
+                    chosen_act = torch.as_tensor(mcts_action, dtype=torch.float32)
                 # trova indice dell'azione scelta tra i legali in O(A) vettoriale
                 # Bitset hashing mapping: encode action as (played_id, capture_bits) to find index in O(A)
-                def _encode_action_64(vec80: torch.Tensor) -> torch.Tensor:
-                    played_id = torch.argmax(vec80[:40]).to(torch.int64)
-                    cap_mask = (vec80[40:] > 0.5).to(torch.int64)
-                    # pack 40 capture bits into 64-bit integer
-                    idxs = torch.arange(40, dtype=torch.int64)
-                    bits = (cap_mask << idxs).sum()
-                    return (played_id | (bits << 6)).to(torch.int64)
-                code_ch = _encode_action_64(chosen_act)
+                code_ch = _encode_action_64_cpu(chosen_act)
                 if torch.is_tensor(legal):
-                    legals_t = legal.detach().to('cpu', dtype=torch.float32)
+                    legals_t = legal.detach().to(dtype=torch.float32)
                 else:
-                    legals_t = torch.stack([(x.detach().to('cpu', dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal], dim=0)
+                    legals_t = torch.stack([(x.detach().to(dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32)) for x in legal], dim=0)
                 # vectorized encode for legals
                 played_ids = torch.argmax(legals_t[:, :40], dim=1).to(torch.int64)
                 cap_mask = (legals_t[:, 40:] > 0.5).to(torch.int64)
@@ -2083,12 +2084,6 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 chosen_index_t_list.append(idx_t)
                 # STRICT: ensure chosen index points to the same action under action-encoding hashing (played | capture_bits<<6)
                 if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    def _encode_action_64_cpu(vec80: torch.Tensor) -> torch.Tensor:
-                        played_id = torch.argmax(vec80[:40]).to(torch.int64)
-                        cap_mask = (vec80[40:] > 0.5).to(torch.int64)
-                        idxs = torch.arange(40, dtype=torch.int64)
-                        bits = (cap_mask << idxs).sum()
-                        return (played_id | (bits << 6)).to(torch.int64)
                     code_chosen = _encode_action_64_cpu(chosen_act if torch.is_tensor(chosen_act) else torch.as_tensor(chosen_act, dtype=torch.float32))
                     leg_codes = []
                     for a in legal:
@@ -2120,7 +2115,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     others = [ (cp + 1) % 4, (cp + 2) % 4, (cp + 3) % 4 ]
                     # usa mirror bitset CPU se disponibile per evitare loop Python
                     if hasattr(env, '_hands_bits_t') and hasattr(env, '_id_range'):
-                        ids = env._id_range.detach().to('cpu', dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
+                        ids = env._id_range.detach().to(dtype=torch.long) if torch.is_tensor(env._id_range) else torch.arange(40, dtype=torch.long)
                         target = _OTHERS_HANDS_ZERO.clone()
                         for i, pid in enumerate(others):
                             bits_t = env._hands_bits_t[pid]
@@ -2141,36 +2136,30 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 _inference = torch.inference_mode if hasattr(torch, 'inference_mode') else torch.no_grad
                 with _inference():
                     # Use GPU for frozen actor scoring but keep env data on CPU
-                    o_cpu = obs.clone().detach().to('cpu', dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32, device='cpu')
-                    leg_cpu = torch.stack([x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device='cpu') for x in legal], dim=0)
+                    o_cpu = obs.clone().detach().to(dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)
+                    leg_cpu = torch.stack([x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32) for x in legal], dim=0)
                     if device.type == 'cuda':
-                        o_t = o_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
-                        leg_t = leg_cpu.pin_memory().to(device=device, non_blocking=True)
+                        o_t = o_cpu.unsqueeze(0).to(device=device, non_blocking=True)
+                        leg_t = leg_cpu.to(device=device, non_blocking=True)
                     else:
                         o_t = o_cpu.unsqueeze(0).to(device=device)
                         leg_t = leg_cpu.to(device=device)
                     # Build seat_team_vec (B,6) for the frozen actor forward
-                    s_cpu = seat_vec.clone().detach().to('cpu', dtype=torch.float32)
+                    s_cpu = seat_vec.clone().detach().to(dtype=torch.float32)
                     if device.type == 'cuda':
-                        s_t = s_cpu.pin_memory().unsqueeze(0).to(device=device, non_blocking=True)
+                        s_t = s_cpu.unsqueeze(0).to(device=device, non_blocking=True)
                     else:
                         s_t = s_cpu.unsqueeze(0).to(device=device)
                     logits = frozen(o_t, leg_t, s_t)
-                    idx_t = torch.argmax(logits).to('cpu')
+                    idx_t = torch.argmax(logits).to()
                     act = leg_cpu[idx_t]
             else:
-                idx_t = torch.randint(len(legal), (1,), device='cpu').squeeze(0)
+                idx_t = torch.randint(len(legal), (1,)).squeeze(0)
                 leg_t = torch.stack([
-                    x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32, device='cpu')
+                    (x.detach().to(dtype=torch.float32) if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32))
                 for x in legal], dim=0)
                 act = leg_t[idx_t]
                 # Fast chosen index via 64-bit action code (played_id | capture_bits<<6)
-                def _encode_action_64_cpu(vec80: torch.Tensor) -> torch.Tensor:
-                    played_id = torch.argmax(vec80[:40]).to(torch.int64)
-                    cap_mask = (vec80[40:] > 0.5).to(torch.int64)
-                    idxs = torch.arange(40, dtype=torch.int64)
-                    bits = (cap_mask << idxs).sum()
-                    return (played_id | (bits << 6)).to(torch.int64)
                 code_ch = _encode_action_64_cpu(act)
                 played_ids = torch.argmax(leg_t[:, :40], dim=1).to(torch.int64)
                 cap_mask = (leg_t[:, 40:] > 0.5).to(torch.int64)
@@ -2235,7 +2224,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             done_mask_bool = torch.as_tensor([bool(d) for d in done_list], dtype=torch.bool, device=device)
             if oh_cpu_tensor is not None:
                 if device.type == 'cuda':
-                    oh_dev_tensor = oh_cpu_tensor.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
+                    oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32, non_blocking=True)
                 else:
                     oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32)
                 oh_next = torch.zeros_like(oh_dev_tensor)
@@ -2313,10 +2302,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             s_all = torch.stack(seat_team_list, dim=0)
             # others_hands per-step (CTDE)
             if oh_dev_tensor is None and oh_cpu_tensor is not None:
-                if device.type == 'cuda':
-                    oh_dev_tensor = oh_cpu_tensor.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
-                else:
-                    oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32)
+                oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32)
             val_t = agent.critic(o_all, s_all, oh_dev_tensor)
             nval_t = next_val_t if next_val_t is not None else torch.zeros_like(val_t)
     else:
@@ -2377,15 +2363,13 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         with torch.no_grad():
             # Ensure source are CPU tensors before pinning
             def to_pinned(x):
-                x_cpu = (x.detach().to('cpu') if torch.is_tensor(x) else torch.as_tensor(x))
-                return x_cpu.pin_memory() if device.type == 'cuda' else x_cpu
-            nb = (device.type == 'cuda')
-            obs_t = to_pinned(obs_cpu).to(device=device, dtype=torch.float32, non_blocking=nb)
-            seat_team_t = to_pinned(seat_team_cpu).to(device=device, non_blocking=nb)
-            legals_t = to_pinned(legals_cpu).to(device=device, non_blocking=nb)
-            legals_offset_t = to_pinned(legals_offset_cpu).to(device=device, non_blocking=nb)
-            legals_count_t = to_pinned(legals_count_cpu).to(device=device, non_blocking=nb)
-            chosen_index_t = to_pinned(chosen_index_cpu).to(device=device, non_blocking=nb)
+                return x.detach() if torch.is_tensor(x) else torch.as_tensor(x)
+            obs_t = to_pinned(obs_cpu).to(device=device, dtype=torch.float32)
+            seat_team_t = to_pinned(seat_team_cpu).to(device=device)
+            legals_t = to_pinned(legals_cpu).to(device=device)
+            legals_offset_t = to_pinned(legals_offset_cpu).to(device=device)
+            legals_count_t = to_pinned(legals_count_cpu).to(device=device)
+            chosen_index_t = to_pinned(chosen_index_cpu).to(device=device)
             # belief summary may be absent
             # belief non più richiesto per calcolare old_logp
             # Two-stage old_logp
@@ -3348,18 +3332,18 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     if len(rew_list) > 0:
         with torch.no_grad():
             if device.type == 'cuda':
-                o_all = obs_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
-                s_all = seat_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True)
+                o_all = obs_cpu_t.to(device=device, dtype=torch.float32, non_blocking=True)
+                s_all = seat_cpu_t.to(device=device, dtype=torch.float32, non_blocking=True)
             else:
                 o_all = obs_cpu_t.to(device=device, dtype=torch.float32)
                 s_all = seat_cpu_t.to(device=device, dtype=torch.float32)
             # others_hands per-step (CTDE): se raccolti dagli env worker, usa quelli
             if others_hands_t.numel() > 0 and others_hands_t.size(0) == o_all.size(0):
-                oh_all = (others_hands_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True) if device.type == 'cuda' else others_hands_t.to(device=device, dtype=torch.float32))
+                oh_all = (others_hands_t.to(device=device, dtype=torch.float32, non_blocking=True) if device.type == 'cuda' else others_hands_t.to(device=device, dtype=torch.float32))
             else:
                 oh_all = None
             val_t = agent.critic(o_all, s_all, oh_all)
-            n_all = (next_obs_cpu_t.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True) if device.type == 'cuda' else next_obs_cpu_t.to(device=device, dtype=torch.float32))
+            n_all = (next_obs_cpu_t.to(device=device, dtype=torch.float32, non_blocking=True) if device.type == 'cuda' else next_obs_cpu_t.to(device=device, dtype=torch.float32))
             # costruisci others_hands next (shift) se disponibile
             if oh_all is not None:
                 oh_next = torch.zeros_like(oh_all)
@@ -3388,14 +3372,12 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     if obs_cpu_t.size(0) > 0:
         with torch.no_grad():
             def to_pinned(x):
-                x_cpu = (x.detach().to('cpu') if torch.is_tensor(x) else torch.as_tensor(x))
-                return x_cpu.pin_memory() if device.type == 'cuda' else x_cpu
-            nb = (device.type == 'cuda')
-            obs_t = to_pinned(obs_cpu_t).to(device=device, dtype=torch.float32, non_blocking=nb)
-            seat_t = to_pinned(seat_cpu_t).to(device=device, non_blocking=nb)
-            leg_t = to_pinned(legals_cpu_t).to(device=device, non_blocking=nb)
-            offs = (leg_off_t.pin_memory().to(device=device, non_blocking=nb) if device.type == 'cuda' else leg_off_t.to(device=device))
-            cnts = (leg_cnt_t.pin_memory().to(device=device, non_blocking=nb) if device.type == 'cuda' else leg_cnt_t.to(device=device))
+                return x.detach() if torch.is_tensor(x) else torch.as_tensor(x)
+            obs_t = to_pinned(obs_cpu_t).to(device=device, dtype=torch.float32)
+            seat_t = to_pinned(seat_cpu_t).to(device=device)
+            leg_t = to_pinned(legals_cpu_t).to(device=device)
+            offs = leg_off_t.to(device=device)
+            cnts = leg_cnt_t.to(device=device)
             B = obs_t.size(0)
             max_cnt = int(cnts.max().item()) if B > 0 else 0
             if max_cnt > 0:
@@ -3420,7 +3402,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 sum_allowed = exp_shift_allowed.sum(dim=1)
                 lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))
                 # Map chosen indices to absolute and card ids
-                chosen_clamped = (torch.minimum(chosen_idx_t.pin_memory().to(device=device), (cnts - 1).clamp_min(0)) if device.type == 'cuda' else torch.minimum(chosen_idx_t.to(device=device), (cnts - 1).clamp_min(0)))
+                chosen_clamped = (torch.minimum(chosen_idx_t.to(device=device), (cnts - 1).clamp_min(0)) if device.type == 'cuda' else torch.minimum(chosen_idx_t.to(device=device), (cnts - 1).clamp_min(0)))
                 chosen_abs = (offs + chosen_clamped)
                 total_legals = leg_t.size(0)
                 pos_map = torch.full((total_legals,), -1, dtype=torch.long, device=device)
@@ -3615,19 +3597,24 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     import math as _math
     minibatch_size = 4096
     _mb_env = int(_os.environ.get('SCOPONE_MINIBATCH', str(minibatch_size)))
+    _align_disabled = str(_os.environ.get('SCOPONE_MINIBATCH_ALIGN', '0')).strip().lower() in ['0', 'false', 'off', 'no']
     if _mb_env > 0:
         minibatch_size = _mb_env
+    else:
+        _align_disabled = True
     # Determine effective per-episode useful transitions based on desired collection semantics
     _tfb_env = str(_os.environ.get('SCOPONE_TRAIN_FROM_BOTH_TEAMS', '0')).strip().lower() in ['1','true','yes','on']
     _frozen_env = str(_os.environ.get('SCOPONE_OPP_FROZEN', '1')).strip().lower() in ['1','true','yes','on']
     # In selfplay, collecting from both teams only makes sense when opponent is not frozen
     _collect_both = (bool(use_selfplay) and _tfb_env and (not _frozen_env))
     _per_ep_util = (40 if _collect_both else 20)
-    lcm_mb_ep = (abs(minibatch_size * _per_ep_util) // _math.gcd(minibatch_size, _per_ep_util)) if (minibatch_size > 0 and _per_ep_util > 0) else max(minibatch_size, _per_ep_util)
-    if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
-        new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
-        tqdm.write(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={_per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
-        horizon = new_h
+    if not _align_disabled:
+        lcm_mb_ep = (abs(minibatch_size * _per_ep_util) // _math.gcd(minibatch_size, _per_ep_util)) if (minibatch_size > 0 and _per_ep_util > 0) else max(minibatch_size, _per_ep_util)
+        if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
+            new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
+            tqdm.write(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={_per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+            horizon = new_h
+    _mb_enforce = (not _align_disabled)
     # Resolve and announce final seed (seed<0 => random per run)
     seed = resolve_seed(seed)
     set_global_seeds(seed)
@@ -3738,7 +3725,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             'robust_child': True,
         }
     # Optional startup refresh: SCOPONE_LEAGUE_REFRESH in {1,0}
-    _refresh_flag = str(os.environ.get('SCOPONE_LEAGUE_REFRESH', '1')).strip().lower() in ['1','true','yes','on']
+    _refresh_flag = str(os.environ.get('SCOPONE_LEAGUE_REFRESH', '0')).strip().lower() in ['1','true','yes','on']
     if _refresh_flag:
         tqdm.write("[league-refresh] starting league refresh from disk …")
         # Refresh league from disk: scan for existing checkpoints not yet registered.
@@ -3938,9 +3925,12 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         resume_A = (topN[0] if len(topN) >= 1 else resume_ckpt)
         resume_B = (topN[1] if len(topN) >= 2 else resume_A)
     # Apply resume to main agent (always)
-    if resume_A:
-        agent.load(resume_A, map_location='cpu')
-        tqdm.write(f"[resume] Loaded agent(A) from {resume_A}")
+    if resume_A and os.path.isfile(resume_A) and os.path.getsize(resume_A) > 0:
+        try:
+            agent.load(resume_A, map_location='cpu')
+            tqdm.write(f"[resume] Loaded agent(A) from {resume_A}")
+        except Exception as e:
+            tqdm.write(f"[resume] Skip loading {resume_A}: {e}")
 
     partner_actor = None
     opponent_actor = None
@@ -4123,11 +4113,12 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             per_ep_util = (40 if train_both_teams else 20)
             # Compute LCM(mb, per_ep_util) and derive episodes from aligned horizon
             import math as _math
-            lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
-            if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
-                new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
-                print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
-                horizon = new_h
+            if not _align_disabled:
+                lcm_mb_ep = (abs(minibatch_size * per_ep_util) // _math.gcd(minibatch_size, per_ep_util)) if (minibatch_size > 0 and per_ep_util > 0) else max(minibatch_size, per_ep_util)
+                if lcm_mb_ep > 0 and (horizon % lcm_mb_ep) != 0:
+                    new_h = ((horizon + lcm_mb_ep - 1) // lcm_mb_ep) * lcm_mb_ep
+                    print(f"[horizon] adjusted to LCM(mb={minibatch_size}, per_ep={per_ep_util})={lcm_mb_ep}: {horizon} -> {new_h}")
+                    horizon = new_h
             episodes_hint = max(1, horizon // per_ep_util)
             if _PPO_DEBUG:
                 # Debug: mostra hint e distribuzione per-env
@@ -4432,6 +4423,8 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         def _ensure_mb(_b):
             B_now = int(_b['obs'].size(0)) if 'obs' in _b and torch.is_tensor(_b['obs']) else 0
             mb = minibatch_size
+            if not _mb_enforce or mb <= 0:
+                return
             drop = (B_now % mb)
             if B_now > 0 and drop > 0:
                 raise RuntimeError(f"train_ppo: batch size {B_now} is not a multiple of minibatch_size={mb}; adjust horizon/collection to avoid dropping {drop} transitions")
@@ -4471,25 +4464,25 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         # proxy per best: media return del batch
         # All device tensors; compute small stats without moving large arrays
         if dual_team_nets and (not opp_frozen_env):
-            avg_return_A = float(batch_A['ret'].mean().detach().cpu().item()) if len(batch_A['ret']) else 0.0
-            avg_return_B = float(batch_B['ret'].mean().detach().cpu().item()) if len(batch_B['ret']) else 0.0
+            avg_return_A = float(batch_A['ret'].mean().detach().item()) if len(batch_A['ret']) else 0.0
+            avg_return_B = float(batch_B['ret'].mean().detach().item()) if len(batch_B['ret']) else 0.0
             avg_return = avg_return_A
             if avg_return_A > best_return:
                 best_return = avg_return_A
         elif dual_team_nets and opp_frozen_env:
             if train_A_now:
-                avg_return_A = float(batch_A['ret'].mean().detach().cpu().item()) if len(batch_A['ret']) else 0.0
+                avg_return_A = float(batch_A['ret'].mean().detach().item()) if len(batch_A['ret']) else 0.0
                 avg_return = avg_return_A
                 if avg_return_A > best_return:
                     best_return = avg_return_A
             else:
-                avg_return_B = float(batch_B['ret'].mean().detach().cpu().item()) if len(batch_B['ret']) else 0.0
+                avg_return_B = float(batch_B['ret'].mean().detach().item()) if len(batch_B['ret']) else 0.0
                 avg_return = avg_return_B
                 if avg_return_B > best_return:
                     best_return = avg_return_B
         else:
             if len(batch['ret']):
-                avg_return = float(batch['ret'].mean().detach().cpu().item())
+                avg_return = float(batch['ret'].mean().detach().item())
             else:
                 avg_return = 0.0
             if avg_return > best_return:
@@ -4497,7 +4490,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
 
         # Aggiorna output terminale ad ogni iterazione
         def _to_float(x):
-            return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
+            return float(x.detach().item()) if torch.is_tensor(x) else float(x)
         preview_keys = ['loss_pi', 'loss_v', 'approx_kl', 'clip_frac', 'avg_clip_frac', 'avg_kl']
         if dual_team_nets and (not opp_frozen_env):
             preview_A = {k: round(_to_float(info_A[k]), 4) for k in preview_keys if k in info_A}
@@ -4530,7 +4523,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
 
         if writer is not None:
             def _to_float(x):
-                return float(x.detach().cpu().item()) if torch.is_tensor(x) else float(x)
+                return float(x.detach().item()) if torch.is_tensor(x) else float(x)
             if dual_team_nets and (not opp_frozen_env):
                 for k, v in info_A.items():
                     writer.add_scalar(f'train/A_{k}', _to_float(v), it)
@@ -4602,7 +4595,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 diag['by_seat/clip_frac_13'].to(torch.float32),
             ]
             stacked = torch.stack(vals)
-            numbers = stacked.detach().cpu().tolist()  # unica sincronizzazione CPU
+            numbers = stacked.detach().tolist()  # unica sincronizzazione CPU
             for key, num in zip(keys, numbers):
                 writer.add_scalar(key, float(num), it)
 

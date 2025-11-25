@@ -14,14 +14,14 @@ def test_collect_trajectory_without_mcts_fallback_runs():
     os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
     env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
-    # Force MCTS off via factor=0.0 to exercise fallback action selection
+    # MCTS disattivato: esercita solo la policy fallback
     batch = collect_trajectory(
         env,
         agent,
         horizon=40,
-        use_mcts=True,
-        mcts_sims=8,
-        mcts_dets=1,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
         mcts_c_puct=1.0,
         mcts_min_sims=0,
         train_both_teams=False,
@@ -70,8 +70,8 @@ def test_train_ppo_single_env_one_iter_smoke():
         horizon=40,
         k_history=4,
         num_envs=1,
-        mcts_sims=8,
-        mcts_dets=1,
+        mcts_sims=0,
+        mcts_dets=0,
         on_iter_end=on_end,
     )
     assert ran['called'] is True

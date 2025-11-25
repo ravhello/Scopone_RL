@@ -1,6 +1,5 @@
 import torch
 import os
-from utils.device import get_env_device
 import gymnasium as gym
 from gymnasium import spaces
 import time
@@ -19,10 +18,9 @@ from observation import (
 from utils.compile import maybe_compile_function
 import torch.nn.functional as F
 
-# Per l'ambiente usiamo la CPU per evitare micro-kernel su GPU.
-# Può essere forzato impostando ENV_DEVICE, ma di default resta CPU.
-device = get_env_device()
-_SKIP_STEP_VALIDATION = (os.environ.get('SCOPONE_SKIP_STEP_VALIDATION', '1') == '1')
+# Ambiente sempre su CPU.
+device = torch.device('cpu')
+_SKIP_STEP_VALIDATION = (os.environ.get('SCOPONE_SKIP_STEP_VALIDATION', '0') == '1')
 
 def _suit_to_int(suit):
     if suit == 'denari':

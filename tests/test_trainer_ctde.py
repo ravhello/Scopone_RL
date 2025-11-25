@@ -11,7 +11,7 @@ def test_collect_trajectory_with_belief_summary():
     os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
     env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
-    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False)
+    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False, mcts_sims=0, mcts_dets=0)
     assert 'belief_summary' in batch and batch['belief_summary'].shape[0] == batch['obs'].shape[0]
 
 
@@ -22,7 +22,7 @@ def test_next_value_ctde_inputs_present():
     os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
     env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
-    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False)
+    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False, mcts_sims=0, mcts_dets=0)
     assert 'seat_team' in batch and batch['seat_team'].shape[0] == batch['obs'].shape[0]
     assert batch['belief_summary'].shape[0] == batch['obs'].shape[0]
     # GAE calcolato con next_vals CTDE coerenti -> dimensioni combaciano
@@ -40,7 +40,7 @@ def test_partner_opponent_routing_basic():
     env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     # frozen actors (random weights but eval mode)
-    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False)
+    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False, mcts_sims=0, mcts_dets=0)
     assert batch['obs'].shape[0] > 0
     # verify routing log contains labels and player ids
     assert 'routing_log' in batch

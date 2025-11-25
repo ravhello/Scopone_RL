@@ -7,10 +7,10 @@ import torch
 
 from environment import ScoponeEnvMA
 from rewards import compute_final_score_breakdown
-from utils.device import get_compute_device
 from utils.fallback import notify_fallback
 
 _DEFAULT_MCTS_MOVE_TIMEOUT_S = 120.0
+device_cpu = torch.device('cpu')
 
 
 class MCTSTimeoutError(RuntimeError):
@@ -398,7 +398,7 @@ def run_is_mcts(env: ScoponeEnvMA,
             priors = (1 - root_dirichlet_eps) * priors + root_dirichlet_eps * noise
     else:
         if not torch.is_tensor(priors):
-            pri_dev = get_compute_device()
+            pri_dev = device_cpu
             priors = torch.as_tensor(priors, dtype=torch.float32, device=pri_dev)
         device = priors.device
         priors_len = int(priors.numel())
@@ -503,7 +503,7 @@ def run_is_mcts(env: ScoponeEnvMA,
         if exact_candidate is not None:
             best_action, probs = exact_candidate
             if return_stats:
-                probs_t = torch.tensor(probs, dtype=torch.float32, device=get_compute_device())
+                probs_t = torch.tensor(probs, dtype=torch.float32, device=device_cpu)
                 ch_keys = [action_key(ch.action) for ch in root.children]
                 probs_np = probs_t.detach().cpu().numpy()
                 agg = {}
@@ -601,7 +601,7 @@ def run_is_mcts(env: ScoponeEnvMA,
                         priors_sel = priors_s[top_idx]
                     else:
                         if not torch.is_tensor(priors_s):
-                            pri_dev2 = get_compute_device()
+                            pri_dev2 = device_cpu
                             priors_s = torch.as_tensor(priors_s, dtype=torch.float32, device=pri_dev2)
                         if prior_smooth_eps > 0 and priors_s.numel() > 1:
                             priors_s = (1.0 - prior_smooth_eps) * priors_s + prior_smooth_eps * (1.0 / priors_s.numel())
@@ -656,7 +656,7 @@ def run_is_mcts(env: ScoponeEnvMA,
                     timer_check()
                 simulate_with_det(det.get('assignment'), float(det.get('weight', 1.0)))
 
-        device = get_compute_device()
+        device = device_cpu
         if timer_check:
             timer_check()
         if root_temperature and root_temperature > 1e-6:

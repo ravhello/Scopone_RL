@@ -6,13 +6,12 @@ from typing import List, Tuple, Optional, Dict
 from contextlib import nullcontext
 
 from models.action_conditioned import ActionConditionedActor, CentralValueNet, StateEncoderCompact
-from utils.device import get_compute_device, get_amp_dtype
 from utils.compile import maybe_compile_module, maybe_compile_function
 from utils.torch_load import safe_torch_load
 import os as _os
 device = torch.device('cpu')
 autocast_device = device.type
-autocast_dtype = get_amp_dtype()
+autocast_dtype = torch.float16
 import os as _os
 STRICT_CHECKS = (_os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
 
@@ -71,9 +70,6 @@ class ActionConditionedPPO:
         except Exception as e:
             raise RuntimeError('ppo.init.compile_compute_loss_failed') from e
 
-        # Ensure parameters start on the intended device for optimizer state placement
-        self.actor.to('cpu')
-        self.critic.to('cpu')
         # Optimizers with deduplicated shared encoder params to avoid double updates
         shared_ids = {id(p) for p in self.actor.state_enc.parameters()}
         actor_params = list(self.actor.parameters())
@@ -147,7 +143,7 @@ class ActionConditionedPPO:
                         raise RuntimeError("select_action: first legal action must have exactly one played bit in [:40]")
         # Accept obs on CPU (CPU-only path)
         if torch.is_tensor(obs):
-            obs_t = obs.detach().to('cpu', dtype=torch.float32)
+            obs_t = obs.detach().to(dtype=torch.float32)
             if obs_t.dim() == 1:
                 obs_t = obs_t.unsqueeze(0)
         else:
@@ -160,10 +156,10 @@ class ActionConditionedPPO:
         if torch.is_tensor(legal_actions):
             if legal_actions.dim() != 2 or legal_actions.size(1) != self.run_config['action_dim']:
                 raise ValueError(f"legal actions tensor must be shape (A, 80), got {tuple(legal_actions.shape)}")
-            actions_t = legal_actions.detach().to('cpu', dtype=torch.float32)
+            actions_t = legal_actions.detach().to(dtype=torch.float32)
         elif isinstance(legal_actions, list) and len(legal_actions) > 0:
             if torch.is_tensor(legal_actions[0]):
-                stacked = torch.stack([a.detach().to('cpu', dtype=torch.float32) for a in legal_actions], dim=0)
+                stacked = torch.stack([a.detach().to(dtype=torch.float32) for a in legal_actions], dim=0)
             else:
                 stacked = torch.as_tensor(legal_actions, dtype=torch.float32, device='cpu')
             if stacked.dim() != 2 or stacked.size(1) != self.run_config['action_dim']:
@@ -186,7 +182,7 @@ class ActionConditionedPPO:
         st = None
         if seat_team_vec is not None:
             if torch.is_tensor(seat_team_vec):
-                st = seat_team_vec.detach().to('cpu', dtype=torch.float32)
+                st = seat_team_vec.detach().to(dtype=torch.float32)
             else:
                 st = torch.as_tensor(seat_team_vec, dtype=torch.float32, device='cpu')
             if st.dim() == 1:
@@ -208,8 +204,8 @@ class ActionConditionedPPO:
             else:
                 chosen_act_d, logp_total_d, idx_t_d = self._select_action_core(obs_t, actions_t, st)
         # Move chosen action and metadata back to CPU for env.step
-        chosen_act = chosen_act_d.detach().to('cpu', non_blocking=True)
-        return chosen_act, logp_total_d.detach().to('cpu'), idx_t_d.detach().to('cpu')
+        chosen_act = chosen_act_d.detach().detach()
+        return chosen_act, logp_total_d.detach().detach(), idx_t_d.detach().detach()
 
     def _select_action_core(self, obs_t: torch.Tensor, actions_t: torch.Tensor, seat_team_t: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pure compute core for select_action. Expects inputs already on device.
@@ -400,13 +396,13 @@ class ActionConditionedPPO:
             if torch.is_tensor(x):
                 if (x.device.type == 'cpu') and (x.dtype == torch.float32):
                     return x
-                return x.detach().to('cpu', dtype=torch.float32)
+                return x.detach().to(dtype=torch.float32)
             return torch.as_tensor(x, dtype=torch.float32, device='cpu')
         def to_long(x):
             if torch.is_tensor(x):
                 if (x.device.type == 'cpu') and (x.dtype == torch.long):
                     return x
-                return x.detach().to('cpu', dtype=torch.long)
+                return x.detach().to(dtype=torch.long)
             return torch.as_tensor(x, dtype=torch.long, device='cpu')
 
         # CPU-only compute path
@@ -416,7 +412,7 @@ class ActionConditionedPPO:
             if torch.is_tensor(x):
                 if (x.device.type == 'cpu') and (x.dtype == dtype):
                     return x
-                return x.detach().to('cpu', dtype=dtype)
+                return x.detach().to(dtype=dtype)
             return torch.as_tensor(x, dtype=dtype, device='cpu')
 
         # Required keys validation

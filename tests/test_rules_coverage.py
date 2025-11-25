@@ -1,4 +1,5 @@
 import pytest
+import torch
 import numpy as np
 
 from environment import ScoponeEnvMA

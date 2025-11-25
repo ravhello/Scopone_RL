@@ -300,7 +300,6 @@ os.environ.setdefault('ENV_DEVICE', 'cpu')
 os.environ.setdefault('SCOPONE_MP_START', os.environ.get('SCOPONE_MP_START', _DEFAULT_MP_START))
 
 import torch
-from utils.device import get_compute_device
 from tqdm import tqdm
 from trainers.train_ppo import train_ppo
 from utils.seed import resolve_seed
@@ -328,7 +327,7 @@ def _maybe_launch_tensorboard():
 
 # Minimal entrypoint: launch PPO training only
 if __name__ == "__main__":
-    device = get_compute_device()
+    device = torch.device('cpu')
     tqdm.write(f"Using device: {device}")
     _train_dev_raw = str(os.environ.get('SCOPONE_TRAIN_DEVICE', 'cpu')).strip().lower()
     tqdm.write(f"Training compute device: {_train_dev_raw}")

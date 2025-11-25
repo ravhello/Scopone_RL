@@ -20,7 +20,6 @@ from environment import ScoponeEnvMA
 from actions import encode_action_from_ids_tensor, decode_action_ids
 from models.action_conditioned import ActionConditionedActor
 from utils.compile import maybe_compile_module
-from utils.device import get_compute_device
 from utils.torch_load import safe_torch_load
 
 # Constants
@@ -330,7 +329,7 @@ class GuiPolicyAgent:
         self.team_id = int(team_id)
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
-        self.device = torch.device(device) if device is not None else get_compute_device()
+        self.device = torch.device(device) if device is not None else torch.device('cpu')
         self.epsilon = 0.0
 
         actor = ActionConditionedActor(obs_dim=self.obs_dim, action_dim=self.action_dim)

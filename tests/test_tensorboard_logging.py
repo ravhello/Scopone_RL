@@ -30,6 +30,15 @@ def _run_short_training(monkeypatch, num_iterations=3):
     """
     # Ensure TB is enabled and execution is fast and deterministic enough for tests
     monkeypatch.setenv('SCOPONE_DISABLE_TB', '0')
+    # Avoid horizon upscaling in collect_trajectory
+    monkeypatch.setenv('SCOPONE_MINIBATCH', '0')
+    monkeypatch.setenv('SCOPONE_MINIBATCH_ALIGN', '0')
+    # Disable progress bars and checkpointing/eval to keep tests fast
+    monkeypatch.setenv('TQDM_DISABLE', '1')
+    monkeypatch.setenv('SCOPONE_DISABLE_SAVE', '1')
+    monkeypatch.setenv('SCOPONE_DISABLE_EVAL', '1')
+    monkeypatch.setenv('SCOPONE_LEAGUE_REFRESH', '0')
+    monkeypatch.setenv('SCOPONE_AUTO_TB', '0')
     # Keep device default; TB logging is independent
     monkeypatch.setenv('OMP_NUM_THREADS', '1')
     monkeypatch.setenv('MKL_NUM_THREADS', '1')
@@ -94,6 +103,13 @@ def test_tb_behavior_when_collect_trajectory_errors(monkeypatch):
     except Exception:
         monkeypatch.setenv('TESTS_FORCE_CPU', '1')
     monkeypatch.setenv('ENV_DEVICE', 'cpu')
+    monkeypatch.setenv('SCOPONE_MINIBATCH', '0')
+    monkeypatch.setenv('SCOPONE_MINIBATCH_ALIGN', '0')
+    monkeypatch.setenv('TQDM_DISABLE', '1')
+    monkeypatch.setenv('SCOPONE_DISABLE_SAVE', '1')
+    monkeypatch.setenv('SCOPONE_DISABLE_EVAL', '1')
+    monkeypatch.setenv('SCOPONE_LEAGUE_REFRESH', '0')
+    monkeypatch.setenv('SCOPONE_AUTO_TB', '0')
     monkeypatch.setenv('OMP_NUM_THREADS', '1')
     monkeypatch.setenv('MKL_NUM_THREADS', '1')
 
