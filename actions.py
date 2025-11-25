@@ -2,12 +2,8 @@
 import os
 import torch
 
-# Device for action encoding/decoding. Prefer ENV_DEVICE (env-side), then explicit ACTIONS_DEVICE, then SCOPONE_DEVICE, else CPU
-_ACTIONS_DEVICE_STR = os.environ.get(
-    "ACTIONS_DEVICE",
-    os.environ.get('ENV_DEVICE', os.environ.get('SCOPONE_DEVICE', 'cpu')),
-)
-device = torch.device(_ACTIONS_DEVICE_STR)
+# CPU-only device for action helpers
+device = torch.device('cpu')
 def encode_action_from_ids_tensor(played_id_t: torch.Tensor, captured_ids_t: torch.Tensor) -> torch.Tensor:
     """
     Variant tensor-native: costruisce il vettore azione 80-d direttamente da tensori int
@@ -75,6 +71,18 @@ def decode_action_ids(action_vec: torch.Tensor):
         raise TypeError("decode_action_ids expects a torch.Tensor of shape (80,)")
     vec_t = action_vec.detach().to('cpu', dtype=torch.float32).reshape(-1)
     return _decode_ids(vec_t)
+
+def encode_action_hash(vec80: torch.Tensor) -> torch.Tensor:
+    """
+    Calcola un hash 64-bit (played_id | capture_bits<<6) dal vettore azione 80-dim.
+    Serve solo per confrontare rapidamente azioni legali, non perde informazione utile.
+    """
+    v = vec80.detach().to(dtype=torch.float32)
+    played_id = torch.argmax(v[:40]).to(torch.int64)
+    cap_mask = (v[40:] > 0.5).to(torch.int64)
+    idxs = torch.arange(40, dtype=torch.int64)
+    bits = (cap_mask << idxs).sum()
+    return (played_id | (bits << 6)).to(torch.int64)
 
 # ----- FAST PATH: subset-sum su ID con numba -----
 def find_sum_subsets_ids(table_ids, target_rank: int):

@@ -26,6 +26,7 @@ from utils.seed import set_global_seeds, resolve_seed, temporary_seed
 from evaluation.eval import evaluate_pair_actors, evaluate_pair_actors_parallel
 
 import torch.optim as optim
+from actions import encode_action_from_ids_tensor, decode_action_ids, encode_action_hash
 
 device = torch.device('cpu')
 # Global perf flags
@@ -365,12 +366,7 @@ def _to_cpu_float32(tensor_like: torch.Tensor) -> torch.Tensor:
 
 
 def _encode_action_64_cpu(vec80: torch.Tensor) -> torch.Tensor:
-    v = vec80.detach().to(dtype=torch.float32)
-    played_id = torch.argmax(v[:40]).to(torch.int64)
-    cap_mask = (v[40:] > 0.5).to(torch.int64)
-    idxs = torch.arange(40, dtype=torch.int64)
-    bits = (cap_mask << idxs).sum()
-    return (played_id | (bits << 6)).to(torch.int64)
+    return encode_action_hash(vec80)
 
 
 def _env_worker(worker_id: int,
