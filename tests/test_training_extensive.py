@@ -1,9 +1,14 @@
 import os
 import torch
+import pytest
+import numpy as np
+from typing import Dict
 
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
-from trainers.train_ppo import collect_trajectory, train_ppo
+from trainers.train_ppo import collect_trajectory, collect_trajectory_parallel, train_ppo
+from models.action_conditioned import ActionConditionedActor
+from utils.seed import set_global_seeds
 
 
 def _set_base_env(monkeypatch):
@@ -86,6 +91,19 @@ def _make_batch_with_dummy_rewards(monkeypatch, team0_reward: float = 1.0, team1
     batch['adv'] = torch.zeros_like(rew)
     batch['ret'] = rew.clone()
     return agent, batch
+
+
+def _check_flat_rewards_for_batch(batch):
+    rew = batch['rew']
+    seats = batch['seat_team']
+    team0_mask = seats[:, 4] > 0.5
+    team1_mask = seats[:, 5] > 0.5
+    if team0_mask.any():
+        r0 = rew[team0_mask]
+        assert torch.allclose(r0, r0[0])
+    if team1_mask.any():
+        r1 = rew[team1_mask]
+        assert torch.allclose(r1, r1[0])
 
 
 def test_collect_trajectory_consistency(monkeypatch):
@@ -429,6 +447,279 @@ def test_iterative_avg_return_monotonicity(monkeypatch):
     assert wrs[-1] >= best - 0.5
 
 
+def test_warm_start_zero_skips_resume_load(monkeypatch, tmp_path):
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv('SCOPONE_WARM_START', '0')
+    ckpt_path = tmp_path / "dummy.pth"
+    ckpt_path.write_bytes(b"123")  # non-empty file to tempt resume
+    load_called = {'flag': False}
+
+    # Spy ActionConditionedPPO.load
+    import algorithms.ppo_ac as ppo_mod
+    orig_load = ppo_mod.ActionConditionedPPO.load
+    def spy_load(self, path, map_location=None):
+        load_called['flag'] = True
+        return orig_load(self, path, map_location=map_location)
+    monkeypatch.setattr(ppo_mod.ActionConditionedPPO, 'load', spy_load, raising=True)
+
+    train_ppo(
+        num_iterations=1,
+        horizon=40,
+        k_history=4,
+        num_envs=1,
+        mcts_sims=0,
+        mcts_dets=0,
+        eval_every=0,
+        save_every=100,
+        ckpt_path=str(ckpt_path),
+    )
+    assert load_called['flag'] is False
+
+
+def _assert_batches_close(b_serial, b_parallel, *, check_values: bool = True) -> bool:
+    fields = [
+        'obs', 'act', 'ret', 'adv', 'rew', 'done',
+        'legals', 'legals_offset', 'legals_count',
+        'chosen_index', 'seat_team',
+    ]
+    diffs = []
+    for f in fields:
+        t1 = b_serial[f]
+        t2 = b_parallel[f]
+        if t1.shape != t2.shape:
+            diffs.append(f"{f}: shape {tuple(t1.shape)} vs {tuple(t2.shape)}")
+            continue
+        if check_values and not torch.allclose(t1, t2, atol=1e-6, rtol=1e-5):
+            delta = (t1 - t2).abs()
+            max_d = float(delta.max().item()) if delta.numel() > 0 else 0.0
+            mean_d = float(delta.to(dtype=torch.float32).mean().item()) if delta.numel() > 0 else 0.0
+            diffs.append(f"{f}: max_diff={max_d} mean_diff={mean_d}")
+    if diffs:
+        print("[serial-vs-parallel mismatch]")
+        for d in diffs:
+            print(d)
+        return False
+    return True
+
+
+def _serial_trend(seed_val: int, opponent_actor: ActionConditionedActor, games: int = 200) -> Dict[str, float]:
+    set_global_seeds(seed_val)
+    env = ScoponeEnvMA(k_history=4)
+    agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
+    diffs, chosen_probs, ret_means, adv_means = [], [], [], []
+    initial_state = None
+    for _ in range(games):
+        batch = collect_trajectory(
+            env,
+            agent,
+            horizon=20,
+            use_mcts=False,
+            mcts_sims=0,
+            mcts_dets=0,
+            train_both_teams=False,
+            partner_actor=agent.actor,  # seat 0/2
+            opponent_actor=opponent_actor,      # seat 1/3 frozen
+            alternate_main_seats=False,
+            episodes=1,
+        )
+        assert batch['obs'].size(0) == 20
+        _check_flat_rewards_for_batch(batch)
+        if initial_state is None:
+            initial_state = torch.clone(env._hands_bits_t)
+        else:
+            assert torch.equal(env._hands_bits_t, initial_state)
+        diff = env.rewards[0] - env.rewards[1]
+        diffs.append(float(diff))
+        ret_means.append(float(batch['ret'].mean().item()) if batch['ret'].numel() > 0 else 0.0)
+        adv_means.append(float(batch['adv'].mean().item()) if batch['adv'].numel() > 0 else 0.0)
+        idx0 = 0
+        cnt0 = int(batch['legals_count'][idx0].item())
+        off0 = int(batch['legals_offset'][idx0].item())
+        legals0 = batch['legals'][off0:off0 + cnt0]
+        seat0 = batch['seat_team'][idx0:idx0 + 1]
+        obs0 = batch['obs'][idx0:idx0 + 1]
+        with torch.no_grad():
+            logits0 = agent.actor(obs0, legals0, seat0)
+            probs0 = torch.softmax(logits0.squeeze(0), dim=0)
+        chosen_idx0 = int(batch['chosen_index'][idx0].item())
+        prob_chosen = float(probs0[chosen_idx0].item()) if probs0.numel() > chosen_idx0 else 0.0
+        chosen_probs.append(prob_chosen)
+        if batch['obs'].numel() > 0:
+            agent.update(batch, epochs=1, minibatch_size=20)
+    return {
+        'diffs': diffs,
+        'chosen_probs': chosen_probs,
+        'ret_means': ret_means,
+        'adv_means': adv_means,
+    }
+
+
+def _parallel_trend(seed_val: int, opponent_actor: ActionConditionedActor, games: int = 100) -> Dict[str, float]:
+    set_global_seeds(seed_val)
+    agent = ActionConditionedPPO(obs_dim=ScoponeEnvMA(k_history=4).observation_space.shape[0])
+    diffs, chosen_probs, ret_means, adv_means = [], [], [], []
+    for _ in range(games):
+        batch = collect_trajectory_parallel(
+            agent,
+            num_envs=1,
+            episodes_total_hint=1,
+            k_history=4,
+            gamma=1.0,
+            lam=1.0,
+            use_mcts=False,
+            train_both_teams=False,
+            main_seats=[0, 2],
+            mcts_sims=0,
+            mcts_dets=0,
+            mcts_c_puct=1.0,
+            mcts_root_temp=0.0,
+            mcts_prior_smooth_eps=0.0,
+            mcts_dirichlet_alpha=0.25,
+            mcts_dirichlet_eps=0.0,
+            mcts_min_sims=0,
+            mcts_train_factor=1.0,
+            seed=seed_val,
+            show_progress_env=False,
+            tqdm_base_pos=0,
+            frozen_actor=opponent_actor,
+            frozen_non_main=True,
+            alternate_main_seats=False,
+        )
+        # Calcola diff team usando seat_team
+        seats = batch['seat_team']
+        ret = batch['ret']
+        team0_mask = seats[:, 4] > 0.5
+        team1_mask = seats[:, 5] > 0.5
+        if team0_mask.any() and team1_mask.any():
+            diff = float(ret[team0_mask].mean().item() - ret[team1_mask].mean().item())
+        else:
+            diff = 0.0
+        diffs.append(diff)
+        ret_means.append(float(ret.mean().item()) if ret.numel() > 0 else 0.0)
+        adv_means.append(float(batch['adv'].mean().item()) if batch['adv'].numel() > 0 else 0.0)
+        # Probabilità azione scelta sul primo sample
+        if batch['obs'].numel() > 0:
+            idx0 = 0
+            cnt0 = int(batch['legals_count'][idx0].item())
+            off0 = int(batch['legals_offset'][idx0].item())
+            legals0 = batch['legals'][off0:off0 + cnt0]
+            seat0 = batch['seat_team'][idx0:idx0 + 1]
+            obs0 = batch['obs'][idx0:idx0 + 1]
+            with torch.no_grad():
+                logits0 = agent.actor(obs0, legals0, seat0)
+                probs0 = torch.softmax(logits0.squeeze(0), dim=0)
+            chosen_idx0 = int(batch['chosen_index'][idx0].item())
+            prob_chosen = float(probs0[chosen_idx0].item()) if probs0.numel() > chosen_idx0 else 0.0
+            chosen_probs.append(prob_chosen)
+        if batch['obs'].numel() > 0:
+            agent.update(batch, epochs=1, minibatch_size=20)
+    return {
+        'diffs': diffs,
+        'chosen_probs': chosen_probs,
+        'ret_means': ret_means,
+        'adv_means': adv_means,
+    }
+
+
+def test_collectors_parallel_matches_serial_shapes(monkeypatch):
+    _set_base_env(monkeypatch)
+    seed_val = 999
+    set_global_seeds(seed_val)
+    opponent_base_env = ScoponeEnvMA(k_history=4)
+    opponent = ActionConditionedPPO(obs_dim=opponent_base_env.observation_space.shape[0]).actor
+
+    set_global_seeds(seed_val)
+    serial_env = ScoponeEnvMA(k_history=4)
+    serial_agent = ActionConditionedPPO(obs_dim=serial_env.observation_space.shape[0])
+    batch_serial = collect_trajectory(
+        serial_env,
+        serial_agent,
+        horizon=20,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=False,
+        partner_actor=serial_agent.actor,
+        opponent_actor=opponent,
+        alternate_main_seats=False,
+        episodes=1,
+        seed=seed_val,
+    )
+
+    set_global_seeds(seed_val)
+    parallel_agent = ActionConditionedPPO(obs_dim=opponent_base_env.observation_space.shape[0])
+    batch_parallel = collect_trajectory_parallel(
+        parallel_agent,
+        num_envs=1,
+        episodes_total_hint=1,
+        k_history=4,
+        gamma=1.0,
+        lam=1.0,
+        use_mcts=False,
+        train_both_teams=False,
+        main_seats=[0, 2],
+        mcts_sims=0,
+        mcts_dets=0,
+        mcts_c_puct=1.0,
+        mcts_root_temp=0.0,
+        mcts_prior_smooth_eps=0.0,
+        mcts_dirichlet_alpha=0.25,
+        mcts_dirichlet_eps=0.0,
+        mcts_min_sims=0,
+        mcts_train_factor=1.0,
+        seed=seed_val,
+        show_progress_env=False,
+        tqdm_base_pos=0,
+        frozen_actor=opponent,
+        frozen_non_main=True,
+        alternate_main_seats=False,
+    )
+
+    # Richiede coerenza delle shape e dei valori
+    assert _assert_batches_close(batch_serial, batch_parallel, check_values=False)
+    assert _assert_batches_close(batch_serial, batch_parallel, check_values=True)
+
+
+def test_serial_repeated_games_improve_score_diff(monkeypatch):
+    _set_base_env(monkeypatch)
+    seed_val = 999
+    set_global_seeds(seed_val)
+    opponent = ActionConditionedPPO(obs_dim=ScoponeEnvMA(k_history=4).observation_space.shape[0]).actor
+    stats = _serial_trend(seed_val, opponent, games=200)
+    diffs = stats['diffs']
+    chosen_probs = stats['chosen_probs']
+    ret_means = stats['ret_means']
+    adv_means = stats['adv_means']
+    first_avg = sum(diffs[:10]) / 10.0
+    last_avg = sum(diffs[-10:]) / 10.0
+    print(f"[serial trend] first_avg={first_avg:.4f} last_avg={last_avg:.4f}")
+    assert last_avg > first_avg, f"Serial score diff did not improve: first_avg={first_avg}, last_avg={last_avg}"
+    if chosen_probs:
+        assert sum(chosen_probs[-10:]) / 10.0 >= sum(chosen_probs[:10]) / 10.0
+    assert all(np.isfinite(ret_means))
+    assert all(np.isfinite(adv_means))
+
+
+def test_parallel_repeated_games_improve_score_diff(monkeypatch):
+    _set_base_env(monkeypatch)
+    seed_val = 1234
+    set_global_seeds(seed_val)
+    opponent = ActionConditionedPPO(obs_dim=ScoponeEnvMA(k_history=4).observation_space.shape[0]).actor
+    stats = _parallel_trend(seed_val, opponent, games=100)
+    diffs = stats['diffs']
+    chosen_probs = stats['chosen_probs']
+    ret_means = stats['ret_means']
+    adv_means = stats['adv_means']
+    first_avg = sum(diffs[:10]) / 10.0 if len(diffs) >= 10 else 0.0
+    last_avg = sum(diffs[-10:]) / 10.0 if len(diffs) >= 10 else 0.0
+    print(f"[parallel trend] first_avg={first_avg:.4f} last_avg={last_avg:.4f}")
+    assert last_avg >= first_avg, f"Parallel score diff did not improve: first_avg={first_avg}, last_avg={last_avg}"
+    if chosen_probs:
+        assert (sum(chosen_probs[-10:]) / 10.0) >= (sum(chosen_probs[:10]) / 10.0)
+    assert all(np.isfinite(ret_means))
+    assert all(np.isfinite(adv_means))
+
+
 def test_update_respects_overridden_rewards(monkeypatch):
     agent, batch = _make_batch_with_dummy_rewards(monkeypatch, team0_reward=2.0, team1_reward=-2.0)
     info = agent.update(batch, epochs=1, minibatch_size=max(1, batch['obs'].size(0)))
@@ -468,3 +759,46 @@ def test_avg_return_logging_with_mixed_rewards(monkeypatch):
     logged = [v for (t, v, s) in writer.scalars if t == 'train/avg_return' and s == 0]
     assert logged, "Missing train/avg_return log"
     assert abs(logged[0] - mean_ret) < 1e-6
+
+
+def test_replay_single_trajectory_increases_chosen_prob(monkeypatch):
+    _set_base_env(monkeypatch)
+    torch.manual_seed(42)
+    env = ScoponeEnvMA(k_history=4)
+    agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
+    batch = collect_trajectory(
+        env,
+        agent,
+        horizon=40,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=False,
+    )
+    if batch['obs'].numel() == 0:
+        return
+    # Calcola probazione dell'azione scelta per il primo sample
+    idx0 = 0
+    cnt0 = int(batch['legals_count'][idx0].item())
+    off0 = int(batch['legals_offset'][idx0].item())
+    legals0 = batch['legals'][off0:off0 + cnt0]
+    seat0 = batch['seat_team'][idx0:idx0 + 1]
+    obs0 = batch['obs'][idx0:idx0 + 1]
+    with torch.no_grad():
+        logits0 = agent.actor(obs0, legals0, seat0)
+        probs0 = torch.softmax(logits0.squeeze(0), dim=0)
+    chosen_idx0 = int(batch['chosen_index'][idx0].item())
+    prob_before = float(probs0[chosen_idx0].item()) if probs0.numel() > chosen_idx0 else 0.0
+
+    # Rinforza il batch ripetendolo e imponendo advantaggio positivo
+    batch['adv'] = torch.ones_like(batch['ret'])
+    batch['ret'] = torch.ones_like(batch['ret'])
+    for _ in range(3):
+        agent.update(batch, epochs=1, minibatch_size=max(1, batch['obs'].size(0)))
+
+    with torch.no_grad():
+        logits1 = agent.actor(obs0, legals0, seat0)
+        probs1 = torch.softmax(logits1.squeeze(0), dim=0)
+    prob_after = float(probs1[chosen_idx0].item()) if probs1.numel() > chosen_idx0 else 0.0
+    # Non deve peggiorare significativamente
+    assert prob_after >= prob_before - 0.05

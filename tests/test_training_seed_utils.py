@@ -24,14 +24,22 @@ def test_normalize_adv_tensor_scales_and_handles_constants():
 
 
 def test_require_team_rewards_validation_and_conversion():
-    ok = train_mod._require_team_rewards({'team_rewards': [1.0, -1.0]}, "ctx")
+    base_info = {
+        'team_rewards': [1.0, -1.0],
+        'score_breakdown': {0: {'total': 5.0}, 1: {'total': 3.0}},
+    }
+    ok = train_mod._require_team_rewards(base_info, "ctx")
     assert ok == [1.0, -1.0]
     with pytest.raises(RuntimeError):
-        train_mod._require_team_rewards({}, "ctx")
+        train_mod._require_team_rewards({'score_breakdown': base_info['score_breakdown']}, "ctx")
     with pytest.raises(RuntimeError):
-        train_mod._require_team_rewards({'team_rewards': [1.0]}, "ctx")
+        train_mod._require_team_rewards({'team_rewards': [1.0], 'score_breakdown': base_info['score_breakdown']}, "ctx")
     with pytest.raises(RuntimeError):
-        train_mod._require_team_rewards({'team_rewards': [float('nan'), 0.0]}, "ctx")
+        train_mod._require_team_rewards({'team_rewards': [float('nan'), 0.0], 'score_breakdown': base_info['score_breakdown']}, "ctx")
+    with pytest.raises(RuntimeError):
+        train_mod._require_team_rewards(
+            {'team_rewards': [0.5, 0.5], 'score_breakdown': {0: {'total': 0.0}, 1: {'total': 0.0}}},
+            "ctx")
 
 
 def test_serial_seed_roundtrip_restores_outer_rng_state():

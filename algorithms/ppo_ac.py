@@ -384,7 +384,7 @@ class ActionConditionedPPO:
         batch:
           - obs: (B, obs_dim)
           - act: (B, 80)
-          - old_logp: (B)
+          - logp: (B)
           - ret: (B)
           - adv: (B)
           - legals: (M, 80) stack di tutte le azioni legali in ordine
@@ -416,31 +416,31 @@ class ActionConditionedPPO:
             return torch.as_tensor(x, dtype=dtype, device='cpu')
 
         # Required keys validation
-        for key in ('obs','act','old_logp','ret','adv','legals','legals_offset','legals_count','chosen_index','seat_team'):
+        for key in ('obs','act','logp','ret','adv','legals','legals_offset','legals_count','chosen_index','seat_team'):
             if key not in batch:
                 raise KeyError(f"compute_loss: missing batch key '{key}'")
         obs = to_cpu(batch['obs'], torch.float32)
         seat = to_cpu(batch['seat_team'], torch.float32)
         act = to_cpu(batch['act'], torch.float32)
-        old_logp = to_cpu(batch['old_logp'], torch.float32)
+        logp = to_cpu(batch['logp'], torch.float32)
         ret = to_cpu(batch['ret'], torch.float32)
         adv = to_cpu(batch['adv'], torch.float32)
         legals = to_cpu(batch['legals'], torch.float32)
         offs = to_cpu(batch['legals_offset'], torch.long)
         cnts = to_cpu(batch['legals_count'], torch.long)
         chosen_idx = to_cpu(batch['chosen_index'], torch.long)
-        # Plausibility checks on old_logp early to catch bad batches
-        if STRICT_CHECKS and (not torch.isfinite(old_logp).all()):
-            raise RuntimeError("compute_loss: old_logp contains non-finite values")
-        if STRICT_CHECKS and old_logp.numel() > 0:
-            pos_any = (old_logp > 1.0e-6).any()
-            small_any = (old_logp < -120.0).any()
+        # Plausibility checks on logp early to catch bad batches
+        if STRICT_CHECKS and (not torch.isfinite(logp).all()):
+            raise RuntimeError("compute_loss: logp contains non-finite values")
+        if STRICT_CHECKS and logp.numel() > 0:
+            pos_any = (logp > 1.0e-6).any()
+            small_any = (logp < -120.0).any()
             if bool(pos_any.detach().cpu().item()):
-                mx = float(old_logp.max().detach().cpu().item())
-                raise RuntimeError(f"compute_loss: old_logp contains positive values (max={mx})")
+                mx = float(logp.max().detach().cpu().item())
+                raise RuntimeError(f"compute_loss: logp contains positive values (max={mx})")
             if bool(small_any.detach().cpu().item()):
-                mn = float(old_logp.min().detach().cpu().item())
-                raise RuntimeError(f"compute_loss: old_logp too small (min={mn})")
+                mn = float(logp.min().detach().cpu().item())
+                raise RuntimeError(f"compute_loss: logp too small (min={mn})")
         # Sanity on ragged indices
         if obs.size(0) != seat.size(0) or obs.size(0) != act.size(0):
             raise RuntimeError("compute_loss: batch size mismatch among obs/seat/act")
@@ -463,7 +463,7 @@ class ActionConditionedPPO:
             obs = obs[valid_mask]
             seat = seat[valid_mask]
             act = act[valid_mask]
-            old_logp = old_logp[valid_mask]
+            logp = logp[valid_mask]
             ret = ret[valid_mask]
             adv = adv[valid_mask]
             offs = offs[valid_mask]
@@ -620,11 +620,11 @@ class ActionConditionedPPO:
         # Ratio: assert inputs finite and gaps not extreme; raise early with diagnostics
         if STRICT_CHECKS and (not torch.isfinite(logp_new).all()):
             raise RuntimeError("compute_loss: logp_new non-finite before ratio")
-        if STRICT_CHECKS and (not torch.isfinite(old_logp).all()):
-            raise RuntimeError("compute_loss: old_logp non-finite before ratio")
-        diff = (logp_new - old_logp)
+        if STRICT_CHECKS and (not torch.isfinite(logp).all()):
+            raise RuntimeError("compute_loss: logp non-finite before ratio")
+        diff = (logp_new - logp)
         if STRICT_CHECKS and (not torch.isfinite(diff).all()):
-            raise RuntimeError("compute_loss: non-finite (logp_new - old_logp)")
+            raise RuntimeError("compute_loss: non-finite (logp_new - logp)")
         if diff.numel() > 0:
             max_gap = diff.abs().amax()
             torch._assert((max_gap <= 80.0), "compute_loss: log-prob gap too large; likely to overflow exp")
@@ -734,7 +734,7 @@ class ActionConditionedPPO:
             belief_aux = (ce_per_card.sum(dim=1) / denom).mean()
 
         loss = loss_pi + self.value_coef * loss_v - self.entropy_coef * entropy + coef * distill_loss + belief_coef * belief_aux
-        approx_kl = (old_logp - logp_new).mean()
+        approx_kl = (logp - logp_new).mean()
         # Finite checks on core scalars
         for name, tensor in (
             ('loss', loss),
@@ -855,7 +855,7 @@ class ActionConditionedPPO:
                 mini = {
                     'obs': sel_cpu(batch_cpu['obs']),
                     'act': sel_cpu(batch_cpu['act']),
-                    'old_logp': sel_cpu(batch_cpu['old_logp']),
+                    'logp': sel_cpu(batch_cpu['logp']),
                     'ret': sel_cpu(batch_cpu['ret']),
                     'adv': sel_cpu(batch_cpu['adv']),
                     'legals': batch_cpu['legals'],  # globale su device

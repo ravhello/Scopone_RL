@@ -67,7 +67,7 @@ def test_maybe_log_ppo_batch_emits_output(monkeypatch, capsys):
         val,
         val,
         done_mask=done,
-        old_logp=torch.tensor([0.1, 0.2]),
+        logp=torch.tensor([0.1, 0.2]),
         seat_tensor=seat,
         episode_lengths=[1, 1],
         extra={'note': 'ok'},

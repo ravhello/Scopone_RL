@@ -1,32 +1,50 @@
 import os
+import pytest
 import torch
 
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
 from trainers.train_ppo import collect_trajectory
 from actions import encode_action_from_ids_tensor, decode_action_ids, encode_action_hash
+from conftest import collect_batch
 
 
-def _make_agent_and_batch(horizon: int = 40):
+def _make_agent_and_batch(horizon: int = 40, collector_kind: str = 'serial'):
     os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
     os.environ.setdefault('ENV_DEVICE', 'cpu')
     os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
     env = ScoponeEnvMA(k_history=4)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
-    batch = collect_trajectory(
-        env,
-        agent,
-        horizon=horizon,
-        use_mcts=False,
-        mcts_sims=0,
-        mcts_dets=0,
-        train_both_teams=False,
-    )
+    if collector_kind == 'serial':
+        batch = collect_trajectory(
+            env,
+            agent,
+            horizon=horizon,
+            use_mcts=False,
+            mcts_sims=0,
+            mcts_dets=0,
+            train_both_teams=False,
+        )
+    else:
+        batch = collect_batch(
+            'parallel',
+            agent,
+            env=env,
+            episodes_total_hint=1,
+            k_history=4,
+            use_mcts=False,
+            mcts_sims=0,
+            mcts_dets=0,
+            train_both_teams=False,
+            main_seats=[0, 2],
+            alternate_main_seats=False,
+        )
     return agent, batch
 
 
-def test_update_changes_parameters_and_metrics_are_finite():
-    agent, batch = _make_agent_and_batch(horizon=40)
+@pytest.mark.parametrize('collector_kind', ['serial', 'parallel'])
+def test_update_changes_parameters_and_metrics_are_finite(collector_kind):
+    agent, batch = _make_agent_and_batch(horizon=40, collector_kind=collector_kind)
     # Snapshot weights before update
     params_before = [p.detach().clone() for p in list(agent.actor.parameters()) + list(agent.critic.parameters())]
     # Run a single update step on the collected batch

@@ -29,11 +29,7 @@ import torch.optim as optim
 from actions import encode_action_from_ids_tensor, decode_action_ids, encode_action_hash
 
 device = torch.device('cpu')
-# Global perf flags
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.enabled = True
-if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
-    torch.backends.cuda.matmul.allow_tf32 = False
+# Global perf flags (CPU-only)
 torch.set_float32_matmul_precision('high')
 
 # Profiling controls (single boolean -> full detail when enabled)
@@ -48,6 +44,39 @@ _OTHERS_HANDS_ZERO = torch.zeros((3, 40), dtype=torch.float32)
 _EMPTY_LEGAL = torch.zeros((0, 80), dtype=torch.float32)
 
 _SERIAL_RNG_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+def _extract_score_totals(info_obj: Any, context: str) -> List[float]:
+    import math as _math
+    if not isinstance(info_obj, dict):
+        raise RuntimeError(f"{context}: info deve essere un dict contenente 'score_breakdown', trovato {type(info_obj)}")
+    sb = info_obj.get('score_breakdown', None)
+    if sb is None:
+        raise RuntimeError(f"{context}: info manca il campo obbligatorio 'score_breakdown' per validare i punteggi di squadra")
+
+    def _extract_total(team_id: int) -> float:
+        if not isinstance(sb, dict):
+            raise RuntimeError(f"{context}: score_breakdown deve essere un dict, trovato {type(sb)}")
+        total_val = None
+        if team_id in sb:
+            total_val = sb[team_id]
+        elif str(team_id) in sb:
+            total_val = sb[str(team_id)]
+        if total_val is None:
+            raise RuntimeError(f"{context}: score_breakdown manca il team {team_id}")
+        if isinstance(total_val, dict):
+            if 'total' not in total_val:
+                raise RuntimeError(f"{context}: score_breakdown[{team_id}] manca il campo 'total'")
+            total_val = total_val.get('total')
+        try:
+            out = float(total_val)
+        except Exception as exc:
+            raise RuntimeError(f"{context}: score_breakdown[{team_id}] total non convertibile a float ({total_val})") from exc
+        if not _math.isfinite(out):
+            raise RuntimeError(f"{context}: score_breakdown[{team_id}] total non finito ({total_val})")
+        return out
+
+    return [_extract_total(0), _extract_total(1)]
 
 
 def _require_team_rewards(info_obj: Any, context: str) -> List[float]:
@@ -72,6 +101,13 @@ def _require_team_rewards(info_obj: Any, context: str) -> List[float]:
         raise RuntimeError(f"{context}: team_rewards non convertibile a float: {tr}") from e
     if not (_math.isfinite(t0) and _math.isfinite(t1)):
         raise RuntimeError(f"{context}: team_rewards contiene valori non finiti: {tr}")
+    score_tot0, score_tot1 = _extract_score_totals(info_obj, context)
+    score_sum = score_tot0 + score_tot1
+    if score_sum <= 0:
+        raise RuntimeError(
+            f"{context}: somma punteggi team0+team1 non valida (team0={score_tot0}, team1={score_tot1}); "
+            "deve essere > 0 (almeno il settebello vale un punto e non può essere pattato)"
+        )
     return [t0, t1]
 
 
@@ -90,8 +126,6 @@ def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
     except AttributeError:
         np_outer = None
     torch_outer = torch.get_rng_state()
-    cuda_outer = None
-
     stored = _SERIAL_RNG_STATE.get(seed_key)
     if stored is None:
         set_global_seeds(seed_key)
@@ -105,14 +139,13 @@ def _serial_seed_enter(seed: Optional[int]) -> Optional[Dict[str, Any]]:
         torch_state = stored.get('torch')
         if torch_state is not None:
             torch.set_rng_state(torch_state)
-        # No CUDA state restore in CPU-only mode
+        # CPU-only mode: nothing else to restore
 
     return {
         'seed': seed_key,
         'py_outer': py_outer,
         'np_outer': np_outer,
         'torch_outer': torch_outer,
-        'cuda_outer': cuda_outer,
     }
 
 
@@ -128,7 +161,6 @@ def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
         'py': random.getstate(),
         'np': np_new,
         'torch': torch.get_rng_state(),
-        'cuda': None,
     }
     py_outer = token.get('py_outer')
     if py_outer is not None:
@@ -139,7 +171,7 @@ def _serial_seed_exit(token: Optional[Dict[str, Any]]) -> None:
     torch_outer = token.get('torch_outer')
     if torch_outer is not None:
         torch.set_rng_state(torch_outer)
-    # No CUDA state restore in CPU-only mode
+    # CPU-only mode: nothing else to restore
 
 def _dbg(msg: str) -> None:
     if _PAR_DEBUG:
@@ -192,6 +224,30 @@ def _format_stats(name: str, stats: Dict[str, float]) -> str:
     )
 
 
+def _diag_stats(t: torch.Tensor) -> Dict[str, float]:
+    return {
+        'min': float(t.min().item()) if t.numel() > 0 else None,
+        'max': float(t.max().item()) if t.numel() > 0 else None,
+        'mean': float(t.mean().item()) if t.numel() > 0 else None,
+        'numel': int(t.numel()),
+    }
+
+
+def _toggle_main_seats(curr: Optional[List[int]],
+                      even_main_seats: Tuple[int, int] = (0, 2),
+                      odd_main_seats: Tuple[int, int] = (1, 3)) -> List[int]:
+    curr_set = set(curr or even_main_seats)
+    return list(odd_main_seats) if curr_set == set(even_main_seats) else list(even_main_seats)
+
+
+def _to_pinned(x: Any) -> torch.Tensor:
+    return x.detach() if torch.is_tensor(x) else torch.as_tensor(x)
+
+
+def _to_float_scalar(x: Any) -> float:
+    return float(x.detach().item()) if torch.is_tensor(x) else float(x)
+
+
 def _maybe_log_ppo_batch(
     label: str,
     rew: Optional[torch.Tensor],
@@ -201,7 +257,7 @@ def _maybe_log_ppo_batch(
     next_val: Optional[torch.Tensor],
     done_mask: Optional[torch.Tensor],
     *,
-    old_logp: Optional[torch.Tensor] = None,
+    logp: Optional[torch.Tensor] = None,
     seat_tensor: Optional[torch.Tensor] = None,
     episode_lengths: Optional[List[int]] = None,
     extra: Optional[Dict[str, Any]] = None,
@@ -214,7 +270,7 @@ def _maybe_log_ppo_batch(
         adv_cpu = _flatten_cpu(adv)
         val_cpu = _flatten_cpu(val)
         next_cpu = _flatten_cpu(next_val)
-        logp_cpu = _flatten_cpu(old_logp) if old_logp is not None else None
+        logp_cpu = _flatten_cpu(logp) if logp is not None else None
         done_cpu = _flatten_cpu(done_mask, dtype=torch.float32)
         seat_cpu = _flatten_cpu(seat_tensor, dtype=torch.float32) if seat_tensor is not None else None
 
@@ -233,7 +289,7 @@ def _maybe_log_ppo_batch(
         msg_parts.append(_format_stats('adv', adv_stats))
         msg_parts.append(_format_stats('next', next_stats))
         if logp_stats.get('count', 0) > 0:
-            msg_parts.append(_format_stats('old_logp', logp_stats))
+            msg_parts.append(_format_stats('logp', logp_stats))
 
         if ret_cpu is not None and val_cpu is not None and ret_stats.get('count', 0) == val_stats.get('count', 0) and ret_stats.get('count', 0) > 0:
             diff = ret_cpu - val_cpu
@@ -284,6 +340,88 @@ def _maybe_log_ppo_batch(
             tqdm.write(f"[ppo-debug {label}] logging failed: {exc}")
         except Exception:
             print(f"[ppo-debug {label}] logging failed: {exc}", flush=True)
+
+
+def _compute_logp_two_stage(
+    actor: ActionConditionedActor,
+    obs_t: torch.Tensor,
+    seat_team_t: torch.Tensor,
+    legals_t: torch.Tensor,
+    legals_offset_t: torch.Tensor,
+    legals_count_t: torch.Tensor,
+    chosen_index_t: torch.Tensor,
+    *,
+    context: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Shared helper to compute per-sample logp (two-stage policy) on device.
+    Uses the actor's compute_two_stage_logp to avoid duplicated implementations
+    between serial and parallel collectors.
+    """
+    B = int(obs_t.size(0))
+    if B == 0:
+        return torch.zeros((0,), dtype=torch.float32, device=device)
+    max_cnt = int(legals_count_t.max().item()) if B > 0 else 0
+    if max_cnt == 0:
+        return torch.zeros((B,), dtype=torch.float32, device=device)
+
+    pos = torch.arange(max_cnt, device=device, dtype=torch.long)
+    rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
+    mask = rel_pos_2d < legals_count_t.unsqueeze(1)
+    abs_idx = (legals_offset_t.unsqueeze(1) + rel_pos_2d)[mask]
+    if abs_idx.numel() == 0:
+        return torch.zeros((B,), dtype=torch.float32, device=device)
+    sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
+
+    state_proj = actor.compute_state_proj(obs_t, seat_team_t)  # (B,64)
+    card_logits_all = torch.matmul(state_proj, actor.card_emb_play.t())  # (B,40)
+    legals_mb = legals_t[abs_idx].contiguous()
+    a_emb_mb = actor.action_enc(legals_mb)
+    logp_per_legal = actor.compute_two_stage_logp(card_logits_all, legals_mb, sample_idx, state_proj, a_emb_mb)
+
+    chosen_clamped = torch.minimum(chosen_index_t.to(device=device), (legals_count_t - 1).clamp_min(0))
+    chosen_abs = (legals_offset_t + chosen_clamped)
+    total_legals = legals_t.size(0)
+    pos_map = torch.full((total_legals,), -1, dtype=torch.long, device=device)
+    pos_map[abs_idx] = torch.arange(abs_idx.numel(), device=device, dtype=torch.long)
+    chosen_pos = pos_map[chosen_abs]
+    if bool((chosen_pos < 0).any().item() if chosen_pos.numel() > 0 else False):
+        bad_rows = torch.nonzero(chosen_pos < 0, as_tuple=False).flatten().tolist()
+        raise RuntimeError(f"{context}: chosen_pos mapping failed for rows {bad_rows}")
+
+    logp_t = torch.zeros((B,), dtype=logp_per_legal.dtype, device=device)
+    valid_mask = (chosen_pos >= 0)
+    if bool(valid_mask.any().item()):
+        logp_t[valid_mask] = logp_per_legal[chosen_pos[valid_mask]]
+
+    strict = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
+    if strict:
+        if not torch.isfinite(logp_t).all():
+            idx_bad = torch.nonzero(~torch.isfinite(logp_t), as_tuple=False).flatten()
+            r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
+            raise RuntimeError(f"{context}: logp non-finite at row {r}")
+        if bool((logp_t > 1e-6).any().item() if logp_t.numel() > 0 else False):
+            r = int(torch.nonzero(logp_t > 1e-6, as_tuple=False).flatten()[0].item())
+            raise RuntimeError(f"{context}: logp positive at row {r} (val={float(logp_t[r].item())})")
+        if bool((logp_t < -100.0).any().item() if logp_t.numel() > 0 else False):
+            idx_bad = torch.nonzero(logp_t < -100.0, as_tuple=False).flatten()
+            r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
+            raise RuntimeError(f"{context}: logp extremely small (row={r}, min={float(logp_t.min().item())})")
+    else:
+        if not torch.isfinite(logp_t).all():
+            idx_bad = torch.nonzero(~torch.isfinite(logp_t), as_tuple=False).flatten()
+            if idx_bad.numel() > 0:
+                _b = int(idx_bad[0].item())
+                tqdm.write(f"[collect] non-finite logp ({context}) -> sanitizing (idx={_b})")
+            logp_t = torch.where(torch.isfinite(logp_t), logp_t, torch.zeros_like(logp_t))
+        logp_t = torch.where(logp_t > 0, torch.zeros_like(logp_t), logp_t)
+        if bool((logp_t < -80.0).any().item() if logp_t.numel() > 0 else False):
+            n_clamped = int((logp_t < -80.0).sum().item())
+            tqdm.write(f"[collect] logp clamped to -80.0 for {n_clamped} rows ({context})")
+            logp_t = torch.clamp(logp_t, min=-80.0)
+
+    return logp_t
 
 
 def _normalize_adv_tensor(label: str, adv_tensor: torch.Tensor) -> torch.Tensor:
@@ -400,9 +538,6 @@ def _env_worker(worker_id: int,
     main_seat_phase = int(cfg.get('main_seat_phase', 0))
     even_main_seats = [0, 2]
     odd_main_seats = [1, 3]
-    def _toggle_main_seats(curr: Optional[List[int]]) -> List[int]:
-        curr_set = set(curr or even_main_seats)
-        return odd_main_seats if curr_set == set(even_main_seats) else even_main_seats
     base_main = list(configured_main_seats) if configured_main_seats is not None else list(even_main_seats)
     if alternate_main_seats and (main_seat_phase % 2 == 1):
         current_main_seats = list(_toggle_main_seats(base_main))
@@ -797,7 +932,7 @@ def _env_worker(worker_id: int,
                     policy_entries = (mcts_probs.tolist() if hasattr(mcts_probs, 'tolist') else list(mcts_probs))
                     policy_weight = 1.0
             else:
-                # Request action selection from master (GPU)
+                # Request action selection from master (CPU)
                 leg_serial = legal_cpu_tensor if send_legals else _EMPTY_LEGAL
                 if step_idx < 3:
                     _wdbg(f"ep {ep} step {step_idx}: STEP -> send, waiting idx (A={len(legal)})")
@@ -981,6 +1116,7 @@ def _env_worker(worker_id: int,
             'leg_cnt': leg_cnt_t,
             'chosen_idx': chosen_idx_t,
             'team_rewards': _require_team_rewards(info, f"worker {worker_id}: episodio terminato"),
+            'score_totals': _extract_score_totals(info, f"worker {worker_id}: episodio terminato"),
             'mcts_policy': mcts_policy_t,
             'mcts_weight': mcts_weight_t,
             'others_hands': others_hands_t,
@@ -1034,7 +1170,7 @@ def _batched_select_indices(agent: ActionConditionedPPO,
     for r in reqs:
         if 'obs' not in r or 'legals' not in r or 'wid' not in r:
             raise KeyError("_batched_select_indices: missing 'obs'/'legals'/'wid' in request")
-    # Stack CPU tensors; keep selection on CPU to avoid small GPU kernels
+    # Stack CPU tensors; keep selection on CPU to avoid device dispatch overhead
     _t_total0 = time.time() if _PAR_TIMING else 0.0
     _t0 = time.time() if _PAR_TIMING else 0.0
     obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
@@ -1177,17 +1313,8 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
     obs_cpu = torch.stack([torch.as_tensor(r['obs'], dtype=torch.float32) for r in reqs], dim=0)
     seat_cpu = torch.stack([torch.as_tensor(r.get('seat', [0,0,0,0,0,0]), dtype=torch.float32) for r in reqs], dim=0)
     with torch.no_grad():
-        # Use CPU tensors directly when not targeting CUDA to avoid unnecessary pinned memory
-        if getattr(device, 'type', str(device)) == 'cuda':
-            if device.type == 'cuda':
-                o_t = obs_cpu.to(device=device, non_blocking=True)
-                s_t = seat_cpu.to(device=device, non_blocking=True)
-            else:
-                o_t = obs_cpu.to(device=device)
-                s_t = seat_cpu.to(device=device)
-        else:
-            o_t = obs_cpu
-            s_t = seat_cpu
+        o_t = obs_cpu
+        s_t = seat_cpu
         state_proj_all = agent.actor.compute_state_proj(o_t, s_t)  # (N,64)
 
     results: List[Dict] = [{} for _ in reqs]
@@ -1223,10 +1350,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
         with torch.no_grad():
             # Concatenate legals
             legals_flat = torch.cat(policy_legals_rows, dim=0)
-            if device.type == 'cuda':
-                legals_flat = legals_flat.to(device=device, non_blocking=True)
-            else:
-                legals_flat = legals_flat.to(device=device)
+            legals_flat = legals_flat.to(device=device)
             Bp = len(policy_positions)
             cnts_t = torch.as_tensor(policy_cnts, dtype=torch.long, device=device)
             max_cnt = int(cnts_t.max().item()) if Bp > 0 else 0
@@ -1273,8 +1397,7 @@ def _batched_service(agent: ActionConditionedPPO, reqs: List[Dict]) -> List[Dict
                     offs_t = torch.repeat_interleave(starts, cnts_t)
                 else:
                     offs_t = torch.zeros((0,), dtype=torch.long, device=device)
-                # Above is heavy; alternatively fill by iterating slices
-                # Use a simple loop in CUDA graph-free context for clarity
+                # Above is heavy; alternatively fill by iterating slices with a simple loop
                 start = 0
                 for j, c in enumerate(policy_cnts):
                     if c > 0:
@@ -1418,7 +1541,7 @@ def _batched_select_indices_with_actor(actor: ActionConditionedActor, reqs: List
 def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> Dict[str, torch.Tensor]:
     """Calcola approx_kl, entropia e clip_frac per gruppi seat 0/2 vs 1/3.
 
-    Tutte le operazioni restano su GPU; ritorna tensori 0-D su device.
+    Tutte le operazioni restano su CPU; ritorna tensori 0-D su device.
     """
     obs = batch['obs'] if torch.is_tensor(batch['obs']) else torch.as_tensor(batch['obs'], dtype=torch.float32)
     obs = obs.to(device=device)
@@ -1432,12 +1555,12 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
     offs = batch['legals_offset'] if torch.is_tensor(batch['legals_offset']) else torch.as_tensor(batch['legals_offset'], dtype=torch.long)
     cnts = batch['legals_count'] if torch.is_tensor(batch['legals_count']) else torch.as_tensor(batch['legals_count'], dtype=torch.long)
     chosen_idx = batch['chosen_index'] if torch.is_tensor(batch['chosen_index']) else torch.as_tensor(batch['chosen_index'], dtype=torch.long)
-    old_logp = torch.as_tensor(batch['old_logp'], dtype=torch.float32)
+    logp = torch.as_tensor(batch['logp'], dtype=torch.float32)
     legals = legals.to(device=device)
     offs = offs.to(device=device)
     cnts = cnts.to(device=device)
     chosen_idx = chosen_idx.to(device=device)
-    old_logp = old_logp.to(device=device)
+    logp = logp.to(device=device)
 
     approx_kl = torch.zeros(obs.size(0), dtype=torch.float32, device=device)
     entropy = torch.zeros(obs.size(0), dtype=torch.float32, device=device)
@@ -1470,11 +1593,11 @@ def _compute_per_seat_diagnostics(agent: ActionConditionedPPO, batch: Dict) -> D
             new_logp_chosen = logp_group[torch.arange(B, device=device), chosen_clamped]
         else:
             entropy[:] = 0.0
-            new_logp_chosen = old_logp
-        approx_kl[:] = (old_logp - new_logp_chosen).abs()
+            new_logp_chosen = logp
+        approx_kl[:] = (logp - new_logp_chosen).abs()
     # clip fraction per-sample sul chosen
-    # ricalcolo ratio corretto: new_logp_chosen - old_logp
-    ratio = torch.exp(new_logp_chosen - old_logp)
+    # ricalcolo ratio corretto: new_logp_chosen - logp
+    ratio = torch.exp(new_logp_chosen - logp)
     clip_low = 1.0 - agent.clip_ratio
     clip_high = 1.0 + agent.clip_ratio
     clipped_mask = (ratio < clip_low) | (ratio > clip_high)
@@ -1621,7 +1744,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     t_action_enc = 0.0
     t_sampling = 0.0
     t_values_gae = 0.0
-    t_oldlogp = 0.0
+    t_logp = 0.0
     env_reset_count = 0
 
     steps = 0
@@ -1634,11 +1757,9 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     current_ep_start_idx = 0
     ep_slices: List[Tuple[int, int]] = []
     ep_team_rewards: List[List[float]] = []
+    ep_score_totals: List[List[float]] = []
     even_main_seats = [0, 2]
     odd_main_seats = [1, 3]
-    def _toggle_main_seats(curr: Optional[List[int]]) -> List[int]:
-        curr_set = set(curr or even_main_seats)
-        return odd_main_seats if curr_set == set(even_main_seats) else even_main_seats
     active_main_seats = list(main_seats) if main_seats is not None else list(even_main_seats)
     episode_main_seats = list(active_main_seats)
     next_starting_player = 1  # env.__init__ already started at 0; alternate afterwards
@@ -1829,13 +1950,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     seat_vec[cp_loc] = 1.0
                     seat_vec[4] = 1.0 if cp_loc in [0, 2] else 0.0
                     seat_vec[5] = 1.0 if cp_loc in [1, 3] else 0.0
-                    # To CUDA
-                    if device.type == 'cuda':
-                        o_t = o_cpu.unsqueeze(0).to(device=device, non_blocking=True)
-                        s_t = seat_vec.unsqueeze(0).to(device=device, non_blocking=True)
-                    else:
-                        o_t = o_cpu.unsqueeze(0).to(device=device)
-                        s_t = seat_vec.unsqueeze(0).to(device=device)
+                    o_t = o_cpu.unsqueeze(0).to(device=device)
+                    s_t = seat_vec.unsqueeze(0).to(device=device)
                     # Costruisci others_hands predetto dal BeliefNet con masking delle carte visibili
                     with torch.no_grad():
                         state_feat = agent.actor.state_enc(o_t, s_t)
@@ -1862,12 +1978,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                     if torch.is_tensor(o_cpu):
                         o_cpu = o_cpu.detach().to(dtype=torch.float32)
                     s_cpu = _seat_vec_for(_env.current_player).detach().to(dtype=torch.float32)
-                    if device.type == 'cuda':
-                        o_t = o_cpu.unsqueeze(0).to(device=device, non_blocking=True)
-                        s_t = s_cpu.unsqueeze(0).to(device=device, non_blocking=True)
-                    else:
-                        o_t = o_cpu.unsqueeze(0).to(device=device)
-                        s_t = s_cpu.unsqueeze(0).to(device=device)
+                    o_t = o_cpu.unsqueeze(0).to(device=device)
+                    s_t = s_cpu.unsqueeze(0).to(device=device)
                     with torch.no_grad():
                         state_feat = agent.actor.state_enc(o_t, s_t)
                         bn_dtype = agent.actor.belief_net.fc_in.weight.dtype
@@ -2131,21 +2243,13 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 # Fast, inference-only path for frozen actor
                 _inference = torch.inference_mode if hasattr(torch, 'inference_mode') else torch.no_grad
                 with _inference():
-                    # Use GPU for frozen actor scoring but keep env data on CPU
                     o_cpu = obs.clone().detach().to(dtype=torch.float32) if torch.is_tensor(obs) else torch.as_tensor(obs, dtype=torch.float32)
                     leg_cpu = torch.stack([x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float32) for x in legal], dim=0)
-                    if device.type == 'cuda':
-                        o_t = o_cpu.unsqueeze(0).to(device=device, non_blocking=True)
-                        leg_t = leg_cpu.to(device=device, non_blocking=True)
-                    else:
-                        o_t = o_cpu.unsqueeze(0).to(device=device)
-                        leg_t = leg_cpu.to(device=device)
+                    o_t = o_cpu.unsqueeze(0).to(device=device)
+                    leg_t = leg_cpu.to(device=device)
                     # Build seat_team_vec (B,6) for the frozen actor forward
                     s_cpu = seat_vec.clone().detach().to(dtype=torch.float32)
-                    if device.type == 'cuda':
-                        s_t = s_cpu.unsqueeze(0).to(device=device, non_blocking=True)
-                    else:
-                        s_t = s_cpu.unsqueeze(0).to(device=device)
+                    s_t = s_cpu.unsqueeze(0).to(device=device)
                     logits = frozen(o_t, leg_t, s_t)
                     idx_t = torch.argmax(logits).to()
                     act = leg_cpu[idx_t]
@@ -2197,6 +2301,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                 # Registra i confini dell'episodio corrente e i team rewards
                 ep_slices.append((current_ep_start_idx, len(obs_list)))
                 ep_team_rewards.append(_require_team_rewards(info, "collect_trajectory: team_rewards mancanti/invalidi"))
+                ep_score_totals.append(_extract_score_totals(info, "collect_trajectory: score_breakdown mancante/invalidi"))
                 if episodes_done >= (episodes - 1):
                     break
                 else:
@@ -2210,7 +2315,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     # Precompute others_hands tensor (CPU) for CTDE targets and critic calls
     oh_cpu_tensor = torch.stack(others_hands_targets, dim=0) if len(others_hands_targets) > 0 else None
 
-    # CTDE: stima V(next) vettorizzata su GPU
+    # CTDE: stima V(next) vettorizzata su CPU
     next_val_t = None
     oh_dev_tensor: Optional[torch.Tensor] = None
     if len(next_obs_list) > 0:
@@ -2219,10 +2324,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             s_all = torch.stack(seat_team_list, dim=0)
             done_mask_bool = torch.as_tensor([bool(d) for d in done_list], dtype=torch.bool, device=device)
             if oh_cpu_tensor is not None:
-                if device.type == 'cuda':
-                    oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32, non_blocking=True)
-                else:
-                    oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32)
+                oh_dev_tensor = oh_cpu_tensor.to(device=device, dtype=torch.float32)
                 oh_next = torch.zeros_like(oh_dev_tensor)
                 if oh_next.size(0) > 1:
                     oh_next[:-1] = oh_dev_tensor[1:]
@@ -2232,7 +2334,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             next_val_t = agent.critic(next_obs_t, s_all, oh_next)
             next_val_t = torch.where(done_mask_bool, torch.zeros_like(next_val_t), next_val_t)
 
-    # Compute V(obs) in batch su GPU e GAE
+    # Compute V(obs) in batch su CPU e GAE
     T = len(rew_list)
     # Consistency check: numero di transizioni utili per episodio (basato su obs_list)
     if final_reward_only:
@@ -2278,6 +2380,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     if T > 0 and len(ep_slices) > 0:
         if len(ep_team_rewards) != len(ep_slices):
             raise RuntimeError(f"collect_trajectory: mismatch tra ep_slices ({len(ep_slices)}) e team_rewards ({len(ep_team_rewards)})")
+        if len(ep_score_totals) > 0 and len(ep_score_totals) != len(ep_slices):
+            raise RuntimeError(f"collect_trajectory: mismatch tra ep_slices ({len(ep_slices)}) e score_totals ({len(ep_score_totals)})")
         flat_rew = [0.0] * T
         for i_ep, (s, e) in enumerate(ep_slices):
             tr = ep_team_rewards[i_ep]
@@ -2312,7 +2416,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         adv_vec[t] = gae
     ret_vec = adv_vec + val_t
 
-    # Keep batch entirely as torch tensors on CUDA
+    # Keep batch entirely as torch tensors on CPU
     # Build CPU tensors first, then pin and transfer as a batch later in update
     if _PAR_TIMING:
         _t0_build = time.time()
@@ -2348,195 +2452,37 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         else:
             padw = torch.zeros((total_samples - mcts_weight_cpu.numel(),), dtype=torch.float32)
             mcts_weight_cpu = torch.cat([mcts_weight_cpu, padw], dim=0)
-    # Keep rewards/done on GPU for GAE already computed; store CPU too for logging if needed
+    # Keep rewards/done on CPU for GAE already computed; store CPU too for logging if needed
     ret_t = ret_vec
     adv_t = adv_vec
     rew_t = rew_t
     done_t = torch.as_tensor(done_list, dtype=torch.bool, device=device) if len(done_list)>0 else torch.zeros((0,), dtype=torch.bool, device=device)
 
-    # Calcola old_logp in batch per evitare sincronizzazioni step-by-step (transfer to CUDA once)
+    _t_olp0 = time.time() if _PAR_TIMING else 0.0
+    # Calcola logp in batch per evitare sincronizzazioni step-by-step
     if obs_cpu.size(0) > 0:
         with torch.no_grad():
-            # Ensure source are CPU tensors before pinning
-            def to_pinned(x):
-                return x.detach() if torch.is_tensor(x) else torch.as_tensor(x)
-            obs_t = to_pinned(obs_cpu).to(device=device, dtype=torch.float32)
-            seat_team_t = to_pinned(seat_team_cpu).to(device=device)
-            legals_t = to_pinned(legals_cpu).to(device=device)
-            legals_offset_t = to_pinned(legals_offset_cpu).to(device=device)
-            legals_count_t = to_pinned(legals_count_cpu).to(device=device)
-            chosen_index_t = to_pinned(chosen_index_cpu).to(device=device)
-            # belief summary may be absent
-            # belief non più richiesto per calcolare old_logp
-            # Two-stage old_logp
-            B = obs_t.size(0)
-            max_cnt = int(legals_count_t.max().item()) if B > 0 else 0
-            if max_cnt > 0:
-                state_proj = agent.actor.compute_state_proj(obs_t, seat_team_t)  # (B,64)
-                card_logits_all = torch.matmul(state_proj, agent.actor.card_emb_play.t())  # (B,40)
-                pos = torch.arange(max_cnt, device=device, dtype=torch.long)
-                rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
-                mask = rel_pos_2d < legals_count_t.unsqueeze(1)
-                abs_idx = (legals_offset_t.unsqueeze(1) + rel_pos_2d)[mask]
-                sample_idx_per_legal = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
-                legals_mb = legals_t[abs_idx].contiguous()
-                played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)
-                # Card log-prob restricted to allowed cards only (two-stage policy)
-                allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
-                allowed_mask[sample_idx_per_legal, played_ids_mb] = True
-                neg_inf = torch.full_like(card_logits_all, float('-inf'))
-                masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
-                max_allowed = torch.amax(masked_logits, dim=1)
-                # Numerically stable exp shift: use masked_logits instead of full logits
-                exp_shift_allowed = torch.exp(masked_logits - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
-                sum_allowed = exp_shift_allowed.sum(dim=1)
-                lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))
-                # STRICT: invariants for card stage – each present row must have at least one allowed card and finite normalizer
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    rows_present = mask.any(dim=1)
-                    allow_any = allowed_mask.any(dim=1)
-                    if bool(((rows_present & (~allow_any)).any()).item()):
-                        bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory_parallel: allowed_mask empty for rows {bad_rows}")
-                    if not torch.isfinite(card_logits_all).all():
-                        bad = card_logits_all[~torch.isfinite(card_logits_all)]
-                        raise RuntimeError(f"collect_trajectory_parallel: card_logits_all non-finite (count={int(bad.numel())})")
-                    if not torch.isfinite(lse_allowed[rows_present]).all():
-                        bad_idx = torch.nonzero(~torch.isfinite(lse_allowed) & rows_present, as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory_parallel: lse_allowed non-finite for rows {bad_idx}")
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    rows_present = mask.any(dim=1)
-                    allow_any = allowed_mask.any(dim=1)
-                    if bool(((rows_present & (~allow_any)).any()).item()):
-                        bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory_parallel: allowed_mask empty for rows {bad_rows}")
-                    if not torch.isfinite(card_logits_all).all():
-                        bad = card_logits_all[~torch.isfinite(card_logits_all)]
-                        raise RuntimeError(f"collect_trajectory_parallel: card_logits_all non-finite (count={int(bad.numel())})")
-                    if not torch.isfinite(lse_allowed[rows_present]).all():
-                        bad_idx = torch.nonzero(~torch.isfinite(lse_allowed) & rows_present, as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory_parallel: lse_allowed non-finite for rows {bad_idx}")
-                # STRICT: invariants for card stage – each present row must have at least one allowed card and finite normalizer
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    rows_present = mask.any(dim=1)
-                    allow_any = allowed_mask.any(dim=1)
-                    if bool(((rows_present & (~allow_any)).any()).item()):
-                        bad_rows = torch.nonzero(rows_present & (~allow_any), as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory: allowed_mask empty for rows {bad_rows}")
-                    if not torch.isfinite(card_logits_all).all():
-                        bad = card_logits_all[~torch.isfinite(card_logits_all)]
-                        raise RuntimeError(f"collect_trajectory: card_logits_all non-finite (count={int(bad.numel())})")
-                    if not torch.isfinite(lse_allowed[rows_present]).all():
-                        bad_idx = torch.nonzero(~torch.isfinite(lse_allowed) & rows_present, as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory: lse_allowed non-finite for rows {bad_idx}")
-                chosen_clamped = torch.minimum(chosen_index_t, (legals_count_t - 1).clamp_min(0))
-                chosen_abs = (legals_offset_t + chosen_clamped)
-                total_legals = legals_t.size(0)
-                pos_map = torch.full((total_legals,), -1, dtype=torch.long, device=device)
-                pos_map[abs_idx] = torch.arange(abs_idx.numel(), device=device, dtype=torch.long)
-                chosen_pos = pos_map[chosen_abs]
-                # Validate chosen_pos mapping succeeded for all rows
-                if bool((chosen_pos < 0).any().item() if chosen_pos.numel() > 0 else False):
-                    bad_rows = torch.nonzero(chosen_pos < 0, as_tuple=False).flatten().tolist()
-                    raise RuntimeError(f"collect_trajectory: chosen_pos mapping failed for rows {bad_rows}")
-                played_ids_all = torch.argmax(legals_t[:, :40], dim=1)
-                chosen_card_ids = played_ids_all[chosen_abs]
-                logp_card = card_logits_all[torch.arange(B, device=device), chosen_card_ids] - lse_allowed[torch.arange(B, device=device)]
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    too_neg = (logp_card < -80.0)
-                    if bool(too_neg.any().item() if logp_card.numel() > 0 else False):
-                        r = int(torch.nonzero(too_neg, as_tuple=False).flatten()[0].item())
-                        raise RuntimeError(f"collect_trajectory_parallel: logp_card too negative at row {r} (val={float(logp_card[r].item())}, chosen_card={int(chosen_card_ids[r].item())})")
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    too_neg = (logp_card < -80.0)
-                    if bool(too_neg.any().item() if logp_card.numel() > 0 else False):
-                        r = int(torch.nonzero(too_neg, as_tuple=False).flatten()[0].item())
-                        raise RuntimeError(f"collect_trajectory: logp_card too negative at row {r} (val={float(logp_card[r].item())}, chosen_card={int(chosen_card_ids[r].item())})")
-                # capture
-                a_emb_mb = agent.actor.action_enc(legals_mb)
-                cap_logits = (a_emb_mb * state_proj[sample_idx_per_legal]).sum(dim=1)
-                group_ids = sample_idx_per_legal * 40 + played_ids_mb
-                num_groups = B * 40
-                group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
-                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-
-                gmax_per_legal = group_max[group_ids]
-                exp_shifted = torch.exp(cap_logits - gmax_per_legal)
-                group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
-                group_sum.index_add_(0, group_ids, exp_shifted)
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    gid_chosen = (torch.arange(B, device=device, dtype=torch.long) * 40 + chosen_card_ids)
-                    denom_chosen = group_sum[gid_chosen]
-                    rows_present = mask.any(dim=1)
-                    bad = (~torch.isfinite(denom_chosen)) | (denom_chosen <= 0)
-                    bad = bad & rows_present
-                    if bool(bad.any().item() if denom_chosen.numel() > 0 else False):
-                        bad_rows = torch.nonzero(bad, as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory_parallel: capture group denominator invalid for rows {bad_rows}")
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    gid_chosen = (torch.arange(B, device=device, dtype=torch.long) * 40 + chosen_card_ids)
-                    denom_chosen = group_sum[gid_chosen]
-                    rows_present = mask.any(dim=1)
-                    bad = (~torch.isfinite(denom_chosen)) | (denom_chosen <= 0)
-                    bad = bad & rows_present
-                    if bool(bad.any().item() if denom_chosen.numel() > 0 else False):
-                        bad_rows = torch.nonzero(bad, as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory: capture group denominator invalid for rows {bad_rows}")
-                lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
-                logp_cap_per_legal = cap_logits - lse_per_legal
-                logp_cap = logp_cap_per_legal[chosen_pos]
-                old_logp_t = (logp_card + logp_cap)
-                # STRICT: fail fast with diagnostics; non-STRICT: sanitize
-                _strict = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
-                if _strict:
-                    if not torch.isfinite(old_logp_t).all():
-                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
-                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
-                        raise RuntimeError(f"collect_trajectory: old_logp non-finite at row {r}; logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}")
-                    if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
-                        r = int(torch.nonzero(old_logp_t > 1e-6, as_tuple=False).flatten()[0].item())
-                        raise RuntimeError(f"collect_trajectory: old_logp positive at row {r} (val={float(old_logp_t[r].item())})")
-                    if bool((old_logp_t < -100.0).any().item() if old_logp_t.numel() > 0 else False):
-                        idx_bad = torch.nonzero(old_logp_t < -100.0, as_tuple=False).flatten()
-                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
-                        # diagnostics for the first bad row
-                        chosen_card = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
-                        cnt_r = int(legals_count_t[r].item()) if legals_count_t.numel() > r else -1
-                        grp_mask = (sample_idx_per_legal == r) & (played_ids_mb == chosen_card)
-                        cap_logits_grp = cap_logits[grp_mask]
-                        def _stats(t):
-                            return {
-                                'min': float(t.min().item()) if t.numel() > 0 else None,
-                                'max': float(t.max().item()) if t.numel() > 0 else None,
-                                'mean': float(t.mean().item()) if t.numel() > 0 else None,
-                                'numel': int(t.numel())
-                            }
-                        raise RuntimeError(
-                            f"collect_trajectory: old_logp extremely small (min={float(old_logp_t.min().item())}); "
-                            f"row={r}, chosen_card={chosen_card}, legals_count={cnt_r}, "
-                            f"logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}, "
-                            f"card_logits_all_stats={_stats(card_logits_all[r])}, cap_logits_grp_stats={_stats(cap_logits_grp)}"
-                        )
-                else:
-                    # Sanitize old_logp to avoid rare numerical issues spilling into PPO ratio
-                    if not torch.isfinite(old_logp_t).all():
-                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
-                        if idx_bad.numel() > 0:
-                            _b = int(idx_bad[0].item())
-                            from tqdm import tqdm as _tqdm_serial
-                            tqdm.write(f"[collect] non-finite old_logp (serial) -> sanitizing (idx={_b})")
-                        old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
-                    # Clamp tiny positive drift to 0 and floor extreme negatives to prevent exp overflow
-                    old_logp_t = torch.where(old_logp_t > 0, torch.zeros_like(old_logp_t), old_logp_t)
-                    if bool((old_logp_t < -80.0).any().item() if old_logp_t.numel() > 0 else False):
-                        from tqdm import tqdm as _tqdm_serial2
-                        n_clamped = int((old_logp_t < -80.0).sum().item())
-                        tqdm.write(f"[collect] old_logp clamped to -80.0 for {n_clamped} rows (serial)")
-                        old_logp_t = torch.clamp(old_logp_t, min=-80.0)
-            else:
-                old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
+            obs_t = _to_pinned(obs_cpu).to(device=device, dtype=torch.float32)
+            seat_team_t = _to_pinned(seat_team_cpu).to(device=device)
+            legals_t = _to_pinned(legals_cpu).to(device=device)
+            legals_offset_t = _to_pinned(legals_offset_cpu).to(device=device)
+            legals_count_t = _to_pinned(legals_count_cpu).to(device=device)
+            chosen_index_t = _to_pinned(chosen_index_cpu).to(device=device)
+            logp_t = _compute_logp_two_stage(
+                agent.actor,
+                obs_t,
+                seat_team_t,
+                legals_t,
+                legals_offset_t,
+                legals_count_t,
+                chosen_index_t,
+                context='collect_trajectory',
+                device=device,
+            )
     else:
-        old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
+        logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
+    if _PAR_TIMING:
+        t_logp = (time.time() - _t_olp0)
 
     ep_debug_lengths = [int(end - start) for (start, end) in ep_slices] if len(ep_slices) > 0 else None
     _maybe_log_ppo_batch(
@@ -2547,7 +2493,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         val_t,
         nval_t,
         done_mask,
-        old_logp=old_logp_t,
+        logp=logp_t,
         seat_tensor=seat_team_cpu,
         episode_lengths=ep_debug_lengths,
         extra={'episodes': len(ep_slices)} if len(ep_slices) > 0 else None,
@@ -2568,7 +2514,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         if seat_team_cpu.size(1) != 6 or not (seat_team_cpu[:, :4].sum(dim=1) == 1).all():
             raise RuntimeError("collect_trajectory: seat_team must be (B,6) with one-hot seat")
 
-    # Mantieni batch già tensori CPU; l'update ora li mapperà tutti su CUDA in un solo passaggio
+    # Mantieni batch già tensori CPU; l'update ora li mapperà tutti su device in un solo passaggio
     if _PAR_TIMING:
         total_collect = time.time() - t_collect_start
         episodes_total = len(ep_slices) if len(ep_slices) > 0 else (1 if len(obs_list) > 0 else 0)
@@ -2576,7 +2522,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             f"[serial-collect] steps={len(obs_list)} episodes={episodes_total} resets={env_reset_count} "
             f"t_reset={t_env_reset:.3f}s t_obs={t_get_obs:.3f}s t_legals={t_get_legals:.3f}s "
             f"t_mcts={t_mcts:.3f}s t_select={t_select:.3f}s state={t_state_proj:.3f}s action_enc={t_action_enc:.3f}s sample={t_sampling:.3f}s t_step={t_step:.3f}s build={t_build:.3f}s "
-            f"values={t_values_gae:.3f}s old_logp={t_oldlogp:.3f}s total={total_collect:.3f}s"
+            f"values={t_values_gae:.3f}s logp={t_logp:.3f}s total={total_collect:.3f}s"
         )
         profiling_payload = {
             'serial/steps': len(obs_list),
@@ -2593,7 +2539,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             'serial/t_step': t_step,
             'serial/t_build': t_build,
             'serial/t_values_gae': t_values_gae,
-            'serial/t_oldlogp': t_oldlogp,
+            'serial/t_logp': t_logp,
             'serial/t_total': total_collect,
         }
         env_profile = {}
@@ -2627,8 +2573,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     batch = {
         'obs': obs_cpu,
         'act': act_cpu,
-        # lascia tensori chiave su CUDA quando presenti ma evita copie inutili se già device-correct
-        'old_logp': (old_logp_t if (torch.is_tensor(old_logp_t) and old_logp_t.device.type == device.type) else old_logp_t.detach()),
+        # lascia tensori chiave sul device corrente evitando copie inutili se già corretti
+        'logp': (logp_t if (torch.is_tensor(logp_t) and logp_t.device.type == device.type) else logp_t.detach()),
         'ret': (ret_t if (torch.is_tensor(ret_t) and ret_t.device.type == device.type) else ret_t.detach()),
         'adv': (adv_t if (torch.is_tensor(adv_t) and adv_t.device.type == device.type) else adv_t.detach()),
         'rew': rew_t,
@@ -2643,6 +2589,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
         'mcts_weight': mcts_weight_cpu,
         'others_hands': others_hands_cpu,
         'routing_log': routing_log,
+        'episode_scores': (torch.as_tensor(ep_score_totals, dtype=torch.float32) if len(ep_score_totals) > 0 else torch.zeros((0, 2), dtype=torch.float32)),
+        'episode_team_rewards': (torch.as_tensor(ep_team_rewards, dtype=torch.float32) if len(ep_team_rewards) > 0 else torch.zeros((0, 2), dtype=torch.float32)),
     }
     if profiling_payload is not None:
         batch.setdefault('profiling', {}).update(profiling_payload)
@@ -2744,9 +2692,9 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         raise ValueError("collect_trajectory_parallel: mcts_dirichlet_eps must be in [0,1]")
     if float(mcts_dirichlet_alpha) < 0:
         raise ValueError("collect_trajectory_parallel: mcts_dirichlet_alpha must be >= 0")
-    # Choose start method with env override and platform/device awareness.
+    # Choose start method with env override and platform awareness.
     # - Windows: 'spawn'
-    # - POSIX with CUDA or background threads: prefer 'forkserver' (avoid forking after CUDA/threads)
+    # - POSIX with background threads: prefer 'forkserver' to avoid forking after threads
     # - Otherwise: 'fork'
     override = str(os.environ.get('SCOPONE_MP_START', '')).strip().lower()
     available_methods = set(mp.get_all_start_methods())
@@ -2806,7 +2754,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'mcts_progress_full': float(mcts_progress_full),
         'mcts_min_sims': int(mcts_min_sims),
         'mcts_train_factor': float(mcts_train_factor),
-        'seed': int(seed),
+        # Non forzare cast quando seed è None: lascia che il worker gestisca il caso non deterministico
+        'seed': (int(seed) if seed is not None else None),
     }
     for wid in range(num_envs):
         cfg = dict(cfg_base)
@@ -2833,7 +2782,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     cnt_block_ok = 0
     cnt_block_timeout = 0
     # Extra timers for post-collector breakdown
-    t_build = 0.0; t_values_gae = 0.0; t_oldlogp = 0.0; t_teardown = 0.0
+    t_build = 0.0; t_values_gae = 0.0; t_logp = 0.0; t_teardown = 0.0
     t_master_start = time.time() if _PAR_TIMING else 0.0
     # Batch size histogram and request type counters (active when profiling)
     bs_hist = {}
@@ -3003,7 +2952,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                 break
         if _PAR_TIMING:
             t_get_reqs += (time.time() - t0_get)
-        # 3) Process batch on GPU
+        # 3) Process batch on CPU
         if len(reqs) > 0:
             _last_activity_ts = time.time()
             if _PAR_TIMING:
@@ -3220,7 +3169,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
                     f"gates={_sp['t_belief_gates']:.3f}s merge={_sp['t_merge']:.3f}s proj={_sp['t_proj']:.3f}s"
                 )
             reset_actor_stateproj()
-        tqdm.write(f"[par-collect-post] build={t_build:.3f} values_gae={t_values_gae:.3f} old_logp={t_oldlogp:.3f} teardown={t_teardown:.3f}")
+        tqdm.write(f"[par-collect-post] build={t_build:.3f} values_gae={t_values_gae:.3f} logp={t_logp:.3f} teardown={t_teardown:.3f}")
 
     # Build batch CPU tensors from payloads
     _t_build0 = time.time() if _PAR_TIMING else 0.0
@@ -3235,7 +3184,25 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     leg_off = []
     leg_cnt = []
     chosen_idx = []
+    episode_scores = []
+    episode_team_rewards = []
     for ep in episodes_payloads:
+        if 'score_totals' not in ep or ep.get('score_totals', None) is None:
+            raise RuntimeError("collector: episode payload missing score_totals")
+        try:
+            st0 = float(ep['score_totals'][0])
+            st1 = float(ep['score_totals'][1])
+        except Exception as exc:
+            raise RuntimeError(f"collector: invalid score_totals payload ({ep.get('score_totals')})") from exc
+        episode_scores.append([st0, st1])
+        if 'team_rewards' not in ep or ep.get('team_rewards', None) is None:
+            raise RuntimeError("collector: episode payload missing team_rewards")
+        try:
+            tr0 = float(ep['team_rewards'][0])
+            tr1 = float(ep['team_rewards'][1])
+        except Exception as exc:
+            raise RuntimeError(f"collector: invalid team_rewards payload ({ep.get('team_rewards')})") from exc
+        episode_team_rewards.append([tr0, tr1])
         # Incoming payload is NumPy; convert lazily per-sample
         obs_ep = [torch.as_tensor(x, dtype=torch.float32) for x in ep['obs']]
         next_obs_ep = [torch.as_tensor(x, dtype=torch.float32) for x in ep['next_obs']]
@@ -3321,25 +3288,48 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
             raise RuntimeError("collector: seat_team must have shape (B,6)")
         if not (seat_mat[:, :4].sum(dim=1) == 1).all():
             raise RuntimeError("collector: seat one-hot invalid (sum != 1)")
-    # Compute values and advantages on GPU similar to collect_trajectory (CTDE coerente)
+    # Compute values and advantages on CPU similar to collect_trajectory (CTDE coerente)
     rew_t = torch.as_tensor(rew_list, dtype=torch.float32, device=device) if len(rew_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
+    # Ricostruisci reward flat per-step a partire dai team_rewards episodici, allineando ai seat registrati
+    # (analogamente al path seriale) per evitare di perdere il segnale di reward finale sui seat non attivi.
+    if len(rew_t) > 0 and len(done_list) > 0 and len(episode_team_rewards) > 0:
+        done_bool = torch.as_tensor(done_list, dtype=torch.bool, device=device)
+        if int(done_bool.sum().item()) == len(episode_team_rewards):
+            flat_rew = torch.zeros_like(rew_t)
+            start = 0
+            ep_idx = 0
+            for i, d in enumerate(done_list):
+                if not d:
+                    continue
+                end = i + 1
+                if ep_idx >= len(episode_team_rewards):
+                    break
+                tr = episode_team_rewards[ep_idx]
+                t0 = float(tr[0])
+                t1 = float(tr[1])
+                seats_ep = seat_cpu_t[start:end]
+                team0_mask = seats_ep[:, 4] > 0.5
+                flat_rew[start:end] = torch.where(team0_mask, torch.as_tensor(t0, device=device, dtype=flat_rew.dtype), torch.as_tensor(t1, device=device, dtype=flat_rew.dtype))
+                start = end
+                ep_idx += 1
+            rew_t = flat_rew
+        else:
+            raise RuntimeError(
+                f"collector: mismatch tra episodi (done count={int(done_bool.sum().item())}) e team_rewards ({len(episode_team_rewards)})"
+            )
     done_mask = torch.as_tensor([0.0 if not d else 1.0 for d in done_list], dtype=torch.float32, device=device) if len(done_list) > 0 else torch.zeros((0,), dtype=torch.float32, device=device)
     _t_val0 = time.time() if _PAR_TIMING else 0.0
     if len(rew_list) > 0:
         with torch.no_grad():
-            if device.type == 'cuda':
-                o_all = obs_cpu_t.to(device=device, dtype=torch.float32, non_blocking=True)
-                s_all = seat_cpu_t.to(device=device, dtype=torch.float32, non_blocking=True)
-            else:
-                o_all = obs_cpu_t.to(device=device, dtype=torch.float32)
-                s_all = seat_cpu_t.to(device=device, dtype=torch.float32)
+            o_all = obs_cpu_t.to(device=device, dtype=torch.float32)
+            s_all = seat_cpu_t.to(device=device, dtype=torch.float32)
             # others_hands per-step (CTDE): se raccolti dagli env worker, usa quelli
             if others_hands_t.numel() > 0 and others_hands_t.size(0) == o_all.size(0):
-                oh_all = (others_hands_t.to(device=device, dtype=torch.float32, non_blocking=True) if device.type == 'cuda' else others_hands_t.to(device=device, dtype=torch.float32))
+                oh_all = others_hands_t.to(device=device, dtype=torch.float32)
             else:
                 oh_all = None
             val_t = agent.critic(o_all, s_all, oh_all)
-            n_all = (next_obs_cpu_t.to(device=device, dtype=torch.float32, non_blocking=True) if device.type == 'cuda' else next_obs_cpu_t.to(device=device, dtype=torch.float32))
+            n_all = next_obs_cpu_t.to(device=device, dtype=torch.float32)
             # costruisci others_hands next (shift) se disponibile
             if oh_all is not None:
                 oh_next = torch.zeros_like(oh_all)
@@ -3363,181 +3353,31 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     if _PAR_TIMING:
         t_values_gae = (time.time() - _t_val0)
 
-    # Compute old_logp in batch on GPU (factored card + capture scheme)
+    # Compute logp in batch on CPU (factored card + capture scheme)
     _t_olp0 = time.time() if _PAR_TIMING else 0.0
     if obs_cpu_t.size(0) > 0:
         with torch.no_grad():
-            def to_pinned(x):
-                return x.detach() if torch.is_tensor(x) else torch.as_tensor(x)
-            obs_t = to_pinned(obs_cpu_t).to(device=device, dtype=torch.float32)
-            seat_t = to_pinned(seat_cpu_t).to(device=device)
-            leg_t = to_pinned(legals_cpu_t).to(device=device)
+            obs_t = _to_pinned(obs_cpu_t).to(device=device, dtype=torch.float32)
+            seat_t = _to_pinned(seat_cpu_t).to(device=device)
+            leg_t = _to_pinned(legals_cpu_t).to(device=device)
             offs = leg_off_t.to(device=device)
             cnts = leg_cnt_t.to(device=device)
-            B = obs_t.size(0)
-            max_cnt = int(cnts.max().item()) if B > 0 else 0
-            if max_cnt > 0:
-                # State projection and card logits
-                state_proj = agent.actor.compute_state_proj(obs_t, seat_t)  # (B,64)
-                card_logits_all = torch.matmul(state_proj, agent.actor.card_emb_play.t())  # (B,40)
-                pos = torch.arange(max_cnt, device=device, dtype=torch.long)
-                rel_pos_2d = pos.unsqueeze(0).expand(B, max_cnt)
-                mask = rel_pos_2d < cnts.unsqueeze(1)
-                abs_idx = (offs.unsqueeze(1) + rel_pos_2d)[mask]
-                sample_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(B, max_cnt)[mask]
-                legals_mb = leg_t[abs_idx].contiguous()                   # (M_mb,80)
-                played_ids_mb = torch.argmax(legals_mb[:, :40], dim=1)    # (M_mb)
-                # Card log-prob restricted to allowed cards only (two-stage policy)
-                allowed_mask = torch.zeros((B, 40), dtype=torch.bool, device=device)
-                allowed_mask[sample_idx, played_ids_mb] = True
-                neg_inf = torch.full_like(card_logits_all, float('-inf'))
-                masked_logits = torch.where(allowed_mask, card_logits_all, neg_inf)
-                max_allowed = torch.amax(masked_logits, dim=1)
-                # Numerically stable exp shift: use masked_logits instead of full logits
-                exp_shift_allowed = torch.exp(masked_logits - max_allowed.unsqueeze(1)) * allowed_mask.to(card_logits_all.dtype)
-                sum_allowed = exp_shift_allowed.sum(dim=1)
-                lse_allowed = max_allowed + torch.log(torch.clamp_min(sum_allowed, 1e-12))
-                # Map chosen indices to absolute and card ids
-                chosen_clamped = (torch.minimum(chosen_idx_t.to(device=device), (cnts - 1).clamp_min(0)) if device.type == 'cuda' else torch.minimum(chosen_idx_t.to(device=device), (cnts - 1).clamp_min(0)))
-                chosen_abs = (offs + chosen_clamped)
-                total_legals = leg_t.size(0)
-                pos_map = torch.full((total_legals,), -1, dtype=torch.long, device=device)
-                pos_map[abs_idx] = torch.arange(abs_idx.numel(), device=device, dtype=torch.long)
-                chosen_pos = pos_map[chosen_abs]
-                # Validate chosen_pos mapping succeeded for all rows
-                if bool((chosen_pos < 0).any().item() if chosen_pos.numel() > 0 else False):
-                    bad_rows = torch.nonzero(chosen_pos < 0, as_tuple=False).flatten().tolist()
-                    raise RuntimeError(f"collect_trajectory_parallel: chosen_pos mapping failed for rows {bad_rows}")
-                played_ids_all = torch.argmax(leg_t[:, :40], dim=1)
-                chosen_card_ids = played_ids_all[chosen_abs]
-                # STRICT: chosen card must be in the allowed set for its sample
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1' and chosen_pos.numel() > 0:
-                    sample_idx_for_chosen = sample_idx[chosen_pos]
-                    valid_chosen = allowed_mask[sample_idx_for_chosen, chosen_card_ids]
-                    if bool((~valid_chosen).any().item() if valid_chosen.numel() > 0 else False):
-                        r = int(torch.nonzero(~valid_chosen, as_tuple=False).flatten()[0].item())
-                        raise RuntimeError(f"collect_trajectory_parallel: chosen card not allowed (row={r}, chosen_card={int(chosen_card_ids[r].item())})")
-                logp_card = card_logits_all[torch.arange(B, device=device), chosen_card_ids] - lse_allowed[torch.arange(B, device=device)]
-                # STRICT: diagnose extremely small logp_card (card stage) with detailed context
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
-                    too_small = (logp_card < -80.0)
-                    if bool(too_small.any().item() if logp_card.numel() > 0 else False):
-                        r = int(torch.nonzero(too_small, as_tuple=False).flatten()[0].item())
-                        s = r  # sample index (row)
-                        allowed_row = allowed_mask[s]
-                        allowed_count = int(allowed_row.sum().item())
-                        logits_row = card_logits_all[s]
-                        chosen_c = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
-                        chosen_logit = float(logits_row[chosen_c].item()) if 0 <= chosen_c < 40 else None
-                        max_allowed = float((logits_row[allowed_row]).max().item()) if allowed_count > 0 else None
-                        # rank of chosen among allowed
-                        if allowed_count > 0 and 0 <= chosen_c < 40 and bool(allowed_row[chosen_c].item()):
-                            allowed_logits_sorted, idxs = torch.sort(logits_row[allowed_row], descending=True)
-                            chosen_val = logits_row[chosen_c]
-                            rank = int((allowed_logits_sorted >= chosen_val - 1e-9).nonzero(as_tuple=False).flatten()[-1].item()) + 1
-                        else:
-                            rank = -1
-                        # Show top-k allowed ids and their logits for context
-                        topk = min(5, allowed_count)
-                        if allowed_count > 0:
-                            top_vals, top_pos = torch.topk(logits_row[allowed_row], k=topk)
-                            # Map positions back to card ids
-                            allowed_ids = torch.nonzero(allowed_row, as_tuple=False).flatten()
-                            top_ids = allowed_ids[top_pos]
-                            top_pairs = [(int(top_ids[i].item()), float(top_vals[i].item())) for i in range(topk)]
-                        else:
-                            top_pairs = []
-                        raise RuntimeError(
-                            f"collect_trajectory_parallel: logp_card extremely small at row={r}; "
-                            f"allowed_count={allowed_count}, chosen_card={chosen_c}, chosen_logit={chosen_logit}, max_allowed={max_allowed}, rank_in_allowed={rank}, "
-                            f"top_allowed={top_pairs}"
-                        )
-                # Capture log-softmax within card groups
-                a_emb_mb = agent.actor.action_enc(legals_mb)               # (M_mb,64)
-                cap_logits = (a_emb_mb * state_proj[sample_idx]).sum(dim=1)
-                group_ids = sample_idx * 40 + played_ids_mb
-                num_groups = B * 40
-                group_max = torch.full((num_groups,), float('-inf'), dtype=cap_logits.dtype, device=device)
-                group_max.scatter_reduce_(0, group_ids, cap_logits, reduce='amax', include_self=True)
-                gmax_per_legal = group_max[group_ids]
-                exp_shifted = torch.exp(cap_logits - gmax_per_legal)
-                group_sum = torch.zeros((num_groups,), dtype=cap_logits.dtype, device=device)
-                group_sum.index_add_(0, group_ids, exp_shifted)
-                # STRICT: denominator for chosen group must be finite and > 0
-                if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1' and chosen_pos.numel() > 0:
-                    gid_chosen = group_ids[chosen_pos]
-                    denom_chosen = group_sum[gid_chosen]
-                    bad = (~torch.isfinite(denom_chosen)) | (denom_chosen <= 0)
-                    if bool(bad.any().item() if denom_chosen.numel() > 0 else False):
-                        bad_rows = torch.nonzero(bad, as_tuple=False).flatten().tolist()
-                        raise RuntimeError(f"collect_trajectory_parallel: capture group denominator invalid for chosen rows {bad_rows}")
-                lse_per_legal = gmax_per_legal + torch.log(torch.clamp_min(group_sum[group_ids], 1e-12))
-                logp_cap_per_legal = cap_logits - lse_per_legal
-                logp_cap = logp_cap_per_legal[chosen_pos]
-                old_logp_t = (logp_card + logp_cap)
-                # STRICT: fail fast with diagnostics; non-STRICT: sanitize
-                _strict = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
-                if _strict:
-                    # Cross-check two-stage logp with reference implementation
-                    try:
-                        lp_ref = agent.actor.compute_two_stage_logp(card_logits_all, legals_mb, sample_idx, state_proj, a_emb_mb)
-                        ref_sel = lp_ref[chosen_pos]
-                        if ref_sel.numel() == old_logp_t.numel():
-                            delta = torch.abs(ref_sel - old_logp_t)
-                            if bool((delta > 1e-4).any().item() if delta.numel() > 0 else False):
-                                r = int(torch.nonzero(delta > 1e-4, as_tuple=False).flatten()[0].item())
-                                raise RuntimeError(f"collect_trajectory_parallel: old_logp mismatch vs ref at row {r} (delta={float(delta[r].item())})")
-                    except Exception as _e:
-                        raise RuntimeError(f"collect_trajectory_parallel: compute_two_stage_logp failed ({type(_e).__name__}: {_e})") from _e
-                    if not torch.isfinite(old_logp_t).all():
-                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
-                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
-                        raise RuntimeError(f"collect_trajectory_parallel: old_logp non-finite at row {r}; logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}")
-                    if bool((old_logp_t > 1e-6).any().item() if old_logp_t.numel() > 0 else False):
-                        r = int(torch.nonzero(old_logp_t > 1e-6, as_tuple=False).flatten()[0].item())
-                        raise RuntimeError(f"collect_trajectory_parallel: old_logp positive at row {r} (val={float(old_logp_t[r].item())})")
-                    if bool((old_logp_t < -100.0).any().item() if old_logp_t.numel() > 0 else False):
-                        idx_bad = torch.nonzero(old_logp_t < -100.0, as_tuple=False).flatten()
-                        r = int(idx_bad[0].item()) if idx_bad.numel() > 0 else 0
-                        chosen_card = int(chosen_card_ids[r].item()) if chosen_card_ids.numel() > r else -1
-                        cnt_r = int(cnts[r].item()) if cnts.numel() > r else -1
-                        grp_mask = (sample_idx == r) & (played_ids_mb == chosen_card)
-                        cap_logits_grp = cap_logits[grp_mask]
-                        def _stats(t):
-                            return {
-                                'min': float(t.min().item()) if t.numel() > 0 else None,
-                                'max': float(t.max().item()) if t.numel() > 0 else None,
-                                'mean': float(t.mean().item()) if t.numel() > 0 else None,
-                                'numel': int(t.numel())
-                            }
-                        raise RuntimeError(
-                            f"collect_trajectory_parallel: old_logp extremely small (min={float(old_logp_t.min().item())}); "
-                            f"row={r}, chosen_card={chosen_card}, legals_count={cnt_r}, "
-                            f"logp_card={float(logp_card[r].item())}, logp_cap={float(logp_cap[r].item())}, "
-                            f"card_logits_all_stats={_stats(card_logits_all[r])}, cap_logits_grp_stats={_stats(cap_logits_grp)}"
-                        )
-                else:
-                    # Sanitize old_logp to avoid rare numerical issues spilling into PPO ratio
-                    if not torch.isfinite(old_logp_t).all():
-                        idx_bad = torch.nonzero(~torch.isfinite(old_logp_t), as_tuple=False).flatten()
-                        if idx_bad.numel() > 0:
-                            _b = int(idx_bad[0].item())
-                            from tqdm import tqdm as _tqdm_par
-                            tqdm.write(f"[collect] non-finite old_logp (parallel) -> sanitizing (idx={_b})")
-                        old_logp_t = torch.where(torch.isfinite(old_logp_t), old_logp_t, torch.zeros_like(old_logp_t))
-                    # Clamp tiny positive drift to 0 and floor extreme negatives to prevent exp overflow
-                    old_logp_t = torch.where(old_logp_t > 0, torch.zeros_like(old_logp_t), old_logp_t)
-                    if bool((old_logp_t < -80.0).any().item() if old_logp_t.numel() > 0 else False):
-                        from tqdm import tqdm as _tqdm_par2
-                        n_clamped = int((old_logp_t < -80.0).sum().item())
-                        tqdm.write(f"[collect] old_logp clamped to -80.0 for {n_clamped} rows (parallel)")
-                        old_logp_t = torch.clamp(old_logp_t, min=-80.0)
-            else:
-                old_logp_t = torch.zeros((B,), dtype=torch.float32, device=device)
+            chosen_t = chosen_idx_t.to(device=device)
+            logp_t = _compute_logp_two_stage(
+                agent.actor,
+                obs_t,
+                seat_t,
+                leg_t,
+                offs,
+                cnts,
+                chosen_t,
+                context='collect_trajectory_parallel',
+                device=device,
+            )
     else:
-        old_logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
+        logp_t = torch.zeros((0,), dtype=torch.float32, device=device)
     if _PAR_TIMING:
-        t_oldlogp = (time.time() - _t_olp0)
+        t_logp = (time.time() - _t_olp0)
 
     ep_debug_lengths = episode_lengths if len(episode_lengths) > 0 else None
     _maybe_log_ppo_batch(
@@ -3548,7 +3388,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         val_t,
         nval_t,
         done_mask,
-        old_logp=old_logp_t,
+        logp=logp_t,
         seat_tensor=seat_cpu_t,
         episode_lengths=ep_debug_lengths,
         extra={'episodes': episodes},
@@ -3557,8 +3397,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     batch = {
         'obs': obs_cpu_t,
         'act': act_cpu_t,
-        # Mantieni tensori chiave su CUDA per evitare D2H→H2D
-        'old_logp': old_logp_t.detach(),
+        # Mantieni tensori chiave sul device corrente per evitare copie inutili
+        'logp': logp_t.detach(),
         'ret': ret_vec.detach(),
         'adv': adv_vec.detach(),
         'rew': rew_t,
@@ -3573,6 +3413,8 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'mcts_weight': mcts_weight_t,
         'others_hands': others_hands_t,
         'routing_log': [('parallel', 'main')],
+        'episode_scores': (torch.as_tensor(episode_scores, dtype=torch.float32) if len(episode_scores) > 0 else torch.zeros((0, 2), dtype=torch.float32)),
+        'episode_team_rewards': (torch.as_tensor(episode_team_rewards, dtype=torch.float32) if len(episode_team_rewards) > 0 else torch.zeros((0, 2), dtype=torch.float32)),
     }
     return batch
 
@@ -3620,10 +3462,6 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
     obs_dim = env.observation_space.shape[0]
     # Passa k_history al modello per evitare inferenze fragili di k
     agent = ActionConditionedPPO(obs_dim=obs_dim, k_history=k_history)
-    # Allow big-compute-on-GPU during update while env/collection stays on CPU.
-    # Controlled by env var SCOPONE_TRAIN_DEVICE (cpu|cuda[:id]). Defaults to cpu.
-    # Models live on CPU for collection; moved to train device inside agent.update.
-
     # Discover existing checkpoints to possibly resume later (actual load happens after league init)
     resume_ckpt = None
     def _is_bootstrap_path(p: str) -> bool:
@@ -4373,7 +4211,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
         else:
             if len(batch['obs']) == 0:
                 continue
-        # normalizza vantaggi completamente su GPU (no sync)
+        # normalizza vantaggi completamente su CPU (no sync)
         _t_p0 = time.time() if _PAR_TIMING else 0.0
         if dual_team_nets and (not opp_frozen_env):
             for label, _b in (('dual-teamA', batch_A), ('dual-teamB', batch_B)):
@@ -4485,26 +4323,24 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                 best_return = avg_return
 
         # Aggiorna output terminale ad ogni iterazione
-        def _to_float(x):
-            return float(x.detach().item()) if torch.is_tensor(x) else float(x)
         preview_keys = ['loss_pi', 'loss_v', 'approx_kl', 'clip_frac', 'avg_clip_frac', 'avg_kl']
         if dual_team_nets and (not opp_frozen_env):
-            preview_A = {k: round(_to_float(info_A[k]), 4) for k in preview_keys if k in info_A}
+            preview_A = {k: round(_to_float_scalar(info_A[k]), 4) for k in preview_keys if k in info_A}
             preview_A.update({'avg_ret': round(avg_return_A, 4)})
-            preview_B = {k: round(_to_float(info_B[k]), 4) for k in preview_keys if k in info_B}
+            preview_B = {k: round(_to_float_scalar(info_B[k]), 4) for k in preview_keys if k in info_B}
             preview_B.update({'avg_ret_B': round(avg_return_B, 4)})
             preview = {**{f"A_{k}": v for k, v in preview_A.items()}, **{f"B_{k}": v for k, v in preview_B.items()}, 't_s': round(dt, 2)}
         elif dual_team_nets and opp_frozen_env:
             if train_A_now:
-                preview_A = {k: round(_to_float(info_A[k]), 4) for k in preview_keys if k in info_A}
+                preview_A = {k: round(_to_float_scalar(info_A[k]), 4) for k in preview_keys if k in info_A}
                 preview_A.update({'avg_ret': round(avg_return, 4)})
                 preview = {**{f"A_{k}": v for k, v in preview_A.items()}, 't_s': round(dt, 2)}
             else:
-                preview_B = {k: round(_to_float(info_B[k]), 4) for k in preview_keys if k in info_B}
+                preview_B = {k: round(_to_float_scalar(info_B[k]), 4) for k in preview_keys if k in info_B}
                 preview_B.update({'avg_ret_B': round(avg_return, 4)})
                 preview = {**{f"B_{k}": v for k, v in preview_B.items()}, 't_s': round(dt, 2)}
         else:
-            preview = {k: round(_to_float(info[k]), 4) for k in preview_keys if k in info}
+            preview = {k: round(_to_float_scalar(info[k]), 4) for k in preview_keys if k in info}
             preview.update({'avg_ret': round(avg_return, 4), 't_s': round(dt, 2)})
         metrics_body = " ".join([f"{k}:{v}" for k, v in preview.items()]) if preview else ""
         metrics_prefix = f"it {it + 1}/{num_iterations}"
@@ -4518,20 +4354,18 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             tqdm.write(f"[iter-timing] total={dt:.3f}s collect={_iter_t_collect:.3f} preproc={_iter_t_preproc:.3f} update={_iter_t_update:.3f} post={_post:.3f}")
 
         if writer is not None:
-            def _to_float(x):
-                return float(x.detach().item()) if torch.is_tensor(x) else float(x)
             if dual_team_nets and (not opp_frozen_env):
                 for k, v in info_A.items():
-                    writer.add_scalar(f'train/A_{k}', _to_float(v), it)
+                    writer.add_scalar(f'train/A_{k}', _to_float_scalar(v), it)
                 for k, v in info_B.items():
-                    writer.add_scalar(f'train/B_{k}', _to_float(v), it)
+                    writer.add_scalar(f'train/B_{k}', _to_float_scalar(v), it)
                 writer.add_scalar('train/A_episode_time_s', dt, it)
                 writer.add_scalar('train/A_avg_return', avg_return_A, it)
                 writer.add_scalar('train/B_avg_return', avg_return_B, it)
             elif dual_team_nets and opp_frozen_env:
                 if train_A_now:
                     for k, v in info_A.items():
-                        writer.add_scalar(f'train/A_{k}', _to_float(v), it)
+                        writer.add_scalar(f'train/A_{k}', _to_float_scalar(v), it)
                     writer.add_scalar('train/A_episode_time_s', dt, it)
                     writer.add_scalar('train/A_avg_return', avg_return, it)
                     # Ensure B tags exist even when B is not updated this iteration
@@ -4539,7 +4373,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     writer.add_scalar('train/B_avg_return', 0.0, it)
                 else:
                     for k, v in info_B.items():
-                        writer.add_scalar(f'train/B_{k}', _to_float(v), it)
+                        writer.add_scalar(f'train/B_{k}', _to_float_scalar(v), it)
                     writer.add_scalar('train/B_episode_time_s', dt, it)
                     writer.add_scalar('train/B_avg_return', avg_return, it)
                     # Ensure A tags still present in this iteration
@@ -4547,7 +4381,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
                     writer.add_scalar('train/A_avg_return', 0.0, it)
             else:
                 for k, v in info.items():
-                    writer.add_scalar(f'train/{k}', _to_float(v), it)
+                    writer.add_scalar(f'train/{k}', _to_float_scalar(v), it)
                 writer.add_scalar('train/episode_time_s', dt, it)
                 writer.add_scalar('train/avg_return', avg_return, it)
             if alternate_main_seats:
@@ -4555,7 +4389,7 @@ def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 
             else:
                 seat_text = str(main_seats)
             writer.add_text('train/main_seats', seat_text, it)
-            # Log by seat completamente su GPU; singola sync per tutto il blocco
+            # Log by seat completamente su CPU; singola sync per tutto il blocco
             if dual_team_nets and opp_frozen_env:
                 _b_used = (batch_A if train_A_now else batch_B)
             elif dual_team_nets and (not opp_frozen_env):

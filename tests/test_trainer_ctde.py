@@ -1,28 +1,38 @@
 import os
+import pytest
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
 from trainers.train_ppo import collect_trajectory
+from conftest import collect_batch
 
 
-def test_collect_trajectory_with_belief_summary():
+@pytest.mark.parametrize('collector_kind', ['serial', 'parallel'])
+def test_collect_trajectory_with_belief_summary(collector_kind):
     os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
     os.environ.setdefault('ENV_DEVICE', 'cpu')
     os.environ.setdefault('TESTS_FORCE_CPU', '1')
     os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-    env = ScoponeEnvMA(k_history=4)
+    env = ScoponeEnvMA(k_history=40)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
-    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False, mcts_sims=0, mcts_dets=0)
+    if collector_kind == 'serial':
+        batch = collect_trajectory(env, agent, horizon=40, use_mcts=False, mcts_sims=0, mcts_dets=0)
+    else:
+        batch = collect_batch('parallel', agent, env=env, episodes_total_hint=1, k_history=40, use_mcts=False, mcts_sims=0, mcts_dets=0, train_both_teams=False, main_seats=[0, 2], alternate_main_seats=False)
     assert 'belief_summary' in batch and batch['belief_summary'].shape[0] == batch['obs'].shape[0]
 
 
-def test_next_value_ctde_inputs_present():
+@pytest.mark.parametrize('collector_kind', ['serial', 'parallel'])
+def test_next_value_ctde_inputs_present(collector_kind):
     os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
     os.environ.setdefault('ENV_DEVICE', 'cpu')
     os.environ.setdefault('TESTS_FORCE_CPU', '1')
     os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-    env = ScoponeEnvMA(k_history=4)
+    env = ScoponeEnvMA(k_history=40)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
-    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False, mcts_sims=0, mcts_dets=0)
+    if collector_kind == 'serial':
+        batch = collect_trajectory(env, agent, horizon=40, use_mcts=False, mcts_sims=0, mcts_dets=0)
+    else:
+        batch = collect_batch('parallel', agent, env=env, episodes_total_hint=1, k_history=40, use_mcts=False, mcts_sims=0, mcts_dets=0, train_both_teams=False, main_seats=[0, 2], alternate_main_seats=False)
     assert 'seat_team' in batch and batch['seat_team'].shape[0] == batch['obs'].shape[0]
     assert batch['belief_summary'].shape[0] == batch['obs'].shape[0]
     # GAE calcolato con next_vals CTDE coerenti -> dimensioni combaciano
@@ -32,15 +42,19 @@ def test_next_value_ctde_inputs_present():
     assert 'done' in batch and 'rew' in batch
 
 
-def test_partner_opponent_routing_basic():
+@pytest.mark.parametrize('collector_kind', ['serial', 'parallel'])
+def test_partner_opponent_routing_basic(collector_kind):
     os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
     os.environ.setdefault('ENV_DEVICE', 'cpu')
     os.environ.setdefault('TESTS_FORCE_CPU', '1')
     os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
-    env = ScoponeEnvMA(k_history=4)
+    env = ScoponeEnvMA(k_history=40)
     agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
     # frozen actors (random weights but eval mode)
-    batch = collect_trajectory(env, agent, horizon=8, use_mcts=False, mcts_sims=0, mcts_dets=0)
+    if collector_kind == 'serial':
+        batch = collect_trajectory(env, agent, horizon=40, use_mcts=False, mcts_sims=0, mcts_dets=0)
+    else:
+        batch = collect_batch('parallel', agent, env=env, episodes_total_hint=1, k_history=40, use_mcts=False, mcts_sims=0, mcts_dets=0, train_both_teams=False, main_seats=[0, 2], alternate_main_seats=False)
     assert batch['obs'].shape[0] > 0
     # verify routing log contains labels and player ids
     assert 'routing_log' in batch
