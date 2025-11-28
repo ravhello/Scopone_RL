@@ -78,7 +78,7 @@ def _serial_run(num_games: int, seed: int) -> List[float]:
     return diffs
 
 
-def _parallel_run(num_games: int, seed: int, num_envs: int = 32) -> List[float]:
+def _parallel_run(num_games: int, seed: int) -> List[float]:
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -87,96 +87,55 @@ def _parallel_run(num_games: int, seed: int, num_envs: int = 32) -> List[float]:
     agent = ActionConditionedPPO(obs_dim=obs_dim)
     opponent = ActionConditionedPPO(obs_dim=obs_dim).actor  # frozen bootstrap
 
-    # Raccogli tutte le partite in una sola chiamata per evitare il respawn continuo dei worker
-    batch = collect_trajectory_parallel(
-        agent,
-        num_envs=num_envs,
-        episodes_total_hint=num_games,
-        k_history=4,
-        gamma=1.0,
-        lam=1.0,
-        use_mcts=False,
-        train_both_teams=False,
-        main_seats=[0, 2],
-        mcts_sims=0,
-        mcts_dets=0,
-        mcts_c_puct=1.0,
-        mcts_root_temp=0.0,
-        mcts_prior_smooth_eps=0.0,
-        mcts_dirichlet_alpha=0.25,
-        mcts_dirichlet_eps=0.0,
-        mcts_min_sims=0,
-        mcts_train_factor=1.0,
-        seed=seed,
-        show_progress_env=False,
-        tqdm_base_pos=0,
-        frozen_actor=opponent,
-        frozen_non_main=True,
-        alternate_main_seats=False,
-    )
-
-    if 'logp' not in batch:
-        raise RuntimeError("collect_trajectory_parallel batch missing logp; check trainer output")
-    logp_full = batch['logp']
-
     diffs: List[float] = []
-    done = batch['done']
-    team_rewards = batch.get('episode_team_rewards', None)
-    leg_off = batch['legals_offset']
-    leg_cnt = batch['legals_count']
-    legals = batch['legals']
-    start = 0
-    ep_idx = 0
-    for end_idx, done_flag in enumerate(done):
-        if not bool(done_flag.item()):
-            continue
-        end = end_idx + 1
-        seats = batch['seat_team'][start:end]
-        rew_ep = batch['rew'][start:end]
-        # calcola diff per la singola partita usando i team_rewards episodici (contengono entrambi i team anche se train_both_teams=False)
-        if team_rewards is not None and ep_idx < team_rewards.size(0):
-            tr = team_rewards[ep_idx]
-            diff = float(tr[0].item() - tr[1].item())
+    for _ in trange(num_games, desc="Parallel", leave=False):
+        batch = collect_trajectory_parallel(
+            agent,
+            num_envs=1,
+            episodes_total_hint=1,
+            k_history=4,
+            gamma=1.0,
+            lam=1.0,
+            use_mcts=False,
+            train_both_teams=False,
+            main_seats=[0, 2],
+            mcts_sims=0,
+            mcts_dets=0,
+            mcts_c_puct=1.0,
+            mcts_root_temp=0.0,
+            mcts_prior_smooth_eps=0.0,
+            mcts_dirichlet_alpha=0.25,
+            mcts_dirichlet_eps=0.0,
+            mcts_min_sims=0,
+            mcts_train_factor=1.0,
+            seed=seed,
+            show_progress_env=False,
+            tqdm_base_pos=0,
+            frozen_actor=opponent,
+            frozen_non_main=True,
+            alternate_main_seats=False,
+        )
+        team_rewards = batch.get('episode_team_rewards', None)
+        if team_rewards is not None and team_rewards.numel() >= 2:
+            diff = float(team_rewards[0][0].item() - team_rewards[0][1].item())
         else:
-            # fallback sul calcolo dai rew step se mancano i team_rewards
+            seats = batch['seat_team']
+            rew_ep = batch['rew']
             team0_mask = seats[:, 4] > 0.5
             team1_mask = seats[:, 5] > 0.5
             diff = float(rew_ep[team0_mask].sum().item() - rew_ep[team1_mask].sum().item())
         diffs.append(diff)
-        ep_idx += 1
-        # costruisci sotto-batch per aggiornare dopo ogni partita
-        leg_start = int(leg_off[start].item())
-        leg_end = int(leg_off[end - 1].item() + leg_cnt[end - 1].item())
-        ep_batch = {
-            'obs': batch['obs'][start:end],
-            'act': batch['act'][start:end],
-            'ret': batch['ret'][start:end],
-            'adv': batch['adv'][start:end],
-            'rew': rew_ep,
-            'done': batch['done'][start:end],
-            'seat_team': seats,
-            'legals': legals[leg_start:leg_end],
-            'legals_offset': leg_off[start:end] - leg_off[start],
-            'legals_count': leg_cnt[start:end],
-            'chosen_index': batch['chosen_index'][start:end],
-        }
-        if 'mcts_policy' in batch:
-            ep_batch['mcts_policy'] = batch['mcts_policy'][leg_start:leg_end]
-        if 'mcts_weight' in batch:
-            ep_batch['mcts_weight'] = batch['mcts_weight'][start:end]
-        if 'others_hands' in batch:
-            ep_batch['others_hands'] = batch['others_hands'][start:end]
-        ep_batch['logp'] = logp_full[start:end]
-        if ep_batch['obs'].numel() > 0:
-            agent.update(ep_batch, epochs=1, minibatch_size=20)
-        start = end
+        # aggiorna per episodio con minibatch costante per coerenza con il seriale
+        if batch['obs'].numel() > 0:
+            agent.update(batch, epochs=1, minibatch_size=20)
     return diffs
 
 
 def main(num_games: int = 2000, seed: int = 999, num_envs_parallel: int = 32) -> None:
     _setup_env_defaults()
     serial_diffs = _serial_run(num_games, seed)
-    parallel_diffs = _parallel_run(num_games, seed, num_envs=num_envs_parallel)
+    # num_envs_parallel non usato: _parallel_run raccoglie 1 env per allinearsi ai test
+    parallel_diffs = _parallel_run(num_games, seed)
 
     n = min(len(serial_diffs), len(parallel_diffs))
     serial_diffs = serial_diffs[:n]
