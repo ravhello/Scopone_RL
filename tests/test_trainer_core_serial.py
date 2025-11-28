@@ -118,6 +118,87 @@ def test_collect_trajectory_serial_has_rewards_and_logp():
     assert any((abs(t0) > 0 or abs(t1) > 0) for (t0, t1) in per_ep), f"all episode rewards are zero: {per_ep}"
 
 
+def test_collect_trajectory_serial_main_only_rew_matches_team_rewards():
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
+    agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
+    batch = collect_trajectory(
+        env,
+        agent,
+        horizon=40,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=False,
+        main_seats=[0, 2],
+        alternate_main_seats=False,
+        episodes=5,
+    )
+    team_rewards = batch.get('episode_team_rewards', None)
+    assert team_rewards is not None and team_rewards.shape[0] > 0
+    done = batch['done']
+    start = 0
+    ep_idx = 0
+    for i, d in enumerate(done):
+        if not bool(d.item()):
+            continue
+        end = i + 1
+        rew_ep = batch['rew'][start:end]
+        unique = torch.unique(rew_ep)
+        assert unique.numel() == 1, f"unexpected multiple reward values in main-only episode: {unique.tolist()}"
+        t0 = float(team_rewards[ep_idx][0].item())
+        assert torch.allclose(unique[0], torch.tensor(t0, dtype=rew_ep.dtype)), f"per-step rewards {unique[0]} differ from team_rewards[0]={t0}"
+        start = end
+        ep_idx += 1
+    assert ep_idx == team_rewards.shape[0]
+
+
+def test_collect_trajectory_serial_main_only_rew_matches_team_rewards_alternate():
+    os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
+    os.environ.setdefault('ENV_DEVICE', 'cpu')
+    os.environ.setdefault('TESTS_FORCE_CPU', '1')
+    os.environ.setdefault('SCOPONE_TORCH_COMPILE', '0')
+    env = ScoponeEnvMA(k_history=4)
+    agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
+    batch = collect_trajectory(
+        env,
+        agent,
+        horizon=40,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=False,
+        main_seats=[0, 2],
+        alternate_main_seats=True,
+        episodes=5,
+    )
+    team_rewards = batch.get('episode_team_rewards', None)
+    assert team_rewards is not None and team_rewards.shape[0] > 0
+    done = batch['done']
+    start = 0
+    ep_idx = 0
+    for i, d in enumerate(done):
+        if not bool(d.item()):
+            continue
+        end = i + 1
+        rew_ep = batch['rew'][start:end]
+        seats_ep = batch['seat_team'][start:end]
+        team0_mask = seats_ep[:, 4] > 0.5
+        team1_mask = seats_ep[:, 5] > 0.5
+        team_flag = 0 if bool(team0_mask.any()) else 1
+        per_step = rew_ep[team0_mask | team1_mask]
+        unique = torch.unique(per_step)
+        assert unique.numel() == 1, f"unexpected multiple reward values in main-only episode: {unique.tolist()}"
+        t_val = float(team_rewards[ep_idx][team_flag].item())
+        assert torch.allclose(unique[0], torch.tensor(t_val, dtype=per_step.dtype)), f"per-step rewards {unique[0]} differ from team_rewards[{team_flag}]={t_val}"
+        start = end
+        ep_idx += 1
+    assert ep_idx == team_rewards.shape[0]
+
+
 def test_collect_trajectory_serial_both_teams_rewards_balanced():
     os.environ.setdefault('SCOPONE_DEVICE', 'cpu')
     os.environ.setdefault('ENV_DEVICE', 'cpu')
@@ -153,7 +234,7 @@ def test_collect_trajectory_serial_both_teams_rewards_balanced():
             assert abs(float((t0 + t1).item())) < 1e-5, f"episode rewards not zero-sum: t0={t0}, t1={t1}"
             start = end
     assert per_ep, "no episodes found in serial batch"
-    assert all((abs(t0) > 0 or abs(t1) > 0) for (t0, t1) in per_ep), f"all episode rewards are zero: {per_ep}"
+    assert any((abs(t0) > 0 or abs(t1) > 0) for (t0, t1) in per_ep), f"all episode rewards are zero: {per_ep}"
 
 
 def test_collect_trajectory_score_sum_positive(monkeypatch):

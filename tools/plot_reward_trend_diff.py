@@ -66,8 +66,13 @@ def _serial_run(num_games: int, seed: int) -> List[float]:
             episodes=1,
             seed=seed,
         )
-        diff = env.rewards[0] - env.rewards[1]
-        diffs.append(float(diff))
+        # Usa i team_rewards episodici per avere la stessa sorgente del parallelo
+        tr = batch.get('episode_team_rewards', None)
+        if tr is not None and hasattr(tr, 'numel') and tr.numel() >= 2:
+            diff = float(tr[0][0].item() - tr[0][1].item())
+        else:
+            diff = env.rewards[0] - env.rewards[1]
+        diffs.append(diff)
         if batch['obs'].numel() > 0:
             agent.update(batch, epochs=1, minibatch_size=20)
     return diffs
@@ -116,24 +121,29 @@ def _parallel_run(num_games: int, seed: int, num_envs: int = 32) -> List[float]:
 
     diffs: List[float] = []
     done = batch['done']
+    team_rewards = batch.get('episode_team_rewards', None)
     leg_off = batch['legals_offset']
     leg_cnt = batch['legals_count']
     legals = batch['legals']
     start = 0
+    ep_idx = 0
     for end_idx, done_flag in enumerate(done):
         if not bool(done_flag.item()):
             continue
         end = end_idx + 1
-        # calcola diff per la singola partita usando reward aggregati per team
         seats = batch['seat_team'][start:end]
         rew_ep = batch['rew'][start:end]
-        team0_mask = seats[:, 4] > 0.5
-        team1_mask = seats[:, 5] > 0.5
-        if team0_mask.any() and team1_mask.any():
-            diff = float(rew_ep[team0_mask].sum().item() - rew_ep[team1_mask].sum().item())
+        # calcola diff per la singola partita usando i team_rewards episodici (contengono entrambi i team anche se train_both_teams=False)
+        if team_rewards is not None and ep_idx < team_rewards.size(0):
+            tr = team_rewards[ep_idx]
+            diff = float(tr[0].item() - tr[1].item())
         else:
-            diff = 0.0
+            # fallback sul calcolo dai rew step se mancano i team_rewards
+            team0_mask = seats[:, 4] > 0.5
+            team1_mask = seats[:, 5] > 0.5
+            diff = float(rew_ep[team0_mask].sum().item() - rew_ep[team1_mask].sum().item())
         diffs.append(diff)
+        ep_idx += 1
         # costruisci sotto-batch per aggiornare dopo ogni partita
         leg_start = int(leg_off[start].item())
         leg_end = int(leg_off[end - 1].item() + leg_cnt[end - 1].item())
