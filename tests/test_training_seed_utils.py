@@ -281,3 +281,73 @@ def test_serial_and_parallel_deterministic_with_same_seed():
         assert torch.allclose(bs['legals'], bp['legals'])
         assert torch.allclose(bs['chosen_index'], bp['chosen_index'])
         assert torch.allclose(bs['rew'], bp['rew'])
+
+
+def _collect_action_histories(seeds, episodes_per_seed, parallel: bool):
+    counts = torch.zeros(40, dtype=torch.float32)
+    for s in seeds:
+        set_global_seeds(s)
+        env = ScoponeEnvMA(k_history=4)
+        agent = ActionConditionedPPO(obs_dim=env.observation_space.shape[0])
+        if parallel:
+            batch = train_mod.collect_trajectory_parallel(
+                agent,
+                num_envs=1,
+                episodes_total_hint=episodes_per_seed,
+                k_history=4,
+                gamma=1.0,
+                lam=1.0,
+                use_mcts=False,
+                train_both_teams=False,
+                main_seats=[0, 2],
+                mcts_sims=0,
+                mcts_dets=0,
+                mcts_c_puct=1.0,
+                mcts_root_temp=0.0,
+                mcts_prior_smooth_eps=0.0,
+                mcts_dirichlet_alpha=0.25,
+                mcts_dirichlet_eps=0.0,
+                mcts_min_sims=0,
+                mcts_train_factor=1.0,
+                seed=s,
+                show_progress_env=False,
+                tqdm_base_pos=0,
+                frozen_actor=agent.actor,
+                frozen_non_main=True,
+                alternate_main_seats=False,
+            )
+        else:
+            batch = train_mod.collect_trajectory(
+                env,
+                agent,
+                horizon=episodes_per_seed * 20,
+                use_mcts=False,
+                mcts_sims=0,
+                mcts_dets=0,
+                train_both_teams=False,
+                partner_actor=agent.actor,
+                opponent_actor=agent.actor,
+                alternate_main_seats=False,
+                episodes=episodes_per_seed,
+                seed=s,
+            )
+        act = batch.get('act', None)
+        if act is None or act.numel() == 0:
+            continue
+        card_ids = torch.argmax(act[:, :40], dim=1)
+        for cid in card_ids:
+            counts[int(cid.item())] += 1.0
+    if counts.sum() == 0:
+        return counts
+    return counts / counts.sum()
+
+
+def test_serial_vs_parallel_action_distribution_similarity():
+    seeds = [111, 222, 333]
+    episodes_per_seed = 2
+    hist_serial = _collect_action_histories(seeds, episodes_per_seed, parallel=False)
+    hist_parallel = _collect_action_histories(seeds, episodes_per_seed, parallel=True)
+    # Con la stessa rete e stessi seed, le distribuzioni di carte giocate devono essere simili (tolleranza L1)
+    assert hist_serial.sum() > 0 and hist_parallel.sum() > 0
+    l1 = torch.abs(hist_serial - hist_parallel).sum().item()
+    assert l1 < 0.35, f"Distribuzioni troppo diverse (L1={l1})"

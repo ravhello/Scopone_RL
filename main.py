@@ -127,9 +127,6 @@ os.environ.setdefault('SCOPONE_MINIBATCH', '4096')  # dimensione minibatch PPO p
 # Checkpoint path control
 os.environ.setdefault('SCOPONE_CKPT', 'checkpoints/ppo_ac.pth')  # percorso checkpoint predefinito
 
-# Default to random seed for training runs (set -1); stable only if user sets it
-seed_env = int(os.environ.get('SCOPONE_SEED', '-1'))  # seed globale (-1=random)
-
 # Allow configuring iterations/horizon/num_envs via env; sensible defaults
 iters = int(os.environ.get('SCOPONE_ITERS', '1000'))  # numero iterazioni di training
 horizon = int(os.environ.get('SCOPONE_HORIZON', '32768'))  # horizon di raccolta per iterazione
@@ -302,7 +299,6 @@ os.environ.setdefault('SCOPONE_MP_START', os.environ.get('SCOPONE_MP_START', _DE
 import torch
 from tqdm import tqdm
 from trainers.train_ppo import train_ppo
-from utils.seed import resolve_seed
 
 def _maybe_launch_tensorboard():
     """Launch TensorBoard in background if enabled.
@@ -409,6 +405,5 @@ if __name__ == "__main__":
               belief_particles=_belief_particles,
               belief_ess_frac=_belief_ess,
               eval_games=_eval_games,
-              seed=seed_env,
               use_selfplay=_selfplay,
               mcts_warmup_iters=_mcts_warmup_iters)
