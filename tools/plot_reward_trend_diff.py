@@ -2,7 +2,7 @@
 Confronta la differenza di score (team A - team B) tra raccolta seriale e parallela,
 allineando i game index: per ogni game calcola diff_serial[i] - diff_parallel[i].
 
-Esegue 2000 game per ciascun collector (horizon=20, episodes=1, main seats 0/2 con opponent congelato).
+Esegue 400 game per ciascun collector (horizon=20, episodes=1, main seats 0/2 con opponent congelato).
 Salva il grafico in reward_trend_diff.png.
 """
 
@@ -131,7 +131,7 @@ def _parallel_run(num_games: int, seed: int) -> List[float]:
     return diffs
 
 
-def main(num_games: int = 2000, seed: int = 999, num_envs_parallel: int = 32) -> None:
+def main(num_games: int = 400, seed: int = 999, num_envs_parallel: int = 32) -> None:
     _setup_env_defaults()
     serial_diffs = _serial_run(num_games, seed)
     # num_envs_parallel non usato: _parallel_run raccoglie 1 env per allinearsi ai test

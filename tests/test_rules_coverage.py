@@ -274,7 +274,7 @@ def test_force_ace_self_capture_on_empty_once_flag():
     assert not done
     assert info["last_move"]["capture_type"] == "scopa"
     # Flag dovrebbe essere consumato
-    assert not env.rules.get("force_ace_self_capture_on_empty_once", False)
+    assert env.rules["force_ace_self_capture_on_empty_once"] is False
 
 
 def test_scopa_on_last_capture_toggle_with_forced_empty():

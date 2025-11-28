@@ -33,5 +33,5 @@ def test_find_sum_subsets_ids_basic():
     table = [0, 4, 8]
     subs = find_sum_subsets_ids(table, target_rank=3)
     # possible: [0,4] (1+2) or [8] (3)
-    flat = [sorted(s) for s in subs]
-    assert [0,4] in flat or [8] in flat
+    flat = {tuple(sorted(s)) for s in subs}
+    assert flat == {(0, 4), (8,)}

@@ -528,7 +528,8 @@ def _env_worker(worker_id: int,
     # Ensure different RNG streams per worker for robustness; tolerate seed=None
     _seed_base = cfg.get('seed', None)
     seed_base_int = int(_seed_base) if _seed_base is not None else 0
-    set_global_seeds(seed_base_int + int(worker_id))
+    # Allinea al seriale: nessun offset per worker, episodico gestito nel loop
+    set_global_seeds(seed_base_int)
     env = ScoponeEnvMA(rules=cfg.get('rules', {'shape_scopa': False}),
                        k_history=int(cfg.get('k_history', 39)))
     episodes_per_env = int(cfg.get('episodes_per_env', 1))
@@ -582,8 +583,15 @@ def _env_worker(worker_id: int,
     t0_glob = time.time()
     _wdbg(f"start (episodes_per_env={int(episodes_per_env)})")
     next_starting_player = 0
+    episode_start_idx = int(cfg.get('episode_start_idx', 0))
     for ep in range(episodes_per_env):
+        # Allinea l'alternanza dei main seats al percorso seriale: toggla a inizio episodio (tranne il primo)
+        if alternate_main_seats and ep > 0:
+            current_main_seats = _toggle_main_seats(current_main_seats)
         episode_main_seats = list(current_main_seats)
+        # Episodic seeding coerente col seriale: seed_base + episodio globale
+        if _seed_base is not None:
+            set_global_seeds(seed_base_int + episode_start_idx + ep)
         starting_player = next_starting_player
         next_starting_player = 1 - next_starting_player
         t0 = time.time(); env.reset(starting_player=starting_player); t_env_reset += (time.time() - t0) if _PAR_TIMING else 0.0
@@ -1140,8 +1148,6 @@ def _env_worker(worker_id: int,
             _wdbg(f"ep {ep} payload put ok")
         except Exception as e:
             raise RuntimeError(f"worker {worker_id}: episode_q.put failed") from e
-        if alternate_main_seats:
-            current_main_seats = _toggle_main_seats(episode_main_seats)
         # Do not advance worker profiler schedule per-episode to avoid Kineto stack issues
     # Stop and export worker torch profiler if active
     if _worker_prof is not None:
@@ -1695,7 +1701,8 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
                        mcts_progress_full: float = 0.75,
                        mcts_min_sims: int = 0,
                        train_both_teams: bool = False,
-                       alternate_main_seats: bool = True) -> Dict:
+                       alternate_main_seats: bool = True,
+                       seed: Optional[int] = None) -> Dict:
     # Enforce minimum horizon of 40 (full hand length)
     horizon = max(40, int(horizon))
     # Enforce horizon multiple of LCM(minibatch_size, per-episode useful transitions)
@@ -1774,10 +1781,29 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
     active_main_seats = list(main_seats) if main_seats is not None else list(even_main_seats)
     episode_main_seats = list(active_main_seats)
     next_starting_player = 1  # env.__init__ already started at 0; alternate afterwards
+    episodes_started = 0
+    # For deterministic runs: reseed and reset the env at the beginning with a known starting player
+    if seed is not None:
+        try:
+            seed_int = int(seed)
+        except Exception:
+            seed_int = None
+        if seed_int is not None:
+            set_global_seeds(seed_int)
+            env.reset(starting_player=0)
+            episodes_started = 1
+            next_starting_player = 1
     while True:
         if env.done:
             if _PAR_TIMING:
                 _t0_env_reset = time.time()
+            if seed is not None:
+                try:
+                    seed_int = int(seed)
+                except Exception:
+                    seed_int = None
+                if seed_int is not None:
+                    set_global_seeds(seed_int + episodes_started)
             starting_player = next_starting_player
             next_starting_player = 1 - next_starting_player
             env.reset(starting_player=starting_player)
@@ -1788,6 +1814,7 @@ def _collect_trajectory_impl(env: ScoponeEnvMA, agent: ActionConditionedPPO, hor
             if alternate_main_seats:
                 active_main_seats = _toggle_main_seats(active_main_seats)
             episode_main_seats = list(active_main_seats)
+            episodes_started += 1
 
         # All env logic on CPU
         if _PAR_TIMING:
@@ -2623,11 +2650,11 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                        mcts_dirichlet_alpha: float = 0.25, mcts_dirichlet_eps: float = 0.0,
                        mcts_train_factor: float = 1.0,
                        mcts_progress_start: float = 0.25,
-                       mcts_progress_full: float = 0.75,
-                       mcts_min_sims: int = 0,
-                       train_both_teams: bool = False,
-                       seed: Optional[int] = None,
-                       alternate_main_seats: bool = True) -> Dict:
+                        mcts_progress_full: float = 0.75,
+                        mcts_min_sims: int = 0,
+                        train_both_teams: bool = False,
+                        seed: Optional[int] = None,
+                        alternate_main_seats: bool = True) -> Dict:
     seed_token = _serial_seed_enter(seed)
     try:
         return _collect_trajectory_impl(env=env,
@@ -2655,7 +2682,8 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
                                         mcts_progress_full=mcts_progress_full,
                                         mcts_min_sims=mcts_min_sims,
                                         train_both_teams=train_both_teams,
-                                        alternate_main_seats=alternate_main_seats)
+                                        alternate_main_seats=alternate_main_seats,
+                                        seed=seed)
     finally:
         _serial_seed_exit(seed_token)
 
@@ -2767,12 +2795,17 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'mcts_train_factor': float(mcts_train_factor),
         # Non forzare cast quando seed è None: lascia che il worker gestisca il caso non deterministico
         'seed': (int(seed) if seed is not None else None),
+        # Con un solo env vogliamo la stessa sequenza del percorso seriale: niente offset per worker_id
+        'seed_offset': (int(num_envs) > 1),
     }
+    cumulative = 0
     for wid in range(num_envs):
         cfg = dict(cfg_base)
         cfg['episodes_per_env'] = int(episodes_per_env_list[wid])
+        cfg['episode_start_idx'] = cumulative
         if alternate_main_seats:
             cfg['main_seat_phase'] = int(wid % 2)
+        cumulative += int(episodes_per_env_list[wid])
         p = ctx.Process(target=_env_worker, args=(wid, cfg, request_q, action_queues[wid], episode_q), daemon=True)
         p.start()
         workers.append(p)

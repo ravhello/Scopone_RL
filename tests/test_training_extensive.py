@@ -8,6 +8,7 @@ from typing import Dict
 from environment import ScoponeEnvMA
 from algorithms.ppo_ac import ActionConditionedPPO
 from trainers.train_ppo import collect_trajectory, collect_trajectory_parallel, train_ppo
+import trainers.train_ppo as train_mod
 from models.action_conditioned import ActionConditionedActor
 from utils.seed import set_global_seeds
 
@@ -33,7 +34,9 @@ def _run_parallel_with_timeout(fn, timeout_s: float = 30.0):
         pytest.fail(f"collect_trajectory_parallel non ha terminato entro {timeout_s}s; abilita SCOPONE_PAR_DEBUG=1 per maggiori log")
     if err:
         raise err[0]
-    return out.get('val')
+    if 'val' not in out:
+        pytest.fail("collect_trajectory_parallel thread terminato senza valorizzare il risultato")
+    return out['val']
 
 
 def _set_base_env(monkeypatch):
@@ -131,6 +134,106 @@ def _check_flat_rewards_for_batch(batch):
         assert torch.allclose(r1, r1[0])
 
 
+def _collect_serial_and_parallel(monkeypatch, seed_val: int, *, episodes: int, train_both_teams: bool):
+    """
+    Raccoglie batch seriale e parallelo con configurazione identica (stessi semi) per confrontare output.
+    """
+    def _deterministic_select(self, obs, legal_actions, seat_team_vec=None, profiling_bins=None):
+        if torch.is_tensor(legal_actions):
+            actions_t = legal_actions.detach().to(dtype=torch.float32)
+        elif isinstance(legal_actions, list) and len(legal_actions) > 0:
+            actions_t = torch.stack([a.detach().to(dtype=torch.float32) if torch.is_tensor(a) else torch.as_tensor(a, dtype=torch.float32) for a in legal_actions], dim=0)
+        else:
+            raise RuntimeError("legal_actions vuoto o non supportato")
+        idx_t = torch.tensor(0, dtype=torch.long)
+        logp = torch.zeros((), dtype=torch.float32)
+        return actions_t[0], logp, idx_t
+
+    def _deterministic_batch_select(_agent, reqs):
+        return [(int(r['wid']), 0) for r in reqs]
+
+    # Rendi la selezione deterministica su entrambi i percorsi
+    monkeypatch.setattr(ActionConditionedPPO, "select_action", _deterministic_select, raising=False)
+    monkeypatch.setattr(train_mod, "_batched_select_indices", _deterministic_batch_select, raising=True)
+    monkeypatch.setattr(train_mod, "_batched_select_indices_with_actor", lambda _actor, reqs: _deterministic_batch_select(None, reqs), raising=True)
+    set_global_seeds(seed_val)
+    env = ScoponeEnvMA(k_history=4)
+    obs_dim = env.observation_space.shape[0]
+    agent_serial = ActionConditionedPPO(obs_dim=obs_dim)
+    batch_serial = collect_trajectory(
+        env,
+        agent_serial,
+        horizon=40,
+        use_mcts=False,
+        mcts_sims=0,
+        mcts_dets=0,
+        train_both_teams=train_both_teams,
+        main_seats=[0, 2],
+        alternate_main_seats=False,
+        episodes=episodes,
+        final_reward_only=True,
+        seed=seed_val,
+    )
+
+    set_global_seeds(seed_val)
+    agent_parallel = ActionConditionedPPO(obs_dim=obs_dim)
+    batch_parallel = _run_parallel_with_timeout(
+        lambda: collect_trajectory_parallel(
+            agent_parallel,
+            num_envs=1,
+            episodes_total_hint=episodes,
+            k_history=4,
+            gamma=1.0,
+            lam=1.0,
+            use_mcts=False,
+            train_both_teams=train_both_teams,
+            main_seats=[0, 2],
+            mcts_sims=0,
+            mcts_dets=0,
+            mcts_c_puct=1.0,
+            mcts_root_temp=0.0,
+            mcts_prior_smooth_eps=0.0,
+            mcts_dirichlet_alpha=0.25,
+            mcts_dirichlet_eps=0.0,
+            mcts_min_sims=0,
+            mcts_train_factor=1.0,
+            seed=seed_val,
+            show_progress_env=False,
+            tqdm_base_pos=0,
+            frozen_actor=None,
+            frozen_non_main=False,
+            alternate_main_seats=False,
+        ),
+        timeout_s=60.0,
+    )
+    return batch_serial, batch_parallel
+
+
+def _assert_batches_identical(batch_serial, batch_parallel, *, atol: float = 1e-5, rtol: float = 1e-5):
+    assert set(batch_serial.keys()) == set(batch_parallel.keys()), f"keys differ between serial and parallel: {batch_serial.keys()} vs {batch_parallel.keys()}"
+    tol_map = {
+        'logp': (1e-3, 1e-3),
+        'ret': (5e-2, 5e-3),
+        'adv': (5e-2, 5e-3),
+    }
+    for key in batch_serial:
+        vs = batch_serial[key]
+        vp = batch_parallel[key]
+        if torch.is_tensor(vs) and torch.is_tensor(vp):
+            assert vs.shape == vp.shape, f"shape mismatch for {key}: {vs.shape} vs {vp.shape}"
+            if torch.is_floating_point(vs) or torch.is_floating_point(vp):
+                key_atol, key_rtol = tol_map.get(key, (atol, rtol))
+                assert torch.allclose(vs, vp, atol=key_atol, rtol=key_rtol), f"values differ for {key}"
+            else:
+                assert torch.equal(vs, vp), f"values differ for {key}"
+        elif isinstance(vs, list) and isinstance(vp, list):
+            assert vs == vp, f"list values differ for {key}"
+        elif isinstance(vs, tuple) and isinstance(vp, tuple):
+            assert vs == vp, f"tuple values differ for {key}"
+        else:
+            assert vs == vp, f"values differ for {key}: {vs} vs {vp}"
+
+
 def test_collect_trajectory_consistency(monkeypatch):
     env, agent = _make_env_agent(monkeypatch)
     batch = collect_trajectory(
@@ -159,7 +262,8 @@ def test_collect_trajectory_consistency(monkeypatch):
     assert torch.isfinite(batch['adv']).all()
     assert torch.isfinite(batch['ret']).all()
     # Routing log should have entries
-    assert len(batch.get('routing_log', [])) > 0
+    assert 'routing_log' in batch
+    assert len(batch['routing_log']) > 0
 
 
 def test_update_metrics_and_ranges(monkeypatch):
@@ -179,15 +283,23 @@ def test_update_metrics_and_ranges(monkeypatch):
         if torch.is_tensor(v):
             assert torch.isfinite(v).all(), f"Metric {k} has non-finite values"
     # Sanity: approx_kl should be finite (può essere leggermente negativo per numerica)
-    akl = info.get('approx_kl', torch.tensor(0.0))
-    if torch.is_tensor(akl):
-        assert torch.isfinite(akl).all()
-    clip_frac = info.get('clip_frac', torch.tensor(0.0))
-    if torch.is_tensor(clip_frac):
-        assert 0.0 <= float(clip_frac) <= 1.0 + 1e-3
+    assert 'approx_kl' in info, "approx_kl mancante nei metriche di update"
+    akl = info['approx_kl']
+    assert torch.is_tensor(akl)
+    assert torch.isfinite(akl).all()
+    assert 'clip_frac' in info, "clip_frac mancante nei metriche di update"
+    clip_frac = info['clip_frac']
+    assert torch.is_tensor(clip_frac)
+    assert 0.0 <= float(clip_frac) <= 1.0 + 1e-3
     # Value loss non negativa per default MSE
     if 'loss_v' in info:
         assert float(info['loss_v']) >= 0.0
+
+
+def test_serial_vs_parallel_collection_both_teams(monkeypatch):
+    _set_base_env(monkeypatch)
+    batch_serial, batch_parallel = _collect_serial_and_parallel(monkeypatch, seed_val=456, episodes=1, train_both_teams=True)
+    _assert_batches_identical(batch_serial, batch_parallel)
 
 
 class _FakeWriter:
@@ -588,10 +700,8 @@ def _parallel_trend(seed_val: int, opponent_actor: ActionConditionedActor, games
             leg_end = last_off + last_cnt
         else:
             leg_end = leg_start
-        def _maybe_slice(key):
-            v = full_batch.get(key, None)
-            if v is None:
-                return v
+        def _slice_key(key):
+            v = full_batch[key]
             if isinstance(v, list):
                 return v[start_idx:end_idx]
             return v[start_idx:end_idx]
@@ -609,18 +719,16 @@ def _parallel_trend(seed_val: int, opponent_actor: ActionConditionedActor, games
             'legals_offset': full_batch['legals_offset'][start_idx:end_idx] - leg_start,
             'legals_count': full_batch['legals_count'][start_idx:end_idx],
             'chosen_index': full_batch['chosen_index'][start_idx:end_idx],
-            'mcts_weight': full_batch.get('mcts_weight', torch.zeros((0,)))[start_idx:end_idx],
-            'others_hands': full_batch.get('others_hands', torch.zeros((0, 3, 40)))[start_idx:end_idx],
-            'routing_log': _maybe_slice('routing_log'),
+            'mcts_weight': _slice_key('mcts_weight'),
+            'others_hands': _slice_key('others_hands'),
+            'routing_log': _slice_key('routing_log'),
         }
         if 'mcts_policy' in full_batch:
             ep['mcts_policy'] = full_batch['mcts_policy'][leg_start:leg_end]
         if 'logp' in full_batch:
             ep['logp'] = full_batch['logp'][start_idx:end_idx]
-        if 'episode_scores' in full_batch:
-            ep['episode_scores'] = full_batch['episode_scores'][ep_idx:ep_idx + 1]
-        if 'episode_team_rewards' in full_batch:
-            ep['episode_team_rewards'] = full_batch['episode_team_rewards'][ep_idx:ep_idx + 1]
+        ep['episode_scores'] = full_batch['episode_scores'][ep_idx:ep_idx + 1]
+        ep['episode_team_rewards'] = full_batch['episode_team_rewards'][ep_idx:ep_idx + 1]
         return ep
 
     while remaining > 0:
@@ -665,16 +773,9 @@ def _parallel_trend(seed_val: int, opponent_actor: ActionConditionedActor, games
             ep_batch = _slice_episode_batch(batch, start, end)
             seats = ep_batch['seat_team']
             ret = ep_batch['ret']
-            team_rewards = ep_batch.get('episode_team_rewards', None)
-            if team_rewards is not None and team_rewards.numel() >= 2:
-                diff = float(team_rewards[0][0].item() - team_rewards[0][1].item())
-            else:
-                team0_mask = seats[:, 4] > 0.5
-                team1_mask = seats[:, 5] > 0.5
-                if team0_mask.any() and team1_mask.any():
-                    diff = float(ret[team0_mask].mean().item() - ret[team1_mask].mean().item())
-                else:
-                    diff = 0.0
+            team_rewards = ep_batch['episode_team_rewards']
+            assert team_rewards.shape[0] >= 1 and team_rewards.shape[1] == 2, "episode_team_rewards assente o con forma inattesa"
+            diff = float(team_rewards[0][0].item() - team_rewards[0][1].item())
             diffs.append(diff)
             ret_means.append(float(ret.mean().item()) if ret.numel() > 0 else 0.0)
             adv_means.append(float(ep_batch['adv'].mean().item()) if ep_batch['adv'].numel() > 0 else 0.0)

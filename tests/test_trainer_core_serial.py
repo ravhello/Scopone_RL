@@ -137,8 +137,8 @@ def test_collect_trajectory_serial_main_only_rew_matches_team_rewards():
         alternate_main_seats=False,
         episodes=5,
     )
-    team_rewards = batch.get('episode_team_rewards', None)
-    assert team_rewards is not None and team_rewards.shape[0] > 0
+    team_rewards = batch['episode_team_rewards']
+    assert team_rewards.shape[0] > 0
     done = batch['done']
     start = 0
     ep_idx = 0
@@ -175,8 +175,8 @@ def test_collect_trajectory_serial_main_only_rew_matches_team_rewards_alternate(
         alternate_main_seats=True,
         episodes=5,
     )
-    team_rewards = batch.get('episode_team_rewards', None)
-    assert team_rewards is not None and team_rewards.shape[0] > 0
+    team_rewards = batch['episode_team_rewards']
+    assert team_rewards.shape[0] > 0
     done = batch['done']
     start = 0
     ep_idx = 0

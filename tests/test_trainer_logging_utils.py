@@ -74,4 +74,4 @@ def test_maybe_log_ppo_batch_emits_output(monkeypatch, capsys):
     )
     captured = capsys.readouterr()
     merged = (captured.out or '') + (captured.err or '')
-    assert '[ppo-debug test]' in merged or 'ppo-debug test' in merged
+    assert '[ppo-debug test]' in merged

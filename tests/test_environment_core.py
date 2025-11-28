@@ -31,6 +31,7 @@ def test_env_reaches_done_eventually():
         assert len(legals) > 0
         env.step(legals[0])
         steps += 1
-    assert env.done or steps >= 40  # almeno una mano completa raggiunta
+    assert env.done is True, f"environment never reached done after {steps} steps"
+    assert steps == 40, f"expected exactly 40 steps to finish a hand, got {steps}"
 
 

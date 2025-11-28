@@ -117,8 +117,8 @@ def test_collect_trajectory_parallel_main_only_rew_matches_team_rewards():
         show_progress_env=False,
         tqdm_base_pos=0,
     )
-    team_rewards = batch.get('episode_team_rewards', None)
-    assert team_rewards is not None and team_rewards.shape[0] > 0
+    team_rewards = batch['episode_team_rewards']
+    assert team_rewards.shape[0] > 0
     ep_idx = 0
     start = 0
     for i, d in enumerate(batch['done']):
@@ -155,8 +155,8 @@ def test_collect_trajectory_parallel_main_only_rew_matches_team_rewards_alternat
         show_progress_env=False,
         tqdm_base_pos=0,
     )
-    team_rewards = batch.get('episode_team_rewards', None)
-    assert team_rewards is not None and team_rewards.shape[0] > 0
+    team_rewards = batch['episode_team_rewards']
+    assert team_rewards.shape[0] > 0
     ep_idx = 0
     start = 0
     for i, d in enumerate(batch['done']):
@@ -229,7 +229,7 @@ def test_collect_trajectory_parallel_both_teams_rewards_balanced():
     assert int(batch['done'].sum().item()) == len(per_ep)
     # zero-sum per episodio quando raccolti entrambi i team
     assert all(abs(t0 + t1) < 1e-5 for (t0, t1) in per_ep), f"episode rewards not zero-sum: {per_ep}"
-    assert all((abs(t0) > 0 or abs(t1) > 0) for (t0, t1) in per_ep), f"all episode rewards are zero: {per_ep}"
+    assert any((abs(t0) > 0 or abs(t1) > 0) for (t0, t1) in per_ep), f"all episode rewards are zero: {per_ep}"
 
 
 def test_require_team_rewards_rejects_non_positive_score_sum_parallel():

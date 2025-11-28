@@ -32,7 +32,9 @@ def _run_parallel_with_timeout(fn, timeout_s: float = 30.0):
         pytest.fail(f"collect_batch(parallel) non ha terminato entro {timeout_s}s; abilita SCOPONE_PAR_DEBUG=1 per maggiori log")
     if err:
         raise err[0]
-    return out.get('val')
+    if 'val' not in out:
+        pytest.fail("collect_batch(parallel) thread terminato senza produrre un valore di ritorno")
+    return out['val']
 
 
 def _make_agent_and_batch(horizon: int = 40, collector_kind: str = 'serial'):
