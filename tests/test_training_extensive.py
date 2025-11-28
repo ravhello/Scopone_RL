@@ -570,12 +570,70 @@ def _parallel_trend(seed_val: int, opponent_actor: ActionConditionedActor, games
     set_global_seeds(seed_val)
     agent = ActionConditionedPPO(obs_dim=ScoponeEnvMA(k_history=4).observation_space.shape[0])
     diffs, ret_means, adv_means = [], [], []
-    for _ in range(games):
+    # Colleziona più episodi per chiamata per ridurre l'overhead di spawn senza rinunciare al percorso parallelo
+    chunk_env = os.environ.get('SCOPONE_PAR_TREND_CHUNK', str(games))
+    try:
+        chunk_size = max(1, min(games, int(chunk_env)))
+    except Exception:
+        chunk_size = games
+    remaining = games
+
+    def _slice_episode_batch(full_batch, start_idx: int, end_idx: int):
+        """Estrai un sotto-batch per singolo episodio, riallineando legals e offset."""
+        leg_off_t = full_batch['legals_offset']
+        leg_cnt_t = full_batch['legals_count']
+        if leg_off_t.numel() > 0:
+            leg_start = int(leg_off_t[start_idx].item())
+        else:
+            leg_start = 0
+        if end_idx > start_idx and leg_cnt_t.numel() > 0:
+            last_off = int(leg_off_t[end_idx - 1].item())
+            last_cnt = int(leg_cnt_t[end_idx - 1].item())
+            leg_end = last_off + last_cnt
+        else:
+            leg_end = leg_start
+        def _maybe_slice(key):
+            v = full_batch.get(key, None)
+            if v is None:
+                return v
+            if isinstance(v, list):
+                return v[start_idx:end_idx]
+            return v[start_idx:end_idx]
+        ep_idx = max(0, episodes_in_batch - 1)
+        ep = {
+            'obs': full_batch['obs'][start_idx:end_idx],
+            'act': full_batch['act'][start_idx:end_idx],
+            'ret': full_batch['ret'][start_idx:end_idx],
+            'adv': full_batch['adv'][start_idx:end_idx],
+            'rew': full_batch['rew'][start_idx:end_idx],
+            'done': full_batch['done'][start_idx:end_idx],
+            'seat_team': full_batch['seat_team'][start_idx:end_idx],
+            'belief_summary': full_batch['belief_summary'][start_idx:end_idx],
+            'legals': full_batch['legals'][leg_start:leg_end],
+            'legals_offset': full_batch['legals_offset'][start_idx:end_idx] - leg_start,
+            'legals_count': full_batch['legals_count'][start_idx:end_idx],
+            'chosen_index': full_batch['chosen_index'][start_idx:end_idx],
+            'mcts_weight': full_batch.get('mcts_weight', torch.zeros((0,)))[start_idx:end_idx],
+            'others_hands': full_batch.get('others_hands', torch.zeros((0, 3, 40)))[start_idx:end_idx],
+            'routing_log': _maybe_slice('routing_log'),
+        }
+        if 'mcts_policy' in full_batch:
+            ep['mcts_policy'] = full_batch['mcts_policy'][leg_start:leg_end]
+        if 'logp' in full_batch:
+            ep['logp'] = full_batch['logp'][start_idx:end_idx]
+        if 'episode_scores' in full_batch:
+            ep['episode_scores'] = full_batch['episode_scores'][ep_idx:ep_idx + 1]
+        if 'episode_team_rewards' in full_batch:
+            ep['episode_team_rewards'] = full_batch['episode_team_rewards'][ep_idx:ep_idx + 1]
+        return ep
+
+    while remaining > 0:
+        run_eps = min(chunk_size, remaining)
         batch = _run_parallel_with_timeout(
             lambda: collect_trajectory_parallel(
                 agent,
                 num_envs=1,
-                episodes_total_hint=1,
+                episodes_total_hint=run_eps,
                 k_history=4,
                 gamma=1.0,
                 lam=1.0,
@@ -598,22 +656,34 @@ def _parallel_trend(seed_val: int, opponent_actor: ActionConditionedActor, games
                 frozen_non_main=True,
                 alternate_main_seats=False,
             ),
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
-        # Calcola diff team usando seat_team
-        seats = batch['seat_team']
-        ret = batch['ret']
-        team0_mask = seats[:, 4] > 0.5
-        team1_mask = seats[:, 5] > 0.5
-        if team0_mask.any() and team1_mask.any():
-            diff = float(ret[team0_mask].mean().item() - ret[team1_mask].mean().item())
-        else:
-            diff = 0.0
-        diffs.append(diff)
-        ret_means.append(float(ret.mean().item()) if ret.numel() > 0 else 0.0)
-        adv_means.append(float(batch['adv'].mean().item()) if batch['adv'].numel() > 0 else 0.0)
-        if batch['obs'].numel() > 0:
-            agent.update(batch, epochs=1, minibatch_size=20)
+        done_flags = batch['done'].tolist()
+        start = 0
+        episodes_in_batch = 0
+        for i, d in enumerate(done_flags):
+            if not d:
+                continue
+            end = i + 1
+            episodes_in_batch += 1
+            ep_batch = _slice_episode_batch(batch, start, end)
+            seats = ep_batch['seat_team']
+            ret = ep_batch['ret']
+            team0_mask = seats[:, 4] > 0.5
+            team1_mask = seats[:, 5] > 0.5
+            if team0_mask.any() and team1_mask.any():
+                diff = float(ret[team0_mask].mean().item() - ret[team1_mask].mean().item())
+            else:
+                diff = 0.0
+            diffs.append(diff)
+            ret_means.append(float(ret.mean().item()) if ret.numel() > 0 else 0.0)
+            adv_means.append(float(ep_batch['adv'].mean().item()) if ep_batch['adv'].numel() > 0 else 0.0)
+            if ep_batch['obs'].numel() > 0:
+                agent.update(ep_batch, epochs=1, minibatch_size=ep_batch['obs'].size(0))
+            start = end
+            if len(diffs) >= games:
+                break
+        remaining = max(0, games - len(diffs))
     return {
         'diffs': diffs,
         'ret_means': ret_means,

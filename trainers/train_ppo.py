@@ -2703,46 +2703,6 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         raise ValueError("collect_trajectory_parallel: mcts_dirichlet_eps must be in [0,1]")
     if float(mcts_dirichlet_alpha) < 0:
         raise ValueError("collect_trajectory_parallel: mcts_dirichlet_alpha must be >= 0")
-    # Fast-path: avoid multiprocessing spawn cost when only one env is requested.
-    # This keeps semantics aligned with the parallel collector while cutting the heavy
-    # process startup overhead that dominates short CI-style runs.
-    _force_mp = str(os.environ.get('SCOPONE_PARALLEL_FORCE_MP', '0')).strip().lower() in ['1', 'true', 'yes', 'on']
-    if int(num_envs) == 1 and (not _force_mp):
-        per_ep_util = 40 if bool(train_both_teams) else 20
-        horizon_hint = max(per_ep_util, int(episodes_total_hint) * per_ep_util)
-        seed_token = _serial_seed_enter(seed)
-        try:
-            env = ScoponeEnvMA(rules={'shape_scopa': False}, k_history=int(k_history))
-            frozen = frozen_actor if bool(frozen_non_main) else None
-            batch = _collect_trajectory_impl(
-                env=env,
-                agent=agent,
-                horizon=horizon_hint,
-                gamma=gamma,
-                lam=lam,
-                partner_actor=frozen,
-                opponent_actor=frozen,
-                main_seats=main_seats if main_seats is not None else [0, 2],
-                episodes=int(episodes_total_hint),
-                final_reward_only=True,
-                use_mcts=use_mcts,
-                mcts_sims=mcts_sims,
-                mcts_dets=mcts_dets,
-                mcts_c_puct=mcts_c_puct,
-                mcts_root_temp=mcts_root_temp,
-                mcts_prior_smooth_eps=mcts_prior_smooth_eps,
-                mcts_dirichlet_alpha=mcts_dirichlet_alpha,
-                mcts_dirichlet_eps=mcts_dirichlet_eps,
-                mcts_train_factor=mcts_train_factor,
-                mcts_progress_start=mcts_progress_start,
-                mcts_progress_full=mcts_progress_full,
-                mcts_min_sims=mcts_min_sims,
-                train_both_teams=train_both_teams,
-                alternate_main_seats=alternate_main_seats,
-            )
-        finally:
-            _serial_seed_exit(seed_token)
-        return batch
     # Choose start method with env override and platform awareness.
     # - Windows: 'spawn'
     # - POSIX with background threads: prefer 'forkserver' to avoid forking after threads
