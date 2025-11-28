@@ -527,9 +527,13 @@ def _env_worker(worker_id: int,
     torch.set_num_interop_threads(1)
     # Ensure different RNG streams per worker for robustness; tolerate seed=None
     _seed_base = cfg.get('seed', None)
-    seed_base_int = int(_seed_base) if _seed_base is not None else 0
+    try:
+        seed_base_int = (int(_seed_base) if _seed_base is not None else None)
+    except Exception:
+        seed_base_int = None
     # Allinea al seriale: nessun offset per worker, episodico gestito nel loop
-    set_global_seeds(seed_base_int)
+    if seed_base_int is not None:
+        set_global_seeds(seed_base_int)
     env = ScoponeEnvMA(rules=cfg.get('rules', {'shape_scopa': False}),
                        k_history=int(cfg.get('k_history', 39)))
     episodes_per_env = int(cfg.get('episodes_per_env', 1))
@@ -590,7 +594,7 @@ def _env_worker(worker_id: int,
             current_main_seats = _toggle_main_seats(current_main_seats)
         episode_main_seats = list(current_main_seats)
         # Episodic seeding coerente col seriale: seed_base + episodio globale
-        if _seed_base is not None:
+        if seed_base_int is not None:
             set_global_seeds(seed_base_int + episode_start_idx + ep)
         starting_player = next_starting_player
         next_starting_player = 1 - next_starting_player
@@ -2688,32 +2692,32 @@ def collect_trajectory(env: ScoponeEnvMA, agent: ActionConditionedPPO, horizon: 
         _serial_seed_exit(seed_token)
 
 
-def collect_trajectory_parallel(agent: ActionConditionedPPO,
-                                num_envs: int = 32,
-                                episodes_total_hint: int = 8,
-                                k_history: int = 39,
-                                gamma: float = 1.0,
-                                lam: float = 1.0,
-                                use_mcts: bool = True,
-                                train_both_teams: bool = True,
-                                main_seats: List[int] = None,
-                                mcts_sims: int = 128,
-                                mcts_dets: int = 4,
-                                mcts_c_puct: float = 1.0,
-                                mcts_root_temp: float = 0.0,
-                                mcts_prior_smooth_eps: float = 0.0,
-                                mcts_dirichlet_alpha: float = 0.25,
-                                mcts_dirichlet_eps: float = 0.0,
-                                mcts_progress_start: float = 0.25,
-                                mcts_progress_full: float = 0.75,
-                                mcts_min_sims: int = 0,
-                                mcts_train_factor: float = 1.0,
-                                seed: int = 0,
-                                show_progress_env: bool = True,
-                                tqdm_base_pos: int = 2,
-                                frozen_actor: ActionConditionedActor = None,
-                                frozen_non_main: bool = False,
-                                alternate_main_seats: bool = True) -> Dict:
+def _collect_trajectory_parallel_impl(agent: ActionConditionedPPO,
+                                      num_envs: int = 32,
+                                      episodes_total_hint: int = 8,
+                                      k_history: int = 39,
+                                      gamma: float = 1.0,
+                                      lam: float = 1.0,
+                                      use_mcts: bool = True,
+                                      train_both_teams: bool = True,
+                                      main_seats: List[int] = None,
+                                      mcts_sims: int = 128,
+                                      mcts_dets: int = 4,
+                                      mcts_c_puct: float = 1.0,
+                                      mcts_root_temp: float = 0.0,
+                                      mcts_prior_smooth_eps: float = 0.0,
+                                      mcts_dirichlet_alpha: float = 0.25,
+                                      mcts_dirichlet_eps: float = 0.0,
+                                      mcts_progress_start: float = 0.25,
+                                      mcts_progress_full: float = 0.75,
+                                      mcts_min_sims: int = 0,
+                                      mcts_train_factor: float = 1.0,
+                                      seed: int = 0,
+                                      show_progress_env: bool = True,
+                                      tqdm_base_pos: int = 2,
+                                      frozen_actor: ActionConditionedActor = None,
+                                      frozen_non_main: bool = False,
+                                      alternate_main_seats: bool = True) -> Dict:
     # Validate configuration invariants
     if int(num_envs) <= 0:
         raise ValueError("collect_trajectory_parallel: num_envs must be > 0")
@@ -3510,6 +3514,70 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'episode_team_rewards': (torch.as_tensor(episode_team_rewards, dtype=torch.float32) if len(episode_team_rewards) > 0 else torch.zeros((0, 2), dtype=torch.float32)),
     }
     return batch
+
+
+def collect_trajectory_parallel(agent: ActionConditionedPPO,
+                                num_envs: int = 32,
+                                episodes_total_hint: int = 8,
+                                k_history: int = 39,
+                                gamma: float = 1.0,
+                                lam: float = 1.0,
+                                use_mcts: bool = True,
+                                train_both_teams: bool = True,
+                                main_seats: List[int] = None,
+                                mcts_sims: int = 128,
+                                mcts_dets: int = 4,
+                                mcts_c_puct: float = 1.0,
+                                mcts_root_temp: float = 0.0,
+                                mcts_prior_smooth_eps: float = 0.0,
+                                mcts_dirichlet_alpha: float = 0.25,
+                                mcts_dirichlet_eps: float = 0.0,
+                                mcts_progress_start: float = 0.25,
+                                mcts_progress_full: float = 0.75,
+                                mcts_min_sims: int = 0,
+                                mcts_train_factor: float = 1.0,
+                                seed: int = 0,
+                                show_progress_env: bool = True,
+                                tqdm_base_pos: int = 2,
+                                frozen_actor: ActionConditionedActor = None,
+                                frozen_non_main: bool = False,
+                                alternate_main_seats: bool = True) -> Dict:
+    """
+    Wrapper che sincronizza il seeding globale con il percorso seriale prima
+    di delegare alla raccolta parallela effettiva.
+    """
+    seed_token = _serial_seed_enter(seed)
+    try:
+        return _collect_trajectory_parallel_impl(
+            agent=agent,
+            num_envs=num_envs,
+            episodes_total_hint=episodes_total_hint,
+            k_history=k_history,
+            gamma=gamma,
+            lam=lam,
+            use_mcts=use_mcts,
+            train_both_teams=train_both_teams,
+            main_seats=main_seats,
+            mcts_sims=mcts_sims,
+            mcts_dets=mcts_dets,
+            mcts_c_puct=mcts_c_puct,
+            mcts_root_temp=mcts_root_temp,
+            mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+            mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+            mcts_dirichlet_eps=mcts_dirichlet_eps,
+            mcts_progress_start=mcts_progress_start,
+            mcts_progress_full=mcts_progress_full,
+            mcts_min_sims=mcts_min_sims,
+            mcts_train_factor=mcts_train_factor,
+            seed=seed,
+            show_progress_env=show_progress_env,
+            tqdm_base_pos=tqdm_base_pos,
+            frozen_actor=frozen_actor,
+            frozen_non_main=frozen_non_main,
+            alternate_main_seats=alternate_main_seats,
+        )
+    finally:
+        _serial_seed_exit(seed_token)
 
 
 def train_ppo(num_iterations: int = 1000, horizon: int = 256, save_every: int = 10, ckpt_path: str = 'checkpoints/ppo_ac.pth', k_history: int = 39, seed: int = 0,

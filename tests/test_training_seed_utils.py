@@ -217,52 +217,67 @@ def test_collect_trajectory_parallel_reproducible_with_seed():
 
 def test_serial_and_parallel_deterministic_with_same_seed():
     seed_val = 123
+    num_eps = 3
     env_serial = ScoponeEnvMA(k_history=4)
     agent_serial = ActionConditionedPPO(obs_dim=env_serial.observation_space.shape[0])
-    batch_serial = train_mod.collect_trajectory(
-        env_serial,
-        agent_serial,
-        horizon=20,
-        use_mcts=False,
-        mcts_sims=0,
-        mcts_dets=0,
-        train_both_teams=False,
-        partner_actor=agent_serial.actor,
-        opponent_actor=agent_serial.actor,
-        alternate_main_seats=False,
-        episodes=1,
-        seed=seed_val,
-    )
     agent_parallel = ActionConditionedPPO(obs_dim=env_serial.observation_space.shape[0])
-    batch_parallel = train_mod.collect_trajectory_parallel(
-        agent_parallel,
-        num_envs=1,
-        episodes_total_hint=1,
-        k_history=4,
-        gamma=1.0,
-        lam=1.0,
-        use_mcts=False,
-        train_both_teams=False,
-        main_seats=[0, 2],
-        mcts_sims=0,
-        mcts_dets=0,
-        mcts_c_puct=1.0,
-        mcts_root_temp=0.0,
-        mcts_prior_smooth_eps=0.0,
-        mcts_dirichlet_alpha=0.25,
-        mcts_dirichlet_eps=0.0,
-        mcts_min_sims=0,
-        mcts_train_factor=1.0,
-        seed=seed_val,
-        show_progress_env=False,
-        tqdm_base_pos=0,
-        frozen_actor=agent_parallel.actor,
-        frozen_non_main=True,
-        alternate_main_seats=False,
-    )
-    # Con lo stesso seed e un solo episodio, obs e legals devono coincidere
-    assert batch_serial['obs'].shape == batch_parallel['obs'].shape
-    assert torch.allclose(batch_serial['obs'], batch_parallel['obs'])
-    assert torch.allclose(batch_serial['legals'], batch_parallel['legals'])
-    assert torch.allclose(batch_serial['chosen_index'], batch_parallel['chosen_index'])
-    assert torch.allclose(batch_serial['rew'], batch_parallel['rew'])
+    serial_batches = []
+    parallel_batches = []
+
+    for _ in range(num_eps):
+        serial_batches.append(
+            train_mod.collect_trajectory(
+                env_serial,
+                agent_serial,
+                horizon=20,
+                use_mcts=False,
+                mcts_sims=0,
+                mcts_dets=0,
+                train_both_teams=False,
+                partner_actor=agent_serial.actor,
+                opponent_actor=agent_serial.actor,
+                alternate_main_seats=False,
+                episodes=1,
+                seed=seed_val,
+            )
+        )
+        parallel_batches.append(
+            train_mod.collect_trajectory_parallel(
+                agent_parallel,
+                num_envs=1,
+                episodes_total_hint=1,
+                k_history=4,
+                gamma=1.0,
+                lam=1.0,
+                use_mcts=False,
+                train_both_teams=False,
+                main_seats=[0, 2],
+                mcts_sims=0,
+                mcts_dets=0,
+                mcts_c_puct=1.0,
+                mcts_root_temp=0.0,
+                mcts_prior_smooth_eps=0.0,
+                mcts_dirichlet_alpha=0.25,
+                mcts_dirichlet_eps=0.0,
+                mcts_min_sims=0,
+                mcts_train_factor=1.0,
+                seed=seed_val,
+                show_progress_env=False,
+                tqdm_base_pos=0,
+                frozen_actor=agent_parallel.actor,
+                frozen_non_main=True,
+                alternate_main_seats=False,
+            )
+        )
+
+    # Con lo stesso seed, ogni episodio raccolto in sequenza deve combaciare 1:1 (seriale vs parallelo)
+    for ep in range(num_eps):
+        bs = serial_batches[ep]
+        bp = parallel_batches[ep]
+        assert bs['obs'].shape == bp['obs'].shape
+        # Distribuzione iniziale delle carte (primo passo dell'episodio) deve coincidere
+        assert torch.allclose(bs['obs'][0], bp['obs'][0])
+        assert torch.allclose(bs['obs'], bp['obs'])
+        assert torch.allclose(bs['legals'], bp['legals'])
+        assert torch.allclose(bs['chosen_index'], bp['chosen_index'])
+        assert torch.allclose(bs['rew'], bp['rew'])
