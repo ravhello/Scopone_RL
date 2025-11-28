@@ -525,8 +525,10 @@ def _env_worker(worker_id: int,
     os.environ['MKL_NUM_THREADS'] = str(wt)
     torch.set_num_threads(wt)
     torch.set_num_interop_threads(1)
-    # Ensure different RNG streams per worker for robustness
-    set_global_seeds(int(cfg.get('seed', 0)) + int(worker_id))
+    # Ensure different RNG streams per worker for robustness; tolerate seed=None
+    _seed_base = cfg.get('seed', None)
+    seed_base_int = int(_seed_base) if _seed_base is not None else 0
+    set_global_seeds(seed_base_int + int(worker_id))
     env = ScoponeEnvMA(rules=cfg.get('rules', {'shape_scopa': False}),
                        k_history=int(cfg.get('k_history', 39)))
     episodes_per_env = int(cfg.get('episodes_per_env', 1))
@@ -629,6 +631,15 @@ def _env_worker(worker_id: int,
             else:
                 legal_cpu_entries = [_to_cpu_float32(x) for x in legal]
                 legal_cpu_tensor = torch.stack(legal_cpu_entries, dim=0) if len(legal_cpu_entries) > 0 else _EMPTY_LEGAL
+            if os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1':
+                if obs_cpu.numel() > 0 and (not torch.isfinite(obs_cpu).all()):
+                    bad = torch.nonzero(~torch.isfinite(obs_cpu), as_tuple=False).flatten()
+                    bad_idx = int(bad[0].item()) if bad.numel() > 0 else -1
+                    raise RuntimeError(f"worker {worker_id}: non-finite observation (ep={ep}, step={step_idx}, player={cp}, idx={bad_idx})")
+                if legal_cpu_tensor.numel() > 0 and (not torch.isfinite(legal_cpu_tensor).all()):
+                    bad = torch.nonzero(~torch.isfinite(legal_cpu_tensor), as_tuple=False).flatten()
+                    bad_idx = int(bad[0].item()) if bad.numel() > 0 else -1
+                    raise RuntimeError(f"worker {worker_id}: non-finite legal action encoding (ep={ep}, step={step_idx}, player={cp}, idx={bad_idx})")
             legal_count = len(legal_cpu_entries)
             is_main = True if train_both_teams else (cp in episode_main_seats)
             store_sample = bool(train_both_teams or is_main)
@@ -2692,6 +2703,46 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         raise ValueError("collect_trajectory_parallel: mcts_dirichlet_eps must be in [0,1]")
     if float(mcts_dirichlet_alpha) < 0:
         raise ValueError("collect_trajectory_parallel: mcts_dirichlet_alpha must be >= 0")
+    # Fast-path: avoid multiprocessing spawn cost when only one env is requested.
+    # This keeps semantics aligned with the parallel collector while cutting the heavy
+    # process startup overhead that dominates short CI-style runs.
+    _force_mp = str(os.environ.get('SCOPONE_PARALLEL_FORCE_MP', '0')).strip().lower() in ['1', 'true', 'yes', 'on']
+    if int(num_envs) == 1 and (not _force_mp):
+        per_ep_util = 40 if bool(train_both_teams) else 20
+        horizon_hint = max(per_ep_util, int(episodes_total_hint) * per_ep_util)
+        seed_token = _serial_seed_enter(seed)
+        try:
+            env = ScoponeEnvMA(rules={'shape_scopa': False}, k_history=int(k_history))
+            frozen = frozen_actor if bool(frozen_non_main) else None
+            batch = _collect_trajectory_impl(
+                env=env,
+                agent=agent,
+                horizon=horizon_hint,
+                gamma=gamma,
+                lam=lam,
+                partner_actor=frozen,
+                opponent_actor=frozen,
+                main_seats=main_seats if main_seats is not None else [0, 2],
+                episodes=int(episodes_total_hint),
+                final_reward_only=True,
+                use_mcts=use_mcts,
+                mcts_sims=mcts_sims,
+                mcts_dets=mcts_dets,
+                mcts_c_puct=mcts_c_puct,
+                mcts_root_temp=mcts_root_temp,
+                mcts_prior_smooth_eps=mcts_prior_smooth_eps,
+                mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                mcts_dirichlet_eps=mcts_dirichlet_eps,
+                mcts_train_factor=mcts_train_factor,
+                mcts_progress_start=mcts_progress_start,
+                mcts_progress_full=mcts_progress_full,
+                mcts_min_sims=mcts_min_sims,
+                train_both_teams=train_both_teams,
+                alternate_main_seats=alternate_main_seats,
+            )
+        finally:
+            _serial_seed_exit(seed_token)
+        return batch
     # Choose start method with env override and platform awareness.
     # - Windows: 'spawn'
     # - POSIX with background threads: prefer 'forkserver' to avoid forking after threads
@@ -3241,6 +3292,35 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     leg_off_t = torch.as_tensor(leg_off, dtype=torch.long)
     leg_cnt_t = torch.as_tensor(leg_cnt, dtype=torch.long)
     chosen_idx_t = torch.as_tensor(chosen_idx, dtype=torch.long)
+    strict_checks = (os.environ.get('SCOPONE_STRICT_CHECKS', '0') == '1')
+    if strict_checks:
+        finite_tensors = {
+            'obs': obs_cpu_t,
+            'next_obs': next_obs_cpu_t,
+            'act': act_cpu_t,
+            'seat_team': seat_cpu_t,
+            'belief_summary': belief_cpu_t,
+            'legals': legals_cpu_t,
+        }
+        for name, tensor in finite_tensors.items():
+            if tensor.numel() > 0 and (not torch.isfinite(tensor).all()):
+                bad = torch.nonzero(~torch.isfinite(tensor), as_tuple=False).flatten()
+                bad_idx = int(bad[0].item()) if bad.numel() > 0 else -1
+                raise RuntimeError(f"collect_trajectory_parallel: non-finite values in {name} (row={bad_idx})")
+        if leg_cnt_t.numel() > 0:
+            if bool((leg_cnt_t <= 0).any().item()):
+                bad = torch.nonzero(leg_cnt_t <= 0, as_tuple=False).flatten()
+                bad_idx = int(bad[0].item()) if bad.numel() > 0 else -1
+                raise RuntimeError(f"collect_trajectory_parallel: non-positive legals_count (row={bad_idx}, cnt={int(leg_cnt_t[bad_idx].item())})")
+            max_end = int((leg_off_t + leg_cnt_t).max().item())
+            if max_end > legals_cpu_t.size(0):
+                raise RuntimeError(f"collect_trajectory_parallel: legals offsets out of bounds (max_end={max_end}, total_legals={legals_cpu_t.size(0)})")
+            if bool((chosen_idx_t >= leg_cnt_t).any().item()):
+                bad = torch.nonzero(chosen_idx_t >= leg_cnt_t, as_tuple=False).flatten()
+                bad_idx = int(bad[0].item()) if bad.numel() > 0 else -1
+                raise RuntimeError(
+                    f"collect_trajectory_parallel: chosen_index overflow (row={bad_idx}, idx={int(chosen_idx_t[bad_idx].item())}, cnt={int(leg_cnt_t[bad_idx].item())})"
+                )
     # Distill/belief aux targets from episodes
     # Ricostruisci mcts_policy_flat per-sample mantenendo allineamento con leg_cnt/leg_off
     mcts_policy_flat = []
@@ -3352,6 +3432,19 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
     ret_vec = adv_vec + val_t
     if _PAR_TIMING:
         t_values_gae = (time.time() - _t_val0)
+    if strict_checks:
+        post_value_tensors = {
+            'rew': rew_t,
+            'ret': ret_vec,
+            'adv': adv_vec,
+            'val': val_t,
+            'next_val': nval_t,
+        }
+        for name, tensor in post_value_tensors.items():
+            if tensor.numel() > 0 and (not torch.isfinite(tensor).all()):
+                bad = torch.nonzero(~torch.isfinite(tensor), as_tuple=False).flatten()
+                bad_idx = int(bad[0].item()) if bad.numel() > 0 else -1
+                raise RuntimeError(f"collect_trajectory_parallel: non-finite {name} tensor after value pass (row={bad_idx})")
 
     # Compute logp in batch on CPU (factored card + capture scheme)
     _t_olp0 = time.time() if _PAR_TIMING else 0.0
@@ -3394,6 +3487,13 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         extra={'episodes': episodes},
     )
 
+    # Costruisci routing_log sintetico per il batch parallelo usando i seat registrati
+    if seat_cpu_t.numel() > 0:
+        seat_idx = torch.argmax(seat_cpu_t[:, :4], dim=1).tolist()
+        routing_log = [(int(pid), 'main') for pid in seat_idx]
+    else:
+        routing_log = []
+
     batch = {
         'obs': obs_cpu_t,
         'act': act_cpu_t,
@@ -3412,7 +3512,7 @@ def collect_trajectory_parallel(agent: ActionConditionedPPO,
         'mcts_policy': mcts_policy_t,
         'mcts_weight': mcts_weight_t,
         'others_hands': others_hands_t,
-        'routing_log': [('parallel', 'main')],
+        'routing_log': routing_log,
         'episode_scores': (torch.as_tensor(episode_scores, dtype=torch.float32) if len(episode_scores) > 0 else torch.zeros((0, 2), dtype=torch.float32)),
         'episode_team_rewards': (torch.as_tensor(episode_team_rewards, dtype=torch.float32) if len(episode_team_rewards) > 0 else torch.zeros((0, 2), dtype=torch.float32)),
     }

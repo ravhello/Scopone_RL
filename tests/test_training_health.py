@@ -1,4 +1,6 @@
 import os
+import os
+import threading
 import pytest
 import torch
 
@@ -7,6 +9,30 @@ from algorithms.ppo_ac import ActionConditionedPPO
 from trainers.train_ppo import collect_trajectory
 from actions import encode_action_from_ids_tensor, decode_action_ids, encode_action_hash
 from conftest import collect_batch
+
+
+def _run_parallel_with_timeout(fn, timeout_s: float = 30.0):
+    """
+    Esegue fn in un thread separato con timeout esplicito per evitare blocchi silenziosi
+    nel collector parallelo; se scade il timeout, fallisce con un messaggio chiaro.
+    """
+    out = {}
+    err = []
+
+    def _wrap():
+        try:
+            out['val'] = fn()
+        except BaseException as exc:
+            err.append(exc)
+
+    t = threading.Thread(target=_wrap, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        pytest.fail(f"collect_batch(parallel) non ha terminato entro {timeout_s}s; abilita SCOPONE_PAR_DEBUG=1 per maggiori log")
+    if err:
+        raise err[0]
+    return out.get('val')
 
 
 def _make_agent_and_batch(horizon: int = 40, collector_kind: str = 'serial'):
@@ -26,18 +52,23 @@ def _make_agent_and_batch(horizon: int = 40, collector_kind: str = 'serial'):
             train_both_teams=False,
         )
     else:
-        batch = collect_batch(
-            'parallel',
-            agent,
-            env=env,
-            episodes_total_hint=1,
-            k_history=4,
-            use_mcts=False,
-            mcts_sims=0,
-            mcts_dets=0,
-            train_both_teams=False,
-            main_seats=[0, 2],
-            alternate_main_seats=False,
+        os.environ.setdefault('SCOPONE_PAR_DEBUG', '1')
+        os.environ.setdefault('SCOPONE_PPO_DEBUG', '1')
+        batch = _run_parallel_with_timeout(
+            lambda: collect_batch(
+                'parallel',
+                agent,
+                env=env,
+                episodes_total_hint=1,
+                k_history=4,
+                use_mcts=False,
+                mcts_sims=0,
+                mcts_dets=0,
+                train_both_teams=False,
+                main_seats=[0, 2],
+                alternate_main_seats=False,
+            ),
+            timeout_s=40.0,
         )
     return agent, batch
 
